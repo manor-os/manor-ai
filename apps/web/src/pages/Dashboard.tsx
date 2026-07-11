@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import { t } from "../lib/i18n";
@@ -6,8 +7,19 @@ import type { Task, Workspace } from "../lib/types";
 import { currentZonedHour, formatTodayFull, isDeadlineOverdue, relativeTime } from "../lib/format";
 import TrendChart from "../components/ui/TrendChart";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
+import Button from "../components/ui/Button";
+import Modal from "../components/ui/Modal";
+import Toggle from "../components/ui/Toggle";
+import {
+  IconCheck,
+  IconChevronDown,
+  IconDragHandle,
+  IconRefresh,
+  IconSettings,
+} from "../components/icons";
 import { useWorkspaceFilter } from "../stores/workspace";
 import { useAuthStore } from "../stores/auth";
+import { useToastStore } from "../stores/toast";
 
 /* ── helpers ────────────────────────────────────────────── */
 
@@ -43,6 +55,285 @@ interface KpiDef {
   color: KpiColor;
 }
 
+const DASHBOARD_WIDGET_IDS = [
+  "daily_brief",
+  "time_saved",
+  "total_tasks",
+  "tasks_running",
+  "activity",
+  "workspaces",
+  "task_trend",
+] as const;
+
+type DashboardWidgetId = (typeof DASHBOARD_WIDGET_IDS)[number];
+
+interface DashboardWidgetPreference {
+  id: DashboardWidgetId;
+  visible: boolean;
+}
+
+interface DashboardLayoutPreference {
+  version: number;
+  widgets: DashboardWidgetPreference[];
+}
+
+const DEFAULT_DASHBOARD_WIDGETS: DashboardWidgetPreference[] =
+  DASHBOARD_WIDGET_IDS.map((id) => ({ id, visible: true }));
+
+const DASHBOARD_WIDGET_META: Record<
+  DashboardWidgetId,
+  { titleKey: string; descriptionKey: string }
+> = {
+  daily_brief: {
+    titleKey: "page.dashboard.widget_daily_brief",
+    descriptionKey: "page.dashboard.widget_daily_brief_desc",
+  },
+  time_saved: {
+    titleKey: "page.dashboard.widget_time_saved",
+    descriptionKey: "page.dashboard.widget_time_saved_desc",
+  },
+  total_tasks: {
+    titleKey: "page.dashboard.widget_total_tasks",
+    descriptionKey: "page.dashboard.widget_total_tasks_desc",
+  },
+  tasks_running: {
+    titleKey: "page.dashboard.widget_tasks_running",
+    descriptionKey: "page.dashboard.widget_tasks_running_desc",
+  },
+  activity: {
+    titleKey: "page.dashboard.widget_activity",
+    descriptionKey: "page.dashboard.widget_activity_desc",
+  },
+  workspaces: {
+    titleKey: "page.dashboard.widget_workspaces",
+    descriptionKey: "page.dashboard.widget_workspaces_desc",
+  },
+  task_trend: {
+    titleKey: "page.dashboard.widget_task_trend",
+    descriptionKey: "page.dashboard.widget_task_trend_desc",
+  },
+};
+
+const DASHBOARD_WIDGET_GROUPS: Array<{
+  id: string;
+  titleKey: string;
+  widgets: DashboardWidgetId[];
+}> = [
+  {
+    id: "brief",
+    titleKey: "page.dashboard.customize_group_brief",
+    widgets: ["daily_brief"],
+  },
+  {
+    id: "metrics",
+    titleKey: "page.dashboard.customize_group_metrics",
+    widgets: ["time_saved", "total_tasks", "tasks_running"],
+  },
+  {
+    id: "content",
+    titleKey: "page.dashboard.customize_group_content",
+    widgets: ["activity", "workspaces", "task_trend"],
+  },
+];
+
+function normalizeDashboardLayout(value: unknown): DashboardLayoutPreference {
+  const rawWidgets = Array.isArray((value as any)?.widgets)
+    ? (value as any).widgets
+    : [];
+  const seen = new Set<DashboardWidgetId>();
+  const widgets: DashboardWidgetPreference[] = [];
+
+  for (const raw of rawWidgets) {
+    const id = String(raw?.id || "") as DashboardWidgetId;
+    if (!DASHBOARD_WIDGET_IDS.includes(id) || seen.has(id)) continue;
+    seen.add(id);
+    widgets.push({ id, visible: raw?.visible !== false });
+  }
+
+  for (const widget of DEFAULT_DASHBOARD_WIDGETS) {
+    if (!seen.has(widget.id)) widgets.push({ ...widget });
+  }
+
+  return { version: 1, widgets };
+}
+
+function reorderDashboardWidget(
+  widgets: DashboardWidgetPreference[],
+  widgetId: DashboardWidgetId,
+  targetId: DashboardWidgetId,
+): DashboardWidgetPreference[] {
+  const group = DASHBOARD_WIDGET_GROUPS.find(
+    (candidate) => candidate.widgets.includes(widgetId) && candidate.widgets.includes(targetId),
+  );
+  if (!group || widgetId === targetId) return widgets;
+
+  const ordered = widgets.filter((widget) => group.widgets.includes(widget.id));
+  const fromIndex = ordered.findIndex((widget) => widget.id === widgetId);
+  const targetIndex = ordered.findIndex((widget) => widget.id === targetId);
+  if (fromIndex < 0 || targetIndex < 0) return widgets;
+
+  const [moved] = ordered.splice(fromIndex, 1);
+  ordered.splice(targetIndex, 0, moved);
+  let cursor = 0;
+  return widgets.map((widget) =>
+    group.widgets.includes(widget.id) ? ordered[cursor++] : widget,
+  );
+}
+
+function DashboardCustomizer({
+  open,
+  widgets,
+  saving,
+  onChange,
+  onClose,
+  onSave,
+}: {
+  open: boolean;
+  widgets: DashboardWidgetPreference[];
+  saving: boolean;
+  onChange: (widgets: DashboardWidgetPreference[]) => void;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  const [draggedWidget, setDraggedWidget] = useState<DashboardWidgetId | null>(null);
+
+  const moveBy = (widgetId: DashboardWidgetId, offset: -1 | 1) => {
+    const group = DASHBOARD_WIDGET_GROUPS.find((candidate) =>
+      candidate.widgets.includes(widgetId),
+    );
+    if (!group) return;
+    const ordered = widgets.filter((widget) => group.widgets.includes(widget.id));
+    const index = ordered.findIndex((widget) => widget.id === widgetId);
+    const target = ordered[index + offset];
+    if (target) onChange(reorderDashboardWidget(widgets, widgetId, target.id));
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={t("page.dashboard.customize_title")}
+      maxWidth="560px"
+      className="dashboard-customizer-dialog"
+      bodyClassName="dashboard-customizer-body"
+      footer={
+        <div className="dashboard-customizer-footer">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => onChange(DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })))}
+          >
+            <IconRefresh size={14} />
+            {t("page.dashboard.restore_defaults")}
+          </Button>
+          <div className="dashboard-customizer-footer-actions">
+            <Button variant="outline" size="sm" onClick={onClose}>
+              {t("action.cancel")}
+            </Button>
+            <Button size="sm" loading={saving} onClick={onSave}>
+              <IconCheck size={14} />
+              {t("page.dashboard.save_layout")}
+            </Button>
+          </div>
+        </div>
+      }
+    >
+      <p className="dashboard-customizer-intro">
+        {t("page.dashboard.customize_description")}
+      </p>
+      <div className="dashboard-customizer-groups">
+        {DASHBOARD_WIDGET_GROUPS.map((group) => {
+          const groupWidgets = widgets.filter((widget) => group.widgets.includes(widget.id));
+          return (
+            <section key={group.id} className="dashboard-customizer-group">
+              <h3>{t(group.titleKey)}</h3>
+              <div className="dashboard-customizer-widget-list">
+                {groupWidgets.map((widget, index) => {
+                  const meta = DASHBOARD_WIDGET_META[widget.id];
+                  const canReorder = groupWidgets.length > 1;
+                  return (
+                    <div
+                      key={widget.id}
+                      className={`dashboard-customizer-widget${draggedWidget === widget.id ? " is-dragging" : ""}`}
+                      onDragOver={(event) => {
+                        if (draggedWidget && group.widgets.includes(draggedWidget)) {
+                          event.preventDefault();
+                        }
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        if (draggedWidget) {
+                          onChange(reorderDashboardWidget(widgets, draggedWidget, widget.id));
+                        }
+                        setDraggedWidget(null);
+                      }}
+                    >
+                      <span
+                        className={`dashboard-customizer-drag${canReorder ? "" : " is-disabled"}`}
+                        draggable={canReorder}
+                        title={canReorder ? t("page.dashboard.drag_to_reorder") : undefined}
+                        onDragStart={(event) => {
+                          if (!canReorder) return;
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData("text/plain", widget.id);
+                          setDraggedWidget(widget.id);
+                        }}
+                        onDragEnd={() => setDraggedWidget(null)}
+                      >
+                        <IconDragHandle size={15} />
+                      </span>
+                      <div className="dashboard-customizer-widget-copy">
+                        <strong>{t(meta.titleKey)}</strong>
+                        <span>{t(meta.descriptionKey)}</span>
+                      </div>
+                      {canReorder && (
+                        <div className="dashboard-customizer-order-actions">
+                          <button
+                            type="button"
+                            disabled={index === 0}
+                            title={t("page.dashboard.move_up")}
+                            aria-label={`${t("page.dashboard.move_up")} ${t(meta.titleKey)}`}
+                            onClick={() => moveBy(widget.id, -1)}
+                          >
+                            <IconChevronDown size={14} style={{ transform: "rotate(180deg)" }} />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={index === groupWidgets.length - 1}
+                            title={t("page.dashboard.move_down")}
+                            aria-label={`${t("page.dashboard.move_down")} ${t(meta.titleKey)}`}
+                            onClick={() => moveBy(widget.id, 1)}
+                          >
+                            <IconChevronDown size={14} />
+                          </button>
+                        </div>
+                      )}
+                      <Toggle
+                        checked={widget.visible}
+                        size="sm"
+                        aria-label={`${t("page.dashboard.show_widget")} ${t(meta.titleKey)}`}
+                        onChange={() =>
+                          onChange(
+                            widgets.map((candidate) =>
+                              candidate.id === widget.id
+                                ? { ...candidate, visible: !candidate.visible }
+                                : candidate,
+                            ),
+                          )
+                        }
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          );
+        })}
+      </div>
+    </Modal>
+  );
+}
+
 /* ── timeline dot colors ───────────────────────────────── */
 const TIMELINE_COLORS = [
   "#2f7550",
@@ -59,6 +350,8 @@ const TIMELINE_COLORS = [
 
 export default function Dashboard() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const toast = useToastStore();
   const storeUser = useAuthStore((s) => s.user);
   const stored = !storeUser ? localStorage.getItem("manor_user") : null;
   const user = storeUser || (stored ? JSON.parse(stored) : null);
@@ -69,6 +362,54 @@ export default function Dashboard() {
     "";
   const wsId = useWorkspaceFilter((s) => s.activeWorkspaceId);
   const wsFilter = wsId !== "all" ? wsId : undefined;
+  const [customizerOpen, setCustomizerOpen] = useState(false);
+  const [draftWidgets, setDraftWidgets] = useState<DashboardWidgetPreference[]>(
+    DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
+  );
+
+  const { data: dashboardLayoutData } = useQuery({
+    queryKey: ["dashboard-layout"],
+    queryFn: () => api.dashboard.layout(),
+    staleTime: 5 * 60_000,
+  });
+  const dashboardLayout = useMemo(
+    () => normalizeDashboardLayout(dashboardLayoutData),
+    [dashboardLayoutData],
+  );
+  const visibleWidgetIds = useMemo(
+    () => new Set(
+      dashboardLayout.widgets
+        .filter((widget) => widget.visible)
+        .map((widget) => widget.id),
+    ),
+    [dashboardLayout.widgets],
+  );
+  const widgetOrder = useMemo(
+    () => new Map(
+      dashboardLayout.widgets.map((widget, index) => [widget.id, index]),
+    ),
+    [dashboardLayout.widgets],
+  );
+  const isWidgetVisible = (widgetId: DashboardWidgetId) =>
+    visibleWidgetIds.has(widgetId);
+
+  const saveLayoutMutation = useMutation({
+    mutationFn: () => api.dashboard.updateLayout(draftWidgets),
+    onSuccess: (value) => {
+      const normalized = normalizeDashboardLayout(value);
+      queryClient.setQueryData(["dashboard-layout"], normalized);
+      setCustomizerOpen(false);
+      toast.success(t("page.dashboard.layout_saved"));
+    },
+    onError: (error: Error) => {
+      toast.error(t("page.dashboard.layout_save_failed"), error.message);
+    },
+  });
+
+  const openCustomizer = () => {
+    setDraftWidgets(dashboardLayout.widgets.map((widget) => ({ ...widget })));
+    setCustomizerOpen(true);
+  };
 
   const { data: stats, isLoading: statsLoading } = useQuery({
     queryKey: ["dashboard-stats", wsFilter],
@@ -330,67 +671,190 @@ export default function Dashboard() {
     }
   };
 
+  const metricWidgetIds = dashboardLayout.widgets
+    .filter(
+      (widget) =>
+        widget.visible &&
+        (["time_saved", "total_tasks", "tasks_running"] as DashboardWidgetId[]).includes(widget.id),
+    )
+    .map((widget) => widget.id);
+  const showDailyBrief = isWidgetVisible("daily_brief");
+  const showActivity = isWidgetVisible("activity");
+  const showWorkspaces = isWidgetVisible("workspaces");
+  const showTaskTrend = isWidgetVisible("task_trend") && (taskTrends ?? []).length > 0;
+  const showContextRail = showWorkspaces || showTaskTrend;
+  const hasContentWidgets = showActivity || showContextRail;
+  const hasVisibleWidgets = showDailyBrief || metricWidgetIds.length > 0 || hasContentWidgets;
+  const activityFirst =
+    (widgetOrder.get("activity") ?? Number.MAX_SAFE_INTEGER) <=
+    Math.min(
+      showWorkspaces ? widgetOrder.get("workspaces") ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER,
+      showTaskTrend ? widgetOrder.get("task_trend") ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER,
+    );
+  const firstContextWidget = (["workspaces", "task_trend"] as DashboardWidgetId[])
+    .filter((widgetId) => isWidgetVisible(widgetId))
+    .sort(
+      (left, right) =>
+        (widgetOrder.get(left) ?? Number.MAX_SAFE_INTEGER) -
+        (widgetOrder.get(right) ?? Number.MAX_SAFE_INTEGER),
+    )[0];
+  const dashboardRows = [
+    "auto",
+    showDailyBrief ? "auto" : null,
+    metricWidgetIds.length > 0 ? "auto" : null,
+    hasContentWidgets || !hasVisibleWidgets ? "minmax(0, 1fr)" : null,
+  ].filter(Boolean).join(" ");
+
+  const renderMetricWidget = (widgetId: DashboardWidgetId) => {
+    if (widgetId === "time_saved") {
+      return (
+        <MetricCard
+          key={widgetId}
+          iconBg="#e4efe8"
+          iconColor="#2f7550"
+          icon={
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 6v6l4 2" />
+            </svg>
+          }
+          label={t("page.dashboard.time_saved")}
+          value={timeSavedMin ? String(timeSavedMin) : "--"}
+          unit="min"
+          sub={
+            tasksCompleted > 0
+              ? `${t("page.dashboard.based_on")} ${tasksCompleted} ${t("page.dashboard.tasks")}`
+              : undefined
+          }
+          trendUp
+        />
+      );
+    }
+    if (widgetId === "total_tasks") {
+      return (
+        <MetricCard
+          key={widgetId}
+          iconBg="#f3f0fb"
+          iconColor="#6f5f9b"
+          icon={
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+              <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+            </svg>
+          }
+          label={t("page.dashboard.total_tasks")}
+          value={String(totalTasks)}
+          unit={t("page.dashboard.total")}
+          sub={
+            tasksInProgress > 0
+              ? `${tasksInProgress} ${t("page.dashboard.in_progress")}`
+              : undefined
+          }
+        />
+      );
+    }
+    if (widgetId === "tasks_running") {
+      return (
+        <MetricCard
+          key={widgetId}
+          iconBg="#e3ebe8"
+          iconColor="#3f665e"
+          icon={
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+              <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2" />
+              <rect x="9" y="3" width="6" height="4" rx="1" />
+              <path d="M9 14l2 2 4-4" />
+            </svg>
+          }
+          label={t("page.dashboard.tasks_running")}
+          value={String(tasksInProgress)}
+          unit={t("page.dashboard.active")}
+          sub={
+            tasksPending > 0
+              ? `${tasksPending} ${t("page.dashboard.pending")}`
+              : undefined
+          }
+          trendWarn={tasksPending > 5}
+        />
+      );
+    }
+    return null;
+  };
+
   return (
-    <div
-      className="dashboard-page"
-      style={{
-        display: "grid",
-        gridTemplateRows: "auto auto auto minmax(0, 1fr)",
-        minHeight: "100%",
-        height: "100%",
-        boxSizing: "border-box",
-        padding: "12px 24px",
-        gap: 10,
-        overflow: "hidden",
-      }}
-    >
+    <>
+      <div
+        className="dashboard-page"
+        style={{
+          display: "grid",
+          gridTemplateRows: dashboardRows,
+          minHeight: "100%",
+          height: "100%",
+          boxSizing: "border-box",
+          padding: "12px 24px",
+          gap: 10,
+          overflow: "hidden",
+        }}
+      >
       {/* ── Greeting Header ──────────────────────────── */}
-      <div>
-        <h1
-          className="dashboard-title"
-          style={{
-            fontSize: 26,
-            fontWeight: 800,
-            color: "#292524",
-            lineHeight: 1.12,
-            margin: 0,
-          }}
-        >
-          {greetingWord()}
-          {greetingName ? `, ${greetingName}` : ""}{" "}
-          <span role="img" aria-label={t("page.dashboard.wave")}>
-            {t("page.dashboard.and_x1f44b")}</span>
-        </h1>
-        {selectedWs && (
-          <p
-            className="dashboard-selected-workspace"
+      <div className="dashboard-heading-row">
+        <div style={{ minWidth: 0 }}>
+          <h1
+            className="dashboard-title"
             style={{
-              fontSize: 14,
-              fontWeight: 600,
-              color: "#436b65",
-              marginTop: 4,
-              marginBottom: 0,
+              fontSize: 26,
+              fontWeight: 800,
+              color: "#292524",
+              lineHeight: 1.12,
+              margin: 0,
             }}
           >
-            {(selectedWs as any).name}
+            {greetingWord()}
+            {greetingName ? `, ${greetingName}` : ""}{" "}
+            <span role="img" aria-label={t("page.dashboard.wave")}>
+              {t("page.dashboard.and_x1f44b")}
+            </span>
+          </h1>
+          {selectedWs && (
+            <p
+              className="dashboard-selected-workspace"
+              style={{
+                fontSize: 14,
+                fontWeight: 600,
+                color: "#436b65",
+                marginTop: 4,
+                marginBottom: 0,
+              }}
+            >
+              {(selectedWs as any).name}
+            </p>
+          )}
+          <p
+            className="dashboard-subtitle"
+            style={{
+              fontSize: 13,
+              fontWeight: 400,
+              color: "#a8a29e",
+              margin: "4px 0 0",
+            }}
+          >
+            {actionCount > 0
+              ? `${actionCount} ${actionCount > 1 ? t("page.dashboard.actions") : t("page.dashboard.action")} ${t("page.dashboard.need_attention")}`
+              : t("page.dashboard.all_clear")}
           </p>
-        )}
-        <p
-          className="dashboard-subtitle"
-          style={{
-            fontSize: 13,
-            fontWeight: 400,
-            color: "#a8a29e",
-            margin: "4px 0 0",
-          }}
+        </div>
+        <button
+          type="button"
+          className="dashboard-customize-trigger"
+          aria-expanded={customizerOpen}
+          onClick={openCustomizer}
         >
-          {actionCount > 0
-            ? `${actionCount} ${actionCount > 1 ? t("page.dashboard.actions") : t("page.dashboard.action")} ${t("page.dashboard.need_attention")}`
-            : t("page.dashboard.all_clear")}
-        </p>
+          <IconSettings size={15} />
+          {t("page.dashboard.customize")}
+        </button>
       </div>
 
       {/* ── Daily Brief Panel ────────────────────────── */}
+      {showDailyBrief && (
       <div
         className="dashboard-brief-card"
         style={{
@@ -746,102 +1210,34 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+      )}
 
       {/* ── Metrics Row ──────────────────────────────── */}
+      {metricWidgetIds.length > 0 && (
       <div
+        className="dashboard-metrics-grid"
         style={{
           display: "grid",
           gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
           gap: 10,
         }}
       >
-        {/* Time Saved */}
-        <MetricCard
-          iconBg="#e4efe8"
-          iconColor="#2f7550"
-          icon={
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              <circle cx="12" cy="12" r="10" />
-              <path d="M12 6v6l4 2" />
-            </svg>
-          }
-          label={t("page.dashboard.time_saved")}
-          value={timeSavedMin ? String(timeSavedMin) : "--"}
-          unit="min"
-          sub={
-            tasksCompleted > 0
-              ? `${t("page.dashboard.based_on")} ${tasksCompleted} ${t("page.dashboard.tasks")}`
-              : undefined
-          }
-          trendUp
-        />
-        {/* Total Tasks */}
-        <MetricCard
-          iconBg="#f3f0fb"
-          iconColor="#6f5f9b"
-          icon={
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
-            </svg>
-          }
-          label={t("page.dashboard.total_tasks")}
-          value={String(totalTasks)}
-          unit={t("page.dashboard.total")}
-          sub={
-            tasksInProgress > 0
-              ? `${tasksInProgress} ${t("page.dashboard.in_progress")}`
-              : undefined
-          }
-        />
-        {/* Tasks Running */}
-        <MetricCard
-          iconBg="#e3ebe8"
-          iconColor="#3f665e"
-          icon={
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2" />
-              <rect x="9" y="3" width="6" height="4" rx="1" />
-              <path d="M9 14l2 2 4-4" />
-            </svg>
-          }
-          label={t("page.dashboard.tasks_running")}
-          value={String(tasksInProgress)}
-          unit={t("page.dashboard.active")}
-          sub={
-            tasksPending > 0
-              ? `${tasksPending} ${t("page.dashboard.pending")}`
-              : undefined
-          }
-          trendWarn={tasksPending > 5}
-        />
+        {metricWidgetIds.map(renderMetricWidget)}
       </div>
+      )}
 
       {/* ── Activity and Context ── */}
+      {(showActivity || showContextRail) && (
       <div
+        className="dashboard-content-grid"
         style={{
           display: "grid",
-          gridTemplateColumns: "minmax(0, 1.18fr) minmax(340px, 0.82fr)",
+          gridTemplateColumns:
+            showActivity && showContextRail
+              ? activityFirst
+                ? "minmax(0, 1.18fr) minmax(340px, 0.82fr)"
+                : "minmax(340px, 0.82fr) minmax(0, 1.18fr)"
+              : "minmax(0, 1fr)",
           gap: 12,
           alignItems: "stretch",
           height: "100%",
@@ -849,9 +1245,11 @@ export default function Dashboard() {
         }}
       >
         {/* Recent activity */}
+        {showActivity && (
         <div
           className="dashboard-activity-card"
           style={{
+            order: activityFirst ? 0 : 1,
             background: "rgba(255,255,255,0.72)",
             backdropFilter: "blur(16px) saturate(1.06)",
             WebkitBackdropFilter: "blur(16px) saturate(1.06)",
@@ -1125,13 +1523,22 @@ export default function Dashboard() {
             </div>
           )}
         </div>
+        )}
 
         {/* Right rail */}
+        {showContextRail && (
         <div
+          className="dashboard-context-rail"
           style={{
             display: "grid",
-            gridTemplateRows: "minmax(0, 1fr) auto",
+            gridTemplateRows:
+              showWorkspaces && showTaskTrend
+                ? firstContextWidget === "workspaces"
+                  ? "minmax(0, 1fr) auto"
+                  : "auto minmax(0, 1fr)"
+                : "minmax(0, 1fr)",
             gap: 12,
+            order: activityFirst ? 1 : 0,
             minWidth: 0,
             minHeight: 0,
             height: "100%",
@@ -1139,9 +1546,11 @@ export default function Dashboard() {
           }}
         >
           {/* Workspaces */}
+          {showWorkspaces && (
           <div
             className="dashboard-workspaces-card"
             style={{
+              order: widgetOrder.get("workspaces") ?? 0,
               background: "rgba(255,255,255,0.72)",
               backdropFilter: "blur(16px) saturate(1.06)",
               WebkitBackdropFilter: "blur(16px) saturate(1.06)",
@@ -1308,11 +1717,13 @@ export default function Dashboard() {
               </div>
             )}
           </div>
+          )}
 
-          {(taskTrends ?? []).length > 0 && (
+          {showTaskTrend && (
             <div
               className="dashboard-trend-card"
               style={{
+                order: widgetOrder.get("task_trend") ?? 0,
                 background: "rgba(255,255,255,0.72)",
                 backdropFilter: "blur(16px) saturate(1.06)",
                 WebkitBackdropFilter: "blur(16px) saturate(1.06)",
@@ -1368,8 +1779,36 @@ export default function Dashboard() {
             </div>
           )}
         </div>
+        )}
       </div>
-    </div>
+      )}
+
+      {!hasVisibleWidgets && (
+        <div className="dashboard-empty-layout">
+          <span className="dashboard-empty-layout-icon">
+            <IconSettings size={20} />
+          </span>
+          <h2>{t("page.dashboard.empty_layout_title")}</h2>
+          <p>{t("page.dashboard.empty_layout_description")}</p>
+          <Button size="sm" onClick={openCustomizer}>
+            <IconSettings size={14} />
+            {t("page.dashboard.add_widgets")}
+          </Button>
+        </div>
+      )}
+      </div>
+
+      <DashboardCustomizer
+        open={customizerOpen}
+        widgets={draftWidgets}
+        saving={saveLayoutMutation.isPending}
+        onChange={setDraftWidgets}
+        onClose={() => {
+          if (!saveLayoutMutation.isPending) setCustomizerOpen(false);
+        }}
+        onSave={() => saveLayoutMutation.mutate()}
+      />
+    </>
   );
 }
 
@@ -1402,6 +1841,8 @@ function MetricCard({
       style={{
         padding: "14px 16px",
         cursor: "default",
+        height: "100%",
+        boxSizing: "border-box",
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>

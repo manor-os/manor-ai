@@ -373,6 +373,13 @@ async def seed_mcp_catalog(engine: Engine) -> int:
         await conn.execute(text(
             "DELETE FROM mcp_servers WHERE server_key = 'wechat'"
         ))
+        await conn.execute(text(
+            "DELETE FROM mcp_servers WHERE server_key IN "
+            "('xiaohongshu_browser', 'xiaohongshu_local', 'facebook_local', 'social_draft')"
+        ))
+        await conn.execute(text(
+            "DELETE FROM mcp_servers WHERE server_key = 'playwright_browser'"
+        ))
 
         # One-time migration: LLM chat APIs (OpenAI / Anthropic /
         # Doubao / Kimi / Qwen / Deepseek) were briefly seeded as MCP

@@ -44,6 +44,79 @@ def _usage_payload(**overrides) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_dashboard_layout_defaults_and_persists(client: AsyncClient):
+    headers = await _auth(client, "dashlayout")
+
+    default_response = await client.get("/api/v1/dashboard/layout", headers=headers)
+    assert default_response.status_code == 200
+    defaults = default_response.json()
+    assert defaults["version"] == 1
+    assert [widget["id"] for widget in defaults["widgets"]] == [
+        "daily_brief",
+        "time_saved",
+        "total_tasks",
+        "tasks_running",
+        "activity",
+        "workspaces",
+        "task_trend",
+    ]
+    assert all(widget["visible"] for widget in defaults["widgets"])
+
+    customized = [
+        {"id": "daily_brief", "visible": True},
+        {"id": "tasks_running", "visible": False},
+        {"id": "total_tasks", "visible": True},
+        {"id": "time_saved", "visible": True},
+        {"id": "task_trend", "visible": False},
+        {"id": "workspaces", "visible": True},
+        {"id": "activity", "visible": True},
+    ]
+    update_response = await client.put(
+        "/api/v1/dashboard/layout",
+        headers=headers,
+        json={"widgets": customized},
+    )
+    assert update_response.status_code == 200
+    assert update_response.json()["widgets"] == customized
+
+    persisted_response = await client.get("/api/v1/dashboard/layout", headers=headers)
+    assert persisted_response.status_code == 200
+    assert persisted_response.json()["widgets"] == customized
+
+    other_headers = await _auth(client, "dashlayoutother")
+    other_response = await client.get(
+        "/api/v1/dashboard/layout", headers=other_headers
+    )
+    assert other_response.status_code == 200
+    assert all(widget["visible"] for widget in other_response.json()["widgets"])
+    assert other_response.json()["widgets"] != customized
+
+
+@pytest.mark.asyncio
+async def test_dashboard_layout_rejects_unknown_and_duplicate_widgets(client: AsyncClient):
+    headers = await _auth(client, "dashlayoutinvalid")
+
+    unknown = await client.put(
+        "/api/v1/dashboard/layout",
+        headers=headers,
+        json={"widgets": [{"id": "weather", "visible": True}]},
+    )
+    assert unknown.status_code == 422
+
+    duplicate = await client.put(
+        "/api/v1/dashboard/layout",
+        headers=headers,
+        json={
+            "widgets": [
+                {"id": "daily_brief", "visible": True},
+                {"id": "daily_brief", "visible": False},
+            ]
+        },
+    )
+    assert duplicate.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_dashboard_stats(client: AsyncClient):
     """Create tasks + docs and verify stats endpoint returns correct counts."""
     headers = await _auth(client, "dashstats")
