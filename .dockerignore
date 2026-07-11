@@ -1,0 +1,30 @@
+# Node
+**/node_modules
+**/dist
+
+# Python
+**/__pycache__
+**/*.pyc
+*.egg-info
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# Git
+.git
+.gitignore
+
+# Env
+.env
+.env.*
+
+# Docker
+docker-compose*.yml
+
+# Docs / tests
+docs
+tests
+README.md
+LICENSE

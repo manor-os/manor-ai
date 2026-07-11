@@ -1,0 +1,21 @@
+{
+  "id": "mcp_woocommerce",
+  "name": "mcp_woocommerce",
+  "type": "runtime_guidance",
+  "description": "Operate the user's WooCommerce store: read/search products, orders, and customers; create/update products, set stock, and update order status.",
+  "category": "ecommerce",
+  "output_format": "guidance",
+  "tags": ["woocommerce", "ecommerce", "orders", "products", "inventory", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__woocommerce__list_products",
+    "mcp__woocommerce__get_product",
+    "mcp__woocommerce__create_product",
+    "mcp__woocommerce__update_product",
+    "mcp__woocommerce__set_stock",
+    "mcp__woocommerce__list_orders",
+    "mcp__woocommerce__get_order",
+    "mcp__woocommerce__update_order_status",
+    "mcp__woocommerce__list_customers",
+    "mcp__woocommerce__get_customer"
+  ]
+}

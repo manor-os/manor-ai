@@ -1,0 +1,17 @@
+{
+  "id": "mcp_producthunt",
+  "name": "mcp_producthunt",
+  "type": "runtime_guidance",
+  "description": "Read Product Hunt: search posts, fetch post detail, see top daily launches and comments, and post a comment as the authenticated user.",
+  "category": "social-media",
+  "output_format": "guidance",
+  "tags": ["producthunt", "launch", "social-media", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__producthunt__search_posts",
+    "mcp__producthunt__get_post",
+    "mcp__producthunt__daily_posts",
+    "mcp__producthunt__list_comments",
+    "mcp__producthunt__post_comment",
+    "mcp__producthunt__me"
+  ]
+}

@@ -1,0 +1,722 @@
+x-api-build: &api-build
+  context: .
+  dockerfile: docker/Dockerfile.api
+
+x-web-build: &web-build
+  context: .
+  dockerfile: docker/Dockerfile.web
+
+x-sandbox-service-build: &sandbox-service-build
+  context: .
+  dockerfile: docker/Dockerfile.sandbox-service
+
+services:
+  # ── Database ──
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: manor-os-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-manor}
+      POSTGRES_USER: ${POSTGRES_USER:-manor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-manor_secret}
+    ports:
+      - "5434:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-manor}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: manor-os-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory ${REDIS_MAXMEMORY:-0} --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-noeviction}
+    ports:
+      - "6389:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Vault — credential encryption (Transit engine) ──
+  # Dev mode: in-memory, single root token. For production, switch to
+  # `server` mode with Shamir/auto-unseal — see docs/vault.md.
+  vault:
+    image: hashicorp/vault:1.18
+    container_name: manor-os-vault
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-manor-dev-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+    ports:
+      - "8210:8200"
+    command: server -dev -dev-root-token-id=${VAULT_TOKEN:-manor-dev-root-token}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    container_name: manor-os-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9020:9000"
+      - "9021:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ── JuiceFS init — verifies the entity filesystem, formatting only when explicitly safe ──
+  # Each service that needs filesystem access mounts JuiceFS via entrypoint.sh.
+  juicefs-init:
+    image: debian:bookworm-slim
+    container_name: manor-os-juicefs-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates && \
+        ARCH=$$(dpkg --print-architecture) && \
+        curl -sSL "https://github.com/juicedata/juicefs/releases/download/v1.2.3/juicefs-1.2.3-linux-$${ARCH}.tar.gz" \
+          | tar xz -C /usr/local/bin juicefs && \
+        chmod +x /usr/local/bin/juicefs
+        META_URL="$${JUICEFS_META_URL:-redis://redis:6379/1}"
+        DEPLOYMENT_MODE="$${DEPLOYMENT_MODE:-oss}"
+        AUTO_FORMAT="$${JUICEFS_AUTO_FORMAT:-}"
+        BOOTSTRAP="$${JUICEFS_BOOTSTRAP:-}"
+        STATUS_FILE="$$(mktemp)"
+
+        extract_status_field() {
+          sed -nE "s/^[[:space:]]*\"$${1}\": \"([^\"]*)\".*/\1/p" "$${STATUS_FILE}" | head -n1
+        }
+
+        verify_expected_metadata() {
+          CURRENT_UUID="$$(extract_status_field UUID)"
+          CURRENT_BUCKET="$$(extract_status_field Bucket)"
+          if [ -n "$${JUICEFS_EXPECTED_UUID:-}" ] && [ "$${CURRENT_UUID}" != "$${JUICEFS_EXPECTED_UUID}" ]; then
+            echo "JuiceFS metadata UUID mismatch: current=$${CURRENT_UUID} expected=$${JUICEFS_EXPECTED_UUID}" >&2
+            exit 1
+          fi
+          if [ -n "$${JUICEFS_EXPECTED_BUCKET:-}" ] && [ "$${CURRENT_BUCKET}" != "$${JUICEFS_EXPECTED_BUCKET}" ]; then
+            echo "JuiceFS metadata bucket mismatch: current=$${CURRENT_BUCKET} expected=$${JUICEFS_EXPECTED_BUCKET}" >&2
+            exit 1
+          fi
+        }
+
+        if juicefs status "$${META_URL}" >"$${STATUS_FILE}" 2>/tmp/juicefs-status.err; then
+          verify_expected_metadata
+          echo "JuiceFS already formatted and verified."
+        else
+          if [ "$${DEPLOYMENT_MODE}" = "cloud" ] && [ "$${AUTO_FORMAT}" = "true" ] && [ "$${BOOTSTRAP}" != "true" ]; then
+            echo "JuiceFS metadata is not initialized; JUICEFS_AUTO_FORMAT=true requires JUICEFS_BOOTSTRAP=true in cloud mode." >&2
+            cat /tmp/juicefs-status.err >&2 || true
+            exit 1
+          fi
+          if [ "$${AUTO_FORMAT}" != "true" ] && { [ -n "$${AUTO_FORMAT}" ] || [ "$${DEPLOYMENT_MODE}" = "cloud" ]; }; then
+            echo "JuiceFS metadata is not initialized; refusing to auto-format in $${DEPLOYMENT_MODE} mode." >&2
+            cat /tmp/juicefs-status.err >&2 || true
+            exit 1
+          fi
+          juicefs format \
+            --storage "$${JUICEFS_STORAGE:-minio}" \
+            --bucket "$${JUICEFS_BUCKET:-http://minio:9000/manor-fs}" \
+            --access-key "$${JUICEFS_ACCESS_KEY:-$${MINIO_ROOT_USER:-minioadmin}}" \
+            --secret-key "$${JUICEFS_SECRET_KEY:-$${MINIO_ROOT_PASSWORD:-minioadmin}}" \
+            "$${META_URL}" \
+            manor-fs
+          echo "JuiceFS formatted successfully."
+        fi
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      JUICEFS_META_URL: ${JUICEFS_META_URL:-redis://redis:6379/1}
+      JUICEFS_STORAGE: ${JUICEFS_STORAGE:-minio}
+      JUICEFS_BUCKET: ${JUICEFS_BUCKET:-http://minio:9000/manor-fs}
+      JUICEFS_ACCESS_KEY: ${JUICEFS_ACCESS_KEY:-minioadmin}
+      JUICEFS_SECRET_KEY: ${JUICEFS_SECRET_KEY:-minioadmin}
+      JUICEFS_AUTO_FORMAT: ${JUICEFS_AUTO_FORMAT:-}
+      JUICEFS_BOOTSTRAP: ${JUICEFS_BOOTSTRAP:-}
+      JUICEFS_EXPECTED_UUID: ${JUICEFS_EXPECTED_UUID:-}
+      JUICEFS_EXPECTED_BUCKET: ${JUICEFS_EXPECTED_BUCKET:-}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-oss}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Backend ──
+  api:
+    image: manor-api:${TAG:-prod}
+    build: *api-build
+    container_name: manor-os-api
+    restart: unless-stopped
+    # Mounts JuiceFS (privileged + /dev/fuse via entrypoint.sh). Give the app
+    # plus the FUSE layer time to flush cache to MinIO and unmount cleanly on
+    # stop — the default 10s can SIGKILL mid-flush and leave a wedged mount the
+    # daemon then can't kill (the deploy self-heal in deploy.yml is the net).
+    stop_grace_period: 30s
+    privileged: true
+    devices:
+      - /dev/fuse
+    ports:
+      - "8010:8000"
+    volumes:
+      - ./docker/entrypoint.sh:/entrypoint.sh
+    # NB: --reload removed for stability — Docker Desktop's volume sync
+    # generates spurious filesystem events that cause uvicorn to restart
+    # mid-request and tear down long-lived connections (WS, SSE). To pick
+    # up code changes during dev, run `docker compose restart api`.
+    command:
+      - uvicorn
+      - apps.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips=*
+      - --workers
+      - ${API_WORKERS:-1}
+      - --limit-concurrency
+      - ${API_LIMIT_CONCURRENCY:-120}
+      - --backlog
+      - ${API_BACKLOG:-256}
+      - --timeout-keep-alive
+      - ${API_TIMEOUT_KEEP_ALIVE:-5}
+    environment:
+      API_WORKERS: ${API_WORKERS:-1}
+      API_LIMIT_CONCURRENCY: ${API_LIMIT_CONCURRENCY:-120}
+      API_BACKLOG: ${API_BACKLOG:-256}
+      API_TIMEOUT_KEEP_ALIVE: ${API_TIMEOUT_KEEP_ALIVE:-5}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-2}
+      DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-10}
+      DATABASE_POOL_RECYCLE: ${DATABASE_POOL_RECYCLE:-1800}
+      REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-false}
+      CHAT_RATE_LIMIT_ENABLED: ${CHAT_RATE_LIMIT_ENABLED:-false}
+      REDIS_RATE_LIMIT_ENABLED: ${REDIS_RATE_LIMIT_ENABLED:-false}
+      CHAT_RATE_LIMIT_REQUESTS: ${CHAT_RATE_LIMIT_REQUESTS:-30}
+      CHAT_RATE_LIMIT_WINDOW_SECONDS: ${CHAT_RATE_LIMIT_WINDOW_SECONDS:-60}
+      API_RATE_LIMIT_REQUESTS: ${API_RATE_LIMIT_REQUESTS:-200}
+      API_RATE_LIMIT_WINDOW_SECONDS: ${API_RATE_LIMIT_WINDOW_SECONDS:-60}
+      DEGRADED_MODE: ${DEGRADED_MODE:-false}
+      DEGRADED_DISABLE_CHAT_STREAM: ${DEGRADED_DISABLE_CHAT_STREAM:-true}
+      DEGRADED_DISABLE_SANDBOX: ${DEGRADED_DISABLE_SANDBOX:-true}
+      DEGRADED_DISABLE_MEDIA_GENERATION: ${DEGRADED_DISABLE_MEDIA_GENERATION:-true}
+      DEGRADED_DISABLE_LARGE_UPLOADS: ${DEGRADED_DISABLE_LARGE_UPLOADS:-true}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MANOR_FS_ENABLED: "true"
+      MANOR_FS_ROOT: /mnt/manor
+      JUICEFS_META_URL: ${JUICEFS_META_URL:-redis://redis:6379/1}
+      JUICEFS_BUCKET: ${JUICEFS_BUCKET:-http://minio:9000/manor-fs}
+      JUICEFS_EXPECTED_UUID: ${JUICEFS_EXPECTED_UUID:-}
+      JUICEFS_EXPECTED_BUCKET: ${JUICEFS_EXPECTED_BUCKET:-}
+      DOCUMENT_FILE_REPAIR_ENABLED: ${DOCUMENT_FILE_REPAIR_ENABLED:-true}
+      DOCUMENT_FILE_STALE_HEAL_ENABLED: ${DOCUMENT_FILE_STALE_HEAL_ENABLED:-true}
+      SANDBOX_SERVICE_URL: http://sandbox:8000
+      SHELL_SANDBOX_ENABLED: "true"
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      EMBEDDING_BASE_URL: http://ollama:11434/v1
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-oss}
+      MANOR_ENV: ${MANOR_ENV:-dev}
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      APP_URL: ${APP_URL:-http://localhost:18080}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8010}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+      VAULT_TOKEN: ${VAULT_TOKEN:-manor-dev-root-token}
+      VAULT_TRANSIT_KEY: ${VAULT_TRANSIT_KEY:-manor-keys}
+      CREDENTIAL_BACKEND: ${CREDENTIAL_BACKEND:-vault}
+      # OTEL — opt-in. Set OTEL_ENABLED=true in .env (or via the
+      # observability compose profile) to start exporting spans.
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+      OTEL_SAMPLE_RATE: ${OTEL_SAMPLE_RATE:-1.0}
+      # Temporal — opt-in. Set TEMPORAL_ENABLED=true to route plans
+      # through the Temporal workflow runtime instead of Celery.
+      TEMPORAL_ENABLED: ${TEMPORAL_ENABLED:-false}
+      TEMPORAL_HOST: ${TEMPORAL_HOST:-temporal:7233}
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      # Nango — set NANGO_SECRET_KEY in .env after first-time admin
+      # bootstrap (visit http://localhost:3003 → Settings → Admin Key).
+      # When unset, Nango integration is disabled gracefully.
+      NANGO_BASE_URL: ${NANGO_BASE_URL:-http://nango-server:3003}
+      NANGO_PUBLIC_URL: ${NANGO_PUBLIC_URL:-}
+      NANGO_SECRET_KEY: ${NANGO_SECRET_KEY:-}
+      NANGO_PUBLIC_KEY: ${NANGO_PUBLIC_KEY:-}
+      NANGO_WEBHOOK_SECRET: ${NANGO_WEBHOOK_SECRET:-}
+      # Ops alerts — comma-separated email recipients for the alert
+      # engine. Empty means "log only, don't actually email."
+      OPS_EMAIL_RECIPIENTS: ${OPS_EMAIL_RECIPIENTS:-}
+      # Where the alerter probes for /health/deep — defaults to the
+      # in-process API. Set this when running the alerter elsewhere.
+      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://localhost:8000/health/deep}
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      juicefs-init:
+        condition: service_completed_successfully
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+
+  # ── Worker ──
+  worker:
+    image: manor-api:${TAG:-prod}
+    build: *api-build
+    container_name: manor-os-worker
+    restart: unless-stopped
+    # Mounts JuiceFS (privileged + /dev/fuse via entrypoint.sh) and runs Celery
+    # tasks against it. Give in-flight tasks plus the FUSE layer time to drain,
+    # flush cache to MinIO, and unmount cleanly on stop — the default 10s can
+    # SIGKILL mid-flush and leave a wedged mount the daemon can't kill, which is
+    # exactly what failed the 2026-06-02 deploy (deploy.yml self-heal is the net).
+    stop_grace_period: 30s
+    privileged: true
+    devices:
+      - /dev/fuse
+    volumes:
+      # Ops monitoring — Celery beat tasks ops.collect_snapshot and
+      # ops.log_scan need read access to the Docker daemon to inspect
+      # peer containers + tail their stderr. Read-only.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: celery -A packages.core.celery_app worker -B -l info -c 4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-2}
+      DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-10}
+      DATABASE_POOL_RECYCLE: ${DATABASE_POOL_RECYCLE:-1800}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      MANOR_FS_ENABLED: "true"
+      MANOR_FS_ROOT: /mnt/manor
+      JUICEFS_META_URL: ${JUICEFS_META_URL:-redis://redis:6379/1}
+      JUICEFS_BUCKET: ${JUICEFS_BUCKET:-http://minio:9000/manor-fs}
+      JUICEFS_EXPECTED_UUID: ${JUICEFS_EXPECTED_UUID:-}
+      JUICEFS_EXPECTED_BUCKET: ${JUICEFS_EXPECTED_BUCKET:-}
+      DOCUMENT_FILE_REPAIR_ENABLED: ${DOCUMENT_FILE_REPAIR_ENABLED:-true}
+      DOCUMENT_FILE_STALE_HEAL_ENABLED: ${DOCUMENT_FILE_STALE_HEAL_ENABLED:-true}
+      EMBEDDING_BASE_URL: http://ollama:11434/v1
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+      VAULT_TOKEN: ${VAULT_TOKEN:-manor-dev-root-token}
+      VAULT_TRANSIT_KEY: ${VAULT_TRANSIT_KEY:-manor-keys}
+      CREDENTIAL_BACKEND: ${CREDENTIAL_BACKEND:-vault}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8010}
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+      OTEL_SAMPLE_RATE: ${OTEL_SAMPLE_RATE:-1.0}
+      TEMPORAL_ENABLED: ${TEMPORAL_ENABLED:-false}
+      TEMPORAL_HOST: ${TEMPORAL_HOST:-temporal:7233}
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      NANGO_BASE_URL: ${NANGO_BASE_URL:-http://nango-server:3003}
+      NANGO_PUBLIC_URL: ${NANGO_PUBLIC_URL:-}
+      NANGO_SECRET_KEY: ${NANGO_SECRET_KEY:-}
+      NANGO_PUBLIC_KEY: ${NANGO_PUBLIC_KEY:-}
+      NANGO_WEBHOOK_SECRET: ${NANGO_WEBHOOK_SECRET:-}
+      OPS_EMAIL_RECIPIENTS: ${OPS_EMAIL_RECIPIENTS:-}
+      # The worker probes the API container's /health/deep, not its own
+      # localhost (the worker doesn't run uvicorn). Inside the docker
+      # network, the api service name resolves to the API container.
+      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://api:8000/health/deep}
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      juicefs-init:
+        condition: service_completed_successfully
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+
+  # ── Sandbox base image ──
+  # Builds the image used by sandbox service child containers so public users
+  # can run `docker compose up --build -d` without a separate prebuild step.
+  sandbox-skill-image:
+    image: sandbox-skill:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sandbox
+    container_name: manor-os-sandbox-skill-image
+    command: sleep infinity
+    restart: unless-stopped
+
+  # ── Sandbox Service ──
+  # Manages isolated Docker containers for skill script execution.
+  # Talks to the host Docker daemon via the mounted socket.
+  sandbox:
+    image: manor-sandbox-service:${TAG:-prod}
+    build: *sandbox-service-build
+    container_name: manor-os-sandbox
+    restart: unless-stopped
+    # Manages child skill containers via the host docker socket — graceful
+    # shutdown can need to wait for in-flight container creates / cleanups
+    # to settle. Default 10s sometimes wasn't enough during deploy windows.
+    stop_grace_period: 30s
+    ports:
+      - "8110:8000"
+    volumes:
+      # Sandbox service needs host Docker daemon to spawn skill containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      SANDBOX_HOST: "0.0.0.0"
+      SANDBOX_PORT: "8000"
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-sandbox-skill:latest}
+      SANDBOX_NETWORK: ${SANDBOX_NETWORK:-bridge}
+      SANDBOX_MEMORY: ${SANDBOX_MEMORY:-512m}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-1.0}
+      SANDBOX_MAX_SANDBOXES: ${SANDBOX_MAX_SANDBOXES:-20}
+      SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-3600}
+      SANDBOX_DEBUG: ${SANDBOX_DEBUG:-false}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      sandbox-skill-image:
+        condition: service_started
+
+  # ── Frontend (Nginx static — production build) ──
+  web:
+    image: manor-web:${TAG:-prod}
+    build: *web-build
+    container_name: manor-os-web
+    restart: unless-stopped
+    # nginx:alpine sets STOPSIGNAL SIGQUIT (graceful — wait for active
+    # connections to drain). Our nginx.conf reverse-proxies /ws (WebSockets)
+    # and /api/ (SSE streams) to the API with proxy_read_timeout 3600s, so
+    # SIGQUIT can keep workers alive for up to an hour after a deploy.
+    # That blew past the default 10s grace period, dockerd reported
+    # "Error while Stopping", and downstream --force-recreate left orphan
+    # containers (see PR #31). Use SIGTERM (fast shutdown — drops live
+    # connections immediately); the API holds the real conversation state
+    # and the SPA reconnects on its own. 20s grace gives dockerd headroom.
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    ports:
+      - "18080:80"
+    depends_on:
+      - api
+
+  # ── WeChat Personal sidecar (opt-in via profile=wechat) ──
+  # Holds an itchat session against a personal WeChat account and exposes
+  # the HTTP API the WeChatPersonalChannelAdapter speaks to.
+  # Start with:  docker compose --profile wechat up wechat-runner
+  # Then visit http://localhost:8801/qr.png in a browser, scan with WeChat.
+  wechat-runner:
+    image: manor-wechat-runner:${TAG:-prod}
+    profiles: ["wechat"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.wechat-runner
+    container_name: manor-os-wechat-runner
+    ports:
+      - "8801:8800"
+    environment:
+      RUNNER_BEARER_TOKEN: ${WECHAT_RUNNER_BEARER_TOKEN:-}
+      PUBLIC_QR_BASE: ${WECHAT_RUNNER_PUBLIC_BASE:-}
+    volumes:
+      - wechat_runner_data:/data
+    restart: unless-stopped
+
+  # ── Ollama (local embeddings) ──
+  # Ships with exactly one embedding model: mxbai-embed-large (1024-dim).
+  # Anything else listed in the Account → Embedding picker (OpenAI text-
+  # embedding-3-*) is a remote API call, not a second local model.
+  ollama:
+    image: ollama/ollama
+    container_name: manor-os-ollama
+    restart: unless-stopped
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Idempotent model preload — first boot pulls mxbai-embed-large into
+  # the ollama_data volume; subsequent boots see it cached and exit fast.
+  # Without this, the first /embeddings call 404s and document RAG
+  # silently degrades to text-only search.
+  ollama-init:
+    image: ollama/ollama
+    container_name: manor-os-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if ollama list | grep -q "mxbai-embed-large"; then
+          echo "mxbai-embed-large already present, skipping pull";
+        else
+          echo "Pulling mxbai-embed-large...";
+          ollama pull mxbai-embed-large;
+        fi
+    restart: "no"
+
+  # ── Observability (M11 — opt-in via profile) ─────────────────────────
+  # All-in-one Jaeger: collects OTLP spans on 4318 (HTTP) / 4317 (gRPC),
+  # serves the UI on 16686. Enable with:
+  #   docker compose --profile observability up -d jaeger
+  # then point the API at it via OTEL_ENABLED=true + the default
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    container_name: manor-os-jaeger
+    profiles: ["observability"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI
+      - "4318:4318"    # OTLP/HTTP (matches our exporter default)
+      - "4317:4317"    # OTLP/gRPC
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Temporal (M3 — opt-in via profile) ───────────────────────────────
+  # Durable workflow backend for opt-in plan execution. The API + worker
+  # only connect when TEMPORAL_ENABLED=true; without that flag, plans
+  # run on the Celery PlanExecutor as before.
+  # Enable with:
+  #   docker compose --profile temporal up -d temporal temporal-ui
+  # Then export TEMPORAL_ENABLED=true and TEMPORAL_HOST=temporal:7233.
+  temporal:
+    image: temporalio/auto-setup:1.27
+    container_name: manor-os-temporal
+    profiles: ["temporal"]
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-manor}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-manor_secret}
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "127.0.0.1:7233", "cluster", "health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  temporal-ui:
+    image: temporalio/ui:2.30.3
+    container_name: manor-os-temporal-ui
+    profiles: ["temporal"]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: ${APP_URL:-http://localhost:18080}
+    ports:
+      - "8088:8080"
+    depends_on:
+      - temporal
+
+  # ── Browser runner sidecar ──
+  # Headless / headed Chromium + Playwright in a self-contained
+  # container with a full X11 stack (Xvfb + fluxbox + x11vnc +
+  # websockify) for headed-login flows.
+  #
+  # api / worker call POST /perform with provider name + cookies and
+  # this container drives the GUI. Used by NotebookLM, Claude.ai web,
+  # ChatGPT web, LinkedIn (Search & Messaging), Xiaohongshu (browser),
+  # and any future "no-API but cookies-let-me-in" tool.
+  #
+  # Used to be profile-gated (``profiles: ["browser"]``) so that
+  # local ``docker compose up`` skipped the heavy X11 image build.
+  # The gate caused two real production incidents: (1) the
+  # production deploy pipeline shipped browser-driven integrations
+  # without ever starting the sidecar (PR #41); (2) developers ran
+  # ``docker compose up`` and got 502s when clicking Connect on any
+  # browser card. Always-on now — the ~3-5 min first-build cost is
+  # one-time per machine and the cache layer reuses across rebuilds.
+  #
+  # Auth between Manor api and this runner: ``BROWSER_RUNNER_TOKEN``
+  # env (shared bearer). When unset, runner accepts unauthenticated
+  # — safe inside the docker network for dev only.
+  browser-runner:
+    # ``image:`` so the deploy pipeline can ``docker load`` a CI-built
+    # tarball (same pattern as api / web / sandbox / sandbox-skill);
+    # ``build:`` so local ``docker compose up --build`` rebuilds
+    # cleanly when the X11 stack changes.
+    image: manor-browser-runner:${TAG:-prod}
+    build:
+      context: ./docker/browser-runner
+    container_name: manor-os-browser-runner
+    environment:
+      BROWSER_RUNNER_TOKEN: ${BROWSER_RUNNER_TOKEN:-}
+      BROWSER_RUNNER_TIMEOUT_MS: ${BROWSER_RUNNER_TIMEOUT_MS:-90000}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5200/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Jimeng API proxy ──
+  # Reverse-engineered Jimeng (即梦) HTTP gateway from
+  # https://github.com/iptag/jimeng-api — exposes OpenAI-compatible
+  # /v1/images/generations + /v1/videos/generations endpoints. Each
+  # request authenticates with the user's Jimeng ``sessionid`` cookie
+  # as Bearer. We let the upstream maintainer absorb Jimeng's
+  # frequent internal-API churn so Manor can stay in pure Python.
+  #
+  # Start with: ``docker compose --profile jimeng up -d jimeng-api``
+  jimeng-api:
+    image: ghcr.io/iptag/jimeng-api:latest
+    container_name: manor-os-jimeng-api
+    profiles: ["jimeng"]
+    environment:
+      SERVER_PORT: 5100
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5100/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Nango — open-source OAuth + API multiplexer for 200+ SaaS platforms ──
+  # Self-hosted equivalent of Composio. Free; we pay only the container cost.
+  # Architecture:
+  #   - nango-server     HTTP API + admin UI (port 3003)
+  #   - nango-postgres   Nango's own DB (isolated from app DB so version
+  #                      bumps don't risk our schema)
+  # The agent layer talks to nango-server via in-process MCP server
+  # ``packages.core.ai.mcp.nango`` — see that module for tool surface.
+  #
+  # Start with: ``docker compose --profile nango up -d nango-server``
+  #
+  # First-time setup:
+  #   1. Visit http://localhost:3003 → set admin password
+  #   2. Settings → copy your "Secret Key", paste into .env as
+  #      ``NANGO_SECRET_KEY=...`` then restart api+worker
+  #   3. Add Integration entries (Twitter, Slack, …) with each
+  #      platform's OAuth client_id/secret
+  # Manor-OS users then OAuth-connect through our
+  # /api/v1/integrations/nango/connect flow.
+  nango-postgres:
+    image: postgres:15-alpine
+    container_name: manor-os-nango-postgres
+    profiles: ["nango"]
+    environment:
+      POSTGRES_DB: nango
+      POSTGRES_USER: nango
+      POSTGRES_PASSWORD: ${NANGO_DB_PASSWORD:-nango_secret}
+    volumes:
+      - nango_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nango -d nango"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  nango-server:
+    # Nango 0.36 (the "latest" tag, which they froze) — uses simple
+    # public_key OAuth popup flow. Newer versions (0.70+) split out a
+    # separate Connect UI service that we'd have to deploy. Until we
+    # bundle that, stay on 0.36 — Connect, webhooks, and the admin API
+    # all work in this single-container setup.
+    image: nangohq/nango-server:latest
+    container_name: manor-os-nango
+    profiles: ["nango"]
+    ports:
+      - "3003:3003"
+    environment:
+      NANGO_DB_HOST: nango-postgres
+      NANGO_DB_PORT: 5432
+      NANGO_DB_NAME: nango
+      NANGO_DB_USER: nango
+      NANGO_DB_PASSWORD: ${NANGO_DB_PASSWORD:-nango_secret}
+      NANGO_DB_SSL: "false"
+      NANGO_ENCRYPTION_KEY: ${NANGO_ENCRYPTION_KEY:-RzV0YjJ4d3F1cFdfQXFqSHdSeUF6UWp4bUtxN1Y4WkE=}  # 32-byte b64; rotate in prod
+      NANGO_SERVER_URL: ${NANGO_PUBLIC_URL:-http://localhost:3003}
+      NANGO_PUBLIC_SERVER_URL: ${NANGO_PUBLIC_URL:-http://localhost:3003}
+      # Keep Nango's API keys stable across fresh DB/bootstrap cycles,
+      # so Manor API can keep using NANGO_SECRET_KEY/NANGO_PUBLIC_KEY.
+      NANGO_SECRET_KEY_PROD: ${NANGO_SECRET_KEY:-}
+      NANGO_PUBLIC_KEY_PROD: ${NANGO_PUBLIC_KEY:-}
+      SERVER_PORT: 3003
+      LOG_LEVEL: info
+      # Admin auth — set these in production.
+      NANGO_ADMIN_INVITE_TOKEN: ${NANGO_ADMIN_INVITE_TOKEN:-manor-dev-admin}
+      # Nango bundles an S3 client (for log archival / large payloads)
+      # whose AWS SDK refuses to initialize without a region, even when
+      # S3 isn't configured. Provide a stub so the server boots; Nango
+      # only actually contacts S3 if FLAG_LOGS_ENABLED + S3 creds are set.
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+    depends_on:
+      nango-postgres:
+        condition: service_healthy
+
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:
+  ollama_data:
+  wechat_runner_data:
+  nango_pg_data:

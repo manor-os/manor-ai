@@ -1,0 +1,17 @@
+{
+  "id": "mcp_wechat_official",
+  "name": "mcp_wechat_official",
+  "type": "runtime_guidance",
+  "description": "Operate a WeChat Official Account: send customer-service text/image messages within the reply window, send pre-approved template messages, upload media, and read followers.",
+  "category": "messaging",
+  "output_format": "guidance",
+  "tags": ["wechat", "official-account", "messaging", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__wechat_official__send_text_message",
+    "mcp__wechat_official__send_image_message",
+    "mcp__wechat_official__send_template_message",
+    "mcp__wechat_official__upload_media",
+    "mcp__wechat_official__get_follower_info",
+    "mcp__wechat_official__list_followers"
+  ]
+}

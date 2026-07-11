@@ -1,0 +1,42 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system deps + FUSE + JuiceFS + LibreOffice (for PPTX/DOCX rendering)
+# tini is PID 1 (see ENTRYPOINT): it reaps zombies and forwards SIGTERM to
+# entrypoint.sh, which traps it to unmount JuiceFS cleanly before exit.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tini curl ripgrep fuse3 ffmpeg \
+    libreoffice-impress libreoffice-writer libreoffice-calc \
+    poppler-utils fonts-liberation fonts-noto-cjk && \
+    rm -rf /var/lib/apt/lists/* && \
+    ARCH=$(dpkg --print-architecture) && \
+    curl -sSL "https://github.com/juicedata/juicefs/releases/download/v1.2.3/juicefs-1.2.3-linux-${ARCH}.tar.gz" \
+      | tar xz -C /usr/local/bin juicefs && \
+    chmod +x /usr/local/bin/juicefs
+
+# Install Python deps
+COPY pyproject.toml .
+RUN for attempt in 1 2 3; do \
+      pip install --no-cache-dir --default-timeout=300 --retries=8 . && exit 0; \
+      echo "pip install attempt ${attempt} failed; retrying..."; \
+      sleep 10; \
+    done; \
+    exit 1
+
+# Copy source
+COPY alembic.ini .
+COPY packages/ packages/
+COPY apps/ apps/
+COPY scripts/ scripts/
+
+# Entrypoint mounts JuiceFS then runs the main command
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENV PYTHONPATH=/app
+
+EXPOSE 8000
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
+CMD ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

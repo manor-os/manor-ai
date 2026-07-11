@@ -1,0 +1,23 @@
+{
+  "id": "mcp_linkedin",
+  "name": "mcp_linkedin",
+  "type": "runtime_guidance",
+  "description": "Publish and manage content on the user's LinkedIn (and company pages they admin) via the official API: posts with media, comments, reactions, and engagement stats.",
+  "category": "social-media",
+  "output_format": "guidance",
+  "tags": ["linkedin", "social-media", "posting", "analytics", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__linkedin__get_profile",
+    "mcp__linkedin__create_post",
+    "mcp__linkedin__upload_image",
+    "mcp__linkedin__upload_video",
+    "mcp__linkedin__upload_document",
+    "mcp__linkedin__list_organizations",
+    "mcp__linkedin__list_org_posts",
+    "mcp__linkedin__get_post_stats",
+    "mcp__linkedin__get_my_posts",
+    "mcp__linkedin__create_comment",
+    "mcp__linkedin__react_to_post",
+    "mcp__linkedin__delete_post"
+  ]
+}

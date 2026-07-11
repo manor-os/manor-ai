@@ -1,0 +1,19 @@
+{
+  "id": "mcp_email",
+  "name": "mcp_email",
+  "type": "runtime_guidance",
+  "description": "Operate a generic IMAP+SMTP mailbox: list, read, send, move, and delete email on any connected IMAP/SMTP account.",
+  "category": "email",
+  "output_format": "guidance",
+  "tags": ["email", "imap", "smtp", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__email__list_messages",
+    "mcp__email__get_message",
+    "mcp__email__send_email",
+    "mcp__email__mark_read",
+    "mcp__email__mark_unread",
+    "mcp__email__move_message",
+    "mcp__email__delete_message",
+    "mcp__email__list_folders"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "id": "mcp_telegram",
+  "name": "mcp_telegram",
+  "type": "runtime_guidance",
+  "description": "Send messages, photos, and documents to a Telegram chat via the Bot API, verify the bot, and acknowledge inline-keyboard callbacks.",
+  "category": "messaging",
+  "output_format": "guidance",
+  "tags": ["telegram", "messaging", "bot", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__telegram__send_message",
+    "mcp__telegram__send_photo",
+    "mcp__telegram__send_document",
+    "mcp__telegram__get_me",
+    "mcp__telegram__answer_callback_query"
+  ]
+}

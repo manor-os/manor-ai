@@ -1,0 +1,23 @@
+{
+  "id": "mcp_youtube",
+  "name": "mcp_youtube",
+  "type": "runtime_guidance",
+  "description": "Operate YouTube: search videos/channels, read video details and comments, manage your own videos and comments, rate videos, and manage playlists.",
+  "category": "social-media",
+  "output_format": "guidance",
+  "tags": ["youtube", "video", "social-media", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__youtube__search",
+    "mcp__youtube__get_video",
+    "mcp__youtube__get_channel",
+    "mcp__youtube__list_comments",
+    "mcp__youtube__list_my_videos",
+    "mcp__youtube__post_comment",
+    "mcp__youtube__reply_comment",
+    "mcp__youtube__delete_comment",
+    "mcp__youtube__rate_video",
+    "mcp__youtube__update_video",
+    "mcp__youtube__create_playlist",
+    "mcp__youtube__add_to_playlist"
+  ]
+}

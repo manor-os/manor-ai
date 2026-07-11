@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;700;800&display=swap"
+          rel="stylesheet">
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            margin: 0; padding: 0; width: 100% !important;
+            background-color: #F8FAFC;
+            font-family: 'Plus Jakarta Sans', Helvetica, Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        img { max-width: 100%; height: auto; border: 0; outline: none; text-decoration: none; display: block; }
+
+        .email-container {
+            width: 100%; max-width: 600px; margin: 40px auto;
+            background-color: #FFFFFF; border-radius: 24px; overflow: hidden;
+            border: 1px solid #E2E8F0;
+            box-shadow: 0 20px 40px -10px rgba(15, 23, 42, 0.05);
+        }
+
+        .section-content { width: 100%; padding: 0 48px; }
+
+        .header {
+            display: flex; justify-content: center; align-items: center;
+            padding: 40px 0 30px 0; border-bottom: 1px solid #F8FAFC;
+        }
+
+        .logo-container { display: flex; align-items: center; }
+
+        .logo-icon {
+            width: 32px; height: 32px; border-radius: 8px;
+            display: block; border: 0; outline: none; text-decoration: none;
+        }
+
+        .brand-name { padding-left: 12px; font-size: 18px; font-weight: 800; color: #0F172A; letter-spacing: -0.5px; }
+
+        .intro-section { padding: 40px 0 10px 0; text-align: center; }
+
+        .badge {
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 1px; padding: 4px 10px;
+            border-radius: 20px; display: inline-block; margin-bottom: 16px;
+            color: {{ severity_color }};
+            background: {{ severity_bg }};
+        }
+
+        .hero-text {
+            margin: 16px 0; font-size: 28px; font-weight: 800; color: #0F172A;
+            letter-spacing: -0.5px; line-height: 1.25;
+        }
+
+        .body-section { padding: 20px 0 40px 0; }
+
+        .body-greeting {
+            font-size: 16px; line-height: 26px; color: #334155; margin-bottom: 16px;
+        }
+
+        .body-content {
+            font-size: 15px; line-height: 26px; color: #334155;
+        }
+        .body-content p { margin: 0 0 16px 0; }
+        .body-content p:last-child { margin-bottom: 0; }
+        .body-content a { color: #0D9488; text-decoration: underline; }
+        .body-content strong { color: #0F172A; font-weight: 700; }
+        .body-content h1, .body-content h2, .body-content h3 {
+            color: #0F172A; font-weight: 800; margin: 24px 0 12px 0; line-height: 1.3;
+        }
+        .body-content h1 { font-size: 22px; }
+        .body-content h2 { font-size: 18px; }
+        .body-content h3 { font-size: 16px; }
+        .body-content ul, .body-content ol { margin: 0 0 16px 24px; padding: 0; }
+        .body-content li { margin-bottom: 6px; }
+        .body-content code {
+            background: #F1F5F9; padding: 2px 6px; border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+        }
+        .body-content blockquote {
+            border-left: 3px solid #CBD5E1; margin: 12px 0;
+            padding: 4px 12px; color: #475569;
+        }
+        .body-content table {
+            border-collapse: collapse; width: 100%; margin: 0 0 16px 0;
+            font-size: 14px;
+        }
+        .body-content th, .body-content td {
+            border: 1px solid #E2E8F0; padding: 8px 12px; text-align: left;
+        }
+        .body-content th { background: #F8FAFC; font-weight: 700; color: #0F172A; }
+        .body-content img { border-radius: 8px; margin: 12px 0; }
+        .body-content hr { border: none; border-top: 1px solid #E2E8F0; margin: 20px 0; }
+
+        .cta-section {
+            padding: 32px 0; text-align: center; background-color: #F0FDFA;
+            border-top: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0;
+        }
+
+        .btn-primary {
+            background-color: #0F766E; color: #ffffff !important; border-radius: 50px;
+            padding: 14px 32px; text-decoration: none; display: inline-block;
+            font-weight: 700; font-size: 14px; letter-spacing: 0.5px; border: none;
+            cursor: pointer; font-family: 'Plus Jakarta Sans', Helvetica, Arial, sans-serif;
+        }
+
+        .footer {
+            padding: 30px 0; background-color: #FFFFFF; text-align: center;
+            border-top: 1px solid #F1F5F9;
+        }
+
+        .footer-title { margin: 0 0 8px 0; font-size: 14px; font-weight: 700; color: #0F172A; }
+        .footer-info { margin: 0; font-size: 11px; color: #94A3B8; line-height: 18px; }
+
+        @media screen and (max-width: 640px) {
+            .email-container { margin: 20px auto; border-radius: 16px; }
+            .section-content { padding: 0 24px !important; }
+            .hero-text { font-size: 24px !important; line-height: 32px !important; }
+            .btn-primary { padding: 12px 24px; font-size: 13px; }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="email-container">
+        <header class="header">
+            <div class="section-content">
+                <div class="logo-container">
+                    <img src="{{ app_url }}/email-logo.png" width="32" height="32" alt="Manor AI" class="logo-icon" style="display:block;border:0;outline:none;text-decoration:none;border-radius:8px;">
+                    <div class="brand-name">Manor AI</div>
+                </div>
+            </div>
+        </header>
+
+        <section class="intro-section">
+            <div class="section-content">
+                <span class="badge">{{ severity_label }}</span>
+                <h1 class="hero-text">{{ title }}</h1>
+            </div>
+        </section>
+
+        <section class="body-section">
+            <div class="section-content">
+                <p class="body-greeting">Hello {{ display_name }},</p>
+                <div class="body-content">
+                    {{ body_html }}
+                </div>
+            </div>
+        </section>
+
+        {{ cta_block }}
+
+        <footer class="footer">
+            <div class="section-content">
+                <p class="footer-title">Empowering Progress, Simplifying Success</p>
+                <p class="footer-info">
+                    You're receiving this because you're a Manor AI customer.<br>
+                    All rights reserved &copy; Manor AI {{ year }}
+                </p>
+            </div>
+        </footer>
+    </div>
+</body>
+
+</html>

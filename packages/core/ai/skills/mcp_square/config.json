@@ -1,0 +1,23 @@
+{
+  "id": "mcp_square",
+  "name": "mcp_square",
+  "type": "runtime_guidance",
+  "description": "Operate the user's Square account: locations, catalog items, orders, customers, and inventory counts/adjustments.",
+  "category": "ecommerce",
+  "output_format": "guidance",
+  "tags": ["square", "ecommerce", "pos", "catalog", "inventory", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__square__list_locations",
+    "mcp__square__search_catalog_items",
+    "mcp__square__get_catalog_object",
+    "mcp__square__search_orders",
+    "mcp__square__get_order",
+    "mcp__square__list_customers",
+    "mcp__square__get_customer",
+    "mcp__square__get_inventory",
+    "mcp__square__create_catalog_item",
+    "mcp__square__create_customer",
+    "mcp__square__update_customer",
+    "mcp__square__adjust_inventory"
+  ]
+}

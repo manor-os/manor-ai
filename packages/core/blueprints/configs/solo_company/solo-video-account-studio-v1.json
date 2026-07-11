@@ -1,0 +1,955 @@
+{
+  "manifest": {
+    "blueprint_version": "1.1",
+    "slug": "solo-video-account-studio-v1",
+    "title": "Video Account Studio",
+    "summary": "A validated multi-agent workspace for a founder's video account: strategy, scripts, production packets, community support, and analytics review.",
+    "use_when": "Use when a founder wants a repeatable video-account operating system before hiring a team, paying for production, or connecting real publishing accounts.",
+    "outcome_summary": "This workspace runs the backstage operating system for a video account. Five role-specific agents handle strategy, scriptwriting, production packets, audience support, and analytics review. They prepare work for approval; they do not publish, delete, reply to viewers, or edit public assets on their own.",
+    "description": "Creates a tested multi-agent operating loop for a video account: niche and pillar strategy, batch planning, daily script queue, review-ready publishing packets, community support triage, weekly analytics, and one next experiment. The blueprint ships with starter documents and explicit acceptance checks. External video accounts remain optional pairing hints so the workspace can run immediately in simulation.",
+    "tags": [
+      "video",
+      "creator",
+      "youtube",
+      "tiktok",
+      "content"
+    ],
+    "kind": "one_person_company",
+    "category": "solo.video_account",
+    "author": {
+      "handle": "manor",
+      "display_name": "Manor AI"
+    },
+    "cover_image_url": null,
+    "forked_from_id": null,
+    "changelog": "Validated on 2026-06-06: added starter operating documents, batch planning workflow, acceptance criteria, and sandbox verification evidence."
+  },
+  "contract": {
+    "variables": [
+      {
+        "key": "business_name",
+        "label": "Business name",
+        "required": false,
+        "default": "Company"
+      },
+      {
+        "key": "operator_timezone",
+        "label": "Operator timezone",
+        "required": false,
+        "default": "America/Los_Angeles"
+      }
+    ],
+    "channels": [
+      {
+        "channel_type": "telegram",
+        "purpose": "approval alerts for scripts, publishing packets, and weekly video reviews",
+        "required": false
+      }
+    ],
+    "sessions": [
+      {
+        "provider": "youtube",
+        "label": "main",
+        "purpose": "Read channel stats and prepare publishing changes when paired.",
+        "required": false
+      },
+      {
+        "provider": "tiktok",
+        "label": "main",
+        "purpose": "Read video performance and prepare publishing changes when paired.",
+        "required": false
+      }
+    ],
+    "requires": {
+      "manor_min_version": "1.0",
+      "tools": [],
+      "mcp_servers": [],
+      "skills": [],
+      "agents": []
+    }
+  },
+  "embedded": {
+    "skills": [
+      {
+        "slug": "solo-video-account-playbook-v1",
+        "name": "Video Account Playbook",
+        "display_name": "Video Account Playbook",
+        "description": "Operating playbook for Video Account Studio.",
+        "system_prompt": "Help a one-person operator run a video account. Prefer repeatable formats, clear hooks, tight scripts, simple production, and weekly decisions based on retention, watch time, saves, comments, and subscriber movement.",
+        "tools": [],
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "request": {
+              "type": "string"
+            },
+            "workspace_context": {
+              "type": "object"
+            }
+          }
+        },
+        "output_format": "markdown",
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-video-account-studio-v1"
+        ],
+        "version": "1.0.0",
+        "config": {
+          "frozen_at": "2026-06-03"
+        },
+        "status": "active"
+      }
+    ],
+    "agents": [
+      {
+        "slug": "solo-video-content-strategist-v1",
+        "name": "Video Content Strategist",
+        "description": "Owns the audience promise, content pillars, weekly batch plan, and next experiment.",
+        "system_prompt": "You are the strategy agent for a video-account workspace. Maintain the audience promise, content pillars, weekly batch plan, and one learning experiment. Hand off approved angles to the scriptwriter. Never publish, delete, reply to viewers, or edit public assets without explicit operator approval.",
+        "config": {
+          "model": "default",
+          "temperature": 0.3,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-video-account-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "solo-video-account-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "operating_principle",
+            "content": "This workspace serves an owner-operator. Protect the operator's attention, ask for approval before public or financial actions, and keep strategy tied to active goals.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-video-scriptwriter-v1",
+        "name": "Video Scriptwriter",
+        "description": "Turns approved angles into hooks, outlines, scripts, title options, descriptions, and tags.",
+        "system_prompt": "You are the scriptwriting agent for a video-account workspace. Turn approved angles into review-ready script packets with hook, promise, proof, full script, production notes, title options, descriptions, tags, and review checklist. Do not claim that public publishing happened.",
+        "config": {
+          "model": "default",
+          "temperature": 0.45,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-video-account-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "solo-video-account-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Write concise, recordable scripts for an owner-operator. Prioritize hook clarity, audience promise, and production simplicity.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-video-production-coordinator-v1",
+        "name": "Video Production Coordinator",
+        "description": "Prepares publishing packets, production checklists, review decisions, and platform-specific packaging.",
+        "system_prompt": "You are the production coordination agent for a video-account workspace. Package scripts, titles, descriptions, tags, shot notes, and approval checklists. Prepare publish-ready review packets only. Never publish, schedule, delete, or edit public assets without explicit operator approval.",
+        "config": {
+          "model": "default",
+          "temperature": 0.25,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-video-account-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "solo-video-account-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Prepare production and publishing packets for review. Keep public actions gated behind operator approval.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-video-community-support-v1",
+        "name": "Video Community Support",
+        "description": "Triages comments, DMs, viewer questions, and support themes into reply drafts and content feedback.",
+        "system_prompt": "You are the community support agent for a video-account workspace. Triage comments, DMs, viewer questions, objections, and support themes. Draft replies and content feedback for operator review. Never send messages, moderate users, delete comments, or promise support outcomes without explicit operator approval.",
+        "config": {
+          "model": "default",
+          "temperature": 0.35,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-video-account-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "solo-video-account-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Turn audience replies into reviewed response drafts and content insights. Do not send external replies automatically.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-video-analytics-reviewer-v1",
+        "name": "Video Analytics Reviewer",
+        "description": "Reads performance signals, separates real data from assumptions, and recommends the next experiment.",
+        "system_prompt": "You are the analytics review agent for a video-account workspace. Separate connected platform data from manual inputs and simulation assumptions. Summarize retention, watch time, saves, comments, subscriber movement, and production constraints. Recommend exactly one next experiment.",
+        "config": {
+          "model": "default",
+          "temperature": 0.2,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-video-account-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "solo-video-account-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Never invent real platform metrics. Mark missing external account data as simulation assumptions or unknown.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      }
+    ],
+    "knowledge_packs": [
+      {
+        "slug": "solo-video-account-ops",
+        "title": "Video Account Ops",
+        "purpose": "Store niche, pillars, reusable formats, scripts, and weekly analytics notes.",
+        "mode": "inline_text",
+        "folder_structure": [
+          "strategy/",
+          "scripts/",
+          "publishing-packets/",
+          "analytics-reviews/"
+        ],
+        "starter_documents": [
+          {
+            "path": "strategy/audience-promise.md",
+            "body_md": "# Audience Promise\n\n## Primary audience\nOwner-operators building a focused business, product, or expertise-led account with limited weekly production time.\n\n## Account promise\nEvery video should help the audience make one sharper decision, avoid one common mistake, or execute one repeatable operating step.\n\n## Content pillars\n- Problem diagnosis: name the expensive mistake.\n- Proof and teardown: show a real pattern or counterexample.\n- Operating tutorial: teach one repeatable workflow.\n- Founder story: connect a lesson to lived execution.\n\n## Format rules\n- One audience, one promise, one proof point.\n- Hook in the first five seconds.\n- Keep the core idea recordable in one sitting.\n- End with one decision or next action, not vague inspiration.\n"
+          },
+          {
+            "path": "scripts/script-packet-template.md",
+            "body_md": "# Script Packet Template\n\n## Batch context\nAudience, pillar, platform, and experiment hypothesis.\n\n## Candidate A\n- Hook:\n- Why now:\n- Full script:\n- Production notes:\n- Title options:\n- Description:\n- Tags:\n\n## Candidate B\nRepeat the same fields.\n\n## Candidate C\nRepeat the same fields.\n\n## Review checklist\n- Does the hook state a concrete tension?\n- Is the promise measurable or observable?\n- Can the operator record this without extra production complexity?\n- Is public publishing explicitly waiting for operator approval?\n"
+          },
+          {
+            "path": "analytics-reviews/weekly-review-template.md",
+            "body_md": "# Weekly Video Review\n\n## Data status\nConnected account data, manual numbers, or simulation assumptions.\n\n## Performance readout\n- Videos shipped:\n- Best retention signal:\n- Best save/comment signal:\n- Weakest drop-off pattern:\n\n## Learning\nWhat did the audience respond to, and what should be stopped?\n\n## Next experiment\nOne hypothesis, one format change, one measurement.\n\n## Operator decision\nApprove, revise, or pause the next batch.\n"
+          },
+          {
+            "path": "publishing-packets/operator-approval-checklist.md",
+            "body_md": "# Operator Approval Checklist\n\nBefore anything goes public, confirm:\n\n- Script and title match the account promise.\n- No private customer, financial, health, legal, or credential-like information is included.\n- Description and tags are accurate.\n- Platform-specific edits are intentional.\n- Publishing, deletion, profile edits, or external messages are approved by the operator.\n\nApproval status: pending.\n"
+          }
+        ],
+        "external_source": null
+      }
+    ]
+  },
+  "recipe": {
+    "operating_model": {
+      "kind": "one_person_company",
+      "context": "One founder is building a focused video account with limited weekly production time and no dedicated editor.",
+      "primary_work": "Plan video angles, draft scripts, package publish-ready assets for review, track analytics, and decide the next weekly experiment.",
+      "settings": {
+        "timezone": "America/Los_Angeles",
+        "blueprint_frozen": true,
+        "frozen_at": "2026-06-03",
+        "install_expectation": "simulate_first_then_promote"
+      },
+      "services": [
+        {
+          "key": "video.strategy",
+          "name": "Niche and content strategy",
+          "description": "Maintain content pillars, audience promise, and format experiments."
+        },
+        {
+          "key": "video.production",
+          "name": "Script and production queue",
+          "description": "Keep the next scripts, shots, titles, and descriptions ready."
+        },
+        {
+          "key": "video.distribution",
+          "name": "Publishing packet review",
+          "description": "Package scripts, titles, descriptions, tags, and approval checklists without publishing externally."
+        },
+        {
+          "key": "video.community",
+          "name": "Audience support and comment triage",
+          "description": "Triage comments, viewer questions, objections, and support themes into reviewed reply drafts and content feedback."
+        },
+        {
+          "key": "video.analytics",
+          "name": "Video analytics review",
+          "description": "Turn weekly performance signals into one next experiment."
+        }
+      ],
+      "rules": [
+        "One primary audience and one measurable promise per video.",
+        "Default to simple repeatable formats the operator can record in batches.",
+        "Public publishing, deletion, or profile edits require operator approval."
+      ],
+      "review_cadence": {
+        "daily": "Check the next action queue and remove low-leverage work.",
+        "weekly": "Review goal pace, current constraints, and the next experiment."
+      }
+    },
+    "strategist": {
+      "business_model": {
+        "model_type": "content_publishing",
+        "primary_metric": "subscriber_count",
+        "secondary_metrics": [
+          "videos_published_per_week",
+          "average_watch_time_seconds"
+        ],
+        "revenue_model": "Audience first, owned list second, paid offer later."
+      },
+      "cadence": {
+        "schedule": "weekly",
+        "trigger_conditions": [
+          "goal_off_track",
+          "two_low_retention_videos",
+          "new_format_winner"
+        ]
+      },
+      "proposal_shape": "one_week_experiment",
+      "priors": [
+        "Consistency beats complex production for a lean operation.",
+        "Retention and comments are stronger early signals than vanity reach."
+      ],
+      "evaluation_rubric": {
+        "weights": {
+          "leverage": 0.35,
+          "operator_time": 0.25,
+          "learning_speed": 0.25,
+          "risk": 0.15
+        }
+      },
+      "do_not_propose": [
+        "Daily posting plans that require more than one hour of editing per video.",
+        "Platform automation that publishes without review."
+      ],
+      "voice": "direct, analytical, practical"
+    },
+    "prompts": [
+      {
+        "key": "content_pillar_map",
+        "title": "Content pillar map",
+        "body": "Create four content pillars for the account. For each pillar, define the audience pain, repeatable format, proof source, and three starter video angles."
+      },
+      {
+        "key": "script_packet",
+        "title": "Review-ready script packet",
+        "body": "Draft three video candidates with hook, promise, proof, full script, production notes, title options, description, tags, and an operator approval checklist."
+      },
+      {
+        "key": "weekly_review",
+        "title": "Weekly operator review",
+        "body": "Summarize goal movement, what shipped, what blocked execution, and the single highest-leverage decision for next week."
+      },
+      {
+        "key": "experiment_decision",
+        "title": "One-week experiment decision",
+        "body": "Turn last week's retention, saves, comments, and production constraints into one next experiment with a hypothesis, action, and measurement."
+      }
+    ],
+    "subscriptions": [
+      {
+        "service_key": "video.strategy",
+        "agent_slug": "solo-video-content-strategist-v1",
+        "custom_prompt": "Own the audience promise, pillar mix, weekly batch plan, and one next experiment. Hand off approved angles to scriptwriting. Do not take external action without operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-video-account-studio-v1",
+          "primary_service": "video.strategy",
+          "service_name": "Niche and content strategy"
+        }
+      },
+      {
+        "service_key": "video.production",
+        "agent_slug": "solo-video-scriptwriter-v1",
+        "custom_prompt": "Draft review-ready script packets from approved angles. Include hooks, full scripts, title options, descriptions, tags, and operator review checklist.",
+        "config": {
+          "workspace_blueprint_slug": "solo-video-account-studio-v1",
+          "primary_service": "video.production",
+          "service_name": "Script and production queue"
+        }
+      },
+      {
+        "service_key": "video.distribution",
+        "agent_slug": "solo-video-production-coordinator-v1",
+        "custom_prompt": "Prepare publish-ready review packets only. Do not publish, schedule, delete, or edit public assets without explicit operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-video-account-studio-v1",
+          "primary_service": "video.production",
+          "service_name": "Publishing packet review"
+        }
+      },
+      {
+        "service_key": "video.community",
+        "agent_slug": "solo-video-community-support-v1",
+        "custom_prompt": "Triage viewer comments, DMs, objections, and support themes. Draft replies and content feedback for operator review. Do not send external messages automatically.",
+        "config": {
+          "workspace_blueprint_slug": "solo-video-account-studio-v1",
+          "primary_service": "video.community",
+          "service_name": "Audience support and comment triage"
+        }
+      },
+      {
+        "service_key": "video.analytics",
+        "agent_slug": "solo-video-analytics-reviewer-v1",
+        "custom_prompt": "Review performance signals and missing-data assumptions. Recommend exactly one next experiment and do not invent real platform metrics.",
+        "config": {
+          "workspace_blueprint_slug": "solo-video-account-studio-v1",
+          "primary_service": "video.analytics",
+          "service_name": "Video analytics review"
+        }
+      }
+    ],
+    "scheduled_jobs": [
+      {
+        "job_id": "solo-video-daily-script-queue",
+        "name": "Daily video script queue",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 8 * * 1-5",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "video.production",
+          "max_turns": 6,
+          "deliverable": "Inline markdown script review packet in workspace_chat. Include three video candidates with hook, outline, full script, production notes, title options, description, tags, and review checklist. No file attachment is required.",
+          "done_when": "The workspace_chat response contains a complete inline markdown script packet ready for operator review, explicitly states that no external publishing action was taken, and does not require or claim any docx/pdf/file attachment."
+        },
+        "payload_message": "Prepare or refine the next video script packet for operator review. Return the packet inline in workspace_chat as markdown only. Do not create docx, PDF, spreadsheet, or other file attachments for this automation. Use the sections: batch context, three video candidates, review checklist, next operator decisions, and attachment status `none required`.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "solo-video-monday-batch-plan",
+        "name": "Monday video batch plan",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 7 * * 1",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "video.strategy",
+          "max_turns": 6,
+          "deliverable": "Inline markdown weekly batch plan in workspace_chat. Include active audience promise, pillar allocation, five candidate angles, production constraints, and approval decisions needed. No file attachment is required.",
+          "done_when": "The workspace_chat response contains a complete weekly batch plan, ties each candidate to a pillar and experiment, states that no external publishing action was taken, and does not require or claim any docx/pdf/file attachment."
+        },
+        "payload_message": "Prepare the weekly video batch plan before scripts are drafted. Return inline markdown in workspace_chat only. Do not create docx, PDF, spreadsheet, or other file attachments. Include audience promise, pillar mix, five candidate angles, production constraints, and operator decisions needed.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "solo-video-weekly-analytics-review",
+        "name": "Weekly video analytics review",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 10 * * 1",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "video.analytics",
+          "max_turns": 6,
+          "deliverable": "Inline markdown analytics review in workspace_chat. Include current assumptions or missing-data note, performance readout, one experiment, and next-week content decisions. No file attachment is required.",
+          "done_when": "The workspace_chat response contains a complete inline weekly analytics review, clearly marks any missing external account data as assumptions or simulation, recommends one experiment, and does not require or claim any docx/pdf/file attachment."
+        },
+        "payload_message": "Review last week's video results and recommend one experiment. Return the review inline in workspace_chat as markdown only. Do not create docx, PDF, spreadsheet, or other file attachments for this automation. If no external YouTube/TikTok account is connected, state the missing-data assumption and continue in simulation mode.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "solo-video-community-triage",
+        "name": "Daily community support triage",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "30 9 * * 1-5",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "video.community",
+          "max_turns": 6,
+          "deliverable": "Inline markdown community triage packet in workspace_chat. Include viewer questions, objections, support themes, reply drafts, content feedback, and escalation items. No file attachment is required. No external replies are sent.",
+          "done_when": "The workspace_chat response contains a complete community triage packet, clearly marks missing real comment data as simulation or unknown, drafts replies for operator review, states that no external messages were sent, and does not require or claim any docx/pdf/file attachment."
+        },
+        "payload_message": "Prepare the daily community support triage. Return inline markdown in workspace_chat only. Do not create docx, PDF, spreadsheet, or other file attachments for this automation. If no YouTube/TikTok account or comment export is connected, state missing-data assumptions and continue in simulation mode. Include questions, objections, reply drafts, content feedback, escalation items, and external reply status `none sent`.",
+        "default_delivery_mode": "workspace_chat"
+      }
+    ],
+    "workflows": [
+      {
+        "slug": "solo-video-idea-to-review-v1",
+        "description": "Move one video idea from angle to review-ready publishing packet.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "video_angle",
+            "default": "operator supplied"
+          }
+        ],
+        "steps": [
+          {
+            "id": "angle",
+            "name": "Clarify angle",
+            "kind": "agent_call",
+            "service_key": "video.strategy",
+            "input": "Define audience, promise, hook, and proof for the video."
+          },
+          {
+            "id": "script",
+            "name": "Draft script packet",
+            "kind": "agent_call",
+            "depends_on": [
+              "angle"
+            ],
+            "service_key": "video.production",
+            "input": "Draft hook, outline, full script, title options, and description."
+          },
+          {
+            "id": "review",
+            "name": "Operator review",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "script"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      },
+      {
+        "slug": "solo-video-weekly-batch-plan-v1",
+        "description": "Turn the account promise and current constraints into a weekly recording batch.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "weekly_constraint",
+            "default": "limited recording time"
+          }
+        ],
+        "steps": [
+          {
+            "id": "pillar_mix",
+            "name": "Choose pillar mix",
+            "kind": "agent_call",
+            "service_key": "video.strategy",
+            "input": "Select the week's pillar mix, experiment hypothesis, and five candidate angles."
+          },
+          {
+            "id": "batch_plan",
+            "name": "Prepare batch plan",
+            "kind": "agent_call",
+            "depends_on": [
+              "pillar_mix"
+            ],
+            "service_key": "video.production",
+            "input": "Turn selected angles into a recording plan with scripts to draft, shots, constraints, and review order."
+          },
+          {
+            "id": "operator_decision",
+            "name": "Operator batch approval",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "batch_plan"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      },
+      {
+        "slug": "solo-video-weekly-learning-loop-v1",
+        "description": "Convert analytics or simulation assumptions into one next experiment.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "review_window",
+            "default": "last 7 days"
+          }
+        ],
+        "steps": [
+          {
+            "id": "data_read",
+            "name": "Read available data",
+            "kind": "agent_call",
+            "service_key": "video.analytics",
+            "input": "Separate connected platform data from manual inputs and simulation assumptions."
+          },
+          {
+            "id": "experiment",
+            "name": "Choose next experiment",
+            "kind": "agent_call",
+            "depends_on": [
+              "data_read"
+            ],
+            "service_key": "video.strategy",
+            "input": "Recommend one format, hook, or pillar experiment with expected signal."
+          },
+          {
+            "id": "approval",
+            "name": "Operator experiment approval",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "experiment"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      },
+      {
+        "slug": "solo-video-community-response-review-v1",
+        "description": "Turn audience questions and comments into reviewed reply drafts and content insights.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "community_source",
+            "default": "comments or DMs supplied by operator"
+          }
+        ],
+        "steps": [
+          {
+            "id": "triage",
+            "name": "Triage audience messages",
+            "kind": "agent_call",
+            "service_key": "video.community",
+            "input": "Group viewer questions, objections, support themes, and reply opportunities."
+          },
+          {
+            "id": "draft_replies",
+            "name": "Draft response packet",
+            "kind": "agent_call",
+            "depends_on": [
+              "triage"
+            ],
+            "service_key": "video.community",
+            "input": "Draft replies, escalation notes, content feedback, and operator approval checklist."
+          },
+          {
+            "id": "approval",
+            "name": "Operator response approval",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "draft_replies"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      }
+    ],
+    "goals": [
+      {
+        "title": "Grow a focused video account to 10,000 subscribers",
+        "description": "Use the weekly content loop to grow a measurable audience while keeping one clear audience promise and one learning experiment active.",
+        "metric_key": "subscriber_count",
+        "target_value": 10000,
+        "baseline_value": 0,
+        "deadline": "2026-12-31",
+        "measurement_source": {
+          "type": "manual",
+          "metric": "channel_subscribers"
+        },
+        "measurement_cadence": "daily",
+        "priority": 2
+      },
+      {
+        "title": "Ship 3 operator-reviewed videos per week",
+        "description": "Keep production consistent by moving scripts through review-ready packets before anything goes public.",
+        "metric_key": "videos_published_per_week",
+        "target_value": 3,
+        "baseline_value": 0,
+        "measurement_source": {
+          "type": "manual",
+          "metric": "published_video_count"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 2
+      },
+      {
+        "title": "Approve 1 learning experiment per week",
+        "description": "Turn analytics or simulation assumptions into one approved format, hook, or pillar experiment for the next batch.",
+        "metric_key": "approved_video_experiments_per_week",
+        "target_value": 1,
+        "baseline_value": 0,
+        "measurement_source": {
+          "type": "manual",
+          "metric": "approved_experiment_count"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 2
+      }
+    ],
+    "task_categories": [
+      {
+        "key": "strategy",
+        "label": "Strategy",
+        "sort_order": 10
+      },
+      {
+        "key": "script",
+        "label": "Script",
+        "sort_order": 20
+      },
+      {
+        "key": "production",
+        "label": "Production",
+        "sort_order": 30
+      },
+      {
+        "key": "distribution",
+        "label": "Distribution",
+        "sort_order": 35
+      },
+      {
+        "key": "community",
+        "label": "Community",
+        "sort_order": 38
+      },
+      {
+        "key": "analytics",
+        "label": "Analytics",
+        "sort_order": 40
+      }
+    ],
+    "custom_fields": [
+      {
+        "name": "content_pillar",
+        "display_name": "Content pillar",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "problem",
+          "proof",
+          "tutorial",
+          "story"
+        ],
+        "sort_order": 10
+      },
+      {
+        "name": "platform",
+        "display_name": "Platform",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "youtube",
+          "tiktok",
+          "instagram",
+          "xiaohongshu"
+        ],
+        "sort_order": 20
+      },
+      {
+        "name": "production_status",
+        "display_name": "Production status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "idea",
+          "scripted",
+          "recorded",
+          "edited",
+          "reviewed",
+          "scheduled"
+        ],
+        "sort_order": 30
+      },
+      {
+        "name": "review_status",
+        "display_name": "Review status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "draft",
+          "needs_operator_review",
+          "approved",
+          "blocked"
+        ],
+        "sort_order": 40
+      },
+      {
+        "name": "experiment_hypothesis",
+        "display_name": "Experiment hypothesis",
+        "field_type": "text",
+        "target": "task",
+        "sort_order": 50
+      },
+      {
+        "name": "community_status",
+        "display_name": "Community status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "new_question",
+          "reply_drafted",
+          "needs_operator_review",
+          "approved_to_send",
+          "escalated"
+        ],
+        "sort_order": 60
+      }
+    ],
+    "sla_policies": [
+      {
+        "key": "operator_review",
+        "target": "task",
+        "threshold_hours": 24,
+        "description": "Review generated assets or decisions within one workday."
+      }
+    ],
+    "escalation_rules": [
+      {
+        "key": "public_or_financial_action",
+        "condition": "public_publish_or_money_movement",
+        "action": "pause_for_operator_review"
+      }
+    ]
+  },
+  "policy": {
+    "governance": {
+      "never_allow_actions": [
+        "billing.*",
+        "video.delete_*",
+        "social.delete_*",
+        "community.delete_*"
+      ],
+      "hitl_required_actions": [
+        "video.publish_*",
+        "social.publish_*",
+        "community.reply_*",
+        "community.moderate_*",
+        "workspace.file.modify"
+      ],
+      "auto_approve_actions": [
+        "workspace.task.create",
+        "workspace.search"
+      ],
+      "max_risk_level": "medium",
+      "budget_caps_per_kind": {
+        "llm": 300,
+        "action": 120
+      }
+    },
+    "post_install_checks": [
+      {
+        "kind": "agent_callable",
+        "service_key": "video.production"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "video.community"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-video-daily-script-queue"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-video-monday-batch-plan"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-video-weekly-analytics-review"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-video-community-triage"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "solo-video-idea-to-review-v1"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "solo-video-weekly-batch-plan-v1"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "solo-video-weekly-learning-loop-v1"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "solo-video-community-response-review-v1"
+      }
+    ],
+    "expected_baseline": {
+      "maturity_level": "Validated operating blueprint",
+      "validation_summary": "Validated as a sandbox-first workspace package with role-specific agents, starter operating documents, zero blocking setup, recurring jobs, manual workflows, governance controls, and post-install checks.",
+      "runnable_in_simulation": true,
+      "blocking_todos_expected": 0,
+      "first_week_outputs": [
+        "audience promise and pillar map",
+        "weekly batch plan",
+        "five script packets",
+        "one community support triage packet",
+        "one weekly analytics review",
+        "one approved next experiment"
+      ],
+      "validation_evidence": [
+        "Blueprint v1.1 payload schema validation passes.",
+        "Sandbox install path creates strategy, scriptwriting, production, community support, and analytics agents with dedicated service bindings.",
+        "All automations deliver inline workspace_chat packets and explicitly avoid docx, PDF, spreadsheet, or other file attachments.",
+        "YouTube, TikTok, and Telegram are optional non-blocking connections; simulation mode can run before accounts are paired."
+      ],
+      "acceptance_criteria": [
+        "Install in simulation with zero blocking todos.",
+        "Monday batch plan returns audience promise, pillar mix, five candidate angles, production constraints, and operator decisions needed.",
+        "Daily script queue returns three video candidates with hook, full script, title options, description, tags, and review checklist.",
+        "Community support triage returns viewer questions, objections, reply drafts, escalation items, and states that no external replies were sent.",
+        "Weekly analytics review separates connected platform data from simulation assumptions and recommends exactly one next experiment.",
+        "No public publishing, deletion, profile edit, external reply, moderation action, or external file modification runs without operator approval."
+      ],
+      "not_included": [
+        "No real YouTube, TikTok, or Telegram account is connected by default.",
+        "No automatic public publishing, comment replies, moderation, or deletion.",
+        "No invented real analytics when external account data is missing.",
+        "No paid production team, editor handoff, sponsorship pipeline, or monetization automation."
+      ]
+    }
+  }
+}

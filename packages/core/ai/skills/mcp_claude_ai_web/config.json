@@ -1,0 +1,14 @@
+{
+  "id": "mcp_claude_ai_web",
+  "name": "mcp_claude_ai_web",
+  "type": "runtime_guidance",
+  "description": "Drive the user's logged-in Claude.ai web session: start a new chat, continue an existing chat, and list recent chats.",
+  "category": "ai-web-automation",
+  "output_format": "guidance",
+  "tags": ["claude", "claude-ai", "web-automation", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__claude_ai_web__new_chat",
+    "mcp__claude_ai_web__continue_chat",
+    "mcp__claude_ai_web__list_chats"
+  ]
+}

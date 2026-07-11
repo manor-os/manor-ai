@@ -1,0 +1,59 @@
+# ── Secrets — NEVER track anywhere ──
+.env
+.env.local
+.env.production
+.env.cloud
+
+# Cloud-only paths (packages/cloud/, caddy/, docker-compose.cloud.yml,
+# scripts/cloud/, apps/api/routers/billing.py, etc.) ARE tracked in
+# the private cloud repo. They get stripped when mirroring to the
+# public OSS repo — see .ossexclude for the strip list and the
+# (future) .github/workflows/oss-mirror.yml that consumes it.
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.venv*/
+venv/
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+
+# ── Node ──
+node_modules/
+apps/web/dist/
+.next/
+*.tsbuildinfo
+
+# ── IDE ──
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ── Claude Code worktrees (ephemeral, not source) ──
+.claude/worktrees/
+
+# ── Docker ──
+docker/data/
+
+# ── Alembic / DB ──
+*.db
+*.sqlite
+.cloud.prod.env
+
+
+.claude
+.cursor
+
+.playwright-mcp
+
+# ── Scratch / build artifacts (sample generation, previews, screenshots) ──
+tmp/
+# git worktrees
+.worktrees/

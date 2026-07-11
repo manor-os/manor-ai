@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Verification - Manor AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;700;800&display=swap"
+          rel="stylesheet">
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            margin: 0; padding: 0; width: 100% !important;
+            background-color: #F8FAFC;
+            font-family: 'Plus Jakarta Sans', Helvetica, Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        img { max-width: 100%; height: auto; border: 0; outline: none; text-decoration: none; display: block; }
+
+        .email-container {
+            width: 100%; max-width: 600px; margin: 40px auto;
+            background-color: #FFFFFF; border-radius: 24px; overflow: hidden;
+            border: 1px solid #E2E8F0;
+            box-shadow: 0 20px 40px -10px rgba(15, 23, 42, 0.05);
+        }
+
+        .section-content { width: 100%; padding: 0 48px; }
+
+        .header {
+            display: flex; justify-content: center; align-items: center;
+            padding: 40px 0 30px 0; border-bottom: 1px solid #F8FAFC;
+        }
+
+        .logo-container { display: flex; align-items: center; }
+
+        .logo-icon {
+            width: 32px; height: 32px; border-radius: 8px;
+            display: block; border: 0; outline: none; text-decoration: none;
+        }
+
+        .brand-name { padding-left: 12px; font-size: 18px; font-weight: 800; color: #0F172A; letter-spacing: -0.5px; }
+
+        .intro-section { padding: 40px 0 10px 0; text-align: center; }
+
+        .badge {
+            font-size: 10px; font-weight: 700; color: #0D9488; text-transform: uppercase;
+            letter-spacing: 1px; background: #F0FDFA; padding: 4px 10px;
+            border-radius: 20px; display: inline-block; margin-bottom: 16px;
+        }
+
+        .hero-text {
+            margin: 16px 0; font-size: 32px; font-weight: 800; color: #0F172A;
+            letter-spacing: -1px; line-height: 1.2;
+        }
+
+        .description { margin: 0; font-size: 16px; line-height: 26px; color: #64748B; }
+
+        .code-section { padding: 30px 0 40px 0; text-align: center; }
+
+        .code-container {
+            background: linear-gradient(135deg, #F0FDFA 0%, #E0F2F1 100%);
+            border: 2px dashed #0D9488; border-radius: 16px; padding: 32px 24px; margin: 24px 0;
+        }
+
+        .code-label {
+            font-size: 12px; font-weight: 700; color: #0D9488;
+            text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;
+        }
+
+        .verification-code {
+            font-size: 36px; font-weight: 800; color: #0F172A;
+            letter-spacing: 8px; font-family: 'Courier New', monospace; margin: 12px 0;
+        }
+
+        .code-instructions { font-size: 14px; color: #64748B; line-height: 22px; margin-top: 16px; }
+
+        .security-note {
+            background: #FEF3C7; border-left: 4px solid #F59E0B;
+            padding: 16px; border-radius: 8px; margin: 24px 0; text-align: left;
+        }
+
+        .security-note-title { font-size: 13px; font-weight: 700; color: #92400E; margin-bottom: 8px; }
+        .security-note-text { font-size: 13px; color: #78350F; line-height: 20px; }
+
+        .expiry-info { font-size: 13px; color: #64748B; margin-top: 16px; font-style: italic; }
+
+        .footer {
+            padding: 30px 0; background-color: #FFFFFF; text-align: center;
+            border-top: 1px solid #F1F5F9;
+        }
+
+        .footer-title { margin: 0 0 8px 0; font-size: 14px; font-weight: 700; color: #0F172A; }
+        .footer-info { margin: 0; font-size: 11px; color: #94A3B8; line-height: 18px; }
+
+        @media screen and (max-width: 640px) {
+            .email-container { margin: 20px auto; border-radius: 16px; }
+            .section-content { padding: 0 24px !important; }
+            .hero-text { font-size: 28px !important; line-height: 36px !important; }
+            .verification-code { font-size: 28px !important; letter-spacing: 4px !important; }
+        }
+
+        @media screen and (max-width: 480px) {
+            .hero-text { font-size: 24px !important; line-height: 32px !important; }
+            .verification-code { font-size: 24px !important; letter-spacing: 2px !important; }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="email-container">
+        <header class="header">
+            <div class="section-content">
+                <div class="logo-container">
+                    <img src="{{ app_url }}/email-logo.png" width="32" height="32" alt="Manor AI" class="logo-icon" style="display:block;border:0;outline:none;text-decoration:none;border-radius:8px;">
+                    <div class="brand-name">Manor AI</div>
+                </div>
+            </div>
+        </header>
+
+        <section class="intro-section">
+            <div class="section-content">
+                <span class="badge">Email Verification</span>
+                <h1 class="hero-text">Verify Your Email</h1>
+                <p class="description">
+                    Please use the verification code below to complete your email verification. This code will expire in 10 minutes.
+                </p>
+            </div>
+        </section>
+
+        <section class="code-section">
+            <div class="section-content">
+                <div class="code-container">
+                    <div class="code-label">Your Verification Code</div>
+                    <div class="verification-code">{{ code }}</div>
+                    <div class="code-instructions">
+                        Enter this code in the verification form to confirm your email address.
+                    </div>
+                </div>
+
+                <div class="security-note">
+                    <div class="security-note-title">&#128274; Security Reminder</div>
+                    <div class="security-note-text">
+                        Please do not share this code with anyone. Manor AI will never ask you for your verification code via email or phone.
+                    </div>
+                </div>
+
+                <p class="expiry-info">
+                    This code expires in 10 minutes. If you didn't request this code, please ignore this email.
+                </p>
+            </div>
+        </section>
+
+        <footer class="footer">
+            <div class="section-content">
+                <p class="footer-title">Empowering Progress, Simplifying Success</p>
+                <p class="footer-info">
+                    Need help? Contact our support team.<br>
+                    All rights reserved &copy; Manor AI {{ year }}
+                </p>
+            </div>
+        </footer>
+    </div>
+</body>
+
+</html>

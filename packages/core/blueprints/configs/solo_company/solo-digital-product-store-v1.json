@@ -1,0 +1,505 @@
+{
+  "manifest": {
+    "blueprint_version": "1.1",
+    "slug": "solo-digital-product-store-v1",
+    "title": "Digital Product Store OS",
+    "summary": "A workspace for selling digital products, templates, or small physical SKUs with listing, fulfillment, support, and margin loops.",
+    "use_when": "Use when an operator needs an e-commerce operating system before hiring operations help.",
+    "description": "Creates the operating loop for a digital product store: catalog improvements, order and support triage, lifecycle marketing, weekly margin review, and safe approval gates for refunds, pricing, and public listing edits.",
+    "tags": [
+      "ecommerce",
+      "digital-products",
+      "shopify",
+      "store"
+    ],
+    "kind": "one_person_company",
+    "category": "solo.digital_product_store",
+    "author": {
+      "handle": "manor",
+      "display_name": "Manor AI"
+    },
+    "cover_image_url": null,
+    "forked_from_id": null,
+    "changelog": "Frozen on 2026-06-03: first runnable owner-operated workspace blueprint."
+  },
+  "contract": {
+    "variables": [
+      {
+        "key": "business_name",
+        "label": "Business name",
+        "required": false,
+        "default": "Company"
+      },
+      {
+        "key": "operator_timezone",
+        "label": "Operator timezone",
+        "required": false,
+        "default": "America/Los_Angeles"
+      }
+    ],
+    "channels": [
+      {
+        "channel_type": "telegram",
+        "purpose": "approval alerts for listing edits, refunds, support escalations, and campaigns",
+        "required": false
+      }
+    ],
+    "sessions": [
+      {
+        "provider": "shopify",
+        "label": "main",
+        "purpose": "Read orders, products, and listing performance when paired.",
+        "required": false
+      },
+      {
+        "provider": "stripe",
+        "label": "main",
+        "purpose": "Read payments, subscriptions, disputes, and revenue when paired.",
+        "required": false
+      },
+      {
+        "provider": "gmail",
+        "label": "support",
+        "purpose": "Draft customer support replies when paired.",
+        "required": false
+      }
+    ],
+    "requires": {
+      "manor_min_version": "1.0",
+      "tools": [],
+      "mcp_servers": [],
+      "skills": [],
+      "agents": []
+    }
+  },
+  "embedded": {
+    "skills": [
+      {
+        "slug": "solo-digital-product-store-playbook-v1",
+        "name": "Digital Product Store Playbook",
+        "display_name": "Digital Product Store Playbook",
+        "description": "Operating playbook for Digital Product Store OS.",
+        "system_prompt": "Help a store operator improve listings, automate simple fulfillment, answer support, recover abandoned carts, and track contribution margin. Favor clear checklists and small weekly experiments.",
+        "tools": [],
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "request": {
+              "type": "string"
+            },
+            "workspace_context": {
+              "type": "object"
+            }
+          }
+        },
+        "output_format": "markdown",
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-digital-product-store-v1"
+        ],
+        "version": "1.0.0",
+        "config": {
+          "frozen_at": "2026-06-03"
+        },
+        "status": "active"
+      }
+    ],
+    "agents": [
+      {
+        "slug": "solo-store-operator-v1",
+        "name": "Store Operator",
+        "description": "Runs the Digital Product Store OS workspace operating loop.",
+        "system_prompt": "You operate a product store. Keep listings conversion-ready, triage orders and support, draft lifecycle campaigns, and review margin. Never issue refunds, cancel orders, change prices, or publish campaigns without operator approval.",
+        "config": {
+          "model": "default",
+          "temperature": 0.3,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-digital-product-store-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "solo-digital-product-store-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "operating_principle",
+            "content": "This workspace serves an owner-operator. Protect the operator's attention, ask for approval before public or financial actions, and keep every weekly review tied to the active goals.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      }
+    ],
+    "knowledge_packs": [
+      {
+        "slug": "solo-digital-product-store-ops",
+        "title": "Digital Product Store Ops",
+        "purpose": "Store catalog strategy, listing experiments, support patterns, and margin reviews.",
+        "mode": "skeleton",
+        "folder_structure": [
+          "catalog/",
+          "listing-experiments/",
+          "support-patterns/",
+          "margin-reviews/"
+        ],
+        "starter_documents": [],
+        "external_source": null
+      }
+    ]
+  },
+  "recipe": {
+    "operating_model": {
+      "kind": "one_person_company",
+      "context": "One operator sells digital products, templates, or a small SKU catalog and needs operational leverage without losing customer trust.",
+      "primary_work": "Improve listings, triage orders and support, prepare campaigns, and keep revenue tied to margin and fulfillment quality.",
+      "settings": {
+        "timezone": "America/Los_Angeles",
+        "blueprint_frozen": true,
+        "frozen_at": "2026-06-03",
+        "install_expectation": "simulate_first_then_promote"
+      },
+      "services": [
+        {
+          "key": "store.catalog",
+          "name": "Catalog and listings",
+          "description": "Improve titles, descriptions, proof, screenshots, bundles, and SEO."
+        },
+        {
+          "key": "store.ops",
+          "name": "Order and support ops",
+          "description": "Triage orders, support requests, refunds, and fulfillment blockers."
+        },
+        {
+          "key": "store.margin",
+          "name": "Margin and lifecycle",
+          "description": "Review revenue, fees, refunds, COGS, and repeat-purchase campaigns."
+        }
+      ],
+      "rules": [
+        "Margin matters more than gross revenue.",
+        "Refunds, cancellations, price changes, and customer-facing campaigns require approval.",
+        "Every listing experiment must name the expected conversion or support impact."
+      ],
+      "review_cadence": {
+        "daily": "Check the next action queue and remove low-leverage work.",
+        "weekly": "Review goal pace, current constraints, and the next experiment."
+      }
+    },
+    "strategist": {
+      "business_model": {
+        "model_type": "marketplace",
+        "primary_metric": "monthly_revenue",
+        "secondary_metrics": [
+          "gross_margin_percent",
+          "refund_rate_percent",
+          "support_first_response_hours"
+        ],
+        "revenue_model": "Digital products and small SKU catalog with lifecycle repeat purchase."
+      },
+      "cadence": {
+        "schedule": "weekly",
+        "trigger_conditions": [
+          "margin_below_target",
+          "refund_spike",
+          "top_listing_conversion_drop"
+        ]
+      },
+      "proposal_shape": "weekly_store_experiment",
+      "priors": [
+        "A few high-converting listings beat a broad neglected catalog.",
+        "Support questions are product and listing feedback."
+      ],
+      "evaluation_rubric": {
+        "weights": {
+          "margin_impact": 0.35,
+          "customer_trust": 0.25,
+          "speed": 0.2,
+          "operator_time": 0.2
+        }
+      },
+      "do_not_propose": [
+        "Discounting without a margin check.",
+        "Support automation that hides unresolved customer issues."
+      ],
+      "voice": "operational, customer-aware, margin-focused"
+    },
+    "prompts": [
+      {
+        "key": "weekly_review",
+        "title": "Weekly operator review",
+        "body": "Summarize goal movement, what shipped, what blocked execution, and the single highest-leverage decision for next week."
+      }
+    ],
+    "subscriptions": [
+      {
+        "service_key": "store.catalog",
+        "agent_slug": "solo-store-operator-v1",
+        "custom_prompt": "Run this workspace in sandbox-first mode. Create tasks, draft assets, and prepare review packets. Do not take external action without operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-digital-product-store-v1",
+          "primary_service": "store.ops",
+          "service_name": "Catalog and listings"
+        }
+      },
+      {
+        "service_key": "store.ops",
+        "agent_slug": "solo-store-operator-v1",
+        "custom_prompt": "Run this workspace in sandbox-first mode. Create tasks, draft assets, and prepare review packets. Do not take external action without operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-digital-product-store-v1",
+          "primary_service": "store.ops",
+          "service_name": "Order and support ops"
+        }
+      },
+      {
+        "service_key": "store.margin",
+        "agent_slug": "solo-store-operator-v1",
+        "custom_prompt": "Run this workspace in sandbox-first mode. Create tasks, draft assets, and prepare review packets. Do not take external action without operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-digital-product-store-v1",
+          "primary_service": "store.ops",
+          "service_name": "Margin and lifecycle"
+        }
+      }
+    ],
+    "scheduled_jobs": [
+      {
+        "job_id": "solo-store-daily-order-support-triage",
+        "name": "Daily order and support triage",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 9 * * 1-6",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "store.ops",
+          "max_turns": 6,
+          "deliverable": "Inline markdown order/support triage packet in workspace_chat. Include order queue, support queue, refund-risk scan, recommended operator actions, and missing-data assumptions when no store integration is connected. No file attachment or external store action is required.",
+          "done_when": "The workspace_chat response contains a complete order/support/refund-risk triage packet, clearly marks missing commerce or support data as assumptions or empty-state findings, recommends operator next actions, and does not require or claim email, refund, order update, file, or integration side effects."
+        },
+        "payload_message": "Prepare the daily order, support, and refund-risk triage packet. Return the packet inline in workspace_chat as markdown only. Do not send messages, issue refunds, update orders, create files, or modify external store systems for this automation. If no commerce or support integration is connected, state the missing-data assumption and continue in simulation mode.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "solo-store-weekly-margin-review",
+        "name": "Weekly margin review",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 11 * * 1",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "store.margin",
+          "max_turns": 6,
+          "deliverable": "Inline markdown weekly margin review in workspace_chat. Include revenue/margin readout, refund rate, listing issues, one store experiment, and missing-data assumptions when no store integration is connected. When live store data is missing, use [NO DATA] or Unknown for numeric metrics; do not invent simulated revenue, order, refund, margin, or growth figures. No file attachment or external finance/store action is required.",
+          "done_when": "The workspace_chat response contains a complete weekly margin review, clearly marks missing revenue/refund/listing data as assumptions or empty-state findings, uses [NO DATA] or Unknown instead of invented numeric store metrics when integrations are missing, recommends one store experiment, and does not require or claim email, payment, refund, order update, file, or integration side effects."
+        },
+        "payload_message": "Review revenue, margin, refund rate, listing issues, and one store experiment. Return the review inline in workspace_chat as markdown only. Do not send messages, change prices, issue refunds, update listings, create files, or modify external store systems for this automation. If no commerce or analytics integration is connected, state the missing-data assumption and continue in empty-state mode: use [NO DATA] or Unknown for revenue, orders, refunds, margin, conversion, and growth metrics. Do not invent simulated numeric store metrics.",
+        "default_delivery_mode": "workspace_chat"
+      }
+    ],
+    "workflows": [
+      {
+        "slug": "solo-store-listing-refresh-v1",
+        "description": "Refresh one product listing with review-ready copy and experiment notes.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "product_name",
+            "default": "operator supplied"
+          }
+        ],
+        "steps": [
+          {
+            "id": "diagnose",
+            "name": "Diagnose listing",
+            "kind": "agent_call",
+            "service_key": "store.catalog",
+            "input": "Identify conversion, clarity, SEO, proof, and support-friction issues."
+          },
+          {
+            "id": "rewrite",
+            "name": "Draft listing refresh",
+            "kind": "agent_call",
+            "depends_on": [
+              "diagnose"
+            ],
+            "service_key": "store.catalog",
+            "input": "Draft revised title, description, bullets, FAQ, and experiment hypothesis."
+          },
+          {
+            "id": "review",
+            "name": "Operator review",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "rewrite"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      }
+    ],
+    "goals": [
+      {
+        "title": "Reach USD 20,000 monthly store revenue",
+        "description": "Grow the store while tracking margin and support quality.",
+        "metric_key": "monthly_revenue",
+        "target_value": 20000,
+        "baseline_value": 0,
+        "deadline": "2026-12-31",
+        "measurement_source": {
+          "type": "manual",
+          "metric": "monthly_store_revenue"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 2
+      },
+      {
+        "title": "Keep first support response under 24 hours",
+        "description": "Protect customer trust while the operation stays lean.",
+        "metric_key": "support_first_response_hours",
+        "target_value": 24,
+        "baseline_value": 48,
+        "measurement_source": {
+          "type": "manual",
+          "metric": "support_response_time"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 3
+      }
+    ],
+    "task_categories": [
+      {
+        "key": "catalog",
+        "label": "Catalog",
+        "sort_order": 10
+      },
+      {
+        "key": "orders",
+        "label": "Orders",
+        "sort_order": 20
+      },
+      {
+        "key": "support",
+        "label": "Support",
+        "sort_order": 30
+      },
+      {
+        "key": "margin",
+        "label": "Margin",
+        "sort_order": 40
+      }
+    ],
+    "custom_fields": [
+      {
+        "name": "product_line",
+        "display_name": "Product line",
+        "field_type": "text",
+        "target": "task",
+        "sort_order": 10
+      },
+      {
+        "name": "margin_band",
+        "display_name": "Margin band",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "unknown",
+          "low",
+          "target",
+          "high"
+        ],
+        "sort_order": 20
+      },
+      {
+        "name": "customer_impact",
+        "display_name": "Customer impact",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "none",
+          "support",
+          "delivery",
+          "refund",
+          "trust"
+        ],
+        "sort_order": 30
+      }
+    ],
+    "sla_policies": [
+      {
+        "key": "operator_review",
+        "target": "task",
+        "threshold_hours": 24,
+        "description": "Review generated assets or decisions within one workday."
+      }
+    ],
+    "escalation_rules": [
+      {
+        "key": "public_or_financial_action",
+        "condition": "public_publish_or_money_movement",
+        "action": "pause_for_operator_review"
+      }
+    ]
+  },
+  "policy": {
+    "governance": {
+      "never_allow_actions": [
+        "billing.*",
+        "payments.refund",
+        "commerce.cancel_order"
+      ],
+      "hitl_required_actions": [
+        "commerce.update_price",
+        "commerce.publish_*",
+        "email.send_campaign",
+        "workspace.file.modify"
+      ],
+      "auto_approve_actions": [
+        "workspace.task.create",
+        "workspace.search"
+      ],
+      "max_risk_level": "medium",
+      "budget_caps_per_kind": {
+        "llm": 260,
+        "action": 140
+      }
+    },
+    "post_install_checks": [
+      {
+        "kind": "agent_callable",
+        "service_key": "store.ops"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-store-daily-order-support-triage"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-store-weekly-margin-review"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "solo-store-listing-refresh-v1"
+      }
+    ],
+    "expected_baseline": {
+      "runnable_in_simulation": true,
+      "blocking_todos_expected": 0,
+      "first_week_outputs": [
+        "daily triage packet",
+        "listing refresh packet",
+        "margin review"
+      ]
+    }
+  }
+}

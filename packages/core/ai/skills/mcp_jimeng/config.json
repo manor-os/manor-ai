@@ -1,0 +1,14 @@
+{
+  "id": "mcp_jimeng",
+  "name": "mcp_jimeng",
+  "type": "runtime_guidance",
+  "description": "Generate and edit images and generate short videos from Chinese or English prompts via Jimeng (即梦).",
+  "category": "media-generation",
+  "output_format": "guidance",
+  "tags": ["jimeng", "即梦", "image-generation", "video-generation", "ai-media", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__jimeng__generate_image",
+    "mcp__jimeng__edit_image",
+    "mcp__jimeng__generate_video"
+  ]
+}

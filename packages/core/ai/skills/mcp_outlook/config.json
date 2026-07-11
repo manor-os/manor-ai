@@ -1,0 +1,23 @@
+{
+  "id": "mcp_outlook",
+  "name": "mcp_outlook",
+  "type": "runtime_guidance",
+  "description": "Operate the user's connected Outlook / Microsoft 365 mailbox: read, search, send, reply, draft, categorize, file, and triage mail via Microsoft Graph.",
+  "category": "email",
+  "output_format": "guidance",
+  "tags": ["outlook", "microsoft365", "email", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__outlook__list_messages",
+    "mcp__outlook__get_message",
+    "mcp__outlook__send_message",
+    "mcp__outlook__reply_to_message",
+    "mcp__outlook__forward_message",
+    "mcp__outlook__create_draft",
+    "mcp__outlook__send_draft",
+    "mcp__outlook__move_message",
+    "mcp__outlook__categorize",
+    "mcp__outlook__list_folders",
+    "mcp__outlook__download_attachment",
+    "mcp__outlook__get_profile"
+  ]
+}

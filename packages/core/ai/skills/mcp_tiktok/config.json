@@ -1,0 +1,18 @@
+{
+  "id": "mcp_tiktok",
+  "name": "mcp_tiktok",
+  "type": "runtime_guidance",
+  "description": "Operate the user's TikTok creator account: read profile/stats, list and query the user's own videos, pre-flight creator settings, publish videos/photos from public URLs, and check publish status.",
+  "category": "social-media",
+  "output_format": "guidance",
+  "tags": ["tiktok", "video", "social-media", "posting", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__tiktok__get_user_info",
+    "mcp__tiktok__list_videos",
+    "mcp__tiktok__query_videos",
+    "mcp__tiktok__get_creator_info",
+    "mcp__tiktok__post_video",
+    "mcp__tiktok__post_photo",
+    "mcp__tiktok__get_publish_status"
+  ]
+}

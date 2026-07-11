@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>You're on the Manor AI waitlist</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;700;800&display=swap"
+          rel="stylesheet">
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            margin: 0; padding: 0; width: 100% !important;
+            background-color: #F8FAFC;
+            font-family: 'Plus Jakarta Sans', Helvetica, Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        img { max-width: 100%; height: auto; border: 0; outline: none; text-decoration: none; display: block; }
+
+        .email-container {
+            width: 100%; max-width: 600px; margin: 40px auto;
+            background-color: #FFFFFF; border-radius: 24px; overflow: hidden;
+            border: 1px solid #E2E8F0;
+            box-shadow: 0 20px 40px -10px rgba(15, 23, 42, 0.05);
+        }
+
+        .section-content { width: 100%; padding: 0 48px; }
+
+        .header {
+            display: flex; justify-content: center; align-items: center;
+            padding: 40px 0 30px 0; border-bottom: 1px solid #F8FAFC;
+        }
+
+        .logo-container { display: flex; align-items: center; }
+
+        .logo-icon {
+            width: 32px; height: 32px; border-radius: 8px;
+            display: block; border: 0; outline: none; text-decoration: none;
+        }
+
+        .brand-name { padding-left: 12px; font-size: 18px; font-weight: 800; color: #0F172A; letter-spacing: -0.5px; }
+
+        .intro-section { padding: 40px 0 10px 0; text-align: center; }
+
+        .badge {
+            font-size: 10px; font-weight: 700; color: #0D9488; text-transform: uppercase;
+            letter-spacing: 1px; background: #F0FDFA; padding: 4px 10px;
+            border-radius: 20px; display: inline-block; margin-bottom: 16px;
+        }
+
+        .hero-text {
+            margin: 16px 0; font-size: 32px; font-weight: 800; color: #0F172A;
+            letter-spacing: -1px; line-height: 1.2;
+        }
+
+        .description { margin: 0; font-size: 16px; line-height: 26px; color: #64748B; }
+
+        .welcome-section { padding: 30px 0 40px 0; }
+        .welcome-message { font-size: 16px; line-height: 26px; color: #334155; margin-bottom: 24px; }
+        .features-list { list-style: none; padding: 0; margin: 24px 0; }
+
+        .features-list li {
+            padding: 12px 0; font-size: 15px; color: #475569; line-height: 24px;
+            display: flex; align-items: flex-start;
+        }
+
+        .features-list li::before {
+            content: "\2713"; color: #0D9488; font-weight: 700;
+            font-size: 18px; margin-right: 12px; flex-shrink: 0;
+        }
+
+        .cta-section {
+            padding: 40px 0; text-align: center; background-color: #F0FDFA;
+            border-top: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0;
+        }
+
+        .cta-heading { margin: 0 0 10px 0; font-size: 20px; font-weight: 800; color: #0F766E; }
+
+        .cta-description {
+            margin: 0 0 24px 0; font-size: 14px; color: #475569; line-height: 22px;
+            max-width: 480px; margin-left: auto; margin-right: auto;
+        }
+
+        .btn-primary {
+            background-color: #0F766E; color: #ffffff !important; border-radius: 50px;
+            padding: 16px 36px; text-decoration: none; display: inline-block;
+            font-weight: 700; font-size: 14px; letter-spacing: 0.5px; border: none;
+            cursor: pointer; font-family: 'Plus Jakarta Sans', Helvetica, Arial, sans-serif;
+        }
+
+        .footer {
+            padding: 30px 0; background-color: #FFFFFF; text-align: center;
+            border-top: 1px solid #F1F5F9;
+        }
+
+        .footer-title { margin: 0 0 8px 0; font-size: 14px; font-weight: 700; color: #0F172A; }
+        .footer-info { margin: 0; font-size: 11px; color: #94A3B8; line-height: 18px; }
+
+        @media screen and (max-width: 640px) {
+            .email-container { margin: 20px auto; border-radius: 16px; }
+            .section-content { padding: 0 24px !important; }
+            .hero-text { font-size: 28px !important; line-height: 36px !important; }
+            .btn-primary { padding: 14px 28px; font-size: 13px; }
+        }
+
+        @media screen and (max-width: 480px) {
+            .hero-text { font-size: 24px !important; line-height: 32px !important; }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="email-container">
+        <header class="header">
+            <div class="section-content">
+                <div class="logo-container">
+                    <img src="{{ app_url }}/email-logo.png" width="32" height="32" alt="Manor AI" class="logo-icon" style="display:block;border:0;outline:none;text-decoration:none;border-radius:8px;">
+                    <div class="brand-name">Manor AI</div>
+                </div>
+            </div>
+        </header>
+
+        <section class="intro-section">
+            <div class="section-content">
+                <span class="badge">Waitlist Confirmed</span>
+                <h1 class="hero-text">You're on the list!</h1>
+                <p class="description">
+                    Thanks for signing up. We'll send you a personal invitation code as soon as your spot opens up.
+                </p>
+            </div>
+        </section>
+
+        <section class="welcome-section">
+            <div class="section-content">
+                <p class="welcome-message">Hello {{ display_name }},</p>
+                <p class="welcome-message">
+                    Thanks for joining the Manor AI waitlist. We've recorded your details and you're now in the queue &mdash; no further action needed from you right now.
+                </p>
+
+                <p class="welcome-message" style="font-weight: 600; color: #0F172A; margin-top: 24px;">
+                    Here's what to expect next:
+                </p>
+
+                <ul class="features-list">
+                    <li>Invitations roll out in waves based on signup order and fit</li>
+                    <li>Watch your inbox for a unique invitation code from this address</li>
+                    <li>Codes are time-limited, so redeem yours promptly when it arrives</li>
+                    <li>Reply to this email if your role, company, or use case changes</li>
+                </ul>
+            </div>
+        </section>
+
+        <section class="cta-section">
+            <div class="section-content">
+                <h2 class="cta-heading">While You Wait</h2>
+                <p class="cta-description">
+                    Catch up on what we've been shipping and where Manor AI is heading.
+                </p>
+                <a href="{{ app_url }}" class="btn-primary" style="color: #ffffff !important;">
+                    Visit Manor AI
+                </a>
+            </div>
+        </section>
+
+        <footer class="footer">
+            <div class="section-content">
+                <p class="footer-title">Empowering Progress, Simplifying Success</p>
+                <p class="footer-info">
+                    If you have any questions, feel free to reach out to our support team.<br>
+                    All rights reserved &copy; Manor AI {{ year }}
+                </p>
+            </div>
+        </footer>
+    </div>
+</body>
+
+</html>

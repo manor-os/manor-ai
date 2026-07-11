@@ -1,0 +1,26 @@
+{
+  "id": "mcp_quickbooks",
+  "name": "mcp_quickbooks",
+  "type": "runtime_guidance",
+  "description": "Operate the user's QuickBooks Online company: query customers, invoices, payments, items, accounts, vendors, and bills; create customers/invoices; send invoices; and run financial reports.",
+  "category": "finance",
+  "output_format": "guidance",
+  "tags": ["quickbooks", "accounting", "invoicing", "finance", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__quickbooks__get_company_info",
+    "mcp__quickbooks__query_customers",
+    "mcp__quickbooks__get_customer",
+    "mcp__quickbooks__create_customer",
+    "mcp__quickbooks__query_invoices",
+    "mcp__quickbooks__get_invoice",
+    "mcp__quickbooks__create_invoice",
+    "mcp__quickbooks__send_invoice",
+    "mcp__quickbooks__query_payments",
+    "mcp__quickbooks__query_items",
+    "mcp__quickbooks__query_accounts",
+    "mcp__quickbooks__query_vendors",
+    "mcp__quickbooks__query_bills",
+    "mcp__quickbooks__run_report",
+    "mcp__quickbooks__custom_query"
+  ]
+}

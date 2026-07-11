@@ -1,0 +1,226 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: "Python test depth for manual runs"
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - regression
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (advisory)
+    runs-on: ubuntu-latest
+    # The current repo-wide Ruff baseline is not clean on dev. Keep this visible
+    # while the required test gate stays fast and stable; make it blocking after
+    # the lint/format debt is burned down in a dedicated cleanup.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ".[dev]"
+
+      - name: Ruff lint
+        run: |
+          if ! ruff check packages/ apps/ tests/; then
+            echo "::warning::Ruff lint reported issues; advisory job is non-blocking until the existing baseline is clean."
+          fi
+
+      - name: Ruff format check
+        run: |
+          if ! ruff format --check packages/ apps/ tests/; then
+            echo "::warning::Ruff format reported issues; advisory job is non-blocking until the existing baseline is clean."
+          fi
+
+      - name: Whitespace check
+        run: git diff --check
+
+  api-versions:
+    name: External API versions
+    runs-on: ubuntu-latest
+    # Fast — runs as a separate job so a stale pin doesn't block lint/test.
+    # Fails the build only when a pin is past 90% of the vendor's
+    # documented EOL window (configurable via API_VERSION_FAIL_PCT).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check pinned vendor API versions
+        run: python scripts/check_api_versions.py
+
+  typecheck-frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install deps
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Build
+        working-directory: apps/web
+        env:
+          BUILD_VERSION: ${{ github.sha }}
+        run: npm run build
+
+  web-source-smoke:
+    name: Web source smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install deps
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Run source smoke tests
+        working-directory: apps/web
+        run: npm run test:source
+
+
+  python-smoke:
+    name: Python smoke tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: manor_test
+          POSTGRES_USER: manor
+          POSTGRES_PASSWORD: manor_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ".[dev]"
+
+      - name: Run tests
+        env:
+          TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
+          MANOR_FS_ENABLED: "false"
+          PYTHONPATH: .
+          REDIS_URL: redis://localhost:6379/0
+        run: >
+          python -m pytest tests/
+          -m "not e2e and not manual and not slow and not network and not docker and not cloud"
+          -q --tb=short -p no:warnings
+
+  python-regression:
+    name: Python regression suite
+    runs-on: ubuntu-latest
+    # Stage gate:
+    # - dev/default PRs run the quick smoke gate above for fast feedback.
+    # - main/main-targeting PRs run the broader regression gate.
+    # - manual runs can opt into this gate with test_level=regression.
+    if: >-
+      github.event_name == 'push' && github.ref_name == 'main' ||
+      github.event_name == 'pull_request' && github.base_ref == 'main' ||
+      github.event_name == 'workflow_dispatch' && inputs.test_level == 'regression'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: manor_test
+          POSTGRES_USER: manor
+          POSTGRES_PASSWORD: manor_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ".[dev]"
+
+      - name: Run Python regression suite
+        env:
+          TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
+          MANOR_FS_ENABLED: "false"
+          PYTHONPATH: .
+          REDIS_URL: redis://localhost:6379/0
+        run: >
+          python -m pytest tests/
+          -m "not manual and not network and not docker and not cloud"
+          -q --tb=short -p no:warnings
+

@@ -1,0 +1,20 @@
+{
+  "id": "mcp_amazon",
+  "name": "mcp_amazon",
+  "type": "runtime_guidance",
+  "description": "Operate the user's Amazon Selling Partner account: read orders and items, search the catalog, check FBA inventory, and read/update your listings.",
+  "category": "ecommerce",
+  "output_format": "guidance",
+  "tags": ["amazon", "selling-partner", "ecommerce", "listings", "fba", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__amazon__get_orders",
+    "mcp__amazon__get_order",
+    "mcp__amazon__get_order_items",
+    "mcp__amazon__search_catalog_items",
+    "mcp__amazon__get_catalog_item",
+    "mcp__amazon__get_inventory_summaries",
+    "mcp__amazon__get_listing_item",
+    "mcp__amazon__patch_listing",
+    "mcp__amazon__put_listing"
+  ]
+}

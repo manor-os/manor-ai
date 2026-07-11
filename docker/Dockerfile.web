@@ -1,0 +1,28 @@
+FROM node:20-alpine AS build
+
+ARG VITE_GOOGLE_CLIENT_ID
+ARG VITE_GOOGLE_DRIVE_API_KEY
+ARG BUILD_VERSION=dev
+ENV VITE_GOOGLE_CLIENT_ID=$VITE_GOOGLE_CLIENT_ID
+ENV VITE_GOOGLE_DRIVE_API_KEY=$VITE_GOOGLE_DRIVE_API_KEY
+ENV BUILD_VERSION=$BUILD_VERSION
+
+WORKDIR /app
+COPY apps/web/package*.json ./
+RUN npm config set registry https://registry.npmjs.org/ \
+    && for attempt in 1 2 3; do \
+         rm -rf node_modules; \
+         npm ci --include=dev --no-audit --no-fund --fetch-retries=5 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000 \
+         && test -x node_modules/.bin/tsc \
+         && exit 0; \
+         echo "npm ci attempt ${attempt} failed; retrying..."; \
+         sleep 10; \
+       done; \
+       exit 1
+COPY apps/web/ .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80

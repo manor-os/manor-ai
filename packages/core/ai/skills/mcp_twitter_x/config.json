@@ -1,0 +1,23 @@
+{
+  "id": "mcp_twitter_x",
+  "name": "mcp_twitter_x",
+  "type": "runtime_guidance",
+  "description": "Operate the user's X (Twitter) account via API v2: post tweets and threads, reply, search recent tweets, read timelines and metrics, and manage likes / retweets / follows.",
+  "category": "social-media",
+  "output_format": "guidance",
+  "tags": ["twitter", "x", "social-media", "posting", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__twitter_x__get_me",
+    "mcp__twitter_x__search_recent",
+    "mcp__twitter_x__get_tweet",
+    "mcp__twitter_x__get_tweet_metrics",
+    "mcp__twitter_x__create_tweet",
+    "mcp__twitter_x__comment_tweet",
+    "mcp__twitter_x__create_thread",
+    "mcp__twitter_x__delete_tweet",
+    "mcp__twitter_x__like_tweet",
+    "mcp__twitter_x__retweet",
+    "mcp__twitter_x__follow_user",
+    "mcp__twitter_x__get_my_timeline"
+  ]
+}

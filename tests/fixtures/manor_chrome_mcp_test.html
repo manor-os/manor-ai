@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manor Chrome MCP Fixture</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      color: #1f2937;
+      background: #f7f7f4;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      padding: 16px 24px;
+      color: white;
+      background: #263238;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    section {
+      margin: 0 0 24px;
+      padding: 16px;
+      border: 1px solid #d7d7cf;
+      border-radius: 8px;
+      background: white;
+    }
+    label {
+      display: block;
+      margin: 12px 0 4px;
+      font-weight: 700;
+    }
+    input, select, textarea, button {
+      font: inherit;
+    }
+    input, select, textarea {
+      box-sizing: border-box;
+      width: 100%;
+      max-width: 420px;
+      padding: 9px 10px;
+      border: 1px solid #aeb4b8;
+      border-radius: 6px;
+    }
+    button {
+      margin: 8px 8px 8px 0;
+      padding: 9px 12px;
+      border: 1px solid #51646d;
+      border-radius: 6px;
+      color: white;
+      background: #2f5d62;
+      cursor: pointer;
+    }
+    button.secondary {
+      color: #263238;
+      background: #eef2f2;
+    }
+    #hover-target {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 12px 14px;
+      border: 1px dashed #65757a;
+      border-radius: 6px;
+      background: #f0f8f7;
+    }
+    #scroll-box {
+      width: 100%;
+      max-width: 520px;
+      height: 160px;
+      overflow: auto;
+      border: 1px solid #aeb4b8;
+      border-radius: 6px;
+      background: #fbfbf8;
+    }
+    .scroll-inner {
+      height: 720px;
+      padding: 12px;
+      background: linear-gradient(#fbfbf8, #dde9e5);
+    }
+    #bottom-marker {
+      margin-top: 520px;
+      font-weight: 700;
+    }
+    #screenshot-target {
+      width: 280px;
+      height: 110px;
+      display: grid;
+      place-items: center;
+      border-radius: 8px;
+      color: white;
+      background: #534b62;
+    }
+    .spacer {
+      height: 900px;
+      border: 1px dashed #c8cec9;
+      background: repeating-linear-gradient(180deg, #ffffff, #ffffff 30px, #f1f5f1 30px, #f1f5f1 60px);
+    }
+    code {
+      padding: 2px 4px;
+      border-radius: 4px;
+      background: #eef2f2;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Manor Chrome MCP Fixture</h1>
+    <div id="header-status">ready</div>
+  </header>
+  <main>
+    <section aria-label="Status panel">
+      <h2>State</h2>
+      <p id="status-text">initial-state</p>
+      <p id="wait-target">waiting-for-action</p>
+      <p id="hover-status">hover-not-triggered</p>
+      <p id="upload-status">upload-empty</p>
+      <p id="keyboard-status">keyboard-empty</p>
+    </section>
+
+    <section aria-label="Controls">
+      <h2>Controls</h2>
+      <button id="click-button" type="button">MCP Click Target</button>
+      <button id="new-tab-button" class="secondary" type="button">Open Fixture Child Tab</button>
+      <button id="delayed-button" class="secondary" type="button">Show Delayed Text</button>
+      <button id="hover-target" class="secondary" type="button">MCP Hover Target</button>
+
+      <label for="text-input">Text input</label>
+      <input id="text-input" name="textInput" placeholder="Fill me from MCP">
+
+      <label for="choice-select">Choice select</label>
+      <select id="choice-select" name="choiceSelect">
+        <option value="">Choose one</option>
+        <option value="alpha">Alpha</option>
+        <option value="bravo">Bravo</option>
+        <option value="charlie">Charlie</option>
+      </select>
+
+      <label for="notes">Notes</label>
+      <textarea id="notes" name="notes" rows="3" placeholder="Type here"></textarea>
+
+      <label for="file-input">Upload target</label>
+      <input id="file-input" type="file">
+
+    </section>
+
+    <section aria-label="Scrollable panel">
+      <h2>Scroll Container</h2>
+      <div id="scroll-box" tabindex="0">
+        <div class="scroll-inner">
+          <p>scroll-start</p>
+          <p id="bottom-marker">scroll-bottom-marker</p>
+        </div>
+      </div>
+    </section>
+
+    <section aria-label="Screenshot panel">
+      <h2>Visual Marker</h2>
+      <div id="screenshot-target">screenshot-marker</div>
+    </section>
+
+    <section aria-label="Long page">
+      <h2>Long Page</h2>
+      <p>Use page scroll tools to move through this area.</p>
+      <div class="spacer"></div>
+      <p id="page-bottom-marker">page-bottom-marker</p>
+    </section>
+  </main>
+
+  <script>
+    const setText = (id, value) => {
+      document.getElementById(id).textContent = value;
+    };
+
+    document.getElementById('click-button').addEventListener('click', () => {
+      setText('status-text', 'clicked-by-mcp');
+      setText('wait-target', 'clicked-wait-target');
+    });
+
+    document.getElementById('new-tab-button').addEventListener('click', () => {
+      window.open('/child.html', '_blank', 'noopener');
+    });
+
+    document.getElementById('delayed-button').addEventListener('click', () => {
+      setTimeout(() => setText('wait-target', 'delayed-ready'), 350);
+    });
+
+    document.getElementById('text-input').addEventListener('input', (event) => {
+      setText('status-text', `input:${event.target.value}`);
+    });
+
+    document.getElementById('choice-select').addEventListener('change', (event) => {
+      setText('status-text', `select:${event.target.value}`);
+    });
+
+    document.getElementById('notes').addEventListener('input', (event) => {
+      setText('status-text', `notes:${event.target.value}`);
+    });
+
+    document.getElementById('file-input').addEventListener('change', (event) => {
+      const file = event.target.files && event.target.files[0];
+      setText('upload-status', file ? `upload:${file.name}` : 'upload-empty');
+    });
+
+    document.getElementById('hover-target').addEventListener('mouseenter', () => {
+      setText('hover-status', 'hovered-by-mcp');
+    });
+
+    document.addEventListener('keydown', (event) => {
+      setText('keyboard-status', `key:${event.key}`);
+    });
+
+    window.manorFixtureState = () => ({
+      statusText: document.getElementById('status-text').textContent,
+      waitTarget: document.getElementById('wait-target').textContent,
+      hoverStatus: document.getElementById('hover-status').textContent,
+      uploadStatus: document.getElementById('upload-status').textContent,
+      keyboardStatus: document.getElementById('keyboard-status').textContent,
+      inputValue: document.getElementById('text-input').value,
+      selectValue: document.getElementById('choice-select').value,
+      notesValue: document.getElementById('notes').value,
+      scrollTop: document.getElementById('scroll-box').scrollTop,
+      pageYOffset: window.pageYOffset,
+      injected: window.__manorInjectedValue || null,
+    });
+  </script>
+</body>
+</html>

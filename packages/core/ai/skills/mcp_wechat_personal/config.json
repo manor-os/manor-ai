@@ -1,0 +1,17 @@
+{
+  "id": "mcp_wechat_personal",
+  "name": "mcp_wechat_personal",
+  "type": "runtime_guidance",
+  "description": "Reply to WeChat groups and 1:1 contacts from a QR-login personal WeChat bot runner; list reachable peers and manage the runner session / QR login.",
+  "category": "messaging",
+  "output_format": "guidance",
+  "tags": ["wechat", "messaging", "bot", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__wechat_personal__list_groups",
+    "mcp__wechat_personal__list_contacts",
+    "mcp__wechat_personal__send_group_message",
+    "mcp__wechat_personal__send_direct_message",
+    "mcp__wechat_personal__get_bot_status",
+    "mcp__wechat_personal__get_qr_code"
+  ]
+}

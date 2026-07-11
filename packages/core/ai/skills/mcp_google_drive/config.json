@@ -1,0 +1,24 @@
+{
+  "id": "mcp_google_drive",
+  "name": "mcp_google_drive",
+  "type": "runtime_guidance",
+  "description": "Operate the user's Google Drive: search, read, create, move, rename, copy, and share files and folders, manage permissions and revisions, and handle file comments.",
+  "category": "files",
+  "output_format": "guidance",
+  "tags": ["google-drive", "files", "storage", "sharing", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__google_drive__list_files",
+    "mcp__google_drive__search_files",
+    "mcp__google_drive__get_file",
+    "mcp__google_drive__read_file",
+    "mcp__google_drive__create_file",
+    "mcp__google_drive__create_folder",
+    "mcp__google_drive__move_file",
+    "mcp__google_drive__rename_file",
+    "mcp__google_drive__copy_file",
+    "mcp__google_drive__share_file",
+    "mcp__google_drive__list_permissions",
+    "mcp__google_drive__delete_file",
+    "mcp__google_drive__restore_file"
+  ]
+}

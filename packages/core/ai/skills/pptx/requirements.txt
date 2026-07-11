@@ -1,0 +1,18 @@
+# Auto-installed by the sandbox service before the built-in pptx skill runs.
+# Keep this file intentionally small: one failing optional dependency prevents
+# the entire skill from starting.
+#
+# Main path covered here:
+#   user request/source text -> SVG pages -> quality/finalize -> editable PPTX
+#
+# Do not add provider SDKs, source converters, web/TLS tools, TTS packages, or
+# editor servers here. AI image generation uses Manor's system
+# `generate_file(kind="image")` tool.
+
+# Editable PPTX export.
+python-pptx>=1.0.2
+
+# Image sizing/cropping helpers used by finalize/export paths when slides
+# contain raster images. Also pulled by python-pptx, listed here explicitly
+# because the skill calls Pillow directly in several scripts.
+Pillow>=10.0.0

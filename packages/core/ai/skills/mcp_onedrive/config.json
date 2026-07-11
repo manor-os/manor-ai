@@ -1,0 +1,26 @@
+{
+  "id": "mcp_onedrive",
+  "name": "mcp_onedrive",
+  "type": "runtime_guidance",
+  "description": "Operate the user's OneDrive: search, read, upload, organize, and share files/folders, manage sharing permissions and version history.",
+  "category": "files",
+  "output_format": "guidance",
+  "tags": ["onedrive", "microsoft365", "files", "storage", "sharing", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__onedrive__list_files",
+    "mcp__onedrive__search_files",
+    "mcp__onedrive__get_file",
+    "mcp__onedrive__get_file_by_path",
+    "mcp__onedrive__read_file",
+    "mcp__onedrive__upload_text_file",
+    "mcp__onedrive__create_folder",
+    "mcp__onedrive__move_file",
+    "mcp__onedrive__rename_file",
+    "mcp__onedrive__copy_file",
+    "mcp__onedrive__create_share_link",
+    "mcp__onedrive__invite",
+    "mcp__onedrive__list_permissions",
+    "mcp__onedrive__delete_file",
+    "mcp__onedrive__restore_version"
+  ]
+}

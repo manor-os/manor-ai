@@ -1,0 +1,14 @@
+{
+  "id": "mcp_replicate",
+  "name": "mcp_replicate",
+  "type": "runtime_guidance",
+  "description": "Generate images and short videos from text prompts via Replicate, or run any Replicate model directly through an escape-hatch tool.",
+  "category": "media-generation",
+  "output_format": "guidance",
+  "tags": ["replicate", "image-generation", "video-generation", "ai-media", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__replicate__generate_image",
+    "mcp__replicate__generate_video",
+    "mcp__replicate__run_model"
+  ]
+}

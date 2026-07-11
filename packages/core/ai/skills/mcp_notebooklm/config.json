@@ -1,0 +1,14 @@
+{
+  "id": "mcp_notebooklm",
+  "name": "mcp_notebooklm",
+  "type": "runtime_guidance",
+  "description": "Operate the user's NotebookLM: list notebooks, create a notebook (optionally seeding sources), and ask questions grounded in a notebook's sources.",
+  "category": "ai-web-automation",
+  "output_format": "guidance",
+  "tags": ["notebooklm", "google", "research", "web-automation", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__notebooklm__list_notebooks",
+    "mcp__notebooklm__create_notebook",
+    "mcp__notebooklm__ask"
+  ]
+}

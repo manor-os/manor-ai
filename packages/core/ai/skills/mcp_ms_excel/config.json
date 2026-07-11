@@ -1,0 +1,24 @@
+{
+  "id": "mcp_ms_excel",
+  "name": "mcp_ms_excel",
+  "type": "runtime_guidance",
+  "description": "Read and edit the user's Excel workbooks: worksheets, A1 ranges, cells, Excel tables, named ranges, and recalculation via Microsoft Graph.",
+  "category": "documents",
+  "output_format": "guidance",
+  "tags": ["excel", "microsoft365", "spreadsheet", "workbooks", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__ms_excel__list_worksheets",
+    "mcp__ms_excel__add_worksheet",
+    "mcp__ms_excel__read_range",
+    "mcp__ms_excel__read_used_range",
+    "mcp__ms_excel__write_range",
+    "mcp__ms_excel__update_cell",
+    "mcp__ms_excel__clear_range",
+    "mcp__ms_excel__list_tables",
+    "mcp__ms_excel__get_table_rows",
+    "mcp__ms_excel__add_table_rows",
+    "mcp__ms_excel__create_table",
+    "mcp__ms_excel__calculate",
+    "mcp__ms_excel__list_named_items"
+  ]
+}

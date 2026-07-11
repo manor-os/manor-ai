@@ -1,0 +1,13 @@
+{
+  "id": "mcp_tavily",
+  "name": "mcp_tavily",
+  "type": "runtime_guidance",
+  "description": "Run web searches and extract clean article text from URLs via Tavily.",
+  "category": "search",
+  "output_format": "guidance",
+  "tags": ["tavily", "web-search", "extraction", "research", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__tavily__search",
+    "mcp__tavily__extract"
+  ]
+}

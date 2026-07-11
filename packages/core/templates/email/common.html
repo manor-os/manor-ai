@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manor AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;700;800&display=swap"
+          rel="stylesheet">
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            margin: 0; padding: 0; width: 100% !important;
+            background-color: #F8FAFC;
+            font-family: 'Plus Jakarta Sans', Helvetica, Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .email-container {
+            width: 100%; max-width: 600px; margin: 40px auto;
+            background-color: #FFFFFF; border-radius: 24px; overflow: hidden;
+            border: 1px solid #E2E8F0;
+            box-shadow: 0 20px 40px -10px rgba(15, 23, 42, 0.05);
+        }
+
+        .section-content { width: 100%; padding: 0 48px; }
+
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 40px 48px 30px 48px; border-bottom: 1px solid #F8FAFC;
+        }
+
+        .logo-container { display: flex; align-items: center; }
+
+        .logo-icon {
+            width: 32px; height: 32px; border-radius: 8px;
+            display: block; border: 0; outline: none; text-decoration: none;
+        }
+
+        .brand-name { padding-left: 12px; font-size: 18px; font-weight: 800; color: #0F172A; letter-spacing: -0.5px; }
+        .header-link { text-decoration: none; font-size: 14px; font-weight: 500; color: #64748B; }
+
+        .content-section { padding: 40px 0; }
+
+        .content-body {
+            font-size: 16px; line-height: 26px; color: #334155; white-space: pre-line;
+        }
+
+        .content-body p { margin: 0 0 16px 0; }
+        .content-body p:last-child { margin-bottom: 0; }
+
+        .footer {
+            padding: 30px 0; background-color: #FFFFFF; text-align: center;
+            border-top: 1px solid #F1F5F9;
+        }
+
+        .footer-title { margin: 0 0 8px 0; font-size: 14px; font-weight: 700; color: #0F172A; }
+        .footer-info { margin: 0; font-size: 11px; color: #94A3B8; line-height: 18px; }
+
+        @media screen and (max-width: 640px) {
+            .email-container { margin: 20px auto; border-radius: 16px; }
+            .section-content { padding: 0 24px !important; }
+            .header { padding: 30px 24px 20px 24px; flex-direction: column; align-items: flex-start; gap: 12px; }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="email-container">
+        <header class="header">
+            <div class="logo-container">
+                <img src="{{ app_url }}/email-logo.png" width="32" height="32" alt="Manor AI" class="logo-icon" style="display:block;border:0;outline:none;text-decoration:none;border-radius:8px;">
+                <div class="brand-name">Manor AI</div>
+            </div>
+            <a href="{{ app_url }}" target="_blank" class="header-link">View in a web browser</a>
+        </header>
+
+        <section class="content-section">
+            <div class="section-content">
+                <div class="content-body">{{ content }}</div>
+            </div>
+        </section>
+
+        <footer class="footer">
+            <div class="section-content">
+                <p class="footer-title">Empowering Progress, Simplifying Success</p>
+                <p class="footer-info">
+                    All rights reserved &copy; Manor AI {{ year }}
+                </p>
+            </div>
+        </footer>
+    </div>
+</body>
+
+</html>

@@ -1,0 +1,25 @@
+{
+  "id": "mcp_linkedin_browser",
+  "name": "mcp_linkedin_browser",
+  "type": "runtime_guidance",
+  "description": "LinkedIn search & messaging via a logged-in browser session: search/view people, companies, jobs and posts; read the feed; read/send DMs; send connection invitations; and Easy Apply to jobs.",
+  "category": "social-media",
+  "output_format": "guidance",
+  "tags": ["linkedin", "social-media", "search", "messaging", "jobs", "browser", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__linkedin_browser__search_people",
+    "mcp__linkedin_browser__view_profile",
+    "mcp__linkedin_browser__search_companies",
+    "mcp__linkedin_browser__view_company",
+    "mcp__linkedin_browser__search_jobs",
+    "mcp__linkedin_browser__view_job",
+    "mcp__linkedin_browser__easy_apply",
+    "mcp__linkedin_browser__list_conversations",
+    "mcp__linkedin_browser__view_conversation",
+    "mcp__linkedin_browser__send_message",
+    "mcp__linkedin_browser__send_invitation",
+    "mcp__linkedin_browser__browse_feed",
+    "mcp__linkedin_browser__search_posts",
+    "mcp__linkedin_browser__view_post"
+  ]
+}

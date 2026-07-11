@@ -1,0 +1,23 @@
+{
+  "id": "mcp_ms_teams",
+  "name": "mcp_ms_teams",
+  "type": "runtime_guidance",
+  "description": "Operate the user's Microsoft Teams: read and post channel messages and replies, read/send 1:1 and group chats, create chats and meeting links, and manage presence.",
+  "category": "team-messaging",
+  "output_format": "guidance",
+  "tags": ["microsoft-teams", "teams", "messaging", "meetings", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__ms_teams__list_my_teams",
+    "mcp__ms_teams__list_channels",
+    "mcp__ms_teams__list_channel_messages",
+    "mcp__ms_teams__send_channel_message",
+    "mcp__ms_teams__reply_to_channel_message",
+    "mcp__ms_teams__list_chats",
+    "mcp__ms_teams__list_chat_messages",
+    "mcp__ms_teams__send_chat_message",
+    "mcp__ms_teams__create_chat",
+    "mcp__ms_teams__create_online_meeting",
+    "mcp__ms_teams__get_my_presence",
+    "mcp__ms_teams__set_my_presence"
+  ]
+}

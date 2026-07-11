@@ -1,0 +1,18 @@
+{
+  "id": "mcp_tiktok_shop",
+  "name": "mcp_tiktok_shop",
+  "type": "runtime_guidance",
+  "description": "Operate the user's TikTok Shop: list authorized shops, search orders and products, read order/product detail, and update SKU prices and inventory.",
+  "category": "ecommerce",
+  "output_format": "guidance",
+  "tags": ["tiktok-shop", "ecommerce", "orders", "products", "inventory", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__tiktok_shop__get_authorized_shops",
+    "mcp__tiktok_shop__search_orders",
+    "mcp__tiktok_shop__get_order_detail",
+    "mcp__tiktok_shop__search_products",
+    "mcp__tiktok_shop__get_product",
+    "mcp__tiktok_shop__update_price",
+    "mcp__tiktok_shop__update_inventory"
+  ]
+}

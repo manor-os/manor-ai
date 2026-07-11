@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY apps/wechat_personal_runner/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY apps/wechat_personal_runner /app/apps/wechat_personal_runner
+
+ENV QR_PATH=/data/qr.png
+VOLUME ["/data"]
+
+EXPOSE 8800
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost:8800/health || exit 1
+
+CMD ["uvicorn", "apps.wechat_personal_runner.runner:app", \
+     "--host", "0.0.0.0", "--port", "8800"]

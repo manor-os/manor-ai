@@ -1,0 +1,6 @@
+{
+  "id": "pptx",
+  "name": "pptx",
+  "type": "sandbox",
+  "description": "Use this skill to generate high-quality editable PowerPoint/PPTX decks from user requirements, topic prompts, or provided text/Markdown. Backed by PPT Master: plans the deck, writes SVG pages, quality-checks them, post-processes them, and exports to natively editable PPTX."
+}

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Solo AI Workflow Studio</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#08111f;color:#f8fafc}
+    main{max-width:1160px;margin:0 auto;padding:34px 28px 64px}
+    nav{display:flex;justify-content:space-between;align-items:center;color:#a7f3d0;font-weight:800}
+    .hero{min-height:620px;display:grid;grid-template-columns:1.05fr .95fr;gap:34px;align-items:center}
+    h1{font-size:clamp(48px,8vw,92px);line-height:.92;margin:0 0 24px;letter-spacing:-.04em}
+    p{color:#cbd5e1;font-size:18px;line-height:1.7;max-width:610px}
+    .cta{display:inline-flex;margin-top:22px;border-radius:999px;background:#2dd4bf;color:#042f2e;padding:14px 20px;font-weight:900;text-decoration:none}
+    .panel{border:1px solid rgba(148,163,184,.35);border-radius:28px;background:linear-gradient(145deg,rgba(15,23,42,.92),rgba(15,118,110,.30));padding:24px;box-shadow:0 30px 90px rgba(0,0,0,.3)}
+    .workflow{display:grid;gap:14px}.step{padding:18px;border-radius:18px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12)}
+    .step b{display:block;color:#5eead4;margin-bottom:8px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.card{border-radius:22px;background:#f8fafc;color:#0f172a;padding:22px;min-height:170px}.card p{color:#64748b;font-size:14px}
+  </style>
+</head>
+<body>
+  <main>
+    <nav><span>Solo AI Workflow Studio</span><span>Audit / Build / Retainer</span></nav>
+    <section class="hero">
+      <div>
+        <h1>把个人业务里的重复流程，变成 AI 工作台。</h1>
+        <p>为独立顾问、创作者和个人服务商搭建客户跟进、内容排程、交付提醒和复盘系统。</p>
+        <a class="cta" href="#packages">预约一次流程诊断</a>
+      </div>
+      <aside class="panel">
+        <div class="workflow">
+          <div class="step"><b>01 Intake</b>收集现有工具、截图、客户旅程和痛点。</div>
+          <div class="step"><b>02 Build</b>搭建可用工作台、自动化提醒和模板。</div>
+          <div class="step"><b>03 Handoff</b>录屏说明、FAQ、复盘指标和下月计划。</div>
+        </div>
+      </aside>
+    </section>
+    <section id="packages" class="grid">
+      <article class="card"><h2>Starter</h2><p>90 分钟诊断，输出优先级和行动清单。</p></article>
+      <article class="card"><h2>Build</h2><p>7 天搭建一个可以真实使用的运营系统。</p></article>
+      <article class="card"><h2>Retainer</h2><p>按月复盘、修流程、加自动化和内容模板。</p></article>
+    </section>
+  </main>
+</body>
+</html>

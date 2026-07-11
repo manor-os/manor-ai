@@ -1,0 +1,26 @@
+{
+  "id": "mcp_gmail",
+  "name": "mcp_gmail",
+  "type": "runtime_guidance",
+  "description": "Operate the user's connected Gmail account: search, read, send, reply, draft, label, and triage messages through the Gmail MCP.",
+  "category": "email",
+  "output_format": "guidance",
+  "tags": ["gmail", "email", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__gmail__list_messages",
+    "mcp__gmail__get_message",
+    "mcp__gmail__send_message",
+    "mcp__gmail__reply_to_message",
+    "mcp__gmail__create_draft",
+    "mcp__gmail__send_draft",
+    "mcp__gmail__list_threads",
+    "mcp__gmail__get_thread",
+    "mcp__gmail__mark_read",
+    "mcp__gmail__archive_message",
+    "mcp__gmail__trash_message",
+    "mcp__gmail__batch_modify",
+    "mcp__gmail__list_labels",
+    "mcp__gmail__download_attachment",
+    "mcp__gmail__get_profile"
+  ]
+}

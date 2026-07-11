@@ -1,0 +1,14 @@
+{
+  "id": "mcp_nango",
+  "name": "mcp_nango",
+  "type": "runtime_guidance",
+  "description": "Reach 200+ apps through Nango: list available providers, list active OAuth connections, and make authenticated HTTP calls to any connected provider's API via the Nango proxy.",
+  "category": "connectors",
+  "output_format": "guidance",
+  "tags": ["nango", "connectors", "oauth", "proxy", "integrations", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__nango__nango_list_providers",
+    "mcp__nango__nango_list_connections",
+    "mcp__nango__nango_proxy"
+  ]
+}

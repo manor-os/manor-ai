@@ -1,0 +1,29 @@
+{
+  "id": "mcp_github",
+  "name": "mcp_github",
+  "type": "runtime_guidance",
+  "description": "Operate the user's GitHub: issues, pull requests, code/files, branches, commits, search, and Actions workflows on repositories they can access.",
+  "category": "developer",
+  "output_format": "guidance",
+  "tags": ["github", "git", "issues", "pull-requests", "ci", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__github__list_issues",
+    "mcp__github__get_issue",
+    "mcp__github__create_issue",
+    "mcp__github__comment_issue",
+    "mcp__github__list_prs",
+    "mcp__github__get_pr",
+    "mcp__github__create_pr",
+    "mcp__github__get_pr_diff",
+    "mcp__github__create_pr_review",
+    "mcp__github__merge_pr",
+    "mcp__github__read_file",
+    "mcp__github__create_or_update_file",
+    "mcp__github__push_files",
+    "mcp__github__list_branches",
+    "mcp__github__create_branch",
+    "mcp__github__search_code",
+    "mcp__github__list_runs",
+    "mcp__github__get_job_logs"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "mcp_discord",
+  "name": "mcp_discord",
+  "type": "runtime_guidance",
+  "description": "Operate a Discord bot: list channels in a guild, read recent channel messages, post messages, and add reactions.",
+  "category": "team-messaging",
+  "output_format": "guidance",
+  "tags": ["discord", "messaging", "bot", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__discord__list_channels",
+    "mcp__discord__get_channel_messages",
+    "mcp__discord__send_message",
+    "mcp__discord__add_reaction"
+  ]
+}

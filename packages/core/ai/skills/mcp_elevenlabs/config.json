@@ -1,0 +1,16 @@
+{
+  "id": "mcp_elevenlabs",
+  "name": "mcp_elevenlabs",
+  "type": "runtime_guidance",
+  "description": "Generate audio via ElevenLabs: text-to-speech voiceovers, multi-speaker dialogue, sound effects/ambience, and music; list available voices.",
+  "category": "media-generation",
+  "output_format": "guidance",
+  "tags": ["elevenlabs", "text-to-speech", "voice", "audio", "ai-media", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__elevenlabs__list_voices",
+    "mcp__elevenlabs__text_to_speech",
+    "mcp__elevenlabs__text_to_dialogue",
+    "mcp__elevenlabs__generate_sound_effect",
+    "mcp__elevenlabs__compose_music"
+  ]
+}

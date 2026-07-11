@@ -1,0 +1,33 @@
+{
+  "id": "mcp_stripe",
+  "name": "mcp_stripe",
+  "type": "runtime_guidance",
+  "description": "Operate Stripe via the official remote Stripe MCP (mcp.stripe.com): manage customers, products, prices, payment links, invoices, refunds, subscriptions, coupons, disputes, read balance, and search Stripe docs.",
+  "category": "payments",
+  "output_format": "guidance",
+  "tags": ["stripe", "payments", "billing", "finance", "remote-mcp", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__stripe__search_documentation",
+    "mcp__stripe__retrieve_balance",
+    "mcp__stripe__create_customer",
+    "mcp__stripe__list_customers",
+    "mcp__stripe__create_product",
+    "mcp__stripe__list_products",
+    "mcp__stripe__create_price",
+    "mcp__stripe__list_prices",
+    "mcp__stripe__create_payment_link",
+    "mcp__stripe__create_invoice",
+    "mcp__stripe__create_invoice_item",
+    "mcp__stripe__finalize_invoice",
+    "mcp__stripe__list_invoices",
+    "mcp__stripe__create_refund",
+    "mcp__stripe__list_payment_intents",
+    "mcp__stripe__list_subscriptions",
+    "mcp__stripe__cancel_subscription",
+    "mcp__stripe__update_subscription",
+    "mcp__stripe__create_coupon",
+    "mcp__stripe__list_coupons",
+    "mcp__stripe__update_dispute",
+    "mcp__stripe__list_disputes"
+  ]
+}

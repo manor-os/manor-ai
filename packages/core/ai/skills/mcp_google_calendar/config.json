@@ -1,0 +1,21 @@
+{
+  "id": "mcp_google_calendar",
+  "name": "mcp_google_calendar",
+  "type": "runtime_guidance",
+  "description": "Read and manage the user's Google Calendar: list and inspect events, check free/busy, create, update, move, and delete events, and respond to invites.",
+  "category": "calendar",
+  "output_format": "guidance",
+  "tags": ["google-calendar", "calendar", "scheduling", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__google_calendar__list_events",
+    "mcp__google_calendar__get_event",
+    "mcp__google_calendar__create_event",
+    "mcp__google_calendar__update_event",
+    "mcp__google_calendar__delete_event",
+    "mcp__google_calendar__list_calendars",
+    "mcp__google_calendar__freebusy_query",
+    "mcp__google_calendar__respond_to_invite",
+    "mcp__google_calendar__quick_add_event",
+    "mcp__google_calendar__move_event"
+  ]
+}

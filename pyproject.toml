@@ -1,0 +1,115 @@
+[project]
+name = "manor"
+version = "0.1.0"
+description = "The AI operating system for autonomous enterprise management"
+requires-python = ">=3.11"
+license = { text = "Manor Sustainable Use License 1.0" }
+
+dependencies = [
+    # Web
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "python-multipart>=0.0.9",
+    # Database
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "psycopg2-binary>=2.9",
+    "alembic>=1.14",
+    # Auth
+    "python-jose[cryptography]>=3.3",
+    "passlib[bcrypt]>=1.7",
+    # Redis
+    "redis>=5.0",
+    # HTTP
+    "httpx>=0.28",
+    # AI
+    "openai>=1.0",
+    # Queue
+    "celery>=5.4",
+    # Email
+    "aiosmtplib>=3.0",
+    # IO
+    "aiofiles>=24.0",
+    "stripe>=8.0",
+    # Office docs
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
+    "python-docx>=1.1",
+    # PDF text extraction — used by chat-attachment + RAG ingest. ``pypdf``
+    # is the maintained fork of PyPDF2.
+    "pypdf>=4.0",
+    # Search (free DuckDuckGo fallback)
+    "ddgs>=7.0",
+    # Object storage (MinIO skill files)
+    "minio>=7.0",
+    # Utils
+    "python-ulid>=3.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    # Credential vault
+    "hvac>=2.0",
+    "cryptography>=42.0",
+    # Workspace memory (frontmatter parsing, wiki-link rendering)
+    "PyYAML>=6.0",
+    # Step I/O strict validation (M3 dispatcher)
+    "jsonschema>=4.20",
+    # Durable plan workflows (M3 — opt-in, off by default;
+    # set TEMPORAL_ENABLED=true to use)
+    "temporalio>=1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    # Used by smoke tests that spin up an in-memory engine.
+    "aiosqlite>=0.21",
+]
+# Extra PDF backends beyond the core `pypdf` dependency.
+pdf = ["pdfplumber>=0.11"]
+# OTEL — install with `pip install manor[otel]` to enable tracing.
+# Without this extra, packages.core.observability silently no-ops.
+otel = [
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
+]
+# Patchright (browser adapter for M7). Heavy install — Chromium binary
+# downloaded at first `patchright install chromium` run.
+browser = [
+    "patchright>=1.49",
+]
+
+[project.scripts]
+# Top-level Manor commands. Available after `pip install -e .` (or wheel install).
+# `manor-api` boots the FastAPI app under uvicorn — handy for ops scripts
+# that don't want to remember the module path.
+manor-api = "apps.api.main:run_cli"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "unit: small tests that do not require app, database, network, or external services",
+    "integration: tests that exercise app or service boundaries with local fixtures",
+    "e2e: end-to-end tests that require deployed/runtime surfaces or broad workflow setup",
+    "manual: tests that are opt-in and should never run in default CI",
+    "slow: tests that are too expensive for PR smoke",
+    "network: tests that call live HTTP endpoints or third-party services",
+    "docker: tests that require Docker or the local Docker Manor stack",
+    "pgvector: tests that require PostgreSQL with pgvector support",
+    "cloud: tests for cloud-only surfaces that are stripped from OSS export",
+    "oss: tests for OSS/self-hosted mode contracts",
+    "running_api: tests that require a running Manor API over HTTP",
+    "running_runner: tests that require a running sidecar/runner over HTTP",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["packages*", "apps*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120

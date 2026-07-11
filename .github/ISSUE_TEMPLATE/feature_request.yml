@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a new capability, integration, or improvement.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the expected workflow, API, UI, or behavior.
+    validations:
+      required: true
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Release boundary
+      description: Where should this live?
+      options:
+        - OSS core
+        - Cloud-only
+        - Shared core with cloud-gated behavior
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you consider?
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, screenshots, related projects, or implementation notes.

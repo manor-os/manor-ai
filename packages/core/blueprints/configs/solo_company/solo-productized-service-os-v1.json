@@ -1,0 +1,517 @@
+{
+  "manifest": {
+    "blueprint_version": "1.1",
+    "slug": "solo-productized-service-os-v1",
+    "title": "Productized Service OS",
+    "summary": "A workspace for turning expertise into a productized offer, running weekly outbound, scheduling calls, and protecting cash flow.",
+    "use_when": "Use when an operator sells expertise and needs a repeatable client-acquisition system.",
+    "description": "Creates the operating loop for productized services: define the offer, build proof, run weekly prospecting, prepare call briefs, and review cash-flow risk before scope expands.",
+    "tags": [
+      "services",
+      "consulting",
+      "sales",
+      "cash-flow"
+    ],
+    "kind": "one_person_company",
+    "category": "solo.productized_services",
+    "author": {
+      "handle": "manor",
+      "display_name": "Manor AI"
+    },
+    "cover_image_url": null,
+    "forked_from_id": null,
+    "changelog": "Frozen on 2026-06-03: first runnable owner-operated workspace blueprint."
+  },
+  "contract": {
+    "variables": [
+      {
+        "key": "business_name",
+        "label": "Business name",
+        "required": false,
+        "default": "Company"
+      },
+      {
+        "key": "operator_timezone",
+        "label": "Operator timezone",
+        "required": false,
+        "default": "America/Los_Angeles"
+      }
+    ],
+    "channels": [
+      {
+        "channel_type": "telegram",
+        "purpose": "approval alerts for outreach, proposals, and payment-sensitive actions",
+        "required": false
+      }
+    ],
+    "sessions": [
+      {
+        "provider": "linkedin",
+        "label": "main",
+        "purpose": "Prospect research and relationship context when paired.",
+        "required": false
+      },
+      {
+        "provider": "gmail",
+        "label": "main",
+        "purpose": "Draft outreach and follow-up when paired.",
+        "required": false
+      },
+      {
+        "provider": "google_calendar",
+        "label": "main",
+        "purpose": "Prepare call briefs and scheduling checks when paired.",
+        "required": false
+      },
+      {
+        "provider": "stripe",
+        "label": "main",
+        "purpose": "Invoice and payment-status review when paired.",
+        "required": false
+      }
+    ],
+    "requires": {
+      "manor_min_version": "1.0",
+      "tools": [],
+      "mcp_servers": [],
+      "skills": [],
+      "agents": []
+    }
+  },
+  "embedded": {
+    "skills": [
+      {
+        "slug": "solo-productized-service-playbook-v1",
+        "name": "Productized Service Playbook",
+        "display_name": "Productized Service Playbook",
+        "description": "Operating playbook for Productized Service OS.",
+        "system_prompt": "Help a service provider convert expertise into a fixed-scope offer. Prioritize narrow ICP, proof, weekly outbound, fast follow-up, deposits, scope control, and simple cash-flow visibility.",
+        "tools": [],
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "request": {
+              "type": "string"
+            },
+            "workspace_context": {
+              "type": "object"
+            }
+          }
+        },
+        "output_format": "markdown",
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-productized-service-os-v1"
+        ],
+        "version": "1.0.0",
+        "config": {
+          "frozen_at": "2026-06-03"
+        },
+        "status": "active"
+      }
+    ],
+    "agents": [
+      {
+        "slug": "solo-service-revenue-operator-v1",
+        "name": "Service Revenue Operator",
+        "description": "Runs the Productized Service OS workspace operating loop.",
+        "system_prompt": "You operate a productized service workspace for an independent consultant. Keep the offer clear, prospecting consistent, proposals scoped, and cash-flow risk visible. Never send outreach, proposal terms, invoices, or payment reminders without operator approval.",
+        "config": {
+          "model": "default",
+          "temperature": 0.3,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-productized-service-os-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "solo-productized-service-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "operating_principle",
+            "content": "This workspace serves an owner-operator. Protect the operator's attention, ask for approval before public or financial actions, and keep every weekly review tied to the active goals.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      }
+    ],
+    "knowledge_packs": [
+      {
+        "slug": "solo-productized-service-ops",
+        "title": "Productized Service Ops",
+        "purpose": "Store ICP, offer, proof, outreach, proposal, and cash-flow review docs.",
+        "mode": "skeleton",
+        "folder_structure": [
+          "offer/",
+          "proof/",
+          "prospects/",
+          "proposals/",
+          "cash-flow/"
+        ],
+        "starter_documents": [],
+        "external_source": null
+      }
+    ]
+  },
+  "recipe": {
+    "operating_model": {
+      "kind": "one_person_company",
+      "context": "One operator sells a productized professional service and must balance delivery time with consistent sales motion.",
+      "primary_work": "Maintain the offer, generate qualified leads, prepare outreach and call briefs, track proposals, and protect payment terms.",
+      "settings": {
+        "timezone": "America/Los_Angeles",
+        "blueprint_frozen": true,
+        "frozen_at": "2026-06-03",
+        "install_expectation": "simulate_first_then_promote"
+      },
+      "services": [
+        {
+          "key": "services.offer",
+          "name": "Offer and positioning",
+          "description": "Keep ICP, fixed scope, pricing, proof, and guarantee crisp."
+        },
+        {
+          "key": "services.pipeline",
+          "name": "Weekly pipeline",
+          "description": "Find prospects, draft outreach, and track next actions."
+        },
+        {
+          "key": "services.cashflow",
+          "name": "Cash-flow guardrail",
+          "description": "Watch deposits, invoices, due dates, and scope creep."
+        }
+      ],
+      "rules": [
+        "Every lead must map to a specific pain, trigger, and offer fit.",
+        "Prefer deposits and short payment terms over large unpaid scopes.",
+        "Outbound messages, proposal terms, and invoices require operator approval."
+      ],
+      "review_cadence": {
+        "daily": "Check the next action queue and remove low-leverage work.",
+        "weekly": "Review goal pace, current constraints, and the next experiment."
+      }
+    },
+    "strategist": {
+      "business_model": {
+        "model_type": "services_delivery",
+        "primary_metric": "new_clients",
+        "secondary_metrics": [
+          "qualified_leads",
+          "proposal_acceptance_rate",
+          "days_sales_outstanding"
+        ],
+        "revenue_model": "Fixed-scope service packages with deposit-first payment terms."
+      },
+      "cadence": {
+        "schedule": "weekly",
+        "trigger_conditions": [
+          "pipeline_below_target",
+          "proposal_stalled",
+          "invoice_overdue"
+        ]
+      },
+      "proposal_shape": "next_week_revenue_action",
+      "priors": [
+        "A narrow offer beats a broad freelancer menu.",
+        "Cash collection is part of delivery for an owner-operated service."
+      ],
+      "evaluation_rubric": {
+        "weights": {
+          "revenue_leverage": 0.4,
+          "delivery_fit": 0.25,
+          "speed": 0.2,
+          "risk": 0.15
+        }
+      },
+      "do_not_propose": [
+        "Free custom strategy work before qualification.",
+        "Outbound volume plans the operator cannot review."
+      ],
+      "voice": "commercial, specific, concise"
+    },
+    "prompts": [
+      {
+        "key": "weekly_review",
+        "title": "Weekly operator review",
+        "body": "Summarize goal movement, what shipped, what blocked execution, and the single highest-leverage decision for next week."
+      }
+    ],
+    "subscriptions": [
+      {
+        "service_key": "services.offer",
+        "agent_slug": "solo-service-revenue-operator-v1",
+        "custom_prompt": "Run this workspace in sandbox-first mode. Create tasks, draft assets, and prepare review packets. Do not take external action without operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-productized-service-os-v1",
+          "primary_service": "services.pipeline",
+          "service_name": "Offer and positioning"
+        }
+      },
+      {
+        "service_key": "services.pipeline",
+        "agent_slug": "solo-service-revenue-operator-v1",
+        "custom_prompt": "Run this workspace in sandbox-first mode. Create tasks, draft assets, and prepare review packets. Do not take external action without operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-productized-service-os-v1",
+          "primary_service": "services.pipeline",
+          "service_name": "Weekly pipeline"
+        }
+      },
+      {
+        "service_key": "services.cashflow",
+        "agent_slug": "solo-service-revenue-operator-v1",
+        "custom_prompt": "Run this workspace in sandbox-first mode. Create tasks, draft assets, and prepare review packets. Do not take external action without operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-productized-service-os-v1",
+          "primary_service": "services.pipeline",
+          "service_name": "Cash-flow guardrail"
+        }
+      }
+    ],
+    "scheduled_jobs": [
+      {
+        "job_id": "solo-services-weekly-prospect-list",
+        "name": "Weekly prospect list",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 9 * * 1",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "services.pipeline",
+          "max_turns": 6,
+          "deliverable": "Inline markdown prospect list in workspace_chat. Include 10 qualified prospects, fit reasons, likely trigger, suggested first message angle, priority, and next operator decision. No file attachment or external outreach is required.",
+          "done_when": "The workspace_chat response contains 10 qualified prospects with a concrete reason each fits the offer, clearly marks assumptions when no CRM or live market source is connected, and does not require or claim email, send, file, or integration side effects."
+        },
+        "payload_message": "Prepare 10 qualified prospects and the reason each fits the offer. Return the list inline in workspace_chat as markdown only. Do not send outreach, create files, email anyone, or modify external systems for this automation. If no CRM or live lead source is connected, state the missing-data assumption and continue in simulation mode.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "solo-services-friday-cash-review",
+        "name": "Friday cash-flow review",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 15 * * 5",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "services.cashflow",
+          "max_turns": 6,
+          "deliverable": "Inline markdown cash-flow review in workspace_chat. Include proposal status, unpaid invoices, next expected payments, scope risks, and operator next actions. No file attachment or external finance action is required.",
+          "done_when": "The workspace_chat response contains a complete cash-flow review packet, clearly marks missing proposal/invoice/payment data as assumptions or empty-state findings, identifies risks and next actions, and does not require or claim email, payment, file, or integration side effects."
+        },
+        "payload_message": "Review proposal status, unpaid invoices, next payments, and scope risks. Return the review inline in workspace_chat as markdown only. Do not send emails, create invoices, create files, collect payments, or modify external systems for this automation. If no accounting, CRM, or proposal data is connected, state the missing-data assumption and continue in simulation mode.",
+        "default_delivery_mode": "workspace_chat"
+      }
+    ],
+    "workflows": [
+      {
+        "slug": "solo-services-lead-to-proposal-v1",
+        "description": "Turn one qualified lead into a reviewed outreach and proposal packet.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "lead_name",
+            "default": "operator supplied"
+          }
+        ],
+        "steps": [
+          {
+            "id": "qualify",
+            "name": "Qualify lead",
+            "kind": "agent_call",
+            "service_key": "services.pipeline",
+            "input": "Map pain, trigger, offer fit, budget signal, and next action."
+          },
+          {
+            "id": "outreach",
+            "name": "Draft outreach",
+            "kind": "agent_call",
+            "depends_on": [
+              "qualify"
+            ],
+            "service_key": "services.pipeline",
+            "input": "Draft concise outreach and a call agenda."
+          },
+          {
+            "id": "review",
+            "name": "Operator approval",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "outreach"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      }
+    ],
+    "goals": [
+      {
+        "title": "Win 3 new productized-service clients per month",
+        "description": "Keep a predictable flow of paid clients for the service business.",
+        "metric_key": "new_clients",
+        "target_value": 3,
+        "baseline_value": 0,
+        "deadline": "2026-12-31",
+        "measurement_source": {
+          "type": "manual",
+          "metric": "closed_won_clients"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 2
+      },
+      {
+        "title": "Maintain 20 qualified leads in active pipeline",
+        "description": "Avoid feast-or-famine by keeping a minimum qualified lead pool.",
+        "metric_key": "qualified_leads",
+        "target_value": 20,
+        "baseline_value": 0,
+        "measurement_source": {
+          "type": "manual",
+          "metric": "qualified_pipeline_count"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 3
+      }
+    ],
+    "task_categories": [
+      {
+        "key": "offer",
+        "label": "Offer",
+        "sort_order": 10
+      },
+      {
+        "key": "pipeline",
+        "label": "Pipeline",
+        "sort_order": 20
+      },
+      {
+        "key": "proposal",
+        "label": "Proposal",
+        "sort_order": 30
+      },
+      {
+        "key": "finance",
+        "label": "Finance",
+        "sort_order": 40
+      }
+    ],
+    "custom_fields": [
+      {
+        "name": "lead_stage",
+        "display_name": "Lead stage",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "research",
+          "outreach",
+          "call",
+          "proposal",
+          "won",
+          "lost"
+        ],
+        "sort_order": 10
+      },
+      {
+        "name": "offer_tier",
+        "display_name": "Offer tier",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "starter",
+          "core",
+          "premium"
+        ],
+        "sort_order": 20
+      },
+      {
+        "name": "cash_risk",
+        "display_name": "Cash risk",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "sort_order": 30
+      }
+    ],
+    "sla_policies": [
+      {
+        "key": "operator_review",
+        "target": "task",
+        "threshold_hours": 24,
+        "description": "Review generated assets or decisions within one workday."
+      }
+    ],
+    "escalation_rules": [
+      {
+        "key": "public_or_financial_action",
+        "condition": "public_publish_or_money_movement",
+        "action": "pause_for_operator_review"
+      }
+    ]
+  },
+  "policy": {
+    "governance": {
+      "never_allow_actions": [
+        "billing.*",
+        "payments.refund",
+        "contract.sign_*"
+      ],
+      "hitl_required_actions": [
+        "email.send_*",
+        "calendar.create_*",
+        "invoice.send_*",
+        "workspace.file.modify"
+      ],
+      "auto_approve_actions": [
+        "workspace.task.create",
+        "workspace.search"
+      ],
+      "max_risk_level": "medium",
+      "budget_caps_per_kind": {
+        "llm": 250,
+        "action": 120
+      }
+    },
+    "post_install_checks": [
+      {
+        "kind": "agent_callable",
+        "service_key": "services.pipeline"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-services-weekly-prospect-list"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-services-friday-cash-review"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "solo-services-lead-to-proposal-v1"
+      }
+    ],
+    "expected_baseline": {
+      "runnable_in_simulation": true,
+      "blocking_todos_expected": 0,
+      "first_week_outputs": [
+        "offer checklist",
+        "10-prospect list",
+        "cash-flow review"
+      ]
+    }
+  }
+}

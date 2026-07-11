@@ -1,0 +1,8 @@
+FROM node:20-alpine
+
+WORKDIR /app
+COPY apps/web/package*.json ./
+RUN npm ci
+# Source is mounted as a volume — no COPY needed
+EXPOSE 3000
+CMD ["npx", "vite", "--host", "0.0.0.0", "--port", "3000"]

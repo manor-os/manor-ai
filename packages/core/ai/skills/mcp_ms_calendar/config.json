@@ -1,0 +1,24 @@
+{
+  "id": "mcp_ms_calendar",
+  "name": "mcp_ms_calendar",
+  "type": "runtime_guidance",
+  "description": "Read and manage the user's Microsoft (Outlook) Calendar: list/inspect events, check free/busy, find meeting times, create/update/cancel events, and respond to invites.",
+  "category": "calendar",
+  "output_format": "guidance",
+  "tags": ["microsoft-calendar", "outlook-calendar", "calendar", "scheduling", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__ms_calendar__list_calendars",
+    "mcp__ms_calendar__list_events",
+    "mcp__ms_calendar__get_event",
+    "mcp__ms_calendar__create_event",
+    "mcp__ms_calendar__update_event",
+    "mcp__ms_calendar__cancel_event",
+    "mcp__ms_calendar__delete_event",
+    "mcp__ms_calendar__accept_event",
+    "mcp__ms_calendar__decline_event",
+    "mcp__ms_calendar__tentatively_accept_event",
+    "mcp__ms_calendar__get_schedule",
+    "mcp__ms_calendar__find_meeting_times",
+    "mcp__ms_calendar__list_event_instances"
+  ]
+}

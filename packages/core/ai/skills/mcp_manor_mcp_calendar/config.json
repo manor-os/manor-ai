@@ -1,0 +1,17 @@
+{
+  "id": "mcp_manor_mcp_calendar",
+  "name": "mcp_manor_mcp_calendar",
+  "type": "runtime_guidance",
+  "description": "Manage Manor calendar settings, booking links, working hours, stored bookings, and the daily agenda.",
+  "category": "calendar",
+  "output_format": "guidance",
+  "tags": ["manor-calendar", "booking", "calendar", "scheduling", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__manor_mcp_calendar__get_calendar_settings",
+    "mcp__manor_mcp_calendar__list_booking_links",
+    "mcp__manor_mcp_calendar__create_booking_link",
+    "mcp__manor_mcp_calendar__update_working_hours",
+    "mcp__manor_mcp_calendar__get_daily_agenda",
+    "mcp__manor_mcp_calendar__list_bookings"
+  ]
+}

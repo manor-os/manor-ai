@@ -1,0 +1,43 @@
+# Sandbox container base image for skill execution.
+#
+# This is the image that runs INSIDE each sandboxed Docker container
+# created by the sandbox-service. It is NOT the service itself.
+# Skill scripts are injected into a running container of this image
+# and executed in isolation.
+#
+# Build (once, before starting the stack):
+#   docker build -t sandbox-skill:latest -f docker/Dockerfile.sandbox .
+#
+# The sandbox-service uses this image via the SANDBOX_IMAGE env var.
+
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # npm cache and global prefix point to writable tmpfs locations.
+    # /home/sandbox is mounted as tmpfs at runtime (read-only root fs).
+    NPM_CONFIG_CACHE=/home/sandbox/.npm \
+    NPM_CONFIG_PREFIX=/home/sandbox/.npm-global \
+    PATH="/home/sandbox/.npm-global/bin:${PATH}"
+
+# Install base tools + Node.js 20.x (LTS) via NodeSource
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    ripgrep \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g npm@10.9.4 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash sandbox
+USER sandbox
+WORKDIR /skill
+
+CMD ["sleep", "infinity"]
