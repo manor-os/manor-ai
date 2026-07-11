@@ -1,6 +1,8 @@
 """E2E tests: dashboard analytics — stats, task trends, usage trends, activity."""
 
 from datetime import datetime, timezone
+import json
+from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
@@ -114,6 +116,70 @@ async def test_dashboard_layout_rejects_unknown_and_duplicate_widgets(client: As
         },
     )
     assert duplicate.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_dashboard_layout_ai_suggestion_updates_preview_only(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import dashboard as dashboard_router
+
+    async def fake_completion(*_args, **_kwargs):
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "widgets": [
+                        {"id": "total_tasks", "visible": True},
+                        {"id": "workspaces", "visible": True},
+                        {"id": "task_trend", "visible": True},
+                        {"id": "daily_brief", "visible": False},
+                        {"id": "time_saved", "visible": False},
+                        {"id": "tasks_running", "visible": False},
+                        {"id": "activity", "visible": False},
+                    ]
+                }
+            )
+        )
+
+    monkeypatch.setattr(
+        dashboard_router,
+        "runtime_execute_text_completion",
+        fake_completion,
+    )
+    headers = await _auth(client, "dashlayoutai")
+    defaults = (await client.get("/api/v1/dashboard/layout", headers=headers)).json()
+
+    response = await client.post(
+        "/api/v1/dashboard/layout/suggest",
+        headers=headers,
+        json={
+            "prompt": "Only show tasks, workspaces, and trend",
+            "widgets": defaults["widgets"],
+        },
+    )
+    assert response.status_code == 200
+    suggestion = response.json()["widgets"]
+    assert [widget["id"] for widget in suggestion[:3]] == [
+        "total_tasks",
+        "workspaces",
+        "task_trend",
+    ]
+    assert [widget["id"] for widget in suggestion if widget["visible"]] == [
+        "total_tasks",
+        "workspaces",
+        "task_trend",
+    ]
+
+    persisted = await client.get("/api/v1/dashboard/layout", headers=headers)
+    assert persisted.json() == defaults
+
+    blank = await client.post(
+        "/api/v1/dashboard/layout/suggest",
+        headers=headers,
+        json={"prompt": "   ", "widgets": defaults["widgets"]},
+    )
+    assert blank.status_code == 422
 
 
 @pytest.mark.asyncio

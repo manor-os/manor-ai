@@ -8,14 +8,17 @@ import { currentZonedHour, formatTodayFull, isDeadlineOverdue, relativeTime } fr
 import TrendChart from "../components/ui/TrendChart";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
 import Button from "../components/ui/Button";
-import Modal from "../components/ui/Modal";
-import Toggle from "../components/ui/Toggle";
+import LoadingSpinner from "../components/ui/LoadingSpinner";
 import {
   IconCheck,
   IconChevronDown,
   IconDragHandle,
+  IconEye,
+  IconEyeOff,
   IconRefresh,
+  IconSend,
   IconSettings,
+  IconSparkles,
 } from "../components/icons";
 import { useWorkspaceFilter } from "../stores/workspace";
 import { useAuthStore } from "../stores/auth";
@@ -82,56 +85,45 @@ const DEFAULT_DASHBOARD_WIDGETS: DashboardWidgetPreference[] =
 
 const DASHBOARD_WIDGET_META: Record<
   DashboardWidgetId,
-  { titleKey: string; descriptionKey: string }
+  { titleKey: string }
 > = {
   daily_brief: {
     titleKey: "page.dashboard.widget_daily_brief",
-    descriptionKey: "page.dashboard.widget_daily_brief_desc",
   },
   time_saved: {
     titleKey: "page.dashboard.widget_time_saved",
-    descriptionKey: "page.dashboard.widget_time_saved_desc",
   },
   total_tasks: {
     titleKey: "page.dashboard.widget_total_tasks",
-    descriptionKey: "page.dashboard.widget_total_tasks_desc",
   },
   tasks_running: {
     titleKey: "page.dashboard.widget_tasks_running",
-    descriptionKey: "page.dashboard.widget_tasks_running_desc",
   },
   activity: {
     titleKey: "page.dashboard.widget_activity",
-    descriptionKey: "page.dashboard.widget_activity_desc",
   },
   workspaces: {
     titleKey: "page.dashboard.widget_workspaces",
-    descriptionKey: "page.dashboard.widget_workspaces_desc",
   },
   task_trend: {
     titleKey: "page.dashboard.widget_task_trend",
-    descriptionKey: "page.dashboard.widget_task_trend_desc",
   },
 };
 
 const DASHBOARD_WIDGET_GROUPS: Array<{
   id: string;
-  titleKey: string;
   widgets: DashboardWidgetId[];
 }> = [
   {
     id: "brief",
-    titleKey: "page.dashboard.customize_group_brief",
     widgets: ["daily_brief"],
   },
   {
     id: "metrics",
-    titleKey: "page.dashboard.customize_group_metrics",
     widgets: ["time_saved", "total_tasks", "tasks_running"],
   },
   {
     id: "content",
-    titleKey: "page.dashboard.customize_group_content",
     widgets: ["activity", "workspaces", "task_trend"],
   },
 ];
@@ -180,157 +172,191 @@ function reorderDashboardWidget(
   );
 }
 
-function DashboardCustomizer({
-  open,
+function DashboardWidgetFrame({
+  widgetId,
+  editing,
   widgets,
-  saving,
-  onChange,
-  onClose,
-  onSave,
+  draggedWidget,
+  style,
+  children,
+  onDragStart,
+  onDragEnd,
+  onDrop,
+  onMove,
+  onHide,
 }: {
-  open: boolean;
+  widgetId: DashboardWidgetId;
+  editing: boolean;
   widgets: DashboardWidgetPreference[];
-  saving: boolean;
-  onChange: (widgets: DashboardWidgetPreference[]) => void;
-  onClose: () => void;
-  onSave: () => void;
+  draggedWidget: DashboardWidgetId | null;
+  style?: React.CSSProperties;
+  children: React.ReactNode;
+  onDragStart: (widgetId: DashboardWidgetId) => void;
+  onDragEnd: () => void;
+  onDrop: (targetId: DashboardWidgetId) => void;
+  onMove: (widgetId: DashboardWidgetId, offset: -1 | 1) => void;
+  onHide: (widgetId: DashboardWidgetId) => void;
 }) {
-  const [draggedWidget, setDraggedWidget] = useState<DashboardWidgetId | null>(null);
+  if (!editing) return <>{children}</>;
 
-  const moveBy = (widgetId: DashboardWidgetId, offset: -1 | 1) => {
-    const group = DASHBOARD_WIDGET_GROUPS.find((candidate) =>
-      candidate.widgets.includes(widgetId),
-    );
-    if (!group) return;
-    const ordered = widgets.filter((widget) => group.widgets.includes(widget.id));
-    const index = ordered.findIndex((widget) => widget.id === widgetId);
-    const target = ordered[index + offset];
-    if (target) onChange(reorderDashboardWidget(widgets, widgetId, target.id));
-  };
+  const group = DASHBOARD_WIDGET_GROUPS.find((candidate) =>
+    candidate.widgets.includes(widgetId),
+  );
+  const groupWidgets = widgets.filter(
+    (widget) => widget.visible && group?.widgets.includes(widget.id),
+  );
+  const index = groupWidgets.findIndex((widget) => widget.id === widgetId);
+  const canReorder = groupWidgets.length > 1;
+  const meta = DASHBOARD_WIDGET_META[widgetId];
 
   return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title={t("page.dashboard.customize_title")}
-      maxWidth="560px"
-      className="dashboard-customizer-dialog"
-      bodyClassName="dashboard-customizer-body"
-      footer={
-        <div className="dashboard-customizer-footer">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => onChange(DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })))}
-          >
-            <IconRefresh size={14} />
-            {t("page.dashboard.restore_defaults")}
-          </Button>
-          <div className="dashboard-customizer-footer-actions">
-            <Button variant="outline" size="sm" onClick={onClose}>
-              {t("action.cancel")}
-            </Button>
-            <Button size="sm" loading={saving} onClick={onSave}>
-              <IconCheck size={14} />
-              {t("page.dashboard.save_layout")}
-            </Button>
-          </div>
-        </div>
-      }
+    <div
+      className={`dashboard-editable-widget${draggedWidget === widgetId ? " is-dragging" : ""}`}
+      data-widget-id={widgetId}
+      style={style}
+      onDragOver={(event) => {
+        if (draggedWidget && group?.widgets.includes(draggedWidget)) {
+          event.preventDefault();
+        }
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        onDrop(widgetId);
+      }}
     >
-      <p className="dashboard-customizer-intro">
-        {t("page.dashboard.customize_description")}
-      </p>
-      <div className="dashboard-customizer-groups">
-        {DASHBOARD_WIDGET_GROUPS.map((group) => {
-          const groupWidgets = widgets.filter((widget) => group.widgets.includes(widget.id));
-          return (
-            <section key={group.id} className="dashboard-customizer-group">
-              <h3>{t(group.titleKey)}</h3>
-              <div className="dashboard-customizer-widget-list">
-                {groupWidgets.map((widget, index) => {
-                  const meta = DASHBOARD_WIDGET_META[widget.id];
-                  const canReorder = groupWidgets.length > 1;
-                  return (
-                    <div
-                      key={widget.id}
-                      className={`dashboard-customizer-widget${draggedWidget === widget.id ? " is-dragging" : ""}`}
-                      onDragOver={(event) => {
-                        if (draggedWidget && group.widgets.includes(draggedWidget)) {
-                          event.preventDefault();
-                        }
-                      }}
-                      onDrop={(event) => {
-                        event.preventDefault();
-                        if (draggedWidget) {
-                          onChange(reorderDashboardWidget(widgets, draggedWidget, widget.id));
-                        }
-                        setDraggedWidget(null);
-                      }}
-                    >
-                      <span
-                        className={`dashboard-customizer-drag${canReorder ? "" : " is-disabled"}`}
-                        draggable={canReorder}
-                        title={canReorder ? t("page.dashboard.drag_to_reorder") : undefined}
-                        onDragStart={(event) => {
-                          if (!canReorder) return;
-                          event.dataTransfer.effectAllowed = "move";
-                          event.dataTransfer.setData("text/plain", widget.id);
-                          setDraggedWidget(widget.id);
-                        }}
-                        onDragEnd={() => setDraggedWidget(null)}
-                      >
-                        <IconDragHandle size={15} />
-                      </span>
-                      <div className="dashboard-customizer-widget-copy">
-                        <strong>{t(meta.titleKey)}</strong>
-                        <span>{t(meta.descriptionKey)}</span>
-                      </div>
-                      {canReorder && (
-                        <div className="dashboard-customizer-order-actions">
-                          <button
-                            type="button"
-                            disabled={index === 0}
-                            title={t("page.dashboard.move_up")}
-                            aria-label={`${t("page.dashboard.move_up")} ${t(meta.titleKey)}`}
-                            onClick={() => moveBy(widget.id, -1)}
-                          >
-                            <IconChevronDown size={14} style={{ transform: "rotate(180deg)" }} />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={index === groupWidgets.length - 1}
-                            title={t("page.dashboard.move_down")}
-                            aria-label={`${t("page.dashboard.move_down")} ${t(meta.titleKey)}`}
-                            onClick={() => moveBy(widget.id, 1)}
-                          >
-                            <IconChevronDown size={14} />
-                          </button>
-                        </div>
-                      )}
-                      <Toggle
-                        checked={widget.visible}
-                        size="sm"
-                        aria-label={`${t("page.dashboard.show_widget")} ${t(meta.titleKey)}`}
-                        onChange={() =>
-                          onChange(
-                            widgets.map((candidate) =>
-                              candidate.id === widget.id
-                                ? { ...candidate, visible: !candidate.visible }
-                                : candidate,
-                            ),
-                          )
-                        }
-                      />
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
-          );
-        })}
+      <div className="dashboard-editable-widget-toolbar">
+        <span
+          className={`dashboard-editable-widget-drag${canReorder ? "" : " is-disabled"}`}
+          draggable={canReorder}
+          title={canReorder ? t("page.dashboard.drag_to_reorder") : undefined}
+          onDragStart={(event) => {
+            if (!canReorder) return;
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", widgetId);
+            onDragStart(widgetId);
+          }}
+          onDragEnd={onDragEnd}
+        >
+          <IconDragHandle size={14} />
+        </span>
+        <strong>{t(meta.titleKey)}</strong>
+        <div className="dashboard-editable-widget-actions">
+          {canReorder && (
+            <>
+              <button
+                type="button"
+                disabled={index === 0}
+                title={t("page.dashboard.move_up")}
+                aria-label={`${t("page.dashboard.move_up")} ${t(meta.titleKey)}`}
+                onClick={() => onMove(widgetId, -1)}
+              >
+                <IconChevronDown size={13} style={{ transform: "rotate(180deg)" }} />
+              </button>
+              <button
+                type="button"
+                disabled={index === groupWidgets.length - 1}
+                title={t("page.dashboard.move_down")}
+                aria-label={`${t("page.dashboard.move_down")} ${t(meta.titleKey)}`}
+                onClick={() => onMove(widgetId, 1)}
+              >
+                <IconChevronDown size={13} />
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            title={t("page.dashboard.hide_widget")}
+            aria-label={`${t("page.dashboard.hide_widget")} ${t(meta.titleKey)}`}
+            onClick={() => onHide(widgetId)}
+          >
+            <IconEyeOff size={13} />
+          </button>
+        </div>
       </div>
-    </Modal>
+      <div className="dashboard-editable-widget-content">{children}</div>
+    </div>
+  );
+}
+
+function DashboardInlineEditor({
+  widgets,
+  aiPrompt,
+  saving,
+  suggesting,
+  onAiPromptChange,
+  onApplyAi,
+  onShow,
+  onRestore,
+  onCancel,
+  onSave,
+}: {
+  widgets: DashboardWidgetPreference[];
+  aiPrompt: string;
+  saving: boolean;
+  suggesting: boolean;
+  onAiPromptChange: (value: string) => void;
+  onApplyAi: () => void;
+  onShow: (widgetId: DashboardWidgetId) => void;
+  onRestore: () => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  const hiddenWidgets = widgets.filter((widget) => !widget.visible);
+  const canApplyAi = aiPrompt.trim().length > 0 && !suggesting;
+
+  return (
+    <section className="dashboard-inline-editor" aria-label={t("page.dashboard.editing_dashboard")}>
+      <div className="dashboard-ai-layout-command">
+        <IconSparkles size={16} />
+        <input
+          value={aiPrompt}
+          placeholder={t("page.dashboard.ai_prompt_placeholder")}
+          aria-label={t("page.dashboard.ai_prompt_label")}
+          onChange={(event) => onAiPromptChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && canApplyAi) onApplyAi();
+          }}
+        />
+        <button
+          type="button"
+          disabled={!canApplyAi}
+          aria-busy={suggesting}
+          title={t("page.dashboard.apply_ai")}
+          aria-label={t("page.dashboard.apply_ai")}
+          onClick={onApplyAi}
+        >
+          {suggesting ? <LoadingSpinner size={13} /> : <IconSend size={14} />}
+        </button>
+      </div>
+      <div className="dashboard-inline-editor-actions">
+        <Button variant="ghost" size="sm" disabled={suggesting} onClick={onRestore}>
+          <IconRefresh size={14} />
+          {t("page.dashboard.restore_defaults")}
+        </Button>
+        <Button variant="outline" size="sm" onClick={onCancel}>
+          {t("action.cancel")}
+        </Button>
+        <Button size="sm" loading={saving} disabled={suggesting} onClick={onSave}>
+          <IconCheck size={14} />
+          {t("page.dashboard.save_layout")}
+        </Button>
+      </div>
+      {hiddenWidgets.length > 0 && (
+        <div className="dashboard-hidden-widgets">
+          <span>{t("page.dashboard.hidden_widgets")}</span>
+          {hiddenWidgets.map((widget) => (
+            <button
+              key={widget.id}
+              type="button"
+              onClick={() => onShow(widget.id)}
+            >
+              <IconEye size={13} />
+              {t(DASHBOARD_WIDGET_META[widget.id].titleKey)}
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -362,10 +388,12 @@ export default function Dashboard() {
     "";
   const wsId = useWorkspaceFilter((s) => s.activeWorkspaceId);
   const wsFilter = wsId !== "all" ? wsId : undefined;
-  const [customizerOpen, setCustomizerOpen] = useState(false);
+  const [editingDashboard, setEditingDashboard] = useState(false);
   const [draftWidgets, setDraftWidgets] = useState<DashboardWidgetPreference[]>(
     DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
   );
+  const [layoutPrompt, setLayoutPrompt] = useState("");
+  const [draggedWidget, setDraggedWidget] = useState<DashboardWidgetId | null>(null);
 
   const { data: dashboardLayoutData } = useQuery({
     queryKey: ["dashboard-layout"],
@@ -376,19 +404,26 @@ export default function Dashboard() {
     () => normalizeDashboardLayout(dashboardLayoutData),
     [dashboardLayoutData],
   );
+  const activeDashboardLayout = useMemo(
+    () =>
+      editingDashboard
+        ? normalizeDashboardLayout({ widgets: draftWidgets })
+        : dashboardLayout,
+    [dashboardLayout, draftWidgets, editingDashboard],
+  );
   const visibleWidgetIds = useMemo(
     () => new Set(
-      dashboardLayout.widgets
+      activeDashboardLayout.widgets
         .filter((widget) => widget.visible)
         .map((widget) => widget.id),
     ),
-    [dashboardLayout.widgets],
+    [activeDashboardLayout.widgets],
   );
   const widgetOrder = useMemo(
     () => new Map(
-      dashboardLayout.widgets.map((widget, index) => [widget.id, index]),
+      activeDashboardLayout.widgets.map((widget, index) => [widget.id, index]),
     ),
-    [dashboardLayout.widgets],
+    [activeDashboardLayout.widgets],
   );
   const isWidgetVisible = (widgetId: DashboardWidgetId) =>
     visibleWidgetIds.has(widgetId);
@@ -398,7 +433,8 @@ export default function Dashboard() {
     onSuccess: (value) => {
       const normalized = normalizeDashboardLayout(value);
       queryClient.setQueryData(["dashboard-layout"], normalized);
-      setCustomizerOpen(false);
+      setEditingDashboard(false);
+      setLayoutPrompt("");
       toast.success(t("page.dashboard.layout_saved"));
     },
     onError: (error: Error) => {
@@ -406,9 +442,59 @@ export default function Dashboard() {
     },
   });
 
-  const openCustomizer = () => {
+  const suggestLayoutMutation = useMutation({
+    mutationFn: () => api.dashboard.suggestLayout(layoutPrompt.trim(), draftWidgets),
+    onSuccess: (value) => {
+      setDraftWidgets(normalizeDashboardLayout(value).widgets);
+      setLayoutPrompt("");
+      toast.success(t("page.dashboard.ai_preview_updated"));
+    },
+    onError: (error: Error) => {
+      toast.error(t("page.dashboard.ai_update_failed"), error.message);
+    },
+  });
+
+  const startDashboardEditing = () => {
     setDraftWidgets(dashboardLayout.widgets.map((widget) => ({ ...widget })));
-    setCustomizerOpen(true);
+    setLayoutPrompt("");
+    setEditingDashboard(true);
+  };
+
+  const setDraftWidgetVisibility = (
+    widgetId: DashboardWidgetId,
+    visible: boolean,
+  ) => {
+    setDraftWidgets((current) =>
+      current.map((widget) =>
+        widget.id === widgetId ? { ...widget, visible } : widget,
+      ),
+    );
+  };
+
+  const moveDraftWidget = (widgetId: DashboardWidgetId, offset: -1 | 1) => {
+    setDraftWidgets((current) => {
+      const group = DASHBOARD_WIDGET_GROUPS.find((candidate) =>
+        candidate.widgets.includes(widgetId),
+      );
+      if (!group) return current;
+      const visibleInGroup = current.filter(
+        (widget) => widget.visible && group.widgets.includes(widget.id),
+      );
+      const index = visibleInGroup.findIndex((widget) => widget.id === widgetId);
+      const target = visibleInGroup[index + offset];
+      return target
+        ? reorderDashboardWidget(current, widgetId, target.id)
+        : current;
+    });
+  };
+
+  const dropDraftWidget = (targetId: DashboardWidgetId) => {
+    if (draggedWidget) {
+      setDraftWidgets((current) =>
+        reorderDashboardWidget(current, draggedWidget, targetId),
+      );
+    }
+    setDraggedWidget(null);
   };
 
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -671,7 +757,7 @@ export default function Dashboard() {
     }
   };
 
-  const metricWidgetIds = dashboardLayout.widgets
+  const metricWidgetIds = activeDashboardLayout.widgets
     .filter(
       (widget) =>
         widget.visible &&
@@ -681,7 +767,7 @@ export default function Dashboard() {
   const showDailyBrief = isWidgetVisible("daily_brief");
   const showActivity = isWidgetVisible("activity");
   const showWorkspaces = isWidgetVisible("workspaces");
-  const showTaskTrend = isWidgetVisible("task_trend") && (taskTrends ?? []).length > 0;
+  const showTaskTrend = isWidgetVisible("task_trend");
   const showContextRail = showWorkspaces || showTaskTrend;
   const hasContentWidgets = showActivity || showContextRail;
   const hasVisibleWidgets = showDailyBrief || metricWidgetIds.length > 0 || hasContentWidgets;
@@ -700,6 +786,7 @@ export default function Dashboard() {
     )[0];
   const dashboardRows = [
     "auto",
+    editingDashboard ? "auto" : null,
     showDailyBrief ? "auto" : null,
     metricWidgetIds.length > 0 ? "auto" : null,
     hasContentWidgets || !hasVisibleWidgets ? "minmax(0, 1fr)" : null,
@@ -780,10 +867,26 @@ export default function Dashboard() {
     return null;
   };
 
+  const widgetFrameProps = (
+    widgetId: DashboardWidgetId,
+    style?: React.CSSProperties,
+  ) => ({
+    widgetId,
+    editing: editingDashboard,
+    widgets: draftWidgets,
+    draggedWidget,
+    style,
+    onDragStart: setDraggedWidget,
+    onDragEnd: () => setDraggedWidget(null),
+    onDrop: dropDraftWidget,
+    onMove: moveDraftWidget,
+    onHide: (id: DashboardWidgetId) => setDraftWidgetVisibility(id, false),
+  });
+
   return (
     <>
       <div
-        className="dashboard-page"
+        className={`dashboard-page${editingDashboard ? " is-editing" : ""}`}
         style={{
           display: "grid",
           gridTemplateRows: dashboardRows,
@@ -842,19 +945,44 @@ export default function Dashboard() {
               : t("page.dashboard.all_clear")}
           </p>
         </div>
-        <button
-          type="button"
-          className="dashboard-customize-trigger"
-          aria-expanded={customizerOpen}
-          onClick={openCustomizer}
-        >
-          <IconSettings size={15} />
-          {t("page.dashboard.customize")}
-        </button>
+        {!editingDashboard && (
+          <button
+            type="button"
+            className="dashboard-customize-trigger"
+            onClick={startDashboardEditing}
+          >
+            <IconSettings size={15} />
+            {t("page.dashboard.customize")}
+          </button>
+        )}
       </div>
+
+      {editingDashboard && (
+        <DashboardInlineEditor
+          widgets={draftWidgets}
+          aiPrompt={layoutPrompt}
+          saving={saveLayoutMutation.isPending}
+          suggesting={suggestLayoutMutation.isPending}
+          onAiPromptChange={setLayoutPrompt}
+          onApplyAi={() => suggestLayoutMutation.mutate()}
+          onShow={(widgetId) => setDraftWidgetVisibility(widgetId, true)}
+          onRestore={() =>
+            setDraftWidgets(
+              DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
+            )
+          }
+          onCancel={() => {
+            setEditingDashboard(false);
+            setLayoutPrompt("");
+            setDraggedWidget(null);
+          }}
+          onSave={() => saveLayoutMutation.mutate()}
+        />
+      )}
 
       {/* ── Daily Brief Panel ────────────────────────── */}
       {showDailyBrief && (
+      <DashboardWidgetFrame {...widgetFrameProps("daily_brief")}>
       <div
         className="dashboard-brief-card"
         style={{
@@ -1210,6 +1338,7 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+      </DashboardWidgetFrame>
       )}
 
       {/* ── Metrics Row ──────────────────────────────── */}
@@ -1222,7 +1351,11 @@ export default function Dashboard() {
           gap: 10,
         }}
       >
-        {metricWidgetIds.map(renderMetricWidget)}
+        {metricWidgetIds.map((widgetId) => (
+          <DashboardWidgetFrame key={widgetId} {...widgetFrameProps(widgetId)}>
+            {renderMetricWidget(widgetId)}
+          </DashboardWidgetFrame>
+        ))}
       </div>
       )}
 
@@ -1246,6 +1379,9 @@ export default function Dashboard() {
       >
         {/* Recent activity */}
         {showActivity && (
+        <DashboardWidgetFrame
+          {...widgetFrameProps("activity", { order: activityFirst ? 0 : 1 })}
+        >
         <div
           className="dashboard-activity-card"
           style={{
@@ -1523,6 +1659,7 @@ export default function Dashboard() {
             </div>
           )}
         </div>
+        </DashboardWidgetFrame>
         )}
 
         {/* Right rail */}
@@ -1547,6 +1684,11 @@ export default function Dashboard() {
         >
           {/* Workspaces */}
           {showWorkspaces && (
+          <DashboardWidgetFrame
+            {...widgetFrameProps("workspaces", {
+              order: widgetOrder.get("workspaces") ?? 0,
+            })}
+          >
           <div
             className="dashboard-workspaces-card"
             style={{
@@ -1717,9 +1859,15 @@ export default function Dashboard() {
               </div>
             )}
           </div>
+          </DashboardWidgetFrame>
           )}
 
           {showTaskTrend && (
+            <DashboardWidgetFrame
+              {...widgetFrameProps("task_trend", {
+                order: widgetOrder.get("task_trend") ?? 0,
+              })}
+            >
             <div
               className="dashboard-trend-card"
               style={{
@@ -1777,6 +1925,7 @@ export default function Dashboard() {
                 color2="#4d6fa8"
               />
             </div>
+            </DashboardWidgetFrame>
           )}
         </div>
         )}
@@ -1790,24 +1939,25 @@ export default function Dashboard() {
           </span>
           <h2>{t("page.dashboard.empty_layout_title")}</h2>
           <p>{t("page.dashboard.empty_layout_description")}</p>
-          <Button size="sm" onClick={openCustomizer}>
+          <Button
+            size="sm"
+            onClick={
+              editingDashboard
+                ? () =>
+                    setDraftWidgets(
+                      DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
+                    )
+                : startDashboardEditing
+            }
+          >
             <IconSettings size={14} />
-            {t("page.dashboard.add_widgets")}
+            {editingDashboard
+              ? t("page.dashboard.restore_defaults")
+              : t("page.dashboard.add_widgets")}
           </Button>
         </div>
       )}
       </div>
-
-      <DashboardCustomizer
-        open={customizerOpen}
-        widgets={draftWidgets}
-        saving={saveLayoutMutation.isPending}
-        onChange={setDraftWidgets}
-        onClose={() => {
-          if (!saveLayoutMutation.isPending) setCustomizerOpen(false);
-        }}
-        onSave={() => saveLayoutMutation.mutate()}
-      />
     </>
   );
 }
