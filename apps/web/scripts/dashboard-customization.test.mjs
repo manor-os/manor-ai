@@ -21,8 +21,10 @@ test("dashboard customization persists widget visibility and order", () => {
   assert.match(dashboardSource, /function DashboardWidgetFrame/);
   assert.doesNotMatch(dashboardSource, /DashboardCustomizer|<Modal/);
   assert.match(dashboardSource, /api\.dashboard\.layout\(\)/);
-  assert.match(dashboardSource, /api\.dashboard\.updateLayout\(draftWidgets\)/);
-  assert.match(dashboardSource, /api\.dashboard\.suggestLayout\(layoutPrompt\.trim\(\), draftWidgets\)/);
+  assert.match(dashboardSource, /api\.dashboard\.updateLayout\(widgets\)/);
+  assert.match(dashboardSource, /api\.dashboard\.suggestLayout\(prompt, widgets\)/);
+  assert.match(dashboardSource, /variables\.saveAfter/);
+  assert.match(dashboardSource, /saveLayoutMutation\.mutate\(normalized\.widgets\)/);
   assert.match(apiSource, /\/dashboard\/layout/);
   assert.match(apiSource, /\/dashboard\/layout\/suggest/);
   assert.match(dashboardSource, /page\.dashboard\.restore_defaults/);

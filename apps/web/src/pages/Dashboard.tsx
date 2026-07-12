@@ -429,7 +429,8 @@ export default function Dashboard() {
     visibleWidgetIds.has(widgetId);
 
   const saveLayoutMutation = useMutation({
-    mutationFn: () => api.dashboard.updateLayout(draftWidgets),
+    mutationFn: (widgets: DashboardWidgetPreference[]) =>
+      api.dashboard.updateLayout(widgets),
     onSuccess: (value) => {
       const normalized = normalizeDashboardLayout(value);
       queryClient.setQueryData(["dashboard-layout"], normalized);
@@ -443,11 +444,23 @@ export default function Dashboard() {
   });
 
   const suggestLayoutMutation = useMutation({
-    mutationFn: () => api.dashboard.suggestLayout(layoutPrompt.trim(), draftWidgets),
-    onSuccess: (value) => {
-      setDraftWidgets(normalizeDashboardLayout(value).widgets);
+    mutationFn: ({
+      prompt,
+      widgets,
+    }: {
+      prompt: string;
+      widgets: DashboardWidgetPreference[];
+      saveAfter: boolean;
+    }) => api.dashboard.suggestLayout(prompt, widgets),
+    onSuccess: (value, variables) => {
+      const normalized = normalizeDashboardLayout(value);
+      setDraftWidgets(normalized.widgets);
       setLayoutPrompt("");
-      toast.success(t("page.dashboard.ai_preview_updated"));
+      if (variables.saveAfter) {
+        saveLayoutMutation.mutate(normalized.widgets);
+      } else {
+        toast.success(t("page.dashboard.ai_preview_updated"));
+      }
     },
     onError: (error: Error) => {
       toast.error(t("page.dashboard.ai_update_failed"), error.message);
@@ -961,10 +974,20 @@ export default function Dashboard() {
         <DashboardInlineEditor
           widgets={draftWidgets}
           aiPrompt={layoutPrompt}
-          saving={saveLayoutMutation.isPending}
+          saving={
+            saveLayoutMutation.isPending ||
+            (suggestLayoutMutation.isPending &&
+              suggestLayoutMutation.variables?.saveAfter === true)
+          }
           suggesting={suggestLayoutMutation.isPending}
           onAiPromptChange={setLayoutPrompt}
-          onApplyAi={() => suggestLayoutMutation.mutate()}
+          onApplyAi={() =>
+            suggestLayoutMutation.mutate({
+              prompt: layoutPrompt.trim(),
+              widgets: draftWidgets,
+              saveAfter: false,
+            })
+          }
           onShow={(widgetId) => setDraftWidgetVisibility(widgetId, true)}
           onRestore={() =>
             setDraftWidgets(
@@ -976,7 +999,18 @@ export default function Dashboard() {
             setLayoutPrompt("");
             setDraggedWidget(null);
           }}
-          onSave={() => saveLayoutMutation.mutate()}
+          onSave={() => {
+            const prompt = layoutPrompt.trim();
+            if (prompt) {
+              suggestLayoutMutation.mutate({
+                prompt,
+                widgets: draftWidgets,
+                saveAfter: true,
+              });
+            } else {
+              saveLayoutMutation.mutate(draftWidgets);
+            }
+          }}
         />
       )}
 
