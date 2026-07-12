@@ -17,12 +17,18 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
+OSS_MIRROR = ROOT / ".github" / "workflows" / "oss-mirror.yml"
 WEB_PACKAGE = ROOT / "apps" / "web" / "package.json"
 
 
 def load_ci() -> dict:
     text = CI.read_text()
     # YAML 1.1 treats "on" as a boolean unless we quote it or normalize it.
+    return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
+
+
+def load_oss_mirror() -> dict:
+    text = OSS_MIRROR.read_text()
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
@@ -101,18 +107,44 @@ def test_web_package_exposes_source_smoke_entrypoint() -> None:
     assert package["scripts"]["test:source"] == "node --test scripts/*.test.mjs"
 
 
-def test_release_workflow_keeps_oss_boundary_gate_for_cloud_repo() -> None:
+def test_release_workflow_only_creates_github_release_for_tags() -> None:
     workflow = yaml.safe_load(RELEASE.read_text().replace("\non:", "\n'on':", 1))
     jobs = workflow["jobs"]
 
-    assert "oss-boundary" in jobs
-    assert jobs["release"]["needs"] == "oss-boundary"
+    assert set(jobs) == {"release"}
+    assert "needs" not in jobs["release"]
     run_commands = "\n".join(
         step.get("run", "")
-        for step in jobs["oss-boundary"]["steps"]
+        for step in jobs["release"]["steps"]
         if isinstance(step, dict)
     )
-    assert "make oss-check" in run_commands
+    uses = [
+        step.get("uses")
+        for step in jobs["release"]["steps"]
+        if isinstance(step, dict)
+    ]
+    assert "make oss-check" not in run_commands
+    assert "softprops/action-gh-release@v2" in uses
+
+
+def test_oss_mirror_installs_python_dependencies_before_export_checks() -> None:
+    workflow = load_oss_mirror()
+    steps = workflow["jobs"]["export"]["steps"]
+
+    step_names = [step.get("name", step.get("uses", "")) for step in steps if isinstance(step, dict)]
+    check_index = step_names.index("Check OSS boundary")
+    previous_steps = steps[:check_index]
+    previous_run_commands = "\n".join(
+        step.get("run", "") for step in previous_steps if isinstance(step, dict)
+    )
+
+    assert any(
+        isinstance(step, dict)
+        and step.get("uses") == "actions/setup-python@v5"
+        and step.get("with", {}).get("python-version") == "3.12"
+        for step in previous_steps
+    )
+    assert 'pip install ".[dev]"' in previous_run_commands
 
 
 def test_cloud_source_keeps_private_runtime_surfaces_for_export_to_strip() -> None:
