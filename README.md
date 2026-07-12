@@ -3,6 +3,8 @@
 > A single monorepo replacing Java Spring Boot + MySQL + Vue 2 with **Python FastAPI + PostgreSQL + React**.
 > AI-native from day one: every feature is built around autonomous agents, agentic loops, and intelligent automation.
 
+Documentation: **https://manor-os.github.io/docs/manor-os/**
+
 | Metric | Value |
 |--------|-------|
 | Total lines of code | **73,485** |

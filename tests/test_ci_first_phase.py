@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
 OSS_MIRROR = ROOT / ".github" / "workflows" / "oss-mirror.yml"
+DOCS_DEPLOY = ROOT / ".github" / "workflows" / "deploy-docs.yml"
 WEB_PACKAGE = ROOT / "apps" / "web" / "package.json"
 
 
@@ -29,6 +30,11 @@ def load_ci() -> dict:
 
 def load_oss_mirror() -> dict:
     text = OSS_MIRROR.read_text()
+    return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
+
+
+def load_docs_deploy() -> dict:
+    text = DOCS_DEPLOY.read_text()
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
@@ -156,6 +162,34 @@ def test_oss_mirror_artifact_includes_hidden_public_files() -> None:
     assert "missing = [path for path in manifest_paths" in verify_step["run"]
     assert 'raise SystemExit("Manifest paths missing from OSS export:' in verify_step["run"]
     assert upload_step["with"]["include-hidden-files"] is True
+
+
+def test_docs_deploy_publishes_manor_os_docs_to_github_pages_repo() -> None:
+    workflow = load_docs_deploy()
+    triggers = workflow["on"]
+    job = workflow["jobs"]["build-and-deploy"]
+    steps = job["steps"]
+
+    assert triggers["push"]["branches"] == ["main"]
+    assert "docs-site/**" in triggers["push"]["paths"]
+    assert job["if"] == "github.repository == 'manor-os/manor-os'"
+    assert any(
+        step.get("uses") == "actions/setup-node@v4"
+        and step.get("with", {}).get("node-version") == "20"
+        for step in steps
+        if isinstance(step, dict)
+    )
+    install_step = next(step for step in steps if step.get("name") == "Install and build docs")
+    assert install_step["working-directory"] == "docs-site"
+    assert "npm ci" in install_step["run"]
+    assert "npm run build" in install_step["run"]
+
+    deploy_step = next(step for step in steps if step.get("name") == "Deploy docs")
+    deploy_with = deploy_step["with"]
+    assert deploy_step["uses"] == "peaceiris/actions-gh-pages@v4"
+    assert deploy_with["external_repository"] == "manor-os/manor-os.github.io"
+    assert deploy_with["destination_dir"] == "docs/manor-os"
+    assert deploy_with["keep_files"] is True
 
 
 def test_cloud_source_keeps_private_runtime_surfaces_for_export_to_strip() -> None:
