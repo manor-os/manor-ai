@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/Manor-AI/manor-os/security/advisories/new
+    url: https://github.com/manor-os/manor-os/security/advisories/new
     about: Please do not report suspected vulnerabilities in public issues.

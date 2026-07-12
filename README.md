@@ -36,7 +36,7 @@
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/Manor-AI/manor-os.git && cd manor-os
+git clone https://github.com/manor-os/manor-os.git && cd manor-os
 cp .env.example .env          # then set local secrets; configure model keys in Settings
 pip install ".[dev]"
 cd apps/web && npm ci && cd ../..
