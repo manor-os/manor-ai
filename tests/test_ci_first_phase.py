@@ -147,6 +147,17 @@ def test_oss_mirror_installs_python_dependencies_before_export_checks() -> None:
     assert 'pip install ".[dev]"' in previous_run_commands
 
 
+def test_oss_mirror_artifact_includes_hidden_public_files() -> None:
+    workflow = load_oss_mirror()
+    steps = workflow["jobs"]["export"]["steps"]
+    verify_step = next(step for step in steps if step.get("name") == "Verify exported tree")
+    upload_step = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+
+    assert "missing = [path for path in manifest_paths" in verify_step["run"]
+    assert 'raise SystemExit("Manifest paths missing from OSS export:' in verify_step["run"]
+    assert upload_step["with"]["include-hidden-files"] is True
+
+
 def test_cloud_source_keeps_private_runtime_surfaces_for_export_to_strip() -> None:
     root = ROOT
 
