@@ -29,12 +29,6 @@ make test
 npm --prefix apps/web run build
 ```
 
-For changes that affect the public release boundary, also run:
-
-```bash
-make oss-check
-```
-
 ## Pull Requests
 
 - Keep changes scoped to one feature, fix, or release-boundary update.
@@ -60,19 +54,16 @@ Please use the GitHub issue templates when possible. A strong issue includes:
 - Environment details such as OS, Python, Node, Docker, browser, and deployment mode.
 - Logs with secrets redacted.
 
-## Public Release Boundary
+## Self-Hosted Scope
 
-The private source tree may contain SaaS/operator code that is stripped from
-the public tree. If you add cloud-only files, update `.ossexclude` in the same
-change. If OSS runtime code imports a helper, keep that helper public and gate
-only the private behavior behind `DEPLOYMENT_MODE=cloud`.
+Manor OS is a source-available self-hosted application. Contributions should be
+usable by operators running the repository on their own infrastructure, with
+configuration documented in `.env.example` or the README when setup changes.
 
-Hosted Skill Marketplace, Agent Marketplace, and Apps Marketplace catalogs,
-imports, subscriptions, ratings, reviews, and rankings are Cloud-only.
-Custom/local skills and agents remain public self-hosted core features.
-
-Use [`docs/OSS_CLOUD_FEATURE_BOUNDARY.md`](docs/OSS_CLOUD_FEATURE_BOUNDARY.md)
-to classify new work as OSS, Cloud-only, or shared-core-cloud-gated.
+Avoid adding dependencies on Manor AI hosted services unless the feature also
+has a self-hosted path or degrades clearly when optional credentials are absent.
+Local skills, agents, integrations, workflows, browser-runner automation,
+documents, and knowledge features should remain operable in self-hosted mode.
 
 ## Secrets
 

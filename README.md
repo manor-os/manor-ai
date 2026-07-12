@@ -72,7 +72,6 @@ account by default: `demo@manor.local` / `manor-demo`.
 ```bash
 make test             # PR smoke: excludes e2e/manual/slow/network/docker/cloud
 make test-regression  # Broader local regression: excludes manual/network/docker/cloud
-make test-cloud-regression # Cloud-only regression with DEPLOYMENT_MODE=cloud
 make test-e2e         # Opt-in e2e/runtime tests
 make test-manual      # Opt-in manual tests
 make test-all         # Everything collected by pytest
@@ -110,7 +109,6 @@ make test-all         # Everything collected by pytest
 | Layer | Path | Description |
 |-------|------|-------------|
 | **Core library** | `packages/core/` | AI engine, models, services, tools, sandbox SDK |
-| **Cloud extensions** | private release tree | Multi-tenant billing, hosted marketplaces, and platform operations stripped from the public source |
 | **API server** | `apps/api/` | FastAPI routers, middleware, dependency injection |
 | **Web frontend** | `apps/web/` | React 18 SPA with TypeScript, Tailwind CSS, shadcn/ui |
 
@@ -220,9 +218,9 @@ make test-all         # Everything collected by pytest
 - Settings management
 
 ### Infrastructure
-- Docker Compose with 8 services (postgres, redis, minio, juicefs-init, api, worker, sandbox, web)
+- Docker Compose stack for postgres, redis, minio, the API, worker, web app, sandbox, browser-runner, and optional sidecars/profiles
 - JuiceFS + MinIO for entity-scoped filesystem storage
-- GitHub Actions CI (lint + test on push/PR, Docker build + deploy on release)
+- GitHub Actions CI (lint, frontend build, source smoke tests, and Python tests on push/PR; tag releases publish GitHub release notes)
 - Alembic database migrations
 - Makefile with dev, test, lint, build, db commands
 - Celery + Redis task queue for background jobs
@@ -320,8 +318,8 @@ manor-os/
 |   +-- nginx.conf
 +-- .github/workflows/
 |   +-- ci.yml               # Lint + test on push/PR
-|   +-- release.yml          # Docker build + deploy
-+-- docker-compose.yml       # 8 services: postgres, redis, minio, juicefs-init, api, worker, sandbox, web
+|   +-- release.yml          # GitHub release notes for version tags
++-- docker-compose.yml       # Self-hosted stack with core services and optional sidecars/profiles
 +-- pyproject.toml           # Python project config (PEP 621)
 +-- alembic.ini              # Alembic migration config
 +-- Makefile                 # dev, test, lint, build, db commands
@@ -352,7 +350,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 | `GOOGLE_CLIENT_SECRET` | No | -- | Google OAuth client secret |
 | `SEARCH_ENGINE` | No | `serper` | Web search provider (`serper` or `tavily`) |
 | `SEARCH_API_KEY` | No | -- | API key for web search tool |
-| `DEPLOYMENT_MODE` | No | `oss` | Public self-hosted mode. The private Cloud tree uses `cloud`. |
+| `DEPLOYMENT_MODE` | No | `oss` | Self-hosted mode. |
 
 ---
 
@@ -369,8 +367,6 @@ make db-migrate      # Run pending Alembic migrations
 make db-init         # Initialize database with seed data
 make docker-up       # Build and start the Docker compose stack
 make build-docker    # Build Docker images without starting services
-make oss-check       # Validate the private-to-public source boundary
-make oss-export      # Export the public source tree to /tmp/manor-os-oss
 make clean           # Remove __pycache__, .pytest_cache, build artifacts
 ```
 
@@ -395,12 +391,10 @@ make clean           # Remove __pycache__, .pytest_cache, build artifacts
 
 | Mode | `DEPLOYMENT_MODE` | Description |
 |------|-------------------|-------------|
-| **OSS** | `oss` | Public self-hosted mode: single tenant, BYOK-only model keys, no hosted billing or marketplace code |
-| **Cloud** | `cloud` | Private Manor SaaS mode: multi-tenant billing, hosted marketplace, and platform operations |
+| **Self-hosted** | `oss` | Source-available deployment for running Manor OS on your own infrastructure with user-provided model keys |
 
-Cloud-only source is stripped from the public repository by the release export
-process. The private repository keeps detailed operator docs under `docs/`;
-the public OSS export intentionally omits that directory.
+Managed Manor Cloud is a separate commercial service operated by Manor AI. This
+repository is the self-hosted codebase.
 
 ---
 
