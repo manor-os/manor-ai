@@ -13801,6 +13801,7 @@ tests/test_presence.py
 tests/test_provider_error_hint.py
 tests/test_provider_keys.py
 tests/test_quotas.py
+tests/test_ref_resolution_tolerance.py
 tests/test_reports.py
 tests/test_retry_policy.py
 tests/test_role_management.py
