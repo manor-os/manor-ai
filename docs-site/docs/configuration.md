@@ -13,7 +13,7 @@ cp .env.example .env
 
 ## Required for Real Deployments
 
-Change these before exposing Manor OS beyond local evaluation:
+Change these before exposing Manor AI beyond local evaluation:
 
 | Variable | Purpose |
 | --- | --- |
@@ -27,13 +27,13 @@ Change these before exposing Manor OS beyond local evaluation:
 
 ## Model Keys
 
-Self-hosted Manor OS is BYOK. Configure model provider credentials in Settings
+Self-hosted Manor AI is BYOK. Configure model provider credentials in Settings
 for each workspace or user. Avoid baking model API keys into images or source
 control.
 
 ## Storage
 
-Manor OS uses MinIO for object storage and JuiceFS for entity-scoped filesystem
+Manor AI uses MinIO for object storage and JuiceFS for entity-scoped filesystem
 storage. The default Compose stack formats and mounts the local JuiceFS volume
 automatically.
 

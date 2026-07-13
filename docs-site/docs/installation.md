@@ -5,7 +5,7 @@ title: Installation
 
 # Installation
 
-Manor OS supports two common self-hosted workflows:
+Manor AI supports two common self-hosted workflows:
 
 - Docker Compose for a production-like single-host deployment.
 - Local development with Python, Node.js, PostgreSQL, Redis, and MinIO.
@@ -15,8 +15,8 @@ Manor OS supports two common self-hosted workflows:
 Docker Compose is the recommended first install path.
 
 ```bash
-git clone https://github.com/manor-os/manor-os.git
-cd manor-os
+git clone https://github.com/manor-os/manor-ai.git
+cd manor-ai
 cp .env.example .env
 docker compose up --build -d
 ```

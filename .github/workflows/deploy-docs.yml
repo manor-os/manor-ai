@@ -12,12 +12,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: manor-os-docs-pages
+  group: manor-ai-docs-pages
   cancel-in-progress: true
 
 jobs:
   build-and-deploy:
-    if: github.repository == 'manor-os/manor-os'
+    if: github.repository == 'manor-os/manor-ai'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -41,5 +41,5 @@ jobs:
           external_repository: manor-os/manor-os.github.io
           publish_branch: main
           publish_dir: docs-site/build
-          destination_dir: docs/manor-os
+          destination_dir: docs/manor-ai
           keep_files: true

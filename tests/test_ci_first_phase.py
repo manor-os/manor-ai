@@ -172,7 +172,7 @@ def test_docs_deploy_publishes_manor_os_docs_to_github_pages_repo() -> None:
 
     assert triggers["push"]["branches"] == ["main"]
     assert "docs-site/**" in triggers["push"]["paths"]
-    assert job["if"] == "github.repository == 'manor-os/manor-os'"
+    assert job["if"] == "github.repository == 'manor-os/manor-ai'"
     assert any(
         step.get("uses") == "actions/setup-node@v4"
         and step.get("with", {}).get("node-version") == "20"
@@ -188,7 +188,7 @@ def test_docs_deploy_publishes_manor_os_docs_to_github_pages_repo() -> None:
     deploy_with = deploy_step["with"]
     assert deploy_step["uses"] == "peaceiris/actions-gh-pages@v4"
     assert deploy_with["external_repository"] == "manor-os/manor-os.github.io"
-    assert deploy_with["destination_dir"] == "docs/manor-os"
+    assert deploy_with["destination_dir"] == "docs/manor-ai"
     assert deploy_with["keep_files"] is True
 
 

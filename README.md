@@ -3,7 +3,7 @@
 > A single monorepo replacing Java Spring Boot + MySQL + Vue 2 with **Python FastAPI + PostgreSQL + React**.
 > AI-native from day one: every feature is built around autonomous agents, agentic loops, and intelligent automation.
 
-Documentation: **https://manor-os.github.io/docs/manor-os/**
+Documentation: **https://manor-os.github.io/docs/manor-ai/**
 
 | Metric | Value |
 |--------|-------|
@@ -38,7 +38,7 @@ Documentation: **https://manor-os.github.io/docs/manor-os/**
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/manor-os/manor-os.git && cd manor-os
+git clone https://github.com/manor-os/manor-ai.git && cd manor-ai
 cp .env.example .env          # then set local secrets; configure model keys in Settings
 pip install ".[dev]"
 cd apps/web && npm ci && cd ../..
@@ -393,7 +393,7 @@ make clean           # Remove __pycache__, .pytest_cache, build artifacts
 
 | Mode | `DEPLOYMENT_MODE` | Description |
 |------|-------------------|-------------|
-| **Self-hosted** | `oss` | Source-available deployment for running Manor OS on your own infrastructure with user-provided model keys |
+| **Self-hosted** | `oss` | Source-available deployment for running Manor AI on your own infrastructure with user-provided model keys |
 
 Managed Manor Cloud is a separate commercial service operated by Manor AI. This
 repository is the self-hosted codebase.

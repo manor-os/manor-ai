@@ -5,7 +5,7 @@ title: Quick Start
 
 # Quick Start
 
-This path gets Manor OS running on one machine with Docker Compose.
+This path gets Manor AI running on one machine with Docker Compose.
 
 ## Prerequisites
 
@@ -17,8 +17,8 @@ This path gets Manor OS running on one machine with Docker Compose.
 ## Clone
 
 ```bash
-git clone https://github.com/manor-os/manor-os.git
-cd manor-os
+git clone https://github.com/manor-os/manor-ai.git
+cd manor-ai
 cp .env.example .env
 ```
 
@@ -46,7 +46,7 @@ demo@manor.local / manor-demo
 
 ## Configure Model Keys
 
-Manor OS is BYOK in self-hosted mode. After signing in, open Settings and add
+Manor AI is BYOK in self-hosted mode. After signing in, open Settings and add
 the provider keys your workspace should use. Keep provider keys out of source
 control and `.env` files when possible.
 
