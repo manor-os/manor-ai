@@ -20,7 +20,7 @@ still need explicit human confirmation:
 
 ## Action Classes
 
-Manor OS policies can treat actions differently:
+Manor AI policies can treat actions differently:
 
 - Allowed: the agent can proceed.
 - HITL required: the agent pauses for confirmation.

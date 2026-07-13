@@ -1,13 +1,13 @@
 // @ts-check
 
 const config = {
-  title: "Manor OS",
+  title: "Manor AI",
   tagline: "Self-hosted AI workspace runtime",
   favicon: "img/favicon.ico",
   url: "https://manor-os.github.io",
-  baseUrl: "/docs/manor-os/",
+  baseUrl: "/docs/manor-ai/",
   organizationName: "manor-os",
-  projectName: "manor-os",
+  projectName: "manor-ai",
   trailingSlash: false,
   onBrokenLinks: "throw",
   onBrokenMarkdownLinks: "warn",
@@ -22,7 +22,7 @@ const config = {
         docs: {
           routeBasePath: "/",
           sidebarPath: require.resolve("./sidebars.js"),
-          editUrl: "https://github.com/manor-os/manor-os/tree/main/docs-site/",
+          editUrl: "https://github.com/manor-os/manor-ai/tree/main/docs-site/",
         },
         blog: false,
         theme: {
@@ -34,10 +34,10 @@ const config = {
   themeConfig: {
     image: "img/social-card.png",
     navbar: {
-      title: "Manor OS",
+      title: "Manor AI",
       items: [
         { type: "docSidebar", sidebarId: "mainSidebar", position: "left", label: "Docs" },
-        { href: "https://github.com/manor-os/manor-os", label: "GitHub", position: "right" },
+        { href: "https://github.com/manor-os/manor-ai", label: "GitHub", position: "right" },
       ],
     },
     footer: {
@@ -46,7 +46,7 @@ const config = {
         {
           title: "Project",
           items: [
-            { label: "GitHub", href: "https://github.com/manor-os/manor-os" },
+            { label: "GitHub", href: "https://github.com/manor-os/manor-ai" },
             { label: "Security", to: "/security" },
             { label: "Contributing", to: "/development" },
           ],

@@ -4,7 +4,7 @@ title: Upgrades and Releases
 
 # Upgrades and Releases
 
-Treat Manor OS upgrades like application releases with database migrations.
+Treat Manor AI upgrades like application releases with database migrations.
 
 ## Recommended Flow
 

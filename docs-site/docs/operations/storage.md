@@ -4,7 +4,7 @@ title: Storage
 
 # Storage
 
-Manor OS uses PostgreSQL, Redis, MinIO, and JuiceFS together.
+Manor AI uses PostgreSQL, Redis, MinIO, and JuiceFS together.
 
 ## PostgreSQL
 
@@ -25,7 +25,7 @@ generated artifacts.
 
 ## JuiceFS
 
-JuiceFS gives Manor OS an entity-scoped filesystem backed by Redis metadata and
+JuiceFS gives Manor AI an entity-scoped filesystem backed by Redis metadata and
 MinIO object blocks. The `juicefs-init` service handles initial setup in the
 Compose stack.
 

@@ -4,7 +4,7 @@ title: Webhooks
 
 # Webhooks
 
-Webhooks let external systems notify Manor OS and let Manor OS call external
+Webhooks let external systems notify Manor AI and let Manor AI call external
 systems.
 
 ## Inbound Webhooks
@@ -13,7 +13,7 @@ Inbound webhooks need:
 
 - A public HTTPS URL.
 - Provider-specific secret or signature settings.
-- A route or integration configuration in Manor OS.
+- A route or integration configuration in Manor AI.
 
 ## Outbound Webhooks
 

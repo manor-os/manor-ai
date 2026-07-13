@@ -164,15 +164,18 @@ def test_oss_mirror_artifact_includes_hidden_public_files() -> None:
     assert upload_step["with"]["include-hidden-files"] is True
 
 
-def test_docs_deploy_publishes_manor_os_docs_to_github_pages_repo() -> None:
+def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None:
     workflow = load_docs_deploy()
     triggers = workflow["on"]
     job = workflow["jobs"]["build-and-deploy"]
     steps = job["steps"]
 
-    assert triggers["push"]["branches"] == ["main"]
-    assert "docs-site/**" in triggers["push"]["paths"]
-    assert job["if"] == "github.repository == 'manor-os/manor-os'"
+    assert triggers["push"]["tags"] == ["v*"]
+    assert "branches" not in triggers["push"]
+    assert "paths" not in triggers["push"]
+    assert triggers["workflow_dispatch"]["inputs"]["publish"]["default"] is False
+    assert triggers["workflow_dispatch"]["inputs"]["publish"]["type"] == "boolean"
+    assert "if" not in job
     assert any(
         step.get("uses") == "actions/setup-node@v4"
         and step.get("with", {}).get("node-version") == "20"
@@ -184,11 +187,16 @@ def test_docs_deploy_publishes_manor_os_docs_to_github_pages_repo() -> None:
     assert "npm ci" in install_step["run"]
     assert "npm run build" in install_step["run"]
 
+    upload_step = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+    assert upload_step["with"]["name"] == "manor-ai-docs-${{ github.sha }}"
+    assert upload_step["with"]["path"] == "docs-site/build"
+
     deploy_step = next(step for step in steps if step.get("name") == "Deploy docs")
+    assert deploy_step["if"] == "${{ github.event_name == 'push' || inputs.publish == true }}"
     deploy_with = deploy_step["with"]
     assert deploy_step["uses"] == "peaceiris/actions-gh-pages@v4"
     assert deploy_with["external_repository"] == "manor-os/manor-os.github.io"
-    assert deploy_with["destination_dir"] == "docs/manor-os"
+    assert deploy_with["destination_dir"] == "docs/manor-ai"
     assert deploy_with["keep_files"] is True
 
 
