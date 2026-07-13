@@ -4,7 +4,7 @@ title: Nango
 
 # Nango
 
-Nango is an optional self-hosted OAuth and API connector service. Manor AI can
+Nango is an optional self-hosted OAuth and API connector service. Manor OS can
 use it to connect many SaaS providers without building every OAuth flow from
 scratch.
 
@@ -16,7 +16,7 @@ The Compose file includes Nango services behind the `nango` profile.
 docker compose --profile nango up -d nango-postgres nango-server
 ```
 
-Open the Nango UI, create or copy keys, and place them in your Manor AI
+Open the Nango UI, create or copy keys, and place them in your Manor OS
 configuration.
 
 ## When to Use Nango

@@ -5,7 +5,7 @@ title: Docker Compose
 
 # Docker Compose
 
-The Compose stack is the fastest way to run a production-like Manor AI instance
+The Compose stack is the fastest way to run a production-like Manor OS instance
 on one host.
 
 ## Core Services

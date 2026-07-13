@@ -4,7 +4,7 @@ title: Integrations Overview
 
 # Integrations Overview
 
-Manor AI supports self-hosted integrations through provider credentials,
+Manor OS supports self-hosted integrations through provider credentials,
 webhooks, OAuth, and optional Nango.
 
 ## Integration Types

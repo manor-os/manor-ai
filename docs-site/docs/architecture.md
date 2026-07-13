@@ -5,7 +5,7 @@ title: Architecture
 
 # Architecture
 
-Manor AI is a monorepo with a Python backend, React frontend, worker runtime,
+Manor OS is a monorepo with a Python backend, React frontend, worker runtime,
 and isolated execution services.
 
 ```text

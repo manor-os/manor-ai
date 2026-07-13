@@ -35,7 +35,7 @@ Good skills:
 
 ## Browser-Backed Tools
 
-Some integrations do not expose complete APIs. Manor AI keeps browser-backed
+Some integrations do not expose complete APIs. Manor OS keeps browser-backed
 automation in the browser-runner sidecar, so the API and worker do not need to
 host Chromium directly.
 
