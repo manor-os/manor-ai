@@ -13794,7 +13794,6 @@ tests/test_plan_contract_enforcement.py
 tests/test_plan_materialization_linker.py
 tests/test_plan_retries.py
 tests/test_plan_schema.py
-tests/test_planner_time_limits.py
 tests/test_portal.py
 tests/test_pptx_editable_diagram_guidance.py
 tests/test_pptx_svg_quality_checker.py
