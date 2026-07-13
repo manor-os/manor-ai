@@ -48,7 +48,7 @@ jobs:
         if: ${{ github.event_name == 'push' || inputs.publish == true }}
         uses: peaceiris/actions-gh-pages@v4
         with:
-          personal_token: ${{ secrets.GH_ACCESS_TOKEN }}
+          personal_token: ${{ secrets.OSS_MIRROR_TOKEN }}
           external_repository: manor-os/manor-os.github.io
           publish_branch: main
           publish_dir: docs-site/build
