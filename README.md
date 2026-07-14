@@ -1,24 +1,11 @@
-# Manor AI -- The AI Operating System for Enterprise Management
+# Manor AI
 
-> A single monorepo replacing Java Spring Boot + MySQL + Vue 2 with **Python FastAPI + PostgreSQL + React**.
-> AI-native from day one: every feature is built around autonomous agents, agentic loops, and intelligent automation.
+Manor AI is a self-hosted AI workspace runtime for teams that want agents,
+documents, tasks, workflows, tools, and integrations under their own control.
+It is designed for BYOK deployments, local data ownership, and auditable
+human-in-the-loop automation.
 
 Documentation: **https://manor-os.github.io/docs/manor-ai/**
-
-| Metric | Value |
-|--------|-------|
-| Total lines of code | **73,485** |
-| Python files | 256 |
-| TypeScript files | 78 |
-| Frontend pages | 50 |
-| UI components | 18 |
-| Tests | Marker-layered pytest suites + frontend source checks |
-| API routes | 320 |
-| OpenAPI paths / schemas | 233 / 243 |
-| Docker services | 8 |
-| Sidebar nav items | 22 |
-| i18n locales | 4 (en, zh, es, ja) |
-| Features | 90+ |
 
 ---
 
@@ -34,40 +21,39 @@ Documentation: **https://manor-os.github.io/docs/manor-ai/**
 | Redis          | 7+      |
 | Docker Compose | v2      |
 
-### Development Setup
+### Self-host Manor AI with Docker Compose
 
 ```bash
-# 1. Clone and install
 git clone https://github.com/manor-os/manor-ai.git && cd manor-ai
-cp .env.example .env          # then set local secrets; configure model keys in Settings
-pip install ".[dev]"
-cd apps/web && npm ci && cd ../..
-
-# 2. Start infrastructure (PostgreSQL, Redis, MinIO)
-./scripts/dev.sh infra
-
-# 3. Initialize database (runs Alembic migrations + seed data)
-./scripts/dev.sh init
-
-# 4. Start API + frontend (separate terminals)
-./scripts/dev.sh api          # FastAPI on http://localhost:8000
-./scripts/dev.sh web          # Vite dev server on http://localhost:3000
-
-# 5. (Optional) Start Celery worker for background jobs
-./scripts/dev.sh worker
-```
-
-Open **http://localhost:3000** to access the application.
-
-### Docker (Production-like)
-
-```bash
 cp .env.example .env          # local defaults run; configure model keys in Settings
 docker compose up --build -d   # builds and starts the self-hosted stack
 ```
 
-Open **http://localhost:18080**. OSS/self-hosted mode seeds a local demo
+Open **http://localhost:18080**. Self-hosted mode seeds a local demo
 account by default: `demo@manor.local` / `manor-demo`.
+
+### Development Setup
+
+```bash
+cp .env.example .env          # then set local secrets; configure model keys in Settings
+pip install ".[dev]"
+cd apps/web && npm ci && cd ../..
+
+# Start infrastructure (PostgreSQL, Redis, MinIO)
+./scripts/dev.sh infra
+
+# Initialize database (runs Alembic migrations + seed data)
+./scripts/dev.sh init
+
+# Start API + frontend (separate terminals)
+./scripts/dev.sh api          # FastAPI on http://localhost:8000
+./scripts/dev.sh web          # Vite dev server on http://localhost:3000
+
+# Optional Celery worker for background jobs
+./scripts/dev.sh worker
+```
+
+Open **http://localhost:3000** to access the development web app.
 
 ### Running Tests
 
@@ -116,7 +102,7 @@ make test-all         # Everything collected by pytest
 
 ---
 
-## Features (90+)
+## Capabilities
 
 ### Security & Auth
 - JWT authentication with refresh tokens
@@ -152,7 +138,7 @@ make test-all         # Everything collected by pytest
 ### AI Engine
 - BYOK model routing for self-hosted deployments (native provider keys configured in Settings)
 - Agentic loop with tool calling (multi-step reasoning)
-- Goal runner (autonomous goal decomposition)
+- Goal runner for multi-step goal decomposition
 - Task runner (AI-driven task execution)
 - 18+ tools: bash, file, document, knowledge, RAG, web, system, skill, task, code, goal, MCP, manor, search, browser, calendar, email, data tools
 - Agent skills system with visibility controls
@@ -240,10 +226,6 @@ Activity, Goals, Memories, Messages, and file/document viewers.
 
 ## API Documentation
 
-The API exposes **320 routes** across 37 router modules.
-
-OpenAPI spec: **233 paths**, **243 schemas**.
-
 | Resource | URL |
 |----------|-----|
 | Swagger UI | http://localhost:8000/api/docs |
@@ -279,25 +261,25 @@ make openapi
 ## Project Structure
 
 ```
-manor-os/
+manor-ai/
 +-- apps/
 |   +-- api/                  # FastAPI application
 |   |   +-- main.py           # App entry point
 |   |   +-- deps.py           # Dependency injection
 |   |   +-- middleware/        # CORS, auth, rate-limiting
-|   |   +-- routers/          # 37 route modules (agents, chat, tasks, ...)
+|   |   +-- routers/          # Route modules (agents, chat, tasks, ...)
 |   +-- web/                  # React + Vite + TypeScript frontend
 |       +-- src/
-|           +-- pages/        # 50 route pages (Dashboard, Chat, Agents, Tasks, ...)
-|           +-- components/   # 18 shared UI components (shadcn/ui)
+|           +-- pages/        # Route pages (Dashboard, Chat, Agents, Tasks, ...)
+|           +-- components/   # Shared UI components
 |           +-- stores/       # State management
 |           +-- lib/          # Utilities
 +-- packages/
 |   +-- core/                 # Shared business logic
 |   |   +-- ai/              # LLM client, agentic loop, goal/task runners
 |   |   |   +-- tools/       # 18+ tool modules (bash, file, doc, web, code, mcp, ...)
-|   |   +-- models/          # SQLAlchemy ORM models (30 modules)
-|   |   +-- services/        # Business logic services (57 modules)
+|   |   +-- models/          # SQLAlchemy ORM models
+|   |   +-- services/        # Business logic services
 |   |   +-- tasks/           # Celery background tasks
 |   |   +-- sandbox/         # Sandboxed execution SDK
 |   |   +-- migrations/      # Alembic database migrations
@@ -395,8 +377,7 @@ make clean           # Remove __pycache__, .pytest_cache, build artifacts
 |------|-------------------|-------------|
 | **Self-hosted** | `oss` | Source-available deployment for running Manor AI on your own infrastructure with user-provided model keys |
 
-Managed Manor Cloud is a separate commercial service operated by Manor AI. This
-repository is the self-hosted codebase.
+This repository contains the self-hosted distribution.
 
 ---
 
