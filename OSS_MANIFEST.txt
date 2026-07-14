@@ -8,12 +8,14 @@
 .github/workflows/deploy-docs.yml
 .github/workflows/release.yml
 .gitignore
+CHANGELOG.md
 CODE_OF_CONDUCT.md
 CONTRIBUTING.md
 DEPLOYMENT_VERSIONING.md
 LICENSE
 Makefile
 README.md
+ROADMAP.md
 SECURITY.md
 TRADEMARKS.md
 alembic.ini
@@ -752,6 +754,11 @@ docs-site/package-lock.json
 docs-site/package.json
 docs-site/sidebars.js
 docs-site/src/css/custom.css
+docs-site/static/img/manor-ai-api-reference.png
+docs-site/static/img/manor-ai-goals.png
+docs-site/static/img/manor-ai-governance.png
+docs-site/static/img/manor-ai-runtime.png
+docs-site/static/img/social-card.png
 lefthook.yml
 packages/__init__.py
 packages/core/__init__.py

@@ -37,6 +37,11 @@ const sidebars = {
     "development",
     "troubleshooting",
     "security",
+    {
+      type: "link",
+      label: "Roadmap",
+      href: "https://github.com/manor-os/manor-ai/blob/main/ROADMAP.md",
+    },
   ],
 };
 
