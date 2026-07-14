@@ -284,87 +284,6 @@ _SERVER_TOOL_SCHEMAS: dict[str, list[dict]] = {
     ],
 
 
-    "notebooklm": [
-        {"name": "list_notebooks",
-         "description": "List the user's NotebookLM notebooks. Returns each notebook's id and title.",
-         "parameters": {"type": "object", "properties": {}}},
-        {"name": "create_notebook",
-         "description": "Create a new NotebookLM notebook, optionally seeding with web sources.",
-         "parameters": {"type": "object", "required": ["name"],
-                        "properties": {"name": {"type": "string"},
-                                       "sources": {"type": "array", "items": {"type": "string"}}}}},
-        {"name": "ask",
-         "description": "Ask a question against a NotebookLM notebook. Returns the answer and source citations.",
-         "parameters": {"type": "object", "required": ["notebook_id", "question"],
-                        "properties": {"notebook_id": {"type": "string"},
-                                       "question": {"type": "string"}}}},
-    ],
-
-    "claude_ai_web": [
-        {"name": "new_chat",
-         "description": "Start a fresh Claude.ai conversation using the user's Pro/Max subscription. Returns chat_id + first response.",
-         "parameters": {"type": "object", "required": ["prompt"],
-                        "properties": {"prompt": {"type": "string"},
-                                       "model": {"type": "string"}}}},
-        {"name": "continue_chat",
-         "description": "Append to an existing Claude.ai conversation by chat_id.",
-         "parameters": {"type": "object", "required": ["chat_id", "prompt"],
-                        "properties": {"chat_id": {"type": "string"},
-                                       "prompt": {"type": "string"}}}},
-        {"name": "list_chats",
-         "description": "List the user's recent Claude.ai conversations.",
-         "parameters": {"type": "object",
-                        "properties": {"limit": {"type": "integer"}}}},
-    ],
-
-    "chatgpt_web": [
-        {"name": "new_chat",
-         "description": "Start a fresh ChatGPT conversation on the user's Plus/Team subscription. Returns chat_id + first response.",
-         "parameters": {"type": "object", "required": ["prompt"],
-                        "properties": {"prompt": {"type": "string"},
-                                       "model": {"type": "string"}}}},
-        {"name": "continue_chat",
-         "description": "Append a turn to an existing ChatGPT conversation.",
-         "parameters": {"type": "object", "required": ["chat_id", "prompt"],
-                        "properties": {"chat_id": {"type": "string"},
-                                       "prompt": {"type": "string"}}}},
-        {"name": "list_chats",
-         "description": "List the user's recent ChatGPT conversations from the sidebar.",
-         "parameters": {"type": "object",
-                        "properties": {"limit": {"type": "integer"}}}},
-    ],
-
-    "gemini_web": [
-        {"name": "new_chat",
-         "description": "Start a fresh Gemini conversation on the user's Gemini Advanced subscription.",
-         "parameters": {"type": "object", "required": ["prompt"],
-                        "properties": {"prompt": {"type": "string"},
-                                       "model": {"type": "string"}}}},
-        {"name": "continue_chat",
-         "description": "Append a turn to an existing Gemini conversation.",
-         "parameters": {"type": "object", "required": ["chat_id", "prompt"],
-                        "properties": {"chat_id": {"type": "string"},
-                                       "prompt": {"type": "string"}}}},
-        {"name": "list_chats",
-         "description": "List the user's recent Gemini conversations.",
-         "parameters": {"type": "object",
-                        "properties": {"limit": {"type": "integer"}}}},
-    ],
-
-    "perplexity_web": [
-        {"name": "search",
-         "description": "Run a search-grounded query on Perplexity using the user's Pro subscription. Returns answer + cited URLs.",
-         "parameters": {"type": "object", "required": ["query"],
-                        "properties": {"query": {"type": "string"},
-                                       "focus": {"type": "string"},
-                                       "model": {"type": "string"}}}},
-        {"name": "follow_up",
-         "description": "Append a follow-up query to an existing Perplexity thread.",
-         "parameters": {"type": "object", "required": ["thread_id", "query"],
-                        "properties": {"thread_id": {"type": "string"},
-                                       "query": {"type": "string"}}}},
-    ],
-
     "producthunt": [
         {"name": "search_posts",
          "description": "Search Product Hunt posts by topic, free-text, or launch date. Use for competitor research before a launch.",
@@ -605,7 +524,6 @@ from packages.core.ai.mcp import ms_teams as _msteams_module  # noqa: E402
 from packages.core.ai.mcp import ms_excel as _msexcel_module  # noqa: E402
 from packages.core.ai.mcp import linkedin as _linkedin_module  # noqa: E402
 from packages.core.ai.mcp import twitter_x as _twitter_x_module  # noqa: E402
-from packages.core.ai.mcp import linkedin_browser as _linkedin_browser_module  # noqa: E402
 from packages.core.ai.mcp import youtube as _youtube_module  # noqa: E402
 from packages.core.ai.mcp import tiktok as _tiktok_module  # noqa: E402
 from packages.core.ai.mcp import shopify as _shopify_module  # noqa: E402
@@ -642,8 +560,6 @@ _SERVER_TOOL_SCHEMAS["linkedin"] = _adapt_module_tools(_linkedin_module)
 # lockstep so workspace allowlists can use the same tool names that dispatch
 # will actually accept (create_tweet, search_recent, get_mentions, etc.).
 _SERVER_TOOL_SCHEMAS["twitter_x"] = _adapt_module_tools(_twitter_x_module)
-# Browser-driven providers are populated from their modules here.
-_SERVER_TOOL_SCHEMAS["linkedin_browser"] = _adapt_module_tools(_linkedin_browser_module)
 _SERVER_TOOL_SCHEMAS["youtube"] = _adapt_module_tools(_youtube_module)
 _SERVER_TOOL_SCHEMAS["tiktok"] = _adapt_module_tools(_tiktok_module)
 _SERVER_TOOL_SCHEMAS["shopify"] = _adapt_module_tools(_shopify_module)
@@ -897,7 +813,7 @@ _JSON_BLOB_PROVIDERS: set[str] = {
 # MCP modules that don't need a bearer_token because their auth lives
 # elsewhere. Private cloud builds add paired local worker providers here.
 _CONTEXT_ONLY_SERVERS: set[str] = {
-    # Future cli_worker / browser_session servers go here as we add them.
+    # Future cli_worker context-only servers go here as we add them.
 }
 
 

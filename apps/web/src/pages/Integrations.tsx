@@ -55,7 +55,6 @@ import { t } from "../lib/i18n";
 const UNCHANGED = "__unchanged__";
 
 
-
 import {
   IconCalendar,
   IconFolder,
@@ -176,12 +175,6 @@ const INTEGRATION_SERVER_CATEGORY_OVERRIDES: Record<
   replicate: "ai_media",
   elevenlabs: "ai_media",
   jimeng: "ai_media",
-  midjourney_web: "ai_media",
-  notebooklm: "ai_media",
-  claude_ai_web: "ai_media",
-  chatgpt_web: "ai_media",
-  gemini_web: "ai_media",
-  perplexity_web: "ai_media",
 };
 
 /* ------------------------------------------------------------------ */
@@ -280,7 +273,6 @@ const MCP_LOGO_COLOR: Record<string, string> = {
   whatsapp: "#25D366",
   twilio: "#F22F46",
   linkedin: "#0A66C2",
-  linkedin_browser: "#0A66C2", // same brand colour as the OAuth card
   twitter_x: "#111111",
   github: "#181717",
   webhook: "#57534e",
@@ -327,7 +319,6 @@ const MCP_ICON: Record<string, (p: IconProps) => JSX.Element> = {
   whatsapp: IconWhatsApp,
   twilio: IconTwilio,
   linkedin: IconLinkedIn,
-  linkedin_browser: IconLinkedIn, // same logo as the OAuth card
   twitter_x: IconTwitter,
   github: IconGitHub,
   webhook: IconWebhook,
@@ -1122,7 +1113,7 @@ function MCPAgentsPanel({
       : baseRowsRaw
   ).filter((s) => !HIDDEN_INTERNAL_AUTOMATION_KEYS.has(s.server_key));
   let baseRows: McpServerRow[] = filteredRows.filter(
-    (s) => s.auth_type !== "cli_worker" && s.auth_type !== "browser_session",
+    (s) => s.auth_type !== "cli_worker",
   );
   const rowsWithWorkerEntry: McpServerRow[] = baseRows;
 
@@ -1146,7 +1137,7 @@ function MCPAgentsPanel({
   // Runtime-managed cards are hidden from the OSS catalog fallback.
   // SaaS/API cards are the inverse.
   const isRuntimeManagedCard = (s: McpServerRow) =>
-    s.auth_type === "cli_worker" || s.auth_type === "browser_session";
+    s.auth_type === "cli_worker";
   const matchesSearch = (s: McpServerRow, value: string) => {
     const hay = [s.name, s.tagline, s.description, s.category]
       .filter(Boolean)
@@ -2797,84 +2788,6 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
       },
     ],
     docs_hint: t("page.integrations.docs_hint_18"),
-  },
-  notebooklm: {
-    fields: [
-      {
-        key: "api_key",
-        label: t("page.integrations.cookie_jar_json"),
-        type: "textarea",
-        placeholder: t("page.integrations.name_nid_value_domain_google_com"),
-        required: true,
-        rows: 8,
-        help: t("page.integrations.field_help_19"),
-      },
-    ],
-    docs_hint: t("page.integrations.docs_hint_20"),
-  },
-  claude_ai_web: {
-    fields: [
-      {
-        key: "api_key",
-        label: t("page.integrations.cookie_jar_json"),
-        type: "textarea",
-        placeholder: t(
-          "page.integrations.name_sessionkey_value_domain_claude_ai",
-        ),
-        required: true,
-        rows: 8,
-        help: t("page.integrations.field_help_21"),
-      },
-    ],
-    docs_hint: t("page.integrations.docs_hint_22"),
-  },
-  chatgpt_web: {
-    fields: [
-      {
-        key: "api_key",
-        label: t("page.integrations.cookie_jar_json"),
-        type: "textarea",
-        placeholder: t(
-          "page.integrations.name_secure_next_auth_session_token_value_domain_chatg",
-        ),
-        required: true,
-        rows: 8,
-        help: t("page.integrations.field_help_23"),
-      },
-    ],
-    docs_hint: t("page.integrations.docs_hint_24"),
-  },
-  gemini_web: {
-    fields: [
-      {
-        key: "api_key",
-        label: t("page.integrations.cookie_jar_json"),
-        type: "textarea",
-        placeholder: t(
-          "page.integrations.name_secure_1psid_value_domain_google_com",
-        ),
-        required: true,
-        rows: 8,
-        help: t("page.integrations.field_help_25"),
-      },
-    ],
-    docs_hint: t("page.integrations.docs_hint_26"),
-  },
-  perplexity_web: {
-    fields: [
-      {
-        key: "api_key",
-        label: t("page.integrations.cookie_jar_json"),
-        type: "textarea",
-        placeholder: t(
-          "page.integrations.name_secure_next_auth_session_token_value_domain_perpl",
-        ),
-        required: true,
-        rows: 8,
-        help: t("page.integrations.field_help_27"),
-      },
-    ],
-    docs_hint: t("page.integrations.docs_hint_28"),
   },
 };
 

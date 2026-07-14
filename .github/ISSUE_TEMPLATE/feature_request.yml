@@ -18,14 +18,14 @@ body:
     validations:
       required: true
   - type: dropdown
-    id: boundary
+    id: self_hosted_fit
     attributes:
-      label: Release boundary
-      description: Where should this live?
+      label: Self-hosted fit
+      description: How should this work for operators running their own deployment?
       options:
-        - OSS core
-        - Cloud-only
-        - Shared core with cloud-gated behavior
+        - Core self-hosted capability
+        - Optional integration with user-provided credentials
+        - Needs design discussion
         - Unsure
     validations:
       required: true

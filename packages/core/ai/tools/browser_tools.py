@@ -155,28 +155,6 @@ async def _browse_web(entity_id: str = "", **kwargs: Any) -> str:
     except (TypeError, ValueError):
         max_chars = 30_000
 
-    runner_error: str | None = None
-    try:
-        from packages.core.ai.mcp import _browser_runner
-
-        resp = await _browser_runner.perform(
-            provider="public_web",
-            action="extract",
-            params={
-                "url": url,
-                "extract_content": extract_content,
-                "selector": selector,
-                "wait_ms": wait_ms,
-                "max_chars": max_chars,
-            },
-            timeout_ms=max(45_000, wait_ms + 45_000),
-        )
-        if resp.get("ok"):
-            return json.dumps(resp.get("result") or {}, ensure_ascii=False)
-        runner_error = str(resp.get("error") or "browser-runner returned non-ok")
-    except Exception as e:
-        runner_error = str(e)
-
     try:
         session = await _get_or_create_session(entity_id)
         nav_result = await session.navigate(url)
@@ -193,20 +171,13 @@ async def _browse_web(entity_id: str = "", **kwargs: Any) -> str:
                 content = content[:max_chars] + "\n\n... [content truncated]"
             result["content"] = content
 
-        if runner_error:
-            result["fallback_warning"] = (
-                "browser-runner public_web was unavailable; used in-process browser fallback."
-            )
         return json.dumps(result, ensure_ascii=False)
 
     except RuntimeError as e:
-        return json.dumps({"error": str(e), "browser_runner_error": runner_error}, ensure_ascii=False)
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
     except Exception as e:
         logger.error("browse_web failed: %s", e)
-        return json.dumps({
-            "error": f"Failed to browse {url}: {e}",
-            "browser_runner_error": runner_error,
-        }, ensure_ascii=False)
+        return json.dumps({"error": f"Failed to browse {url}: {e}"}, ensure_ascii=False)
 
 
 async def _take_screenshot(entity_id: str = "", **kwargs: Any) -> str:

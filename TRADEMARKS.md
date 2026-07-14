@@ -10,9 +10,9 @@ The public source license does not grant any trademark rights.
 You may use Manor AI names in a fair and truthful way to:
 
 - refer to the original Manor AI project;
-- describe compatibility with Manor OS;
+- describe compatibility with Manor AI;
 - state that your work is a fork, plugin, connector, skill, agent, or
-  integration for Manor OS; or
+  integration for Manor AI; or
 - link back to the official Manor AI project.
 
 ## Not Allowed
@@ -32,5 +32,5 @@ Without separate written permission from Manor AI, you may not:
 ## Forks and Modified Versions
 
 If you distribute a fork or modified version, make it clear that it is not the
-official Manor AI product. Hosted or managed services based on Manor OS require
+official Manor AI product. Hosted or managed services based on Manor AI require
 a separate commercial agreement under the Manor Sustainable Use License 1.0.
