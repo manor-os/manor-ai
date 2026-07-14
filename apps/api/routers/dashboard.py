@@ -1,10 +1,13 @@
 """Dashboard analytics endpoints — stats, trends, goals, activity feed."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime import runtime_execute_text_completion
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services.analytics_service import (
@@ -14,9 +17,81 @@ from packages.core.services.analytics_service import (
     get_task_trends,
     get_usage_trends,
 )
+from packages.core.services.settings_service import (
+    get_user_preferences,
+    update_user_preferences,
+)
+from packages.core.services.skill_bundle import extract_json_object
 from apps.api.deps import get_current_user
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
+
+DASHBOARD_WIDGET_IDS = (
+    "daily_brief",
+    "time_saved",
+    "total_tasks",
+    "tasks_running",
+    "activity",
+    "workspaces",
+    "task_trend",
+)
+
+
+def _default_dashboard_layout() -> dict:
+    return {
+        "version": 1,
+        "widgets": [
+            {"id": widget_id, "visible": True}
+            for widget_id in DASHBOARD_WIDGET_IDS
+        ],
+    }
+
+
+def _normalize_dashboard_layout(value: object) -> dict:
+    if not isinstance(value, dict) or not isinstance(value.get("widgets"), list):
+        return _default_dashboard_layout()
+
+    widgets: list[dict] = []
+    seen: set[str] = set()
+    for item in value["widgets"]:
+        if not isinstance(item, dict):
+            continue
+        widget_id = str(item.get("id") or "")
+        if widget_id not in DASHBOARD_WIDGET_IDS or widget_id in seen:
+            continue
+        seen.add(widget_id)
+        widgets.append({"id": widget_id, "visible": bool(item.get("visible", True))})
+
+    for widget_id in DASHBOARD_WIDGET_IDS:
+        if widget_id not in seen:
+            widgets.append({"id": widget_id, "visible": True})
+
+    return {"version": 1, "widgets": widgets}
+
+
+def _merge_dashboard_layout_suggestion(value: object, current: dict) -> dict:
+    if not isinstance(value, dict) or not isinstance(value.get("widgets"), list):
+        raise ValueError("Dashboard suggestion did not include widgets")
+
+    widgets: list[dict] = []
+    seen: set[str] = set()
+    for item in value["widgets"]:
+        if not isinstance(item, dict):
+            continue
+        widget_id = str(item.get("id") or "")
+        if widget_id not in DASHBOARD_WIDGET_IDS or widget_id in seen:
+            continue
+        seen.add(widget_id)
+        widgets.append({"id": widget_id, "visible": bool(item.get("visible", True))})
+
+    if not widgets:
+        raise ValueError("Dashboard suggestion did not include valid widgets")
+
+    for item in current["widgets"]:
+        if item["id"] not in seen:
+            widgets.append(dict(item))
+
+    return {"version": 1, "widgets": widgets}
 
 
 # ── Schemas ──
@@ -101,7 +176,119 @@ class ActivityItem(BaseModel):
     task_id: str | None = None
 
 
+class DashboardWidgetPreference(BaseModel):
+    id: str
+    visible: bool = True
+
+
+class DashboardLayoutResponse(BaseModel):
+    version: int = 1
+    widgets: list[DashboardWidgetPreference] = Field(default_factory=list)
+
+
+class DashboardLayoutUpdate(BaseModel):
+    widgets: list[DashboardWidgetPreference] = Field(default_factory=list)
+
+
+class DashboardLayoutSuggestionRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=500)
+    widgets: list[DashboardWidgetPreference] = Field(default_factory=list)
+
+
 # ── Endpoints ──
+
+@router.get("/layout", response_model=DashboardLayoutResponse)
+async def dashboard_layout(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    preferences = await get_user_preferences(db, user.id)
+    return DashboardLayoutResponse(
+        **_normalize_dashboard_layout(preferences.get("dashboard_layout"))
+    )
+
+
+@router.put("/layout", response_model=DashboardLayoutResponse)
+async def update_dashboard_layout(
+    req: DashboardLayoutUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    widget_ids = [widget.id for widget in req.widgets]
+    invalid = sorted(set(widget_ids) - set(DASHBOARD_WIDGET_IDS))
+    if invalid:
+        raise HTTPException(422, f"Unknown dashboard widgets: {', '.join(invalid)}")
+    if len(widget_ids) != len(set(widget_ids)):
+        raise HTTPException(422, "Dashboard widgets must not contain duplicates")
+
+    layout = _normalize_dashboard_layout(
+        {"widgets": [widget.model_dump() for widget in req.widgets]}
+    )
+    await update_user_preferences(db, user.id, {"dashboard_layout": layout})
+    return DashboardLayoutResponse(**layout)
+
+
+@router.post("/layout/suggest", response_model=DashboardLayoutResponse)
+async def suggest_dashboard_layout(
+    req: DashboardLayoutSuggestionRequest,
+    user: User = Depends(get_current_user),
+):
+    if not req.prompt.strip():
+        raise HTTPException(422, "Dashboard request must not be empty")
+
+    current = _normalize_dashboard_layout(
+        {"widgets": [widget.model_dump() for widget in req.widgets]}
+    )
+    widget_catalog = [
+        {
+            "id": "daily_brief",
+            "description": "AI summary, key counts, and actions needing attention",
+        },
+        {"id": "time_saved", "description": "estimated time saved"},
+        {"id": "total_tasks", "description": "total task volume"},
+        {"id": "tasks_running", "description": "active and pending tasks"},
+        {"id": "activity", "description": "recent work and activity"},
+        {"id": "workspaces", "description": "workspace status"},
+        {"id": "task_trend", "description": "14-day task trend"},
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You configure a user's dashboard. Return JSON only with a widgets array. "
+                "Each widget must have id and visible fields. Order the array in the user's "
+                "preferred visual order. Preserve unspecified choices from the current layout, "
+                "never invent widget IDs, and include every known widget exactly once."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Request: {req.prompt.strip()}\n"
+                f"Available widgets: {json.dumps(widget_catalog)}\n"
+                f"Current layout: {json.dumps(current['widgets'])}"
+            ),
+        },
+    ]
+
+    try:
+        completion = await runtime_execute_text_completion(
+            messages,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            max_tokens=500,
+        )
+        suggestion = extract_json_object(completion.content)
+        layout = _merge_dashboard_layout_suggestion(suggestion, current)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, "Could not interpret dashboard request") from exc
+
+    return DashboardLayoutResponse(**layout)
+
 
 @router.get("/stats", response_model=DashboardStatsResponse)
 async def dashboard_stats(

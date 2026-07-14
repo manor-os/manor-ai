@@ -480,6 +480,8 @@ apps/web/scripts/assistant-process-flow-collapse.test.mjs
 apps/web/scripts/chat-layering.test.mjs
 apps/web/scripts/chat-mode-turn-scope.test.mjs
 apps/web/scripts/chat-stream-lifecycle.test.mjs
+apps/web/scripts/dashboard-customization.test.mjs
+apps/web/scripts/embedded-chat-conversation-minimap.test.mjs
 apps/web/scripts/file-references.test.mjs
 apps/web/scripts/knowledge-layout.test.mjs
 apps/web/scripts/live-edit-filetype-smoke.mjs

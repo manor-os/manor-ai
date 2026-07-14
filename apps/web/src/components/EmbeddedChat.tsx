@@ -2707,6 +2707,158 @@ function toDisplayText(value: unknown): string | undefined {
   }
 }
 
+type ConversationMarker = {
+  index: number;
+  position: number;
+};
+
+function sameConversationMarkers(
+  previous: ConversationMarker[],
+  next: ConversationMarker[],
+): boolean {
+  return (
+    previous.length === next.length &&
+    previous.every(
+      (marker, index) =>
+        marker.index === next[index]?.index &&
+        Math.abs(marker.position - next[index].position) < 0.002,
+    )
+  );
+}
+
+function sampleConversationMarkers(
+  markers: ConversationMarker[],
+  activeIndex: number,
+  maximum = 72,
+): ConversationMarker[] {
+  if (markers.length <= maximum) return markers;
+  const step = Math.ceil(markers.length / Math.max(1, maximum - 2));
+  return markers.filter(
+    (marker, index) =>
+      index === 0 ||
+      index === markers.length - 1 ||
+      index % step === 0 ||
+      marker.index === activeIndex,
+  );
+}
+
+function cleanConversationPreview(value: unknown): string {
+  return (toDisplayText(value) || "")
+    .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1")
+    .replace(/[`*_>#~-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function conversationPreviewContent(message: ChatMessage | undefined) {
+  const fallback = t(
+    message?.role === "user"
+      ? "component.embedded_chat.user_message"
+      : "component.embedded_chat.assistant_message",
+  );
+  const source = toDisplayText(message?.content) || "";
+  const lines = source
+    .split(/\r?\n/)
+    .map(cleanConversationPreview)
+    .filter(Boolean);
+  const body = cleanConversationPreview(source) || fallback;
+  const firstLine = lines[0] || fallback;
+  const title = trimText(firstLine, 56) || fallback;
+  const attachment = message?.attachments?.[0];
+  const extension = attachment?.name.split(".").pop()?.toUpperCase() || "FILE";
+  return {
+    fallback,
+    title,
+    body: trimText(body, 240) || fallback,
+    attachment,
+    extension: extension.slice(0, 4),
+  };
+}
+
+function ConversationMinimap({
+  messages,
+  markers,
+  activeIndex,
+  onSelect,
+}: {
+  messages: ChatMessage[];
+  markers: ConversationMarker[];
+  activeIndex: number;
+  onSelect: (index: number) => void;
+}) {
+  const visibleMarkers = useMemo(
+    () => sampleConversationMarkers(markers, activeIndex),
+    [activeIndex, markers],
+  );
+  const highlightedIndex = visibleMarkers.reduce(
+    (closest, marker) =>
+      Math.abs(marker.index - activeIndex) < Math.abs(closest - activeIndex)
+        ? marker.index
+        : closest,
+    visibleMarkers[0]?.index ?? activeIndex,
+  );
+  const compactLayout = visibleMarkers.length <= 32;
+  const compactGap =
+    visibleMarkers.length > 1
+      ? Math.min(18, 520 / (visibleMarkers.length - 1))
+      : 0;
+  const markerTop = (marker: ConversationMarker, visualIndex: number) =>
+    compactLayout
+      ? `calc(50% + ${(visualIndex - (visibleMarkers.length - 1) / 2) * compactGap}px)`
+      : `${marker.position * 100}%`;
+
+  return (
+    <nav
+      aria-label={t("component.embedded_chat.conversation_navigation")}
+      className="embedded-chat-conversation-minimap"
+    >
+      {visibleMarkers.map((marker, visualIndex) => {
+        const message = messages[marker.index];
+        const content = conversationPreviewContent(message);
+        const preview = trimText(content.body, 72) || content.fallback;
+        const isActive = marker.index === highlightedIndex;
+        const previewId = `conversation-minimap-preview-${marker.index}`;
+        return (
+          <div
+            key={marker.index}
+            className="embedded-chat-conversation-minimap-item"
+            style={{ top: markerTop(marker, visualIndex) }}
+          >
+            <button
+              aria-current={isActive ? "location" : undefined}
+              aria-describedby={previewId}
+              aria-label={t("component.embedded_chat.jump_to_message", {
+                number: String(marker.index + 1),
+                preview,
+              })}
+              className={isActive ? "is-active" : undefined}
+              data-chat-minimap-index={marker.index}
+              type="button"
+              onClick={() => onSelect(marker.index)}
+            >
+              <span aria-hidden="true" />
+            </button>
+            <aside
+              id={previewId}
+              className="embedded-chat-conversation-preview"
+              role="tooltip"
+            >
+              <strong>{content.title}</strong>
+              <p>{content.body}</p>
+              {content.attachment && (
+                <div className="embedded-chat-conversation-preview-file">
+                  <span>{content.extension}</span>
+                  <b>{content.attachment.name}</b>
+                </div>
+              )}
+            </aside>
+          </div>
+        );
+      })}
+    </nav>
+  );
+}
+
 function trimText(value?: unknown, max = 360) {
   const text = toDisplayText(value);
   if (!text) return undefined;
@@ -5000,7 +5152,15 @@ export default function EmbeddedChat({
   // Resolved agent ID for stream calls (DM prop takes priority over @mention selection)
   const resolvedAgentId = agentId || mentionedAgent?.id || selectedAgent?.id;
 
+  const chatBodyRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const conversationMapFrameRef = useRef<number | null>(null);
+  const [conversationMarkers, setConversationMarkers] = useState<
+    ConversationMarker[]
+  >([]);
+  const [activeMessageIndex, setActiveMessageIndex] = useState(0);
+  const [conversationMinimapVisible, setConversationMinimapVisible] =
+    useState(false);
   const resumedRef = useRef(false);
   const selectedArtifactReturnTo = useMemo(() => {
     const base = `${location.pathname}${location.search}`;
@@ -5026,6 +5186,129 @@ export default function EmbeddedChat({
     }, 250);
     return () => window.clearTimeout(timer);
   }, [location.hash, messages.length]);
+
+  const updateConversationMinimap = useCallback(() => {
+    const body = chatBodyRef.current;
+    if (!body) return;
+    const rows = Array.from(
+      body.querySelectorAll<HTMLElement>("[data-chat-message-index]"),
+    );
+    const canNavigate =
+      rows.length > 2 && body.scrollHeight > body.clientHeight + 24;
+    setConversationMinimapVisible(canNavigate);
+    if (!rows.length) {
+      setConversationMarkers([]);
+      setActiveMessageIndex(0);
+      return;
+    }
+
+    const bodyRect = body.getBoundingClientRect();
+    const scrollRange = Math.max(1, body.scrollHeight - body.clientHeight);
+    const nextMarkers = rows.map((row, fallbackIndex) => {
+      const parsedIndex = Number(row.dataset.chatMessageIndex);
+      const index = Number.isFinite(parsedIndex) ? parsedIndex : fallbackIndex;
+      const contentTop =
+        row.getBoundingClientRect().top - bodyRect.top + body.scrollTop;
+      return {
+        index,
+        position: Math.min(1, Math.max(0, contentTop / scrollRange)),
+      };
+    });
+    setConversationMarkers((previous) =>
+      sameConversationMarkers(previous, nextMarkers) ? previous : nextMarkers,
+    );
+
+    let nextActive = nextMarkers[0].index;
+    if (body.scrollTop <= 4) {
+      nextActive = nextMarkers[0].index;
+    } else if (
+      body.scrollTop + body.clientHeight >=
+      body.scrollHeight - 4
+    ) {
+      nextActive = nextMarkers[nextMarkers.length - 1].index;
+    } else {
+      const focusY = bodyRect.top + body.clientHeight * 0.44;
+      let closestDistance = Number.POSITIVE_INFINITY;
+      let closestCenterDistance = Number.POSITIVE_INFINITY;
+      rows.forEach((row, fallbackIndex) => {
+        const rect = row.getBoundingClientRect();
+        const distance =
+          focusY < rect.top
+            ? rect.top - focusY
+            : focusY > rect.bottom
+              ? focusY - rect.bottom
+              : 0;
+        const centerDistance = Math.abs((rect.top + rect.bottom) / 2 - focusY);
+        if (
+          distance < closestDistance ||
+          (distance === closestDistance && centerDistance < closestCenterDistance)
+        ) {
+          const parsedIndex = Number(row.dataset.chatMessageIndex);
+          nextActive = Number.isFinite(parsedIndex)
+            ? parsedIndex
+            : fallbackIndex;
+          closestDistance = distance;
+          closestCenterDistance = centerDistance;
+        }
+      });
+    }
+    setActiveMessageIndex((current) =>
+      current === nextActive ? current : nextActive,
+    );
+  }, []);
+
+  const scheduleConversationMinimapUpdate = useCallback(() => {
+    if (conversationMapFrameRef.current !== null) return;
+    conversationMapFrameRef.current = window.requestAnimationFrame(() => {
+      conversationMapFrameRef.current = null;
+      updateConversationMinimap();
+    });
+  }, [updateConversationMinimap]);
+
+  useLayoutEffect(() => {
+    const body = chatBodyRef.current;
+    if (!body) return undefined;
+    const rows = Array.from(
+      body.querySelectorAll<HTMLElement>("[data-chat-message-index]"),
+    );
+    body.addEventListener("scroll", scheduleConversationMinimapUpdate, {
+      passive: true,
+    });
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(scheduleConversationMinimapUpdate);
+    resizeObserver?.observe(body);
+    rows.forEach((row) => resizeObserver?.observe(row));
+    scheduleConversationMinimapUpdate();
+
+    return () => {
+      body.removeEventListener("scroll", scheduleConversationMinimapUpdate);
+      resizeObserver?.disconnect();
+      if (conversationMapFrameRef.current !== null) {
+        window.cancelAnimationFrame(conversationMapFrameRef.current);
+        conversationMapFrameRef.current = null;
+      }
+    };
+  }, [currentSessionKey, messages.length, scheduleConversationMinimapUpdate]);
+
+  const handleConversationMarkerSelect = useCallback((index: number) => {
+    const body = chatBodyRef.current;
+    const row = body?.querySelector<HTMLElement>(
+      `[data-chat-message-index="${index}"]`,
+    );
+    if (!body || !row) return;
+    const bodyRect = body.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const rowTop = rowRect.top - bodyRect.top + body.scrollTop;
+    const targetTop =
+      rowTop - Math.max(24, (body.clientHeight - rowRect.height) / 2);
+    setActiveMessageIndex(index);
+    body.scrollTo({
+      top: Math.max(0, Math.min(targetTop, body.scrollHeight - body.clientHeight)),
+      behavior: "smooth",
+    });
+  }, []);
 
   const closeOutputPanel = useCallback(() => {
     setOutputOpen(false);
@@ -5723,11 +6006,21 @@ export default function EmbeddedChat({
       >
         <div className="embedded-chat-column">
           {/* ---- Chat Body ---- */}
-          <div
-            className={`embedded-chat-body ${
-              messages.length === 0 ? "embedded-chat-body--empty" : ""
-            }`}
-          >
+          <div className="embedded-chat-scroll-shell">
+            {conversationMinimapVisible && (
+              <ConversationMinimap
+                activeIndex={activeMessageIndex}
+                markers={conversationMarkers}
+                messages={messages}
+                onSelect={handleConversationMarkerSelect}
+              />
+            )}
+            <div
+              ref={chatBodyRef}
+              className={`embedded-chat-body ${
+                messages.length === 0 ? "embedded-chat-body--empty" : ""
+              }`}
+            >
             {messages.length === 0 && (
               <WorkspaceWelcome
                 activeCapability={activeCapability}
@@ -5784,6 +6077,7 @@ export default function EmbeddedChat({
 	                <div
 	                  key={i}
                     id={messageAnchorId}
+	                  data-chat-message-index={i}
 	                  className={`chat-message-row chat-message-shell ${msg.role === "user" ? "chat-message-row--user" : ""}`}
 	                >
                   {/* Avatar */}
@@ -6137,6 +6431,7 @@ export default function EmbeddedChat({
             })}
 
             <div ref={messagesEndRef} />
+            </div>
           </div>
 
           {/* Sticky approval bar — surfaces the oldest unresolved

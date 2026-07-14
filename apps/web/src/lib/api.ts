@@ -3191,6 +3191,30 @@ export const api = {
   },
 
   dashboard: {
+    layout: () =>
+      request<{
+        version: number;
+        widgets: Array<{ id: string; visible: boolean }>;
+      }>("/dashboard/layout"),
+    updateLayout: (widgets: Array<{ id: string; visible: boolean }>) =>
+      request<{
+        version: number;
+        widgets: Array<{ id: string; visible: boolean }>;
+      }>("/dashboard/layout", {
+        method: "PUT",
+        body: JSON.stringify({ widgets }),
+      }),
+    suggestLayout: (
+      prompt: string,
+      widgets: Array<{ id: string; visible: boolean }>,
+    ) =>
+      request<{
+        version: number;
+        widgets: Array<{ id: string; visible: boolean }>;
+      }>("/dashboard/layout/suggest", {
+        method: "POST",
+        body: JSON.stringify({ prompt, widgets }),
+      }),
     stats: (wsId?: string) => request<any>(`/dashboard/stats${wsId ? `?workspace_id=${wsId}` : ""}`),
     taskTrends: (days = 30, wsId?: string) =>
       request<any[]>(`/dashboard/task-trends?days=${days}${wsId ? `&workspace_id=${wsId}` : ""}`),
