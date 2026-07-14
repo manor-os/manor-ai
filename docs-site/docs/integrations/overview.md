@@ -12,7 +12,6 @@ webhooks, OAuth, and optional Nango.
 - Webhooks for inbound and outbound events.
 - OAuth-based provider connections.
 - API-key-based tools.
-- Browser-backed automations through browser-runner.
 - Nango-backed SaaS connectors for providers supported by Nango.
 
 ## Credentials

@@ -17,7 +17,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
-OSS_MIRROR = ROOT / ".github" / "workflows" / "oss-mirror.yml"
 DOCS_DEPLOY = ROOT / ".github" / "workflows" / "deploy-docs.yml"
 WEB_PACKAGE = ROOT / "apps" / "web" / "package.json"
 
@@ -28,9 +27,6 @@ def load_ci() -> dict:
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
-def load_oss_mirror() -> dict:
-    text = OSS_MIRROR.read_text()
-    return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
 def load_docs_deploy() -> dict:
@@ -133,35 +129,6 @@ def test_release_workflow_only_creates_github_release_for_tags() -> None:
     assert "softprops/action-gh-release@v2" in uses
 
 
-def test_oss_mirror_installs_python_dependencies_before_export_checks() -> None:
-    workflow = load_oss_mirror()
-    steps = workflow["jobs"]["export"]["steps"]
-
-    step_names = [step.get("name", step.get("uses", "")) for step in steps if isinstance(step, dict)]
-    check_index = step_names.index("Check OSS boundary")
-    previous_steps = steps[:check_index]
-    previous_run_commands = "\n".join(
-        step.get("run", "") for step in previous_steps if isinstance(step, dict)
-    )
-
-    assert any(
-        isinstance(step, dict)
-        and step.get("uses") == "actions/setup-python@v5"
-        and step.get("with", {}).get("python-version") == "3.12"
-        for step in previous_steps
-    )
-    assert 'pip install ".[dev]"' in previous_run_commands
-
-
-def test_oss_mirror_artifact_includes_hidden_public_files() -> None:
-    workflow = load_oss_mirror()
-    steps = workflow["jobs"]["export"]["steps"]
-    verify_step = next(step for step in steps if step.get("name") == "Verify exported tree")
-    upload_step = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
-
-    assert "missing = [path for path in manifest_paths" in verify_step["run"]
-    assert 'raise SystemExit("Manifest paths missing from OSS export:' in verify_step["run"]
-    assert upload_step["with"]["include-hidden-files"] is True
 
 
 def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None:
@@ -200,22 +167,3 @@ def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None
     assert deploy_with["keep_files"] is True
 
 
-def test_cloud_source_keeps_private_runtime_surfaces_for_export_to_strip() -> None:
-    root = ROOT
-
-    entrypoint = (root / "docker/entrypoint.sh").read_text()
-    assert "Base.metadata.create_all(engine)" in entrypoint
-    assert "alembic stamp heads" in entrypoint
-    assert "20260516_01_merge_commerce_and_repair_heads.py" in entrypoint
-
-    integration_resolution = (root / "packages/core/services/integration_resolution.py").read_text()
-    assert "from packages.core.models.worker import Worker" in integration_resolution
-    assert "worker_supports_provider" in integration_resolution
-    assert "keys.add(_BROWSER_PROVIDER)" in integration_resolution
-
-    api_main = (root / "apps/api/main.py").read_text()
-
-    workspace_setup = (root / "packages/core/services/workspace_setup_service.py").read_text()
-    assert "marketplace_agents" in workspace_setup
-    assert '"source": _PUBLIC_TEMPLATE_AGENT_SOURCE' in workspace_setup
-    assert '_PUBLIC_TEMPLATE_AGENT_SOURCE = "marketplace"' in workspace_setup

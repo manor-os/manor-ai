@@ -33,10 +33,3 @@ Good skills:
 - Include examples for common workflows.
 - Avoid broad permissions when narrower tools are available.
 
-## Browser-Backed Tools
-
-Some integrations do not expose complete APIs. Manor AI keeps browser-backed
-automation in the browser-runner sidecar, so the API and worker do not need to
-host Chromium directly.
-
-See [Browser Runner](../operations/browser-runner.md).

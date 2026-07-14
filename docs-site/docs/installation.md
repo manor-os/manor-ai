@@ -21,8 +21,7 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-This starts the API, web frontend, worker, PostgreSQL, Redis, MinIO, sandbox,
-browser-runner, and supporting services.
+This starts the API, web frontend, worker, PostgreSQL, Redis, MinIO, sandbox, and supporting services.
 
 ## Local Development
 

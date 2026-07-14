@@ -44,12 +44,6 @@ docker compose logs redis --tail=100
 docker compose logs worker --tail=200
 ```
 
-## Browser Automations Fail
-
-See [Browser Runner](operations/browser-runner.md). Most failures are caused by
-expired sessions, site UI changes, runner startup issues, or missing
-credentials.
-
 ## File or Knowledge Uploads Fail
 
 Check MinIO and JuiceFS:

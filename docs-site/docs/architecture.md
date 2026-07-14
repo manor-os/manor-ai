@@ -19,7 +19,6 @@ FastAPI API  <----> PostgreSQL + pgvector
 Celery worker
     |
     +---- Sandbox service
-    +---- Browser runner
     +---- Integrations and webhooks
 ```
 
@@ -54,8 +53,6 @@ configuration model as the API.
 ## Isolation Boundaries
 
 - The sandbox service handles code execution in a constrained container.
-- Browser automation runs in `browser-runner`, isolated from API and worker
-  processes.
 - Entity filesystem paths are scoped through the Manor file service.
 - Tool access is constrained by agent settings and HITL governance.
 

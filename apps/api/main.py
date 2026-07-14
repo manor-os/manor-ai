@@ -502,7 +502,7 @@ def create_app() -> FastAPI:
         })
 
     # ── Core routers (always loaded) ──
-    from apps.api.routers import auth, health, entities, workspaces, workspace_drafts, tasks, chat, messages, agents, documents, integrations, headed_login, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support
+    from apps.api.routers import auth, health, entities, workspaces, workspace_drafts, tasks, chat, messages, agents, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support
     from apps.api.routers.channels import wechat as wechat_channel
     from apps.api.routers.channels import twilio as twilio_channel
     from apps.api.routers.channels import whatsapp as whatsapp_channel
@@ -531,7 +531,6 @@ def create_app() -> FastAPI:
     app.include_router(folder_permissions.router)            # /api/v1/folders/{id}/properties, /grants, /shares
     app.include_router(folder_permissions.public_router)     # /api/v1/shared-folder/{token} — unauth viewer
     app.include_router(integrations.router)
-    app.include_router(headed_login.router)
     app.include_router(notifications.router)
     app.include_router(admin.router)
     app.include_router(admin_oauth.router)

@@ -64,7 +64,5 @@ For a deeper view of the stack, see [Docker Compose](docker-compose.md).
 ## Next Steps
 
 - Read [Configuration](configuration.md) for production-minded settings.
-- Review [Browser Runner](operations/browser-runner.md) if you plan to use
-  browser-backed automations.
 - Review [Backup and Restore](operations/backup-restore.md) before storing
   important data.

@@ -342,7 +342,6 @@ function mcpProcessVerb(name: string, args: Record<string, any> | null, target: 
     "x",
     "xiaohongshu",
     "linkedin",
-    "linkedin_browser",
     "facebook",
     "instagram",
     "tiktok",
@@ -455,31 +454,11 @@ function mcpProcessVerb(name: string, args: Record<string, any> | null, target: 
     }
     return t("component.assistant_process.tool.knowledge.read", { target: target || serverText });
   }
-  if (lowerServer.includes("notebooklm")) {
-    if (lowerTool === "ask") {
-      return t("component.assistant_process.tool.knowledge.ask", { target: target || serverText });
-    }
-    if (hasAny(lowerTool, ["create", "save"])) {
-      return t("component.assistant_process.tool.knowledge.save", { target: target || serverText });
-    }
-    return t("component.assistant_process.tool.knowledge.search", { target: target || serverText });
-  }
   if (lowerServer.includes("tavily") || lowerServer.includes("perplexity")) {
     if (lowerTool.includes("fetch") || lowerTool.includes("extract")) {
       return t("component.assistant_process.tool.web.fetch", { target: target || serverText });
     }
     return t("component.assistant_process.tool.web.search", { target: target || serverText });
-  }
-  if (
-    lowerServer.includes("chatgpt_web") ||
-    lowerServer.includes("gemini_web") ||
-    lowerServer.includes("claude_ai_web") ||
-    lowerServer.includes("openai_api")
-  ) {
-    if (lowerTool.includes("list") || lowerTool.includes("model")) {
-      return t("component.assistant_process.tool.ai_web.list", { target: target || serverText });
-    }
-    return t("component.assistant_process.tool.ai_web.ask", { target: target || serverText });
   }
   if (lowerServer.includes("nango")) {
     if (hasAny(lowerTool, ["list", "providers", "connections"])) {

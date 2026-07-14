@@ -22,7 +22,6 @@ const sidebars = {
       type: "category",
       label: "Operations",
       items: [
-        "operations/browser-runner",
         "operations/sandbox",
         "operations/storage",
         "operations/backup-restore",

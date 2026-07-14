@@ -21,7 +21,6 @@ on one host.
 | `juicefs-init` | Formats and mounts entity filesystem storage. |
 | `sandbox` | Isolated code execution service. |
 | `sandbox-skill-image` | Build helper image for sandbox execution. |
-| `browser-runner` | Chromium and Playwright sidecar for browser automation. |
 | `vault` | Local secret-encryption helper for development-style deployments. |
 
 Optional profiles include additional services such as Temporal, Nango, and

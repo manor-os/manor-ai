@@ -47,8 +47,8 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "Post to LinkedIn (text, images, video, documents, carousels), "
      "manage your own posts and comments, publish on company pages "
      "you admin, and see engagement stats on your posts. "
-     "For people / company search, third-party profile reads, jobs, "
-     "DMs, or feed browse, also connect 'LinkedIn (Search & Messaging)'.",
+     "People/company search, third-party profile reads, jobs, DMs, "
+     "and feed browsing are not available through LinkedIn's official API.",
      "builtin", "packages.core.ai.mcp.linkedin", "oauth2",
      "w_member_social,openid,profile,email,"
      "r_organization_admin,r_organization_social,w_organization_social"),
@@ -160,43 +160,6 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "pastes their jimeng.jianying.com ``sessionid`` cookie as the "
      "API key.",
      "builtin", "packages.core.ai.mcp.jimeng", "api_key", None),
-    # Midjourney still has no public API; deferred until we add a
-    # browser-runner sidecar with Playwright.
-    ("midjourney_web", "Midjourney",
-     "Midjourney via the web app. Browser automation is not shipped yet.",
-     "builtin", "packages.core.ai.mcp.generic_browser", "browser_session", None),
-
-    # ── Browser-session AI tools (api_key = exported cookie JSON) ──
-    # Drive the user's logged-in web app via the browser-runner
-    # sidecar. User pastes their session cookies (via Cookie-Editor
-    # extension JSON export) once; agents call typed tools per
-    # platform. No API key needed — uses the user's subscription.
-    ("notebooklm", "NotebookLM",
-     "Google NotebookLM — research notebooks grounded in user-supplied "
-     "sources. No public API; Manor drives the web app via the "
-     "browser-runner sidecar with the user's exported cookies.",
-     "builtin", "packages.core.ai.mcp.notebooklm", "api_key", None),
-    ("claude_ai_web", "Claude.ai (web)",
-     "Anthropic Claude via claude.ai. Lets users with a Claude Pro / "
-     "Max subscription put Claude in the loop without burning API "
-     "credits. Browser-runner sidecar drives the chat UI.",
-     "builtin", "packages.core.ai.mcp.claude_ai_web", "api_key", None),
-    ("chatgpt_web", "ChatGPT (web)",
-     "OpenAI ChatGPT via chatgpt.com. Lets users with a Plus / Team "
-     "subscription run agent calls on their subscription quota — "
-     "no per-token API spend.",
-     "builtin", "packages.core.ai.mcp.chatgpt_web", "api_key", None),
-    ("gemini_web", "Gemini (web)",
-     "Google Gemini via gemini.google.com. Uses the user's Google AI "
-     "/ Gemini Advanced subscription. Same Google session cookies as "
-     "NotebookLM.",
-     "builtin", "packages.core.ai.mcp.gemini_web", "api_key", None),
-    ("perplexity_web", "Perplexity (web)",
-     "Perplexity Pro via the web app. Pro users get unlimited Sonar "
-     "Pro / Sonar Reasoning — using the web instead of the API saves "
-     "real money for research-heavy agents.",
-     "builtin", "packages.core.ai.mcp.perplexity_web", "api_key", None),
-
     # ── Launch / community platforms (OAuth) ──
     ("producthunt", "Product Hunt",
      "Product Hunt v2 GraphQL API — search posts, fetch details, list "
@@ -267,23 +230,6 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "marketplace_id (+ seller_id).",
      "builtin", "packages.core.ai.mcp.amazon", "credentials", None),
 
-    # ── Social platforms (browser-driven, cookie auth) ──
-    # Covers the surface LinkedIn's REST API does NOT expose: people /
-    # company search, third-party profile reads, jobs, feed, DMs.
-    # Uses the user's exported cookies via the browser-runner sidecar
-    # (same pattern as notebooklm / chatgpt_web).
-    # NOTE: violates LinkedIn ToS — recommend a dedicated account, low
-    # call rates, and ideally a residential proxy.
-    ("linkedin_browser", "LinkedIn (Search & Messaging)",
-     "Search people, companies, and jobs, read third-party profiles + "
-     "posts, send DMs, browse your feed, and use Easy Apply. Covers "
-     "what LinkedIn's official API can't do. "
-     "⚠ This goes against LinkedIn's Terms of Service — use a "
-     "dedicated account, not your main one, and keep activity low. "
-     "For compliant posting on your own profile use 'LinkedIn "
-     "(Posting & Analytics)' instead.",
-     "builtin", "packages.core.ai.mcp.linkedin_browser", "api_key", None),
-
 
     # ── Microsoft 365 (Graph API, single shared OAuth app) ──
     # All 5 share one Azure AD App Registration — a single consent
@@ -326,22 +272,7 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
 # 1-to-1 spec rows for the new auth_types. Keyed by server_key so the
 # seeder can attach them after the base mcp_servers row is upserted.
 
-_BROWSER_SPECS: dict[str, dict] = {
-    # Jimeng moved from browser_session to api_key (HTTP gateway). No
-    # browser spec needed.
-    "midjourney_web": {
-        "login_url": "https://www.midjourney.com",
-        "session_check_selector": "[data-testid='user-menu']",
-        "provider_module": "midjourney_web",
-        "tool_actions": {
-            "generate_image": {
-                "description": "Generate an image via /imagine.",
-                "args": {"prompt": "string"},
-            },
-        },
-        "cookie_ttl_days": 30,
-    },
-}
+_BROWSER_SPECS: dict[str, dict] = {}
 
 
 async def seed_mcp_catalog(engine: Engine) -> int:
@@ -373,6 +304,20 @@ async def seed_mcp_catalog(engine: Engine) -> int:
         await conn.execute(text(
             "DELETE FROM mcp_servers WHERE server_key = 'wechat'"
         ))
+        await conn.execute(text(
+            "DELETE FROM browser_tool_specs "
+            "WHERE mcp_server_id IN ("
+            "SELECT id FROM mcp_servers WHERE server_key IN "
+            "('midjourney_web', 'notebooklm', 'claude_ai_web', "
+            "'chatgpt_web', 'gemini_web', 'perplexity_web', "
+            "'linkedin_browser'))"
+        ))
+        await conn.execute(text(
+            "DELETE FROM mcp_servers WHERE server_key IN "
+            "('midjourney_web', 'notebooklm', 'claude_ai_web', "
+            "'chatgpt_web', 'gemini_web', 'perplexity_web', "
+            "'linkedin_browser')"
+        ))
 
         # One-time migration: LLM chat APIs (OpenAI / Anthropic /
         # Doubao / Kimi / Qwen / Deepseek) were briefly seeded as MCP
@@ -384,8 +329,8 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "('openai', 'anthropic', 'doubao', 'deepseek', 'kimi', 'qwen')"
         ))
 
-        # One-time migration: jimeng was moved from browser_session
-        # auth to api_key auth (HTTP gateway sidecar). Re-point its
+        # One-time migration: jimeng was moved from legacy GUI auth
+        # to api_key auth (HTTP gateway sidecar). Re-point its
         # row + drop the obsolete browser spec.
         await conn.execute(text(
             "UPDATE mcp_servers "
@@ -397,13 +342,6 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "DELETE FROM browser_tool_specs "
             "WHERE mcp_server_id IN "
             "(SELECT id FROM mcp_servers WHERE server_key = 'jimeng')"
-        ))
-        # Midjourney's endpoint was previously pointing at missing or obsolete
-        # Playwright wrapper modules.
-        await conn.execute(text(
-            "UPDATE mcp_servers "
-            "SET endpoint = 'packages.core.ai.mcp.generic_browser' "
-            "WHERE server_key = 'midjourney_web'"
         ))
         # Stripe consolidation: the legacy api_key/builtin row and the
         # interim ``stripe_mcp`` row are merged into one ``stripe`` row

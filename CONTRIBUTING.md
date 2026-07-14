@@ -62,7 +62,7 @@ configuration documented in `.env.example` or the README when setup changes.
 
 Avoid adding dependencies on Manor AI hosted services unless the feature also
 has a self-hosted path or degrades clearly when optional credentials are absent.
-Local skills, agents, integrations, workflows, browser-runner automation,
+Local skills, agents, integrations, workflows, automation,
 documents, and knowledge features should remain operable in self-hosted mode.
 
 ## Secrets

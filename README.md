@@ -206,7 +206,7 @@ make test-all         # Everything collected by pytest
 - Settings management
 
 ### Infrastructure
-- Docker Compose stack for postgres, redis, minio, the API, worker, web app, sandbox, browser-runner, and optional sidecars/profiles
+- Docker Compose stack for postgres, redis, minio, the API, worker, web app, sandbox, and optional sidecars/profiles
 - JuiceFS + MinIO for entity-scoped filesystem storage
 - GitHub Actions CI (lint, frontend build, source smoke tests, and Python tests on push/PR; tag releases publish GitHub release notes)
 - Alembic database migrations

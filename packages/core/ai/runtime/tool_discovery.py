@@ -55,7 +55,6 @@ MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
         "Chrome上传",
     ),
     "linkedin": ("linkedin", "linked in", "领英"),
-    "linkedin_browser": ("linkedin", "linked in", "领英"),
     "twitter_x": ("twitter", "tweet", "x.com", "推特"),
     "facebook": ("facebook", "fb", "脸书"),
     "discord": ("discord",),
@@ -83,7 +82,6 @@ MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
     "notion": ("notion",),
     "replicate": ("replicate",),
     "tavily": ("tavily",),
-    "perplexity_web": ("perplexity",),
     "jimeng": ("jimeng", "即梦"),
     "claude_code": (
         "claude code",

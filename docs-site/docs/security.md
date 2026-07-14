@@ -12,8 +12,7 @@ repository root for vulnerability reporting.
 
 - Replace all default secrets.
 - Use HTTPS for `APP_URL` and `PUBLIC_BASE_URL`.
-- Restrict database, Redis, MinIO, sandbox, and browser-runner to private
-  networks.
+- Restrict database, Redis, MinIO, and sandbox services to private networks.
 - Configure backups.
 - Require HITL for sensitive agent actions.
 - Limit agent tool scopes.
@@ -23,12 +22,6 @@ repository root for vulnerability reporting.
 
 Never commit `.env`, provider keys, OAuth secrets, webhook secrets, database
 passwords, or production logs.
-
-## Browser Automation
-
-Browser-backed automations can interact with external accounts. Treat connected
-sessions as sensitive credentials. Use HITL for externally visible actions such
-as publishing, sending messages, or changing account state.
 
 ## Sandbox
 

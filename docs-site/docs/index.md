@@ -10,7 +10,7 @@ tools, documents, workflows, and integrations under their own control.
 
 The repository is designed for operators who want to run Manor AI on their own
 infrastructure with user-provided model keys. It includes the API server, React
-web app, worker runtime, sandbox service, browser-runner sidecar, workspace
+web app, worker runtime, sandbox service, workspace
 data model, knowledge tools, document tooling, and integration surfaces needed
 for a self-hosted deployment.
 
@@ -20,7 +20,6 @@ for a self-hosted deployment.
 - Custom agents with scoped tools and human-in-the-loop approval.
 - BYOK model routing for OpenAI-compatible, Anthropic, OpenRouter, and other
   supported provider paths.
-- Browser-backed automations through the browser-runner sidecar.
 - Self-hosted integrations through webhooks, OAuth providers, and Nango.
 - Internal operational workflows that need auditability and data isolation.
 
