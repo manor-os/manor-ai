@@ -3,7 +3,7 @@
 const config = {
   title: "Manor AI",
   tagline: "Self-hosted AI workspace runtime",
-  favicon: "img/favicon.ico",
+  favicon: "img/favicon.svg",
   url: "https://manor-os.github.io",
   baseUrl: "/docs/manor-ai/",
   organizationName: "manor-os",
@@ -31,12 +31,36 @@ const config = {
       },
     ],
   ],
+  themes: [
+    [
+      require.resolve("@easyops-cn/docusaurus-search-local"),
+      {
+        hashed: true,
+        language: ["en"],
+        indexBlog: false,
+        docsRouteBasePath: "/",
+        highlightSearchTermsOnTargetPage: true,
+      },
+    ],
+  ],
   themeConfig: {
     image: "img/social-card.png",
+    colorMode: {
+      defaultMode: "dark",
+      disableSwitch: false,
+      respectPrefersColorScheme: false,
+    },
     navbar: {
       title: "Manor AI",
+      logo: {
+        alt: "Manor AI",
+        src: "img/logo.svg",
+        srcDark: "img/logo.svg",
+      },
       items: [
         { type: "docSidebar", sidebarId: "mainSidebar", position: "left", label: "Docs" },
+        { to: "/quickstart", label: "Quickstart", position: "left" },
+        { to: "/api-reference", label: "API", position: "left" },
         { href: "https://github.com/manor-os/manor-ai", label: "GitHub", position: "right" },
       ],
     },

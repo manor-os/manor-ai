@@ -1,129 +1,141 @@
 ---
 sidebar_position: 1
-title: Overview
+title: Quickstart Path
+description: The shortest path from a fresh clone to a running Manor AI workspace.
 ---
 
-<section className="ma-hero">
-  <div className="ma-hero__copy">
-    <span className="ma-kicker">Self-hosted AI workspace runtime</span>
-    <h1>Manor AI</h1>
-    <p className="ma-lede">
-      Run agents, tasks, documents, tools, integrations, and approval gates in
-      one workspace that your team can inspect and operate.
-    </p>
-    <div className="ma-actions">
-      <a className="ma-button ma-button--primary" href="quickstart">Start locally</a>
-      <a className="ma-button ma-button--secondary" href="https://github.com/manor-os/manor-ai">View GitHub</a>
-    </div>
-    <div className="ma-hero__facts" aria-label="Runtime highlights">
-      <span>BYOK model providers</span>
-      <span>Human approval for sensitive actions</span>
-      <span>Local data ownership</span>
-    </div>
-  </div>
-  <figure className="ma-hero__visual">
-    <img src="img/manor-ai-runtime.png" alt="Manor AI workspace runtime showing goals, tasks, documents, agents, and workspace health" />
-  </figure>
-</section>
+# Quickstart Path
 
-<section className="ma-section ma-section--paths">
-  <div className="ma-section__heading">
-    <span className="ma-kicker">Choose a path</span>
-    <h2>Get from clone to operating workspace.</h2>
-  </div>
-  <div className="ma-path-grid">
-    <a className="ma-path-card" href="quickstart">
-      <span>Run locally</span>
-      <strong>Docker Compose quick start</strong>
-      <p>Boot the web app, API, worker, PostgreSQL, Redis, MinIO, and sandbox on one machine.</p>
-    </a>
-    <a className="ma-path-card" href="concepts/agents">
-      <span>Understand the runtime</span>
-      <strong>Agents, skills, tools, and HITL</strong>
-      <p>Learn how workspaces scope context, tool access, and review requirements.</p>
-    </a>
-    <a className="ma-path-card" href="configuration">
-      <span>Prepare a deployment</span>
-      <strong>Configuration and operations</strong>
-      <p>Set secrets, model providers, storage, backups, and upgrade routines before inviting users.</p>
-    </a>
-  </div>
-</section>
+Everything you need to verify Manor AI as a self-hosted AI workspace runtime:
+clone the repository, start the local stack, sign in, add a model key, inspect
+the seeded workspace, and confirm that governed actions pause for human review.
 
-<section className="ma-section ma-scenario">
-  <div className="ma-scenario__copy">
-    <span className="ma-kicker">Human-in-the-loop controls</span>
-    <h2>Governance is part of the runtime, not a policy document.</h2>
-    <p>
-      Operators can write plain-language rules, map them to runtime action
-      patterns, and require approval before customer-facing or irreversible
-      actions run.
-    </p>
-    <ul className="ma-check-list">
-      <li>Rules can require review before email, chat, or social posts are sent.</li>
-      <li>Destructive actions can be denied at runtime instead of relying on prompt wording.</li>
-      <li>Policy revisions make operator changes visible during audits.</li>
-    </ul>
-  </div>
-  <figure className="ma-scenario__visual">
-    <img src="img/manor-ai-governance.png" alt="Manor AI governance rules requiring approval for external messages and blocking destructive actions" />
-  </figure>
-</section>
+<img
+  src="img/manor-ai-runtime.png"
+  alt="Manor AI workspace runtime showing a running workspace dashboard"
+/>
 
-<section className="ma-section ma-evidence">
-  <div className="ma-section__heading">
-    <span className="ma-kicker">Developer surface</span>
-    <h2>Use the web app, or integrate directly against the API.</h2>
-  </div>
-  <div className="ma-evidence__grid">
-    <figure className="ma-evidence__visual">
-      <img src="img/manor-ai-goals.png" alt="Manor AI goal execution canvas showing goals connected to workspace tasks" />
-    </figure>
-    <figure className="ma-evidence__visual">
-      <img src="img/manor-ai-api-reference.png" alt="Manor AI OpenAPI reference with authentication endpoints" />
-    </figure>
-  </div>
-</section>
+## What this is, briefly
 
-<section className="ma-section ma-capabilities">
-  <div className="ma-section__heading">
-    <span className="ma-kicker">What ships</span>
-    <h2>The self-hosted stack includes the runtime surface, not just an SDK.</h2>
-  </div>
-  <div className="ma-capability-grid">
-    <div className="ma-capability">
-      <span>01</span>
-      <h3>Workspaces</h3>
-      <p>Shared operating rooms for goals, tasks, documents, knowledge, channels, and activity.</p>
-    </div>
-    <div className="ma-capability">
-      <span>02</span>
-      <h3>Agents and tools</h3>
-      <p>Scoped skills, tool calls, model routing, task execution, and audit-friendly traces.</p>
-    </div>
-    <div className="ma-capability">
-      <span>03</span>
-      <h3>HITL governance</h3>
-      <p>Approval policies for externally visible, irreversible, or high-risk actions.</p>
-    </div>
-    <div className="ma-capability">
-      <span>04</span>
-      <h3>Self-hosted services</h3>
-      <p>FastAPI, React, workers, PostgreSQL with pgvector, Redis, MinIO, and sandbox execution.</p>
-    </div>
-  </div>
-</section>
+Manor AI is a self-hosted AI workspace runtime. A workspace holds goals, tasks,
+documents, knowledge, agents, tools, and human approval rules in one place so
+operators can see what agents are allowed to do.
 
-<section className="ma-section ma-boundary">
-  <div>
-    <span className="ma-kicker">Scope</span>
-    <h2>Designed for operators who want control.</h2>
-  </div>
-  <p>
-    Manor AI does not require hosted Manor AI services to boot, create
-    workspaces, configure model keys, run agents, use the sandbox, or manage
-    documents and knowledge. Start with <a href="quickstart">Quick Start</a>,
-    then review <a href="security">Security</a> and <a href="operations/backup-restore">Backup and Restore</a>
-    before running important workloads.
-  </p>
-</section>
+The first run should prove four things:
+
+| Idea | What to look for |
+| --- | --- |
+| Workspace | Goals, tasks, knowledge, rules, and agent mappings in one operating view |
+| Runtime | API, worker, PostgreSQL, Redis, MinIO, and sandbox services running together |
+| Governance | Plain-language rules mapped to approval and deny action patterns |
+| API surface | FastAPI endpoints that match what the web app uses |
+
+## Before the path
+
+Install Docker Compose v2, Git, Python 3.11 or newer, and Node.js 20 or newer.
+For a local evaluation, copy the example environment file as-is. For any shared
+deployment, replace the generated secrets and configure provider credentials
+before inviting users.
+
+```bash
+git clone https://github.com/manor-os/manor-ai.git
+cd manor-ai
+cp .env.example .env
+```
+
+> Change secrets before sharing a deployment. The demo account and default
+> `.env.example` values are only for local evaluation.
+
+## The 5-minute path
+
+Allow about 5-10 minutes after Docker images are available locally.
+
+<div className="ma-path-table">
+
+| Step | Page or command | What you should see | Approx. |
+| --- | --- | --- | --- |
+| 1 | `docker compose up --build -d` | Core containers become healthy | 2-5 min |
+| 2 | `http://localhost:18080` | Login page and seeded demo account | 1 min |
+| 3 | Settings | Provider key saved in your deployment | 1-2 min |
+| 4 | Workspace | Tasks, goals, documents, and runtime score | 1 min |
+| 5 | Governance | Sensitive actions require approval before tools run | 1 min |
+
+</div>
+
+### 1. Start the stack
+
+```bash
+docker compose up --build -d
+```
+
+This starts the web app, API, worker, PostgreSQL with pgvector, Redis, MinIO,
+and the sandbox service.
+
+### 2. Open Manor AI
+
+Open the local web app:
+
+```text
+http://localhost:18080
+```
+
+Self-hosted mode seeds a local demo account:
+
+```text
+demo@manor.local / manor-demo
+```
+
+### 3. Add a model key
+
+Open Settings and add a provider key for the model path you want to use. Manor
+AI is BYOK in self-hosted deployments; provider credentials stay in your
+deployment.
+
+### 4. Inspect the workspace
+
+Open the workspace view and check the operating score, goals, tasks, documents,
+and agent mappings. The workspace should look like a running system, not an
+empty SDK sample.
+
+<img
+  src="img/manor-ai-goals.png"
+  alt="Manor AI goal execution canvas showing goals connected to workspace tasks"
+/>
+
+### 5. Check governance
+
+Open workspace rules. Sensitive actions, such as external messages or social
+posts, can require human approval. Destructive actions can be denied before a
+tool runs.
+
+<img
+  src="img/manor-ai-governance.png"
+  alt="Manor AI governance rules requiring approval for external messages and blocking destructive actions"
+/>
+
+## What you'll see at the end
+
+By the end of the path you should have:
+
+- A browser session at `http://localhost:18080`.
+- A signed-in local demo account.
+- The API, worker, database, cache, object storage, and sandbox services
+  running.
+- A workspace with tasks, goals, and governance rules visible.
+- Local API documentation available from the same deployment.
+
+<img
+  src="img/manor-ai-api-reference.png"
+  alt="Manor AI OpenAPI reference with authentication endpoints"
+/>
+
+## Where to go next
+
+- [Installation](installation.md) explains local and deployment prerequisites.
+- [Configuration](configuration.md) covers secrets, model providers, storage,
+  and runtime settings.
+- [Agents, Skills, and Tools](concepts/agents.md) explains how agents use
+  workspace context.
+- [HITL Governance](concepts/hitl-governance.md) explains approval and deny
+  policies before agents touch external systems.
+- [API Reference](api-reference.md) maps the HTTP API used by the web app.

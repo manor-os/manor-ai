@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" role="img" aria-labelledby="title">
+  <title id="title">Manor AI</title>
+  <rect width="36" height="36" rx="9" fill="#15140f"/>
+  <path d="M9 25V11h3.5l5.5 7.8 5.5-7.8H27v14h-3.4v-8.5l-4.4 6.1h-2.4l-4.4-6.1V25H9Z" fill="#f3e8c8"/>
+  <path d="M29 9.2a2.2 2.2 0 1 1-4.4 0 2.2 2.2 0 0 1 4.4 0Z" fill="#32d583"/>
+</svg>

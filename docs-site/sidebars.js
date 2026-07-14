@@ -2,16 +2,14 @@
 
 const sidebars = {
   mainSidebar: [
-    "index",
-    "quickstart",
-    "installation",
-    "configuration",
-    "docker-compose",
-    "architecture",
     {
       type: "category",
-      label: "Core Concepts",
+      label: "Learn",
+      collapsed: false,
       items: [
+        "index",
+        "quickstart",
+        "installation",
         "concepts/agents",
         "concepts/skills-tools",
         "concepts/hitl-governance",
@@ -20,23 +18,32 @@ const sidebars = {
     },
     {
       type: "category",
-      label: "Operations",
+      label: "Operating",
+      collapsed: false,
       items: [
+        "configuration",
+        "docker-compose",
+        "architecture",
         "operations/sandbox",
         "operations/storage",
         "operations/backup-restore",
         "operations/upgrade-release",
+        "troubleshooting",
+        "security",
       ],
     },
     {
       type: "category",
-      label: "Integrations",
-      items: ["integrations/overview", "integrations/webhooks", "integrations/nango"],
+      label: "Reference",
+      collapsed: false,
+      items: [
+        "api-reference",
+        "integrations/overview",
+        "integrations/webhooks",
+        "integrations/nango",
+        "development",
+      ],
     },
-    "api-reference",
-    "development",
-    "troubleshooting",
-    "security",
     {
       type: "link",
       label: "Roadmap",

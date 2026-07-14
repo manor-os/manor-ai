@@ -1410,19 +1410,6 @@ type McpServerRow = {
     expires_at: string | null;
     is_default: boolean;
     connected_at: string | null;
-    health: {
-      ok: boolean | null;
-      detail: string | null;
-      checked_at: string | null;
-      wiring?: {
-        ok: boolean | null;
-        detail: string | null;
-        configured_url?: string | null;
-        expected_url?: string | null;
-        last_error?: string | null;
-        pending_update_count?: number | null;
-      } | null;
-    } | null;
   }>;
   entity_accounts: Array<{
     id: string;
@@ -1612,21 +1599,10 @@ function GoogleWorkspaceCard({
   ).length;
   const total = subs.length;
   const hasAnyConnection = connectedCount > 0;
-  const hasAuthFailure = subs.some(
-    (s) =>
-      s.connections.some((connection) => connection.health?.ok === false) ||
-      (s.entity_accounts ?? []).some((account) => account.health?.ok === false),
-  );
-  const statusColor = hasAuthFailure
-    ? "#d65f59"
-    : hasAnyConnection
-      ? "#168a5b"
-      : "#d6d3d1";
+  const statusColor = hasAnyConnection ? "#168a5b" : "#d6d3d1";
   const statusLabel = isComingSoon
     ? t("page.integrations.coming_soon")
-    : hasAuthFailure
-      ? t("page.integrations.reconnect_required")
-      : connectedCount === total
+    : connectedCount === total
       ? t("page.integrations.ready")
       : connectedCount > 0
         ? t("page.integrations.connected_count_of_total")
@@ -1654,11 +1630,11 @@ function GoogleWorkspaceCard({
             width: 7,
             height: 7,
             borderRadius: "50%",
-            background: hasAuthFailure ? statusColor : "currentColor",
+            background: "currentColor",
           }}
         />
       }
-      metaTone={hasAnyConnection && !hasAuthFailure ? "connected" : "muted"}
+      metaTone={hasAnyConnection ? "connected" : "muted"}
       onClick={() =>
         openDetail({
           icon: (
@@ -1703,13 +1679,6 @@ function GoogleWorkspaceCard({
                 const hasConn =
                   s.connections.length > 0 ||
                   (s.entity_accounts?.length ?? 0) > 0;
-                const subAuthFailed =
-                  s.connections.some(
-                    (connection) => connection.health?.ok === false,
-                  ) ||
-                  (s.entity_accounts ?? []).some(
-                    (account) => account.health?.ok === false,
-                  );
                 const Icon = MCP_ICON[s.server_key];
                 const friendlyName =
                   s.server_key === "gmail"
@@ -1779,9 +1748,7 @@ function GoogleWorkspaceCard({
                         <div style={{ fontSize: 10, color: "#a8a29e" }}>
                           {isComingSoon
                             ? t("page.integrations.coming_soon")
-                            : subAuthFailed
-                              ? t("page.integrations.reconnect_required")
-                              : hasConn
+                            : hasConn
                               ? t("status.connected")
                               : s.oauth_configured
                                 ? t("page.integrations.ready_to_connect")
@@ -1794,7 +1761,7 @@ function GoogleWorkspaceCard({
                         </Chip>
                       ) : hasConn ? (
                         <Chip size="sm" variant="slate">
-                          {subAuthFailed ? "!" : "✓"}
+                          ✓
                         </Chip>
                       ) : s.oauth_configured ? (
                         <Button
@@ -4122,15 +4089,8 @@ function ConnectionRow({
 
   const expired =
     connection.expires_at && new Date(connection.expires_at) < new Date();
+  const label = connectionLabel(connection, t("status.connected"));
   const authFailed = connection.health?.ok === false;
-  const label = connectionLabel(
-    connection,
-    authFailed
-      ? t("page.integrations.reconnect_required")
-      : expired
-        ? t("page.integrations.expired")
-        : t("status.connected"),
-  );
   const needsReconnect = Boolean(onReconnect && (authFailed || expired));
 
   return (
@@ -4153,7 +4113,7 @@ function ConnectionRow({
           width: 8,
           height: 8,
           borderRadius: "50%",
-          background: authFailed ? "#d65f59" : expired ? "#a8a29e" : "#54a176",
+          background: expired ? "#a8a29e" : "#54a176",
           flexShrink: 0,
         }}
       />
