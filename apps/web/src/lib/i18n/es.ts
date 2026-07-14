@@ -5196,6 +5196,7 @@ const es: Record<string, string> = {
   "page.integrations.register_webhook": "Registrar webhook",
   "page.integrations.untested": "Sin probar",
   "page.integrations.auth_failed": "Autenticación fallida",
+  "page.integrations.reconnect_required": "Requiere reconexión",
   "page.integrations.polling_off": "Sondeo desactivado",
   "page.integrations.webhook_off": "Webhook desactivado",
   "page.integrations.running_connection_test": "Ejecutando prueba de conexión...",

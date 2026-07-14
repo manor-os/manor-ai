@@ -1842,6 +1842,13 @@ async def oauth_callback(
         if refresh_token:
             existing.refresh_token = refresh_token
         existing.token_expires_at = token_expires_at
+        profile = dict(existing.profile or {})
+        # A user just completed OAuth again, so any previous "auth failed /
+        # reconnect required" health result is stale. The async health probe
+        # below will write a fresh result after it validates the new token.
+        profile.pop("last_health_check", None)
+        profile.pop("oauth_refresh", None)
+        existing.profile = profile
         oauth_row_id = existing.id
     else:
         new_row = OAuthAccount(

@@ -5284,6 +5284,7 @@ const zh: Record<string, string> = {
   "page.integrations.register_webhook": "注册 webhook",
   "page.integrations.untested": "未测试",
   "page.integrations.auth_failed": "认证失败",
+  "page.integrations.reconnect_required": "需要重新连接",
   "page.integrations.polling_off": "轮询关闭",
   "page.integrations.webhook_off": "Webhook 关闭",
   "page.integrations.running_connection_test": "正在运行连接测试...",
