@@ -163,6 +163,7 @@ def _mcp_display_metadata(
         "x",
         "xiaohongshu",
         "linkedin",
+        "linkedin_browser",
         "facebook",
         "producthunt",
         "instagram",
@@ -295,8 +296,30 @@ def _mcp_display_metadata(
             "display_params": {"target": target or server_pretty},
         }
 
+    if "notebooklm" in lower_server:
+        if lower_tool == "ask":
+            key = "knowledge.ask"
+        elif any(token in lower_tool for token in ("create", "save")):
+            key = "knowledge.save"
+        else:
+            key = "knowledge.search"
+        return {
+            "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.{key}",
+            "display_params": {"target": target or server_pretty},
+        }
+
     if any(token in lower_server for token in ("tavily", "perplexity")):
         key = "web.fetch" if any(token in lower_tool for token in ("fetch", "extract")) else "web.search"
+        return {
+            "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.{key}",
+            "display_params": {"target": target or server_pretty},
+        }
+
+    if any(token in lower_server for token in ("chatgpt_web", "gemini_web", "claude_ai_web", "openai_api")):
+        if any(token in lower_tool for token in ("list", "model")):
+            key = "ai_web.list"
+        else:
+            key = "ai_web.ask"
         return {
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.{key}",
             "display_params": {"target": target or server_pretty},

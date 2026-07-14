@@ -450,6 +450,12 @@ _CHANNEL_TO_PROVIDER = {
 _COMING_SOON_SERVERS_BASE = {
     # CLI workers - need a paired worker daemon on the user's machine
     "claude_code", "codex_cli", "gemini_cli", "cursor_cli", "aider", "continue_cli",
+    # Browser automation — needs playwright runner sidecar
+    "midjourney_web", "notebooklm",
+    "claude_ai_web", "chatgpt_web", "gemini_web", "perplexity_web",
+    # LinkedIn browser uses the same headed-login/noVNC surface as the
+    # web AI tools and remains hidden in dev unless explicitly previewed.
+    "linkedin_browser",
     # facebook + gmail + google_calendar + google_drive ship by default
     # for screencast / App Review demo on the test server. Production
     # gating is now handled at the provider level (Meta App Review,

@@ -2,9 +2,9 @@
 
 Please do not report suspected vulnerabilities in public issues.
 
-Use GitHub vulnerability reporting for the repository when it is enabled. If it
-is not enabled, contact the maintainers through the project's published support
-channel and include:
+Use the repository's private security advisory flow if it is enabled. If it is
+not enabled, contact the maintainers privately through the project's published
+support channel and include:
 
 - Affected version or commit.
 - Clear reproduction steps.

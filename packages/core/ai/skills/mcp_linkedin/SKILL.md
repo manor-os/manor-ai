@@ -12,7 +12,7 @@ Use this skill to publish and manage content on the user's **LinkedIn** via the 
 
 Use this skill to: post to LinkedIn, attach images/video/documents to a post, comment/react on posts, publish on an admin'd company page, manage (list/delete) the user's own posts, or read engagement stats on their posts.
 
-**Do NOT use this for**: people/company search, reading third-party profiles, jobs, DMs/messaging, or browsing the feed. LinkedIn's official API does not expose those surfaces in this runtime.
+**Do NOT use this for**: people/company search, reading third-party profiles, jobs, DMs/messaging, or browsing the feed — those require the separate `linkedin_browser` (Search & Messaging) MCP.
 
 ## Connection
 

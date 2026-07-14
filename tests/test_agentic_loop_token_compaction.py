@@ -191,6 +191,7 @@ def test_compact_search_tools_result_preserves_mcp_option_status():
         "query": "linkedin",
         "matches": [
             {"name": "mcp__linkedin__get_profile", "available": False},
+            {"name": "mcp__linkedin_browser__search_people", "available": True},
         ],
         "mcp_options": [
             {
@@ -202,20 +203,30 @@ def test_compact_search_tools_result_preserves_mcp_option_status():
                 "reason": "Connect LinkedIn",
                 "matched_tools": ["mcp__linkedin__get_profile"],
             },
+            {
+                "server_key": "linkedin_browser",
+                "name": "LinkedIn (Search & Messaging)",
+                "ready": True,
+                "authorization_method": "browser_session",
+                "execution_mode": "browser_automation",
+                "reason": "Using entity-level linkedin_browser credentials.",
+                "matched_tools": ["mcp__linkedin_browser__search_people"],
+            },
         ],
     }
 
     compact = json.loads(
         _compact_search_tools_result_for_context(
             search_result,
-            ["mcp__linkedin__get_profile"],
+            ["mcp__linkedin_browser__search_people"],
         )
     )
 
     options = {item["server_key"]: item for item in compact["mcp_options"]}
     assert options["linkedin"]["ready"] is False
     assert options["linkedin"]["authorization_method"] == "oauth"
-    assert options["linkedin"]["execution_mode"] == "official_api"
+    assert options["linkedin_browser"]["ready"] is True
+    assert options["linkedin_browser"]["execution_mode"] == "browser_automation"
 
 
 def test_compact_tool_result_preserves_json_metadata():

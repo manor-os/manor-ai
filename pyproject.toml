@@ -1,7 +1,7 @@
 [project]
 name = "manor"
 version = "0.1.0"
-description = "Self-hosted AI workspace runtime for agents, tools, documents, workflows, and integrations"
+description = "The AI operating system for autonomous enterprise management"
 requires-python = ">=3.11"
 license = { text = "Manor Sustainable Use License 1.0" }
 

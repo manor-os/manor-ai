@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 _SOCIAL_PROVIDER_LABELS = {
     "twitter_x": "X/Twitter",
     "linkedin": "LinkedIn",
+    "linkedin_browser": "LinkedIn",
     "facebook": "Facebook",
 }
 _STRATEGIST_SETTINGS_KEY = "strategist"
@@ -595,6 +596,8 @@ def _enforce_allowlists(
 def _enforce_integration_scope(proposal: Proposal, ctx) -> None:
     """Drop social-platform tasks outside this workspace's provider scope."""
     scoped_providers = set(getattr(ctx, "configured_integrations", []) or []) & set(_SOCIAL_PROVIDER_LABELS)
+    if "linkedin" in scoped_providers or "linkedin_browser" in scoped_providers:
+        scoped_providers.update({"linkedin", "linkedin_browser"})
     if not scoped_providers:
         return
 

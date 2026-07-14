@@ -1,9 +1,6 @@
 # Code of Conduct
 
-Manor AI is a source-available project for builders running AI workspaces,
-agents, and operational automation on their own infrastructure. We want the
-community to be direct, technical, curious, and safe for people with different
-backgrounds and levels of experience.
+Manor OS is an open-source project for builders working on AI-native operating systems for real work. We want the community to be direct, technical, curious, and safe for people with different backgrounds and levels of experience.
 
 ## Expected Behavior
 
@@ -19,16 +16,10 @@ backgrounds and levels of experience.
 - Sexualized, violent, or discriminatory language or imagery.
 - Publishing private information without explicit permission.
 - Spam, coordinated manipulation, paid stars, or fake engagement.
-- Repeatedly derailing issues, discussions, or pull requests after maintainers
-  ask you to stop.
+- Repeatedly derailing issues, discussions, or pull requests after maintainers ask you to stop.
 
 ## Enforcement
 
-Maintainers may edit, hide, lock, or delete comments; close issues or pull
-requests; remove community privileges; or ban participants when behavior harms
-the project or community.
+Maintainers may edit, hide, lock, or delete comments; close issues or pull requests; remove community privileges; or ban participants when behavior harms the project or community.
 
-Report conduct concerns privately through the security or support contact
-published for the project. Include links, screenshots, and context where
-possible. Maintainers will review reports in good faith and avoid public
-disclosure of reporter details.
+Report conduct concerns privately through the security/support contact published for the project. Include links, screenshots, and context where possible. Maintainers will review reports in good faith and avoid public disclosure of reporter details.

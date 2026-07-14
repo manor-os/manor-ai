@@ -231,6 +231,24 @@ def describe_runtime_approval_action(tool_name: str, arguments: dict[str, Any]) 
         # lists) when all they needed was "Manor is about to <do thing>".
         return ""
 
+    if tool_name == "mcp__linkedin_browser__send_invitation":
+        profile = _str("profile") or "(unspecified profile)"
+        note = _trunc(_str("note"))
+        return (
+            f"Send LinkedIn connection invitation to {profile}"
+            + (f' — note: "{note}"' if note else "")
+        )
+    if tool_name == "mcp__linkedin_browser__send_message":
+        conv = _str("conversation") or _str("recipient") or "(unspecified)"
+        text = _trunc(_str("text"))
+        return f'Send LinkedIn message to {conv}: "{text}"'
+    if tool_name == "mcp__linkedin_browser__easy_apply":
+        job = _str("job") or "(unspecified job)"
+        return f"Submit LinkedIn Easy Apply for: {job}"
+    if tool_name == "mcp__linkedin_browser__create_post":
+        text = _trunc(_str("text"))
+        return f'Publish LinkedIn post: "{text}"'
+
     if tool_name == "mcp__linkedin__create_post":
         text = _trunc(_str("text"))
         return f'Publish LinkedIn post: "{text}"'

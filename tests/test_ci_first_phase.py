@@ -17,20 +17,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
-DOCS_DEPLOY = ROOT / ".github" / "workflows" / "deploy-docs.yml"
 WEB_PACKAGE = ROOT / "apps" / "web" / "package.json"
 
 
 def load_ci() -> dict:
     text = CI.read_text()
     # YAML 1.1 treats "on" as a boolean unless we quote it or normalize it.
-    return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
-
-
-
-
-def load_docs_deploy() -> dict:
-    text = DOCS_DEPLOY.read_text()
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
@@ -109,61 +101,36 @@ def test_web_package_exposes_source_smoke_entrypoint() -> None:
     assert package["scripts"]["test:source"] == "node --test scripts/*.test.mjs"
 
 
-def test_release_workflow_only_creates_github_release_for_tags() -> None:
+def test_release_workflow_keeps_oss_boundary_gate_for_cloud_repo() -> None:
     workflow = yaml.safe_load(RELEASE.read_text().replace("\non:", "\n'on':", 1))
     jobs = workflow["jobs"]
 
-    assert set(jobs) == {"release"}
-    assert "needs" not in jobs["release"]
+    assert "oss-boundary" in jobs
+    assert jobs["release"]["needs"] == "oss-boundary"
     run_commands = "\n".join(
         step.get("run", "")
-        for step in jobs["release"]["steps"]
+        for step in jobs["oss-boundary"]["steps"]
         if isinstance(step, dict)
     )
-    uses = [
-        step.get("uses")
-        for step in jobs["release"]["steps"]
-        if isinstance(step, dict)
-    ]
-    assert "make oss-check" not in run_commands
-    assert "softprops/action-gh-release@v2" in uses
+    assert "make oss-check" in run_commands
 
 
+def test_cloud_source_keeps_private_runtime_surfaces_for_export_to_strip() -> None:
+    root = ROOT
 
+    entrypoint = (root / "docker/entrypoint.sh").read_text()
+    assert "Base.metadata.create_all(engine)" in entrypoint
+    assert "alembic stamp heads" in entrypoint
+    assert "20260516_01_merge_commerce_and_repair_heads.py" in entrypoint
 
-def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None:
-    workflow = load_docs_deploy()
-    triggers = workflow["on"]
-    job = workflow["jobs"]["build-and-deploy"]
-    steps = job["steps"]
+    integration_resolution = (root / "packages/core/services/integration_resolution.py").read_text()
+    assert "from packages.core.models.worker import Worker" in integration_resolution
+    assert "worker_supports_provider" in integration_resolution
+    assert "keys.add(_BROWSER_PROVIDER)" in integration_resolution
 
-    assert triggers["push"]["tags"] == ["v*"]
-    assert "branches" not in triggers["push"]
-    assert "paths" not in triggers["push"]
-    assert triggers["workflow_dispatch"]["inputs"]["publish"]["default"] is False
-    assert triggers["workflow_dispatch"]["inputs"]["publish"]["type"] == "boolean"
-    assert "if" not in job
-    assert any(
-        step.get("uses") == "actions/setup-node@v4"
-        and step.get("with", {}).get("node-version") == "20"
-        for step in steps
-        if isinstance(step, dict)
-    )
-    install_step = next(step for step in steps if step.get("name") == "Install and build docs")
-    assert install_step["working-directory"] == "docs-site"
-    assert "npm ci" in install_step["run"]
-    assert "npm run build" in install_step["run"]
+    api_main = (root / "apps/api/main.py").read_text()
 
-    upload_step = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
-    assert upload_step["with"]["name"] == "manor-ai-docs-${{ github.sha }}"
-    assert upload_step["with"]["path"] == "docs-site/build"
-
-    deploy_step = next(step for step in steps if step.get("name") == "Deploy docs")
-    assert deploy_step["if"] == "${{ github.event_name == 'push' || inputs.publish == true }}"
-    deploy_with = deploy_step["with"]
-    assert deploy_step["uses"] == "peaceiris/actions-gh-pages@v4"
-    assert deploy_with["external_repository"] == "manor-os/manor-os.github.io"
-    assert deploy_with["destination_dir"] == "docs/manor-ai"
-    assert deploy_with["keep_files"] is True
-
-
+    workspace_setup = (root / "packages/core/services/workspace_setup_service.py").read_text()
+    assert "marketplace_agents" in workspace_setup
+    assert '"source": _PUBLIC_TEMPLATE_AGENT_SOURCE' in workspace_setup
+    assert '_PUBLIC_TEMPLATE_AGENT_SOURCE = "marketplace"' in workspace_setup

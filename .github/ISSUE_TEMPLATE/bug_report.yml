@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Manor AI. Please redact secrets, customer data, and private URLs before submitting.
+        Thanks for helping improve Manor OS. Please redact secrets, customer data, and private URLs before submitting.
   - type: textarea
     id: expected
     attributes:

@@ -1,0 +1,13 @@
+{
+  "id": "mcp_perplexity_web",
+  "name": "mcp_perplexity_web",
+  "type": "runtime_guidance",
+  "description": "Run search-grounded queries on the user's logged-in Perplexity session and append follow-up questions to an existing thread.",
+  "category": "ai-web-automation",
+  "output_format": "guidance",
+  "tags": ["perplexity", "search", "web-automation", "research", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__perplexity_web__search",
+    "mcp__perplexity_web__follow_up"
+  ]
+}

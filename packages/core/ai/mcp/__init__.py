@@ -21,6 +21,7 @@ from . import (
     manor_mcp_calendar,
     github,
     linkedin,
+    linkedin_browser,
     quickbooks,
     stripe,
     twitter_x,
@@ -31,6 +32,11 @@ from . import (
     elevenlabs,
     tavily,
     jimeng,
+    notebooklm,
+    claude_ai_web,
+    chatgpt_web,
+    gemini_web,
+    perplexity_web,
     producthunt,
     facebook,
     youtube,
@@ -71,6 +77,12 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     "elevenlabs": elevenlabs,
     "tavily": tavily,
     "jimeng": jimeng,
+    # Browser-session AI tools (cookie auth, dispatch via browser-runner sidecar)
+    "notebooklm": notebooklm,
+    "claude_ai_web": claude_ai_web,
+    "chatgpt_web": chatgpt_web,
+    "gemini_web": gemini_web,
+    "perplexity_web": perplexity_web,
     # Launch / community platforms
     "producthunt": producthunt,
     # Social platforms (OAuth via Nango)
@@ -88,6 +100,9 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     # Marketplace seller APIs (signed / token-exchange auth)
     "tiktok_shop": tiktok_shop,
     "amazon": amazon,
+    # Social platforms (browser session — covers what each platform's
+    # public API does NOT expose: profile/company/jobs/messages/feed)
+    "linkedin_browser": linkedin_browser,
 }
 
 
