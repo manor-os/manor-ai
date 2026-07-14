@@ -30,7 +30,8 @@ make openapi
 ```
 
 This writes the OpenAPI document to `docs/openapi.json` in a development tree.
-The generated schema is useful for local inspection and client generation.
+The public documentation site focuses on human-authored operator docs; API
+schema publication can be layered into the site as a later release.
 
 ## Authentication
 

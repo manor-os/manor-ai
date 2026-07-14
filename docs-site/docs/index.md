@@ -5,14 +5,15 @@ title: Overview
 
 # Manor AI
 
-Manor AI is a self-hosted AI workspace runtime for teams that want agents,
-tools, documents, workflows, and integrations under their own control.
+Manor AI is a source-available, self-hosted AI workspace runtime for teams that
+want agents, tools, documents, workflows, and integrations under their own
+control.
 
-The repository is designed for operators who want to run Manor AI on their own
-infrastructure with user-provided model keys. It includes the API server, React
-web app, worker runtime, sandbox service, browser-runner sidecar, workspace
-data model, knowledge tools, document tooling, and integration surfaces needed
-for a self-hosted deployment.
+The public repository is designed for operators who want to run Manor AI on
+their own infrastructure with user-provided model keys. It includes the API
+server, React web app, worker runtime, sandbox service, browser-runner sidecar,
+workspace data model, knowledge tools, document tooling, and integration
+surfaces needed for a complete local deployment.
 
 ## What You Can Build
 
@@ -24,11 +25,14 @@ for a self-hosted deployment.
 - Self-hosted integrations through webhooks, OAuth providers, and Nango.
 - Internal operational workflows that need auditability and data isolation.
 
-## Scope
+## Public Scope
 
-This codebase focuses on self-hosted operation. It does not require hosted
-Manor AI services to boot, create workspaces, configure model keys, run agents,
+The public codebase focuses on self-hosted operation. It does not require Manor
+AI hosted services to boot, create workspaces, configure model keys, run agents,
 use the sandbox, or manage documents and knowledge.
+
+Managed Manor Cloud is a separate commercial service operated by Manor AI. This
+documentation covers the self-hosted distribution.
 
 ## Start Here
 
@@ -42,4 +46,4 @@ use the sandbox, or manage documents and knowledge.
 
 - Source: [github.com/manor-os/manor-ai](https://github.com/manor-os/manor-ai)
 - License: Manor Sustainable Use License 1.0
-- Security reports: use GitHub private vulnerability reporting for the repository.
+- Security reports: use the private security advisory link in the repository.
