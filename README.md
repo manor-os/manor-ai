@@ -37,7 +37,7 @@
 </p>
 
 <div align="center">
-  <video src="https://github.com/user-attachments/assets/5fd1e08d-73fe-490c-b92d-aacf66d50272" width="900" controls poster="./docs-site/static/img/social-card.png"></video>
+  <video src="https://github.com/user-attachments/assets/89aac5f8-3fbb-405b-81e0-6522e8df1513" width="900" controls poster="./docs-site/static/img/social-card.png"></video>
 </div>
 
 ## Why Manor AI
