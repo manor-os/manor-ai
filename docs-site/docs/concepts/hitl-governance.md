@@ -26,6 +26,11 @@ Manor AI policies can treat actions differently:
 - HITL required: the agent pauses for confirmation.
 - Blocked: the action is not available.
 
+<img
+  src="../img/manor-why-governance.png"
+  alt="Manor AI chat approval prompts for high-impact governed actions"
+/>
+
 ## Operational Guidance
 
 Start conservative. Require HITL for irreversible or externally visible

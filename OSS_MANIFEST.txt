@@ -763,6 +763,10 @@ docs-site/static/img/manor-ai-goals.png
 docs-site/static/img/manor-ai-governance.png
 docs-site/static/img/manor-ai-runtime.png
 docs-site/static/img/manor-byok.png
+docs-site/static/img/manor-why-governance.png
+docs-site/static/img/manor-why-task-evidence.png
+docs-site/static/img/manor-why-task-evidence2.png
+docs-site/static/img/manor-why-task-evidence3.png
 docs-site/static/img/social-card.png
 docs-site/static/video/manor.mov
 docs-site/static/video/manor.webm

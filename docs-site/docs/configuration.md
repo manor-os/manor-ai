@@ -31,6 +31,11 @@ Self-hosted Manor AI is BYOK. Configure model provider credentials in Settings
 for each workspace or user. Avoid baking model API keys into images or source
 control.
 
+<img
+  src="img/manor-byok.png"
+  alt="Manor AI model settings showing BYOK model configuration"
+/>
+
 ## Storage
 
 Manor AI uses MinIO for object storage and JuiceFS for entity-scoped filesystem

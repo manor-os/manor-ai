@@ -1,4 +1,18 @@
-# Manor AI
+<p align="center">
+  <img src="./docs-site/static/img/logo.svg" height="56" alt="Manor AI logo" />
+</p>
+
+<h1 align="center">Manor AI</h1>
+
+<p align="center">
+  <strong>Self-hosted AI workspace runtime for governed agents, tasks, tools, and knowledge.</strong>
+</p>
+
+<p align="center">
+  Bring agents out of one-off chat and into accountable workspace operations:
+  BYOK models, durable tasks, scoped tools, approvals, audit trails, and local
+  data ownership.
+</p>
 
 <p align="center">
   <a href="https://manor-os.github.io/docs/manor-ai/quickstart"><strong>Quickstart</strong></a>
@@ -22,18 +36,13 @@
   <a href="https://manorai.xyz/"><img alt="Website" src="https://img.shields.io/badge/Website-manorai.xyz-0f766e"></a>
 </p>
 
-Manor AI is a self-hosted AI workspace runtime for teams that want agents,
-documents, tasks, workflows, tools, and integrations under their own control.
-It is built for BYOK deployments, local data ownership, and auditable
-human-in-the-loop automation.
+<div align="center">
+  <video src="https://github.com/manor-os/manor-ai/raw/main/docs-site/static/video/manor.webm" width="900" controls poster="./docs-site/static/img/social-card.png"></video>
+</div>
 
-<video src="./docs-site/static/video/manor.webm" controls muted loop playsinline poster="./docs-site/static/img/manor-ai-runtime.png">
-  Feature overview video: ./docs-site/static/video/manor.webm
-</video>
-
-[Watch the feature overview video](./docs-site/static/video/manor.webm).
-
-![Manor AI workspace runtime screenshot](./docs-site/static/img/manor-ai-runtime.png)
+<p align="center">
+  <a href="./docs-site/static/video/manor.webm"><strong>Open the feature overview video</strong></a>
+</p>
 
 ## Why Manor AI
 
@@ -41,7 +50,8 @@ Most AI products stop at chat. Real teams need an operating layer around AI:
 shared context, durable tasks, scoped tools, approvals, audit trails, and a way
 to keep sensitive data inside infrastructure they control.
 
-Manor AI is built for that layer.
+Manor AI is built for that layer: the product surface where model choice,
+workspace memory, tasks, permissions, and human review all meet.
 
 ### Own the runtime, not just the chat box
 
@@ -49,24 +59,21 @@ Manor AI brings the core surfaces of an AI workspace into one runtime: chat,
 documents, agents, goals, workflows, reports, integrations, settings, and the
 infrastructure around them. Self-host the app, database, files, agent runtime,
 and integration surfaces; bring your own model keys instead of handing your
-workspace to a hosted black box.
-
-![Manor AI BYOK and runtime ownership](./docs-site/static/img/manor-byok.png)
+workspace to a hosted black box. Model provider keys are configured in your
+deployment, and operational data stays inside your infrastructure.
 
 ### Turn prompts into accountable work
 
 Agents operate through goals, tasks, workspace context, tool permissions, and
 human approval gates. Important automation leaves durable status, evidence, and
-review points instead of disappearing into a one-off chat transcript.
-
-![Manor AI goals and tasks](./docs-site/static/img/manor-ai-goals.png)
+review points instead of disappearing into a one-off chat transcript. Goals
+break work into linked execution steps that teams can inspect and improve.
 
 ### Make governance part of the product
 
 Approval gates, scoped tools, audit logs, workspace permissions, and runtime
-signals make automation inspectable before it touches critical workflows.
-
-![Manor AI governance and approvals](./docs-site/static/img/manor-ai-governance.png)
+signals make automation inspectable before it touches critical workflows. Rules
+are visible to operators and mapped to enforcement patterns in the runtime.
 
 ## How Manor AI works
 
@@ -146,8 +153,6 @@ Use the first run to verify the whole system, not just the login page:
 4. Create or run a task so an agent uses workspace context and tools.
 5. Trigger a governed action and confirm it pauses for human approval.
 6. Review the resulting task status, evidence, comments, and audit trail.
-
-![Manor AI runtime overview](./docs-site/static/img/manor-ai-runtime.png)
 
 ## What ships in the OSS self-hosted stack
 

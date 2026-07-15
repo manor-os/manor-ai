@@ -30,6 +30,28 @@ During a conversation or task run, the agent can:
 3. Request human approval for sensitive actions.
 4. Produce user-visible results and artifacts.
 
+<img
+  src="../img/manor-why-task-evidence.png"
+  alt="Manor AI task detail showing task status, priority, brief, and workspace metadata"
+/>
+
+## Execution Evidence
+
+Agent work should remain inspectable after the conversation moves on. Task runs
+can show plan steps, step output, generated artifacts, waiting human input, and
+status changes so operators can understand what happened and resume work from a
+known state.
+
+<img
+  src="../img/manor-why-task-evidence2.png"
+  alt="Manor AI task run steps showing completed agent output and a waiting human approval step"
+/>
+
+<img
+  src="../img/manor-why-task-evidence3.png"
+  alt="Manor AI task activity timeline showing execution steps, reminders, and status changes"
+/>
+
 ## Good Agent Design
 
 - Give agents clear ownership.
