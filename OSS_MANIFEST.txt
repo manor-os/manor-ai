@@ -1,3 +1,13 @@
+.agents/skills/manor-ci-triage/SKILL.md
+.agents/skills/manor-ci-triage/agents/openai.yaml
+.agents/skills/manor-dev-stack-run-verify/SKILL.md
+.agents/skills/manor-dev-stack-run-verify/agents/openai.yaml
+.agents/skills/manor-doc-maintenance/SKILL.md
+.agents/skills/manor-doc-maintenance/agents/openai.yaml
+.agents/skills/manor-pr-prep/SKILL.md
+.agents/skills/manor-pr-prep/agents/openai.yaml
+.agents/skills/manor-release/SKILL.md
+.agents/skills/manor-release/agents/openai.yaml
 .dockerignore
 .env.example
 .github/ISSUE_TEMPLATE/bug_report.yml
