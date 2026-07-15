@@ -27,7 +27,7 @@ from packages.core.templates.registry import (
 RECOMMENDED_MCP = ["youtube", "tiktok", "facebook", "linkedin", "gmail", "tavily"]
 # Real skill slugs (marketplace + built-in doc skills) — see test integrity check.
 RECOMMENDED_SKILLS = [
-    "brand_voice", "blog_writer", "social_media_draft_studio",
+    "brand_voice", "blog_writer",
     "email_marketing", "lead_magnets", "reef_copywriting", "pricing",
 ]
 
