@@ -37,12 +37,8 @@
 </p>
 
 <div align="center">
-  <video src="https://github.com/manor-os/manor-ai/raw/main/docs-site/static/video/manor.webm" width="900" controls poster="./docs-site/static/img/social-card.png"></video>
+  <video src="https://github.com/user-attachments/assets/5fd1e08d-73fe-490c-b92d-aacf66d50272" width="900" controls poster="./docs-site/static/img/social-card.png"></video>
 </div>
-
-<p align="center">
-  <a href="./docs-site/static/video/manor.webm"><strong>Open the feature overview video</strong></a>
-</p>
 
 ## Why Manor AI
 
