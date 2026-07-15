@@ -3,6 +3,8 @@
 import pytest
 from httpx import AsyncClient
 
+pytestmark = pytest.mark.oss_regression
+
 
 async def _register(client: AsyncClient, username: str = "testuser") -> dict:
     resp = await client.post(

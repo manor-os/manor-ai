@@ -9,7 +9,7 @@ documents, tasks, workflows, tools, and integrations under their own control.
 It is built for BYOK deployments, local data ownership, and auditable
 human-in-the-loop automation.
 
-![Manor AI workspace runtime screenshot](https://raw.githubusercontent.com/manor-os/manor-ai/main/docs-site/static/img/manor-ai-runtime.png)
+![Manor AI workspace runtime screenshot](./docs-site/static/img/manor-ai-runtime.png)
 
 **Start here:** [Documentation](https://manor-os.github.io/docs/manor-ai/) ·
 [Quick Start](https://manor-os.github.io/docs/manor-ai/quickstart) ·

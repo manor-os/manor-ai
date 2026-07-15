@@ -163,7 +163,7 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
         run: >
           python -m pytest tests/
-          -m "not e2e and not manual and not slow and not network and not docker and not cloud"
+          -m "oss_smoke"
           -q --tb=short -p no:warnings
 
   python-regression:
@@ -221,6 +221,6 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
         run: >
           python -m pytest tests/
-          -m "not manual and not network and not docker and not cloud"
+          -m "oss_smoke or oss_regression"
           -q --tb=short -p no:warnings
 

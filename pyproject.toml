@@ -99,6 +99,8 @@ markers = [
     "pgvector: tests that require PostgreSQL with pgvector support",
     "cloud: tests for cloud-only surfaces that are stripped from OSS export",
     "oss: tests for OSS/self-hosted mode contracts",
+    "oss_smoke: tests included in the public OSS Python smoke CI gate",
+    "oss_regression: tests included in the public OSS Python regression CI gate",
     "running_api: tests that require a running Manor API over HTTP",
     "running_runner: tests that require a running sidecar/runner over HTTP",
 ]

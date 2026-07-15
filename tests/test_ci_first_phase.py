@@ -11,12 +11,16 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 import yaml
+
+pytestmark = pytest.mark.oss_smoke
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
+IS_PUBLIC_EXPORT = not (ROOT / ".ossexclude").exists()
 DOCS_DEPLOY = ROOT / ".github" / "workflows" / "deploy-docs.yml"
 WEB_PACKAGE = ROOT / "apps" / "web" / "package.json"
 
@@ -82,8 +86,14 @@ def test_python_smoke_tests_are_the_required_first_phase_python_gate() -> None:
     run_commands = "\n".join(step.get("run", "") for step in smoke_job["steps"] if isinstance(step, dict))
 
     assert "continue-on-error" not in smoke_job
-    assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
-    assert "not e2e and not manual and not slow and not network and not docker and not cloud" in run_commands
+    if not IS_PUBLIC_EXPORT:
+        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
+        assert "not e2e and not manual and not slow and not network and not docker and not cloud" in run_commands
+    else:
+        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
+        assert '-m "oss_smoke"' in run_commands
+        assert "tests/test_ci_first_phase.py" not in run_commands
+        assert "tests/test_integrations.py" not in run_commands
 
 
 def test_python_regression_suite_runs_only_for_main_or_manual_opt_in() -> None:
@@ -96,8 +106,14 @@ def test_python_regression_suite_runs_only_for_main_or_manual_opt_in() -> None:
     assert "github.ref_name == 'main'" in condition
     assert "github.base_ref == 'main'" in condition
     assert "inputs.test_level == 'regression'" in condition
-    assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
-    assert "not manual and not network and not docker and not cloud" in run_commands
+    if not IS_PUBLIC_EXPORT:
+        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
+        assert "not manual and not network and not docker and not cloud" in run_commands
+    else:
+        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
+        assert '-m "oss_smoke or oss_regression"' in run_commands
+        assert "tests/test_ci_first_phase.py" not in run_commands
+        assert "tests/test_integrations.py" not in run_commands
     assert "DEPLOYMENT_MODE" not in regression_job["steps"][-1].get("env", {})
 
 
