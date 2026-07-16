@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -238,59 +237,6 @@ async def runtime_list_scheduled_jobs_action(*, entity_id: str) -> str:
             f"last: {job.last_run_at or 'never'}"
         )
     return "\n".join(lines)
-
-
-async def runtime_query_scheduled_jobs_action(
-    *,
-    entity_id: str,
-    query: str = "",
-    workspace_id: str = "",
-    enabled_only: bool = False,
-    limit: int = 50,
-) -> str:
-    """Return structured scheduled-job data through the Runtime boundary."""
-
-    from packages.core.database import async_session
-    from packages.core.services.scheduler_service import list_scheduled_jobs
-
-    resolved_limit = max(1, min(int(limit or 50), 200))
-    resolved_workspace_id = str(workspace_id or "").strip() or None
-    normalized_query = str(query or "").strip().casefold()
-    async with async_session() as db:
-        jobs, _total = await list_scheduled_jobs(
-            db,
-            entity_id,
-            enabled_only=enabled_only,
-            workspace_id=resolved_workspace_id,
-            limit=200,
-        )
-
-    items = []
-    for job in jobs:
-        if normalized_query and normalized_query not in (
-            f"{job.name or ''} {job.job_id}".casefold()
-        ):
-            continue
-        items.append(
-            {
-                "job_id": job.job_id,
-                "name": job.name,
-                "schedule_kind": job.schedule_kind,
-                "cron_expr": job.cron_expr,
-                "every_seconds": job.every_seconds,
-                "run_at": job.run_at,
-                "timezone": job.timezone,
-                "enabled": bool(job.enabled),
-                "last_run_at": job.last_run_at.isoformat() if job.last_run_at else None,
-                "last_status": job.last_status,
-                "consecutive_errors": int(job.consecutive_errors or 0),
-                "workspace_id": job.workspace_id,
-                "agent_id": job.agent_id,
-            }
-        )
-        if len(items) >= resolved_limit:
-            break
-    return json.dumps({"automations": items, "total": len(items)})
 
 
 async def runtime_cancel_scheduled_job_action(

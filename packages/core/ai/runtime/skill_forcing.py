@@ -169,14 +169,13 @@ def runtime_manual_skill_forced_tool_calls(
 ) -> list[dict]:
     if not manual_skill_refs:
         return []
-    default_skill_input = runtime_manual_skill_input(message)
+    skill_input = runtime_manual_skill_input(message)
     calls: list[dict] = []
     for skill in manual_skill_refs:
         # Prefer slug or name over id so clients can render readable labels.
         skill_ref = skill.get("slug") or skill.get("name") or skill.get("id")
         if not skill_ref:
             continue
-        skill_input = str(skill.get("input") or "").strip() or default_skill_input
         calls.append({
             "name": "invoke_skill",
             "arguments": {

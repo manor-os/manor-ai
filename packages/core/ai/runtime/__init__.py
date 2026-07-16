@@ -41,10 +41,7 @@ from packages.core.ai.runtime.agent_files import (
     runtime_read_agent_file,
     runtime_write_agent_file,
 )
-from packages.core.ai.runtime.agent_provisioning import (
-    runtime_provision_agent_action,
-    runtime_query_entity_agents_action,
-)
+from packages.core.ai.runtime.agent_provisioning import runtime_provision_agent_action
 from packages.core.ai.runtime.approval_store import (
     RUNTIME_APPROVALS_KEY,
     runtime_approvals,
@@ -466,7 +463,6 @@ from packages.core.ai.runtime.scheduling import (
     runtime_ensure_scheduled_workspace_ai_billing_context,
     runtime_ensure_strategist_review_billing_context,
     runtime_list_scheduled_jobs_action,
-    runtime_query_scheduled_jobs_action,
     runtime_run_scheduled_job_now_action,
     runtime_scheduled_job_prompt,
     runtime_scheduled_skill_prompt,
@@ -926,7 +922,6 @@ __all__ = [
     "runtime_list_agent_files",
     "runtime_normalize_entity_file_path",
     "runtime_provision_agent_action",
-    "runtime_query_entity_agents_action",
     "runtime_read_agent_file",
     "runtime_sync_entity_file_to_knowledge",
     "runtime_trash_knowledge_path",
@@ -1449,7 +1444,6 @@ __all__ = [
     "runtime_ensure_scheduled_workspace_ai_billing_context",
     "runtime_ensure_strategist_review_billing_context",
     "runtime_list_scheduled_jobs_action",
-    "runtime_query_scheduled_jobs_action",
     "runtime_run_scheduled_job_now_action",
     "runtime_scheduled_job_prompt",
     "runtime_scheduled_skill_prompt",

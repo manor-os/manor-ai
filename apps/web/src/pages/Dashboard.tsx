@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
@@ -9,20 +9,12 @@ import TrendChart from "../components/ui/TrendChart";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
 import Button from "../components/ui/Button";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
-import Tooltip from "../components/ui/Tooltip";
-import GeneratedDashboardModule, {
-  normalizeGeneratedModules,
-  type DashboardGeneratedModule,
-  type DashboardModuleConversationMessage,
-} from "../components/dashboard/GeneratedDashboardModule";
 import {
   IconCheck,
   IconChevronDown,
-  IconCode,
   IconDragHandle,
   IconEye,
   IconEyeOff,
-  IconInfo,
   IconRefresh,
   IconSend,
   IconSettings,
@@ -47,16 +39,6 @@ function greetingWord(): string {
 
 function Skeleton({ className = "" }: { className?: string }) {
   return <div className={`skeleton rounded-xl ${className}`} />;
-}
-
-function isAbortError(error: unknown): boolean {
-  return (
-    (error instanceof DOMException && error.name === "AbortError") ||
-    (typeof error === "object" &&
-      error !== null &&
-      "name" in error &&
-      (error as { name?: unknown }).name === "AbortError")
-  );
 }
 
 /* ── KPI card color presets ─────────────────────────────── */
@@ -86,9 +68,6 @@ const DASHBOARD_WIDGET_IDS = [
   "task_trend",
 ] as const;
 
-const DASHBOARD_AI_REQUEST_TIMEOUT_MS = 120_000;
-const DASHBOARD_LAST_SEEN_STORAGE_KEY = "manor_dashboard_last_seen_at";
-
 type DashboardWidgetId = (typeof DASHBOARD_WIDGET_IDS)[number];
 
 interface DashboardWidgetPreference {
@@ -99,7 +78,6 @@ interface DashboardWidgetPreference {
 interface DashboardLayoutPreference {
   version: number;
   widgets: DashboardWidgetPreference[];
-  modules: DashboardGeneratedModule[];
 }
 
 const DEFAULT_DASHBOARD_WIDGETS: DashboardWidgetPreference[] =
@@ -168,29 +146,7 @@ function normalizeDashboardLayout(value: unknown): DashboardLayoutPreference {
     if (!seen.has(widget.id)) widgets.push({ ...widget });
   }
 
-  return {
-    version: 2,
-    widgets,
-    modules: normalizeGeneratedModules((value as any)?.modules),
-  };
-}
-
-function cloneGeneratedModules(
-  modules: DashboardGeneratedModule[],
-): DashboardGeneratedModule[] {
-  return modules.map((module) => ({
-    ...module,
-    code: {
-      ...module.code,
-      data_requests: module.code.data_requests.map((request) => ({
-        ...request,
-        params: { ...request.params },
-        tool_arguments: request.tool_arguments
-          ? { ...request.tool_arguments }
-          : undefined,
-      })),
-    },
-  }));
+  return { version: 1, widgets };
 }
 
 function reorderDashboardWidget(
@@ -324,102 +280,68 @@ function DashboardWidgetFrame({
 
 function DashboardInlineEditor({
   widgets,
-  modules,
   aiPrompt,
   saving,
   suggesting,
-  previewPending,
-  aiStatusMessage,
-  aiStatusTone,
   onAiPromptChange,
   onApplyAi,
   onShow,
-  onShowModule,
   onRestore,
   onCancel,
   onSave,
 }: {
   widgets: DashboardWidgetPreference[];
-  modules: DashboardGeneratedModule[];
   aiPrompt: string;
   saving: boolean;
   suggesting: boolean;
-  previewPending: boolean;
-  aiStatusMessage?: string | null;
-  aiStatusTone?: "loading" | "error";
   onAiPromptChange: (value: string) => void;
   onApplyAi: () => void;
   onShow: (widgetId: DashboardWidgetId) => void;
-  onShowModule: (moduleId: string) => void;
   onRestore: () => void;
   onCancel: () => void;
   onSave: () => void;
 }) {
   const hiddenWidgets = widgets.filter((widget) => !widget.visible);
-  const hiddenModules = modules.filter((module) => !module.visible);
-  const canApplyAi = aiPrompt.trim().length > 0 && !suggesting && !previewPending;
+  const canApplyAi = aiPrompt.trim().length > 0 && !suggesting;
 
   return (
     <section className="dashboard-inline-editor" aria-label={t("page.dashboard.editing_dashboard")}>
-      <div className="dashboard-ai-layout-stack">
-        <div className="dashboard-ai-layout-command">
-          <IconSparkles size={16} />
-          <input
-            value={aiPrompt}
-            placeholder={t("page.dashboard.ai_prompt_placeholder")}
-            aria-label={t("page.dashboard.ai_prompt_label")}
-            disabled={suggesting || previewPending}
-            onChange={(event) => onAiPromptChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && canApplyAi) onApplyAi();
-            }}
-          />
-          <button
-            type="button"
-            disabled={!canApplyAi}
-            aria-busy={suggesting}
-            title={t("page.dashboard.apply_ai")}
-            aria-label={t("page.dashboard.apply_ai")}
-            onClick={onApplyAi}
-          >
-            {suggesting ? <LoadingSpinner size={13} /> : <IconSend size={14} />}
-          </button>
-        </div>
-        {aiStatusMessage && (
-          <div className={`dashboard-ai-layout-status is-${aiStatusTone || "loading"}`}>
-            {aiStatusTone === "error" ? <IconInfo size={13} /> : <LoadingSpinner size={11} />}
-            <span>{aiStatusMessage}</span>
-          </div>
-        )}
+      <div className="dashboard-ai-layout-command">
+        <IconSparkles size={16} />
+        <input
+          value={aiPrompt}
+          placeholder={t("page.dashboard.ai_prompt_placeholder")}
+          aria-label={t("page.dashboard.ai_prompt_label")}
+          onChange={(event) => onAiPromptChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && canApplyAi) onApplyAi();
+          }}
+        />
+        <button
+          type="button"
+          disabled={!canApplyAi}
+          aria-busy={suggesting}
+          title={t("page.dashboard.apply_ai")}
+          aria-label={t("page.dashboard.apply_ai")}
+          onClick={onApplyAi}
+        >
+          {suggesting ? <LoadingSpinner size={13} /> : <IconSend size={14} />}
+        </button>
       </div>
       <div className="dashboard-inline-editor-actions">
         <Button variant="ghost" size="sm" disabled={suggesting} onClick={onRestore}>
           <IconRefresh size={14} />
           {t("page.dashboard.restore_defaults")}
         </Button>
-        <Button variant="outline" size="sm" disabled={saving} onClick={onCancel}>
-          {suggesting ? t("page.dashboard.stop_generation") : t("action.cancel")}
+        <Button variant="outline" size="sm" onClick={onCancel}>
+          {t("action.cancel")}
         </Button>
-        <Button
-          size="sm"
-          loading={saving}
-          disabled={suggesting || previewPending || aiPrompt.trim().length > 0}
-          title={
-            previewPending
-              ? t("page.dashboard.confirm_generated_preview")
-              : aiPrompt.trim()
-                ? t("page.dashboard.preview_before_save")
-                : undefined
-          }
-          onClick={onSave}
-        >
-          {previewPending ? <IconEye size={14} /> : <IconCheck size={14} />}
-          {previewPending
-            ? t("page.dashboard.review_preview_below")
-            : t("page.dashboard.save_layout")}
+        <Button size="sm" loading={saving} disabled={suggesting} onClick={onSave}>
+          <IconCheck size={14} />
+          {t("page.dashboard.save_layout")}
         </Button>
       </div>
-      {(hiddenWidgets.length > 0 || hiddenModules.length > 0) && (
+      {hiddenWidgets.length > 0 && (
         <div className="dashboard-hidden-widgets">
           <span>{t("page.dashboard.hidden_widgets")}</span>
           {hiddenWidgets.map((widget) => (
@@ -432,64 +354,9 @@ function DashboardInlineEditor({
               {t(DASHBOARD_WIDGET_META[widget.id].titleKey)}
             </button>
           ))}
-          {hiddenModules.map((module) => (
-            <button
-              key={module.id}
-              type="button"
-              onClick={() => onShowModule(module.id)}
-            >
-              <IconEye size={13} />
-              {module.title}
-            </button>
-          ))}
         </div>
       )}
     </section>
-  );
-}
-
-function DashboardGeneratingModule({ request }: { request: string }) {
-  return (
-    <article
-      className="dashboard-generated-module dashboard-generated-module--wide dashboard-generated-module--generating"
-      data-dashboard-generating="true"
-      aria-live="polite"
-      aria-busy="true"
-    >
-      <header className="dashboard-generated-module-header">
-        <div className="dashboard-generated-module-heading">
-          <span className="dashboard-generated-module-icon" aria-hidden="true">
-            <LoadingSpinner size={15} />
-          </span>
-          <div>
-            <h2>{t("page.dashboard.generating_module")}</h2>
-            <p>{request}</p>
-          </div>
-        </div>
-        <span className="dashboard-generating-code-label">
-          <IconCode size={13} />
-          {t("page.dashboard.code_and_tools")}
-        </span>
-      </header>
-      <div className="dashboard-generating-module-body">
-        <div className="dashboard-generating-module-copy">
-          <strong>{t("page.dashboard.preparing_preview")}</strong>
-          <span>{t("page.dashboard.generating_module_detail")}</span>
-        </div>
-        <div className="dashboard-generating-progress" aria-hidden="true">
-          <div className="dashboard-generating-stages">
-            <span><IconSparkles size={12} />{t("page.dashboard.module_stage_plan")}</span>
-            <span><IconCode size={12} />{t("page.dashboard.module_stage_build")}</span>
-            <span><IconCheck size={12} />{t("page.dashboard.module_stage_validate")}</span>
-          </div>
-          <div className="dashboard-generating-module-lines">
-            <span />
-            <span />
-            <span />
-          </div>
-        </div>
-      </div>
-    </article>
   );
 }
 
@@ -525,67 +392,10 @@ export default function Dashboard() {
   const [draftWidgets, setDraftWidgets] = useState<DashboardWidgetPreference[]>(
     DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
   );
-  const [draftModules, setDraftModules] = useState<DashboardGeneratedModule[]>([]);
   const [layoutPrompt, setLayoutPrompt] = useState("");
-  const [pendingPreviewModuleId, setPendingPreviewModuleId] = useState<string | null>(null);
-  const [moduleConversationId, setModuleConversationId] = useState<string | null>(null);
-  const [moduleConversationPrompt, setModuleConversationPrompt] = useState("");
-  const [moduleConversations, setModuleConversations] = useState<
-    Record<string, DashboardModuleConversationMessage[]>
-  >({});
-  const [moduleConversationIds, setModuleConversationIds] = useState<
-    Record<string, string>
-  >({});
-  const [layoutConversationId, setLayoutConversationId] = useState<string | null>(null);
-  const [loadingModuleConversationId, setLoadingModuleConversationId] = useState<
-    string | null
-  >(null);
-  const [layoutGenerationError, setLayoutGenerationError] = useState<string | null>(null);
   const [draggedWidget, setDraggedWidget] = useState<DashboardWidgetId | null>(null);
-  const preSuggestionLayoutRef = useRef<DashboardLayoutPreference | null>(null);
-  const suggestLayoutAbortRef = useRef<AbortController | null>(null);
-  const suggestLayoutAbortReasonRef = useRef<"timeout" | "user" | null>(null);
-  const [dashboardLastSeenAt, setDashboardLastSeenAt] = useState<string | null>(() =>
-    typeof window === "undefined"
-      ? null
-      : window.localStorage.getItem(DASHBOARD_LAST_SEEN_STORAGE_KEY),
-  );
 
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const readLastSeen = () =>
-      window.localStorage.getItem(DASHBOARD_LAST_SEEN_STORAGE_KEY);
-    const markDashboardSeen = () => {
-      window.localStorage.setItem(
-        DASHBOARD_LAST_SEEN_STORAGE_KEY,
-        new Date().toISOString(),
-      );
-    };
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "hidden") {
-        markDashboardSeen();
-      } else {
-        setDashboardLastSeenAt(readLastSeen());
-      }
-    };
-    const handleFocus = () => setDashboardLastSeenAt(readLastSeen());
-
-    const markSeenTimer = window.setTimeout(markDashboardSeen, 1500);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("focus", handleFocus);
-    window.addEventListener("pagehide", markDashboardSeen);
-
-    return () => {
-      window.clearTimeout(markSeenTimer);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("focus", handleFocus);
-      window.removeEventListener("pagehide", markDashboardSeen);
-      markDashboardSeen();
-    };
-  }, []);
-
-  const { data: dashboardLayoutData, isLoading: dashboardLayoutLoading } = useQuery({
+  const { data: dashboardLayoutData } = useQuery({
     queryKey: ["dashboard-layout"],
     queryFn: () => api.dashboard.layout(),
     staleTime: 5 * 60_000,
@@ -597,9 +407,9 @@ export default function Dashboard() {
   const activeDashboardLayout = useMemo(
     () =>
       editingDashboard
-        ? normalizeDashboardLayout({ widgets: draftWidgets, modules: draftModules })
+        ? normalizeDashboardLayout({ widgets: draftWidgets })
         : dashboardLayout,
-    [dashboardLayout, draftModules, draftWidgets, editingDashboard],
+    [dashboardLayout, draftWidgets, editingDashboard],
   );
   const visibleWidgetIds = useMemo(
     () => new Set(
@@ -617,36 +427,15 @@ export default function Dashboard() {
   );
   const isWidgetVisible = (widgetId: DashboardWidgetId) =>
     visibleWidgetIds.has(widgetId);
-  const visibleGeneratedModules = activeDashboardLayout.modules.filter(
-    (module) => module.visible,
-  );
-  const appendModuleConversationMessage = (
-    moduleId: string,
-    message: DashboardModuleConversationMessage,
-  ) => {
-    setModuleConversations((current) => ({
-      ...current,
-      [moduleId]: [...(current[moduleId] ?? []), message].slice(-20),
-    }));
-  };
 
   const saveLayoutMutation = useMutation({
-    mutationFn: (layout: DashboardLayoutPreference) =>
-      api.dashboard.updateLayout(layout.widgets, layout.modules),
+    mutationFn: (widgets: DashboardWidgetPreference[]) =>
+      api.dashboard.updateLayout(widgets),
     onSuccess: (value) => {
       const normalized = normalizeDashboardLayout(value);
       queryClient.setQueryData(["dashboard-layout"], normalized);
       setEditingDashboard(false);
       setLayoutPrompt("");
-      setLayoutGenerationError(null);
-      setPendingPreviewModuleId(null);
-      setModuleConversationId(null);
-      setModuleConversationPrompt("");
-      setModuleConversations({});
-      setModuleConversationIds({});
-      setLayoutConversationId(null);
-      setLoadingModuleConversationId(null);
-      preSuggestionLayoutRef.current = null;
       toast.success(t("page.dashboard.layout_saved"));
     },
     onError: (error: Error) => {
@@ -658,195 +447,30 @@ export default function Dashboard() {
     mutationFn: ({
       prompt,
       widgets,
-      modules,
-      targetModuleId,
-      conversationId,
     }: {
       prompt: string;
       widgets: DashboardWidgetPreference[];
-      modules: DashboardGeneratedModule[];
-      targetModuleId?: string;
-      conversationId?: string;
-    }) => {
-      suggestLayoutAbortRef.current?.abort();
-      const controller = new AbortController();
-      suggestLayoutAbortRef.current = controller;
-      suggestLayoutAbortReasonRef.current = null;
-      const timeoutId = window.setTimeout(() => {
-        suggestLayoutAbortReasonRef.current = "timeout";
-        controller.abort();
-      }, DASHBOARD_AI_REQUEST_TIMEOUT_MS);
-      return api.dashboard
-        .suggestLayout(prompt, widgets, modules, {
-          targetModuleId,
-          conversationId,
-          signal: controller.signal,
-        })
-        .catch((error: unknown) => {
-          if (isAbortError(error)) {
-            throw new Error(
-              suggestLayoutAbortReasonRef.current === "user"
-                ? t("page.dashboard.ai_update_cancelled")
-                : t("page.dashboard.ai_update_timeout"),
-            );
-          }
-          throw error;
-        })
-        .finally(() => {
-          window.clearTimeout(timeoutId);
-          if (suggestLayoutAbortRef.current === controller) {
-            suggestLayoutAbortRef.current = null;
-          }
-          suggestLayoutAbortReasonRef.current = null;
-        });
-    },
-    onMutate: ({ widgets, modules, targetModuleId }) => {
-      setLayoutGenerationError(null);
-      if (!preSuggestionLayoutRef.current) {
-        preSuggestionLayoutRef.current = {
-          version: 2,
-          widgets: widgets.map((widget) => ({ ...widget })),
-          modules: cloneGeneratedModules(modules),
-        };
-      }
-      if (!targetModuleId) setPendingPreviewModuleId(null);
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => {
-          document
-            .querySelector(
-              targetModuleId
-                ? `[data-module-id="${targetModuleId}"]`
-                : "[data-dashboard-generating]",
-            )
-            ?.scrollIntoView({ behavior: "smooth", block: "center" });
-        });
-      });
-    },
+      saveAfter: boolean;
+    }) => api.dashboard.suggestLayout(prompt, widgets),
     onSuccess: (value, variables) => {
-      setLayoutGenerationError(null);
-      if (value.conversation_id) {
-        if (variables.targetModuleId) {
-          setModuleConversationIds((current) => ({
-            ...current,
-            [variables.targetModuleId as string]: value.conversation_id as string,
-          }));
-        } else {
-          setLayoutConversationId(value.conversation_id);
-        }
-      }
-      if (variables.targetModuleId) {
-        appendModuleConversationMessage(variables.targetModuleId, {
-          role: "assistant",
-          content:
-            value.assistant_message ||
-            (value.preview_created
-              ? t("page.dashboard.module_edit_default_reply")
-              : t("page.dashboard.ai_no_changes_detail")),
-          toolCalls: value.tool_calls ?? [],
-        });
-      }
-      if (!value.preview_created) {
-        setPendingPreviewModuleId(null);
-        preSuggestionLayoutRef.current = null;
-        if (!variables.targetModuleId) {
-          toast.warning(
-            t("page.dashboard.ai_no_changes"),
-            value.assistant_message || t("page.dashboard.ai_no_changes_detail"),
-          );
-        }
-        return;
-      }
       const normalized = normalizeDashboardLayout(value);
-      const currentDraft = normalizeDashboardLayout({
-        widgets: draftWidgets,
-        modules: draftModules,
-      });
-      if (JSON.stringify(normalized) === JSON.stringify(currentDraft)) {
-        if (!variables.targetModuleId) {
-          setPendingPreviewModuleId(null);
-          preSuggestionLayoutRef.current = null;
-        }
-        toast.warning(
-          t("page.dashboard.ai_no_changes"),
-          t("page.dashboard.ai_no_changes_detail"),
-        );
-        return;
-      }
-      const changedModule = normalized.modules.find((module) => {
-        const existing = draftModules.find((candidate) => candidate.id === module.id);
-        return !existing || JSON.stringify(existing) !== JSON.stringify(module);
-      });
       setDraftWidgets(normalized.widgets);
-      setDraftModules(normalized.modules);
-      if (variables.targetModuleId) {
-        setPendingPreviewModuleId(variables.targetModuleId);
+      setLayoutPrompt("");
+      if (variables.saveAfter) {
+        saveLayoutMutation.mutate(normalized.widgets);
       } else {
-        setLayoutPrompt("");
-        setPendingPreviewModuleId(changedModule?.id ?? null);
-        toast.success(
-          t("page.dashboard.ai_preview_updated"),
-          t("page.dashboard.ai_preview_updated_detail"),
-        );
-      }
-      if (changedModule) {
-        window.requestAnimationFrame(() => {
-          window.requestAnimationFrame(() => {
-            document
-              .querySelector(`[data-module-id="${changedModule.id}"]`)
-              ?.scrollIntoView({ behavior: "smooth", block: "center" });
-          });
-        });
+        toast.success(t("page.dashboard.ai_preview_updated"));
       }
     },
-    onError: (error: Error, variables) => {
-      const wasStopped = error.message === t("page.dashboard.ai_update_cancelled");
-      setLayoutGenerationError(wasStopped ? null : error.message);
-      if (variables.targetModuleId) {
-        appendModuleConversationMessage(variables.targetModuleId, {
-          role: "assistant",
-          content: error.message,
-        });
-      } else {
-        setPendingPreviewModuleId(null);
-        preSuggestionLayoutRef.current = null;
-      }
-      if (wasStopped) {
-        toast.warning(t("page.dashboard.ai_update_cancelled"));
-      } else {
-        toast.error(t("page.dashboard.ai_update_failed"), error.message);
-      }
-    },
-    onSettled: () => {
-      suggestLayoutAbortRef.current = null;
-      suggestLayoutAbortReasonRef.current = null;
+    onError: (error: Error) => {
+      toast.error(t("page.dashboard.ai_update_failed"), error.message);
     },
   });
 
-  const startDashboardEditing = (conversationModuleId?: string) => {
+  const startDashboardEditing = () => {
     setDraftWidgets(dashboardLayout.widgets.map((widget) => ({ ...widget })));
-    setDraftModules(cloneGeneratedModules(dashboardLayout.modules));
     setLayoutPrompt("");
-    setLayoutGenerationError(null);
-    setPendingPreviewModuleId(null);
-    setModuleConversationId(conversationModuleId ?? null);
-    setModuleConversationPrompt("");
-    setModuleConversationIds(Object.fromEntries(
-      dashboardLayout.modules
-        .filter((module) => module.conversation_id)
-        .map((module) => [module.id, module.conversation_id as string]),
-    ));
-    setLayoutConversationId(null);
-    preSuggestionLayoutRef.current = null;
     setEditingDashboard(true);
-    if (conversationModuleId) {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => {
-          document
-            .querySelector(`[data-module-id="${conversationModuleId}"]`)
-            ?.scrollIntoView({ behavior: "smooth", block: "center" });
-        });
-      });
-    }
   };
 
   const setDraftWidgetVisibility = (
@@ -886,141 +510,19 @@ export default function Dashboard() {
     setDraggedWidget(null);
   };
 
-  const setDraftModuleVisibility = (moduleId: string, visible: boolean) => {
-    setDraftModules((current) =>
-      current.map((module) =>
-        module.id === moduleId ? { ...module, visible } : module,
-      ),
-    );
-  };
-
-  const moveDraftModule = (moduleId: string, offset: -1 | 1) => {
-    setDraftModules((current) => {
-      const index = current.findIndex((module) => module.id === moduleId);
-      const targetIndex = index + offset;
-      if (index < 0 || targetIndex < 0 || targetIndex >= current.length) return current;
-      const next = [...current];
-      const [moved] = next.splice(index, 1);
-      next.splice(targetIndex, 0, moved);
-      return next;
-    });
-  };
-
-  const loadModuleConversation = async (moduleId: string) => {
-    if (!dashboardLayout.modules.some((module) => module.id === moduleId)) return;
-    setLoadingModuleConversationId(moduleId);
-    try {
-      const value = await api.dashboard.moduleConversation(moduleId);
-      if (value.conversation_id) {
-        setModuleConversationIds((current) => ({
-          ...current,
-          [moduleId]: value.conversation_id as string,
-        }));
-      }
-      setModuleConversations((current) => ({
-        ...current,
-        [moduleId]: value.messages.map((message) => ({
-          role: message.role,
-          content: message.content,
-          toolCalls: message.tool_calls ?? [],
-        })),
-      }));
-    } catch {
-      // Unsaved previews do not have server-side conversation history yet.
-    } finally {
-      setLoadingModuleConversationId((current) =>
-        current === moduleId ? null : current,
-      );
-    }
-  };
-
-  const openModuleConversation = (moduleId: string) => {
-    if (!editingDashboard) {
-      startDashboardEditing(moduleId);
-      void loadModuleConversation(moduleId);
-      return;
-    }
-    if (pendingPreviewModuleId && pendingPreviewModuleId !== moduleId) {
-      document
-        .querySelector(`[data-module-id="${pendingPreviewModuleId}"]`)
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
-      return;
-    }
-    setModuleConversationId(moduleId);
-    setModuleConversationPrompt("");
-    void loadModuleConversation(moduleId);
-  };
-
-  const submitModuleConversation = (moduleId: string) => {
-    const prompt = moduleConversationPrompt.trim();
-    if (!prompt || suggestLayoutMutation.isPending) return;
-    appendModuleConversationMessage(moduleId, { role: "user", content: prompt });
-    setModuleConversationPrompt("");
-    suggestLayoutMutation.mutate({
-      prompt,
-      widgets: draftWidgets,
-      modules: draftModules,
-      targetModuleId: moduleId,
-      conversationId:
-        moduleConversationIds[moduleId] ||
-        draftModules.find((module) => module.id === moduleId)?.conversation_id ||
-        undefined,
-    });
-  };
-
-  const saveDraftLayout = () => {
-    saveLayoutMutation.mutate({
-      version: 2,
-      widgets: draftWidgets,
-      modules: draftModules,
-    });
-  };
-
-  const discardGeneratedPreview = () => {
-    const previous = preSuggestionLayoutRef.current;
-    if (previous) {
-      setDraftWidgets(previous.widgets.map((widget) => ({ ...widget })));
-      setDraftModules(cloneGeneratedModules(previous.modules));
-    }
-    const targetModuleId = suggestLayoutMutation.variables?.targetModuleId;
-    if (!targetModuleId) {
-      setLayoutPrompt(suggestLayoutMutation.variables?.prompt || "");
-    }
-    setPendingPreviewModuleId(null);
-    preSuggestionLayoutRef.current = null;
-    window.requestAnimationFrame(() => {
-      document
-        .querySelector(".dashboard-inline-editor")
-        ?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-  };
-
   const { data: stats, isLoading: statsLoading } = useQuery({
     queryKey: ["dashboard-stats", wsFilter],
     queryFn: () => api.dashboard.stats(wsFilter),
   });
 
-  const taskTrendDays = Math.max(
-    14,
-    ...visibleGeneratedModules
-      .flatMap((module) => module.code.data_requests)
-      .filter((request) => request.source === "task_trends")
-      .map((request) => Math.min(365, Math.max(1, Number(request.params.days) || 14))),
-  );
   const { data: taskTrends, isLoading: _trendsLoading } = useQuery({
-    queryKey: ["dashboard-task-trends", taskTrendDays, wsFilter],
-    queryFn: () => api.dashboard.taskTrends(taskTrendDays, wsFilter),
+    queryKey: ["dashboard-task-trends", wsFilter],
+    queryFn: () => api.dashboard.taskTrends(14, wsFilter),
   });
 
   const { data: recentActivity, isLoading: activityLoading } = useQuery({
-    queryKey: ["dashboard-recent-activity", wsFilter, dashboardLastSeenAt],
-    enabled: Boolean(dashboardLastSeenAt),
-    queryFn: () =>
-      api.dashboard.recentActivity(
-        100,
-        wsFilter,
-        dashboardLastSeenAt ?? undefined,
-      ),
+    queryKey: ["dashboard-recent-activity", wsFilter],
+    queryFn: () => api.dashboard.recentActivity(100, wsFilter),
   });
 
   const { data: activeGoals } = useQuery({
@@ -1031,15 +533,6 @@ export default function Dashboard() {
   const { data: workspaces } = useQuery({
     queryKey: ["workspaces"],
     queryFn: () => api.workspaces.list(),
-  });
-
-  const generatedModulesNeedTasks = visibleGeneratedModules.some(
-    (module) => module.code.data_requests.some((request) => request.source === "tasks"),
-  );
-  const { data: generatedTasksData } = useQuery({
-    queryKey: ["dashboard-generated-module-tasks", wsFilter],
-    enabled: generatedModulesNeedTasks,
-    queryFn: () => api.tasks.list({ limit: 200, workspace_id: wsFilter }),
   });
 
   const { data: usageData } = useQuery({
@@ -1109,14 +602,17 @@ export default function Dashboard() {
 
   /* While-you-were-away: recent visible task activity */
   const sleepItems = (recentActivity ?? []) as Record<string, any>[];
+  const sleepIntakeItems = sleepItems.filter(
+    (i) => i.action === "created" || i.action === "proposed",
+  );
   const sleepCompletedCount = sleepItems.filter(
-    (item) => item.action === "completed",
+    (i) => i.action === "completed",
   ).length;
   const sleepFailedCount = sleepItems.filter(
-    (item) => item.action === "failed",
+    (i) => i.action === "failed",
   ).length;
   const sleepNeedsInput = sleepItems.filter(
-    (item) => item.action === "waiting_on_customer",
+    (i) => i.action === "waiting_on_customer",
   ).length;
 
   const latestWorkspaces = (() => {
@@ -1189,9 +685,10 @@ export default function Dashboard() {
     { value: agentsSubscribed, label: t("nav.agents"), color: "gray" },
   ];
 
+  /* Task trend summary for brief prose */
   const trendTotal = (taskTrends ?? []).reduce(
-    (sum: number, item: any) =>
-      sum + ((item.created ?? item.count ?? item.value ?? 0) as number),
+    (sum: number, d: any) =>
+      sum + ((d.created ?? d.count ?? d.value ?? 0) as number),
     0,
   );
 
@@ -1285,20 +782,8 @@ export default function Dashboard() {
   const showWorkspaces = isWidgetVisible("workspaces");
   const showTaskTrend = isWidgetVisible("task_trend");
   const showContextRail = showWorkspaces || showTaskTrend;
-  const hasGeneratedModules = visibleGeneratedModules.length > 0;
-  const editingModuleWithAiId = suggestLayoutMutation.variables?.targetModuleId;
-  const isGeneratingModule =
-    suggestLayoutMutation.isPending && !editingModuleWithAiId;
-  const showInlineGeneratingPlaceholder = editingDashboard && isGeneratingModule;
-  const showGeneratedSection =
-    hasGeneratedModules || (isGeneratingModule && !showInlineGeneratingPlaceholder);
   const hasContentWidgets = showActivity || showContextRail;
-  const hasVisibleWidgets =
-    showDailyBrief ||
-    metricWidgetIds.length > 0 ||
-    showInlineGeneratingPlaceholder ||
-    showGeneratedSection ||
-    hasContentWidgets;
+  const hasVisibleWidgets = showDailyBrief || metricWidgetIds.length > 0 || hasContentWidgets;
   const activityFirst =
     (widgetOrder.get("activity") ?? Number.MAX_SAFE_INTEGER) <=
     Math.min(
@@ -1315,10 +800,8 @@ export default function Dashboard() {
   const dashboardRows = [
     "auto",
     editingDashboard ? "auto" : null,
-    showInlineGeneratingPlaceholder ? "auto" : null,
     showDailyBrief ? "auto" : null,
     metricWidgetIds.length > 0 ? "auto" : null,
-    showGeneratedSection ? "auto" : null,
     hasContentWidgets || !hasVisibleWidgets ? "minmax(0, 1fr)" : null,
   ].filter(Boolean).join(" ");
 
@@ -1413,28 +896,19 @@ export default function Dashboard() {
     onHide: (id: DashboardWidgetId) => setDraftWidgetVisibility(id, false),
   });
 
-  const generatedModuleData = {
-    tasks: (generatedTasksData?.items ?? []) as Task[],
-    workspaces: (workspaces ?? []) as Workspace[],
-    activity: (recentActivity ?? []) as Record<string, any>[],
-    taskTrends: (taskTrends ?? []) as Record<string, any>[],
-    stats: stats as Record<string, any> | undefined,
-  };
-
   return (
     <>
       <div
-        className={`dashboard-page${editingDashboard ? " is-editing" : ""}${showGeneratedSection ? " has-generated-modules" : ""}`}
+        className={`dashboard-page${editingDashboard ? " is-editing" : ""}`}
         style={{
           display: "grid",
           gridTemplateRows: dashboardRows,
           minHeight: "100%",
-          height: showGeneratedSection ? "auto" : "100%",
+          height: "100%",
           boxSizing: "border-box",
           padding: "12px 24px",
           gap: 10,
-          overflowY: showGeneratedSection ? "auto" : "hidden",
-          overflowX: "hidden",
+          overflow: "hidden",
         }}
       >
       {/* ── Greeting Header ──────────────────────────── */}
@@ -1485,90 +959,58 @@ export default function Dashboard() {
           </p>
         </div>
         {!editingDashboard && (
-          <Tooltip content={t("page.dashboard.customize_tooltip")} position="left">
-            <button
-              type="button"
-              className="dashboard-customize-trigger"
-              aria-label={t("page.dashboard.customize")}
-              disabled={dashboardLayoutLoading}
-              onClick={() => startDashboardEditing()}
-            >
-              <IconSettings size={16} />
-            </button>
-          </Tooltip>
+          <button
+            type="button"
+            className="dashboard-customize-trigger"
+            onClick={startDashboardEditing}
+          >
+            <IconSettings size={15} />
+            {t("page.dashboard.customize")}
+          </button>
         )}
       </div>
 
       {editingDashboard && (
         <DashboardInlineEditor
           widgets={draftWidgets}
-          modules={draftModules}
           aiPrompt={layoutPrompt}
-          saving={saveLayoutMutation.isPending}
-          suggesting={suggestLayoutMutation.isPending}
-          previewPending={pendingPreviewModuleId !== null}
-          aiStatusMessage={
-            suggestLayoutMutation.isPending
-              ? t("page.dashboard.ai_generating_inline")
-              : layoutGenerationError
+          saving={
+            saveLayoutMutation.isPending ||
+            (suggestLayoutMutation.isPending &&
+              suggestLayoutMutation.variables?.saveAfter === true)
           }
-          aiStatusTone={suggestLayoutMutation.isPending ? "loading" : "error"}
-          onAiPromptChange={(value) => {
-            setLayoutPrompt(value);
-            if (layoutGenerationError) setLayoutGenerationError(null);
-          }}
+          suggesting={suggestLayoutMutation.isPending}
+          onAiPromptChange={setLayoutPrompt}
           onApplyAi={() =>
             suggestLayoutMutation.mutate({
               prompt: layoutPrompt.trim(),
               widgets: draftWidgets,
-              modules: draftModules,
-              conversationId: layoutConversationId ?? undefined,
+              saveAfter: false,
             })
           }
           onShow={(widgetId) => setDraftWidgetVisibility(widgetId, true)}
-          onShowModule={(moduleId) => setDraftModuleVisibility(moduleId, true)}
-          onRestore={() => {
-            suggestLayoutAbortRef.current?.abort();
+          onRestore={() =>
             setDraftWidgets(
               DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
-            );
-            setDraftModules([]);
-            setLayoutGenerationError(null);
-            setPendingPreviewModuleId(null);
-            setModuleConversationId(null);
-            setModuleConversationPrompt("");
-            setModuleConversations({});
-            setModuleConversationIds({});
-            setLayoutConversationId(null);
-            setLoadingModuleConversationId(null);
-            preSuggestionLayoutRef.current = null;
-          }}
+            )
+          }
           onCancel={() => {
-            if (suggestLayoutMutation.isPending) {
-              suggestLayoutAbortReasonRef.current = "user";
-              suggestLayoutAbortRef.current?.abort();
-              return;
-            }
             setEditingDashboard(false);
             setLayoutPrompt("");
-            setLayoutGenerationError(null);
-            setPendingPreviewModuleId(null);
-            setModuleConversationId(null);
-            setModuleConversationPrompt("");
-            setModuleConversations({});
-            setModuleConversationIds({});
-            setLayoutConversationId(null);
-            setLoadingModuleConversationId(null);
-            preSuggestionLayoutRef.current = null;
             setDraggedWidget(null);
           }}
-          onSave={saveDraftLayout}
-        />
-      )}
-
-      {showInlineGeneratingPlaceholder && (
-        <DashboardGeneratingModule
-          request={suggestLayoutMutation.variables?.prompt || layoutPrompt}
+          onSave={() => {
+            const prompt = layoutPrompt.trim();
+            if (prompt) {
+              suggestLayoutMutation.mutate({
+                prompt,
+                widgets: draftWidgets,
+                saveAfter: true,
+              });
+            } else {
+              saveLayoutMutation.mutate(draftWidgets);
+            }
+          }}
         />
       )}
 
@@ -1685,7 +1127,41 @@ export default function Dashboard() {
         <div
           style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 22 }}
         >
+          {/* Left — What AI Did Yesterday */}
           <div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                marginBottom: 7,
+              }}
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="#78716c"
+                strokeWidth={2}
+              >
+                <circle cx="12" cy="12" r="10" />
+                <path d="M12 6v6l4 2" />
+              </svg>
+              <span
+                className="dashboard-eyebrow"
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.05em",
+                  color: "#78716c",
+                }}
+              >
+                {t("page.dashboard.what_ai_did_yesterday")}
+              </span>
+            </div>
+
             {statsLoading ? (
               <Skeleton className="h-16 mb-4" />
             ) : (
@@ -1710,15 +1186,12 @@ export default function Dashboard() {
                   : t("page.dashboard.document")}
                 , {t("page.dashboard.handled")} <strong>{trendTotal}</strong>{" "}
                 {t("page.dashboard.tasks_past_14_days")}{" "}
-                {t("page.dashboard.estimated")}{" "}
-                <strong>
-                  {timeSavedMin}
-                  {t("page.dashboard.m")}
-                </strong>{" "}
+                {t("page.dashboard.estimated")} <strong>{timeSavedMin}{t("page.dashboard.m")}</strong>{" "}
                 {t("page.dashboard.time_saved_suffix")}
               </p>
             )}
 
+            {/* KPI cards row */}
             <div
               style={{
                 display: "grid",
@@ -1770,7 +1243,7 @@ export default function Dashboard() {
           </div>
 
           {/* Right — Requires Your Attention */}
-          <div style={{ width: "100%", maxWidth: 640, marginLeft: "auto" }}>
+          <div>
             <div
               style={{
                 display: "flex",
@@ -1918,74 +1391,6 @@ export default function Dashboard() {
           </DashboardWidgetFrame>
         ))}
       </div>
-      )}
-
-      {showGeneratedSection && (
-        <section className="dashboard-generated-grid">
-          {isGeneratingModule && !showInlineGeneratingPlaceholder && (
-            <DashboardGeneratingModule
-              request={suggestLayoutMutation.variables?.prompt || layoutPrompt}
-            />
-          )}
-          {visibleGeneratedModules.map((module) => {
-            const moduleIndex = draftModules.findIndex((item) => item.id === module.id);
-            return (
-              <GeneratedDashboardModule
-                key={module.id}
-                module={module}
-                data={generatedModuleData}
-                editing={editingDashboard}
-                conversationOpen={moduleConversationId === module.id}
-                conversationMessages={moduleConversations[module.id] ?? []}
-                conversationPrompt={
-                  moduleConversationId === module.id ? moduleConversationPrompt : ""
-                }
-                conversationUpdating={
-                  suggestLayoutMutation.isPending && editingModuleWithAiId === module.id
-                }
-                conversationLoading={loadingModuleConversationId === module.id}
-                previewPending={pendingPreviewModuleId === module.id}
-                confirming={saveLayoutMutation.isPending}
-                canMoveUp={moduleIndex > 0}
-                canMoveDown={moduleIndex >= 0 && moduleIndex < draftModules.length - 1}
-                onMove={(offset) => moveDraftModule(module.id, offset)}
-                onHide={() => setDraftModuleVisibility(module.id, false)}
-                onOpenConversation={() => openModuleConversation(module.id)}
-                onCloseConversation={() => {
-                  setModuleConversationId(null);
-                  setModuleConversationPrompt("");
-                }}
-                onConversationPromptChange={setModuleConversationPrompt}
-                onSubmitConversation={() => submitModuleConversation(module.id)}
-                onConfirm={saveDraftLayout}
-                onDiscard={discardGeneratedPreview}
-                onDelete={() => {
-                  if (pendingPreviewModuleId === module.id) {
-                    setPendingPreviewModuleId(null);
-                    preSuggestionLayoutRef.current = null;
-                  }
-                  if (moduleConversationId === module.id) {
-                    setModuleConversationId(null);
-                    setModuleConversationPrompt("");
-                  }
-                  setModuleConversations((current) => {
-                    const next = { ...current };
-                    delete next[module.id];
-                    return next;
-                  });
-                  setModuleConversationIds((current) => {
-                    const next = { ...current };
-                    delete next[module.id];
-                    return next;
-                  });
-                  setDraftModules((current) =>
-                    current.filter((item) => item.id !== module.id),
-                  );
-                }}
-              />
-            );
-          })}
-        </section>
       )}
 
       {/* ── Activity and Context ── */}
@@ -2551,7 +1956,7 @@ export default function Dashboard() {
                 type="area"
                 height={96}
                 color="#4f7169"
-                color2="#8f8780"
+                color2="#4d6fa8"
               />
             </div>
             </DashboardWidgetFrame>
@@ -2572,13 +1977,11 @@ export default function Dashboard() {
             size="sm"
             onClick={
               editingDashboard
-                ? () => {
+                ? () =>
                     setDraftWidgets(
                       DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
-                    );
-                    setDraftModules([]);
-                  }
-                : () => startDashboardEditing()
+                    )
+                : startDashboardEditing
             }
           >
             <IconSettings size={14} />

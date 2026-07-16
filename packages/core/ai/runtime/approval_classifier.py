@@ -58,7 +58,6 @@ _MUTATION_PREFIXES = ("update_", "create_", "publish_", "send_", "upload_", "arc
 _READ_ONLY_TOOLS = {
     "search_tools",
     "web_search",
-    "web_event_search",
     "web_fetch",
     "read_file",
     "list_files",

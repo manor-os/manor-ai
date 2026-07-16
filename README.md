@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="./docs-site/static/img/logo.svg" height="56" alt="Manor AI logo" />
+  <img src="./docs-site/static/img/content.png" width="750" alt="Manor AI logo" style="max-width: 100%" />
 </p>
 
-<h1 align="center">Manor AI</h1>
+<!-- <h1 align="center">Manor AI</h1>
 
 <p align="center">
   <strong>Self-hosted AI workspace runtime for governed agents, tasks, tools, and knowledge.</strong>
-</p>
+</p> -->
 
 <p align="center">
   Bring agents out of one-off chat and into accountable workspace operations:

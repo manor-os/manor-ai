@@ -13,10 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from packages.core.ai.runtime import (
-    runtime_provision_agent_action,
-    runtime_query_entity_agents_action,
-)
+from packages.core.ai.runtime import runtime_provision_agent_action
 
 
 PROVISION_AGENT_SCHEMA = {
@@ -86,61 +83,13 @@ PROVISION_AGENT_SCHEMA = {
 }
 
 
-QUERY_ENTITY_AGENTS_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "query_entity_agents",
-        "description": (
-            "Return structured, read-only Agent metadata visible to the current entity. "
-            "Includes status, category, bindings, and deployment counts, but never system prompts."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Optional name, description, or category filter.",
-                },
-                "statuses": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": 10,
-                },
-                "include_templates": {
-                    "type": "boolean",
-                    "description": "Include public platform templates when true.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                },
-            },
-        },
-    },
-}
-
-
 async def _provision_agent_handler(
     entity_id: str = "", user_id: str = "", **kwargs: Any,
 ) -> str:
     return await runtime_provision_agent_action(entity_id=entity_id, params=kwargs)
 
 
-async def _query_entity_agents_handler(
-    entity_id: str = "", user_id: str = "", **kwargs: Any,
-) -> str:
-    return await runtime_query_entity_agents_action(
-        entity_id=entity_id,
-        query=str(kwargs.get("query") or ""),
-        statuses=list(kwargs.get("statuses") or []),
-        include_templates=bool(kwargs.get("include_templates", False)),
-        limit=int(kwargs.get("limit") or 50),
-    )
-
-
 def get_tools():
     return [
         (PROVISION_AGENT_SCHEMA, _provision_agent_handler),
-        (QUERY_ENTITY_AGENTS_SCHEMA, _query_entity_agents_handler),
     ]

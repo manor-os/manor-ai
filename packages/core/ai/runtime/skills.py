@@ -271,18 +271,6 @@ async def runtime_invoke_skill_action(
 ) -> str:
     """Invoke a skill and format the tool result through Runtime."""
 
-    manually_selected_slugs = {
-        str(value).strip().lower()
-        for value in (getattr(runtime_context, "manual_skill_slugs", None) or ())
-        if str(value or "").strip()
-    }
-    if (
-        bool(getattr(runtime_context, "manual_skill_selected", False))
-        and manually_selected_slugs
-        and str(skill or "").strip().lower() not in manually_selected_slugs
-    ):
-        return f"Error invoking skill '{skill}': skill was not selected for this turn"
-
     effective_input_text = str(input_text or "").strip()
     if not effective_input_text:
         effective_input_text = str(getattr(runtime_context, "active_user_message", "") or "").strip()

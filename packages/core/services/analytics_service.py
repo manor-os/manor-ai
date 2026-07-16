@@ -1,7 +1,7 @@
 """Dashboard analytics service — aggregate stats, trends, and activity feeds."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 
 from sqlalchemy import Date, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -326,40 +326,6 @@ async def get_recent_activity(
         "completed",
         "failed",
     ]
-    def parse_since(value: str | None) -> datetime | None:
-        if not value:
-            return None
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-
-    def aware(value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value
-
-    def activity_timestamp(task: Task) -> datetime | None:
-        if task.status == "completed":
-            return aware(task.completed_at or task.updated_at or task.started_at or task.created_at)
-        if task.status == "in_progress":
-            return aware(task.started_at or task.updated_at or task.created_at)
-        if task.status in {"proposed", "waiting_on_customer", "failed"}:
-            return aware(task.updated_at or task.completed_at or task.started_at or task.created_at)
-        return aware(task.created_at or task.updated_at)
-
-    since_dt = parse_since(since)
-    activity_time_expr = func.coalesce(
-        Task.completed_at,
-        Task.started_at,
-        Task.updated_at,
-        Task.created_at,
-    )
     task_q = (
         select(Task)
         .where(
@@ -368,13 +334,11 @@ async def get_recent_activity(
             # Keep scheduler-created internal tasks out of the human dashboard.
             Task.details["scheduled_job_id"].astext.is_(None),
         )
-        .order_by(activity_time_expr.desc())
+        .order_by(Task.created_at.desc())
         .limit(limit)
     )
     if workspace_id:
         task_q = task_q.where(Task.workspace_id == workspace_id)
-    if since_dt:
-        task_q = task_q.where(activity_time_expr >= since_dt)
 
     try:
         tasks = (await db.execute(task_q)).scalars().all()
@@ -421,12 +385,11 @@ async def get_recent_activity(
         except Exception:
             pass
 
+        ts = None
         try:
-            ts = activity_timestamp(t)
+            ts = t.completed_at or t.started_at or t.created_at
         except Exception:
-            ts = aware(t.created_at)
-        if since_dt and (ts is None or ts <= since_dt):
-            continue
+            ts = t.created_at
 
         results.append({
             "id": f"task-{t.id}",
