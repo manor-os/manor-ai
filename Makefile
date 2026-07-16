@@ -1,13 +1,10 @@
 TAG ?= prod
-OSS_RELEASE_DIR ?= /tmp/manor-os-oss
-OSS_PYTHON ?= $(shell if [ -x .venv/bin/python ]; then printf '%s' .venv/bin/python; else printf '%s' python3; fi)
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then printf '%s' .venv/bin/python; else printf '%s' python3; fi)
 PYTEST_DEFAULT_MARKERS ?= not e2e and not manual and not slow and not network and not docker and not cloud
 PYTEST_REGRESSION_MARKERS ?= not manual and not network and not docker and not cloud
-PYTEST_CLOUD_REGRESSION_MARKERS ?= cloud and not manual and not network and not docker
 PYTEST_ENV = TEST_DATABASE_URL="postgresql+asyncpg://manor:manor_secret@localhost:5434/manor_test" MANOR_FS_ENABLED=false PYTHONPATH=.
 
-.PHONY: dev test test-smoke test-regression test-cloud-regression test-manual test-e2e test-all test-ws test-embedding lint build clean docker-up
+.PHONY: dev test test-smoke test-regression test-manual test-e2e test-all test-ws test-embedding lint build clean docker-up
 
 # Development
 dev-api:
@@ -28,8 +25,6 @@ test-smoke: test
 test-regression:
 	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "$(PYTEST_REGRESSION_MARKERS)" -q --tb=short -p no:warnings
 
-test-cloud-regression:
-	$(PYTEST_ENV) DEPLOYMENT_MODE=cloud $(PYTHON) -m pytest tests/ -m "$(PYTEST_CLOUD_REGRESSION_MARKERS)" -q --tb=short -p no:warnings
 
 test-manual:
 	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "manual" -q --tb=short -p no:warnings

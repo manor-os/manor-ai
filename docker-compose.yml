@@ -575,47 +575,6 @@ services:
     depends_on:
       - temporal
 
-  # ── Browser runner sidecar ──
-  # Headless / headed Chromium + Playwright in a self-contained
-  # container with a full X11 stack (Xvfb + fluxbox + x11vnc +
-  # websockify) for headed-login flows.
-  #
-  # api / worker call POST /perform with provider name + cookies and
-  # this container drives the GUI. Used by NotebookLM, Claude.ai web,
-  # ChatGPT web, LinkedIn (Search & Messaging), Xiaohongshu (browser),
-  # and any future "no-API but cookies-let-me-in" tool.
-  #
-  # Used to be profile-gated (``profiles: ["browser"]``) so that
-  # local ``docker compose up`` skipped the heavy X11 image build.
-  # The gate caused two real production incidents: (1) the
-  # production deploy pipeline shipped browser-driven integrations
-  # without ever starting the sidecar (PR #41); (2) developers ran
-  # ``docker compose up`` and got 502s when clicking Connect on any
-  # browser card. Always-on now — the ~3-5 min first-build cost is
-  # one-time per machine and the cache layer reuses across rebuilds.
-  #
-  # Auth between Manor api and this runner: ``BROWSER_RUNNER_TOKEN``
-  # env (shared bearer). When unset, runner accepts unauthenticated
-  # — safe inside the docker network for dev only.
-  browser-runner:
-    # ``image:`` so the deploy pipeline can ``docker load`` a CI-built
-    # tarball (same pattern as api / web / sandbox / sandbox-skill);
-    # ``build:`` so local ``docker compose up --build`` rebuilds
-    # cleanly when the X11 stack changes.
-    image: manor-browser-runner:${TAG:-prod}
-    build:
-      context: ./docker/browser-runner
-    container_name: manor-os-browser-runner
-    environment:
-      BROWSER_RUNNER_TOKEN: ${BROWSER_RUNNER_TOKEN:-}
-      BROWSER_RUNNER_TIMEOUT_MS: ${BROWSER_RUNNER_TIMEOUT_MS:-90000}
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:5200/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
   # ── Jimeng API proxy ──
   # Reverse-engineered Jimeng (即梦) HTTP gateway from
   # https://github.com/iptag/jimeng-api — exposes OpenAI-compatible

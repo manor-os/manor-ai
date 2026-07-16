@@ -6,6 +6,8 @@ import pytest
 
 from apps.api.routers import health as health_router
 
+pytestmark = pytest.mark.oss_smoke
+
 
 @pytest.mark.asyncio
 async def test_health(client):

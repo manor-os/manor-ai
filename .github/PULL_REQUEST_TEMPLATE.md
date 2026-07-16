@@ -7,12 +7,11 @@ What changed and why?
 - [ ] `make lint`
 - [ ] `make test`
 - [ ] `npm --prefix apps/web run build`
-- [ ] `make oss-check` if this touches cloud-only, billing, marketplace, deploy, docs, or public release files
 
-## Release Boundary
+## Self-Hosted Compatibility
 
-- [ ] This is OSS-safe as-is
-- [ ] This includes cloud-only code and updates `.ossexclude`
+- [ ] This works in self-hosted mode
+- [ ] README, `.env.example`, or setup docs were updated if configuration changed
 - [ ] Not applicable
 
 ## Notes

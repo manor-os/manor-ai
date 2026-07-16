@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manor Dev Stack Verify"
+  short_description: "Run and verify the local Manor stack."
+  default_prompt: "Start or verify the Manor local dev stack and report health."

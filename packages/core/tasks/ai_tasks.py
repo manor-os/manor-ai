@@ -698,7 +698,7 @@ def run_plan(self, plan_id: str):
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
-@celery_app.task(bind=True, max_retries=2)
+@celery_app.task(bind=True, max_retries=2, soft_time_limit=900, time_limit=1080)
 def plan_and_run_task(self, task_id: str):
     """Plan a task → persist as ExecutionPlan → dispatch first cycle.
 
@@ -750,7 +750,7 @@ def plan_and_run_task(self, task_id: str):
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
 
 
-@celery_app.task(bind=True, max_retries=3)
+@celery_app.task(bind=True, max_retries=3, soft_time_limit=1500, time_limit=1800)
 def run_agent_task(self, task_id: str, agent_id: str | None = None):
     """Dispatch an agent to work on a task ticket.
 

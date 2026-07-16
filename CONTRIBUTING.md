@@ -1,6 +1,10 @@
 # Contributing
 
-Thanks for improving Manor OS.
+Thanks for improving Manor AI.
+
+Manor AI is a source-available, self-hosted AI workspace runtime. Contributions
+should help operators run the repository on their own infrastructure with clear
+configuration, predictable upgrades, and user-controlled credentials.
 
 ## Development Setup
 
@@ -29,25 +33,37 @@ make test
 npm --prefix apps/web run build
 ```
 
-For changes that affect the public release boundary, also run:
+Docs changes should also build locally:
 
 ```bash
-make oss-check
+cd docs-site
+npm ci
+npm run build
 ```
 
 ## Pull Requests
 
 - Keep changes scoped to one feature, fix, or release-boundary update.
 - Add or update tests when behavior changes.
-- Update README or docs when user-facing setup, routes, features, or deployment modes change.
+- Update README, docs, or `.env.example` when setup, configuration, routes, or
+  deployment behavior changes.
 - Link the issue or discussion that motivated the change when there is one.
-- Do not include generated binaries, production logs, real customer data, or local `.env` files.
+- Do not include generated binaries, production logs, real customer data, or
+  local `.env` files.
+
+## Good First Areas
+
+- Documentation that makes self-hosted setup clearer.
+- Tests around agent tools, HITL approvals, integrations, and upgrade paths.
+- Small UI improvements that preserve the existing workspace patterns.
+- Connectors that work with user-provided credentials and degrade clearly when
+  optional services are absent.
 
 ## Contribution License
 
 Unless a separate contributor agreement applies, contributions intentionally
 submitted to Manor AI are submitted under the
-[`Manor Sustainable Use License 1.0`](LICENSE). Do not submit code, assets, or
+[Manor Sustainable Use License 1.0](LICENSE). Do not submit code, assets, or
 documents unless you have the right to contribute them under that license.
 
 ## Issues
@@ -57,22 +73,19 @@ Please use the GitHub issue templates when possible. A strong issue includes:
 - What you expected to happen.
 - What actually happened.
 - Reproduction steps or a minimal failing example.
-- Environment details such as OS, Python, Node, Docker, browser, and deployment mode.
+- Environment details such as OS, Python, Node, Docker, browser, and deployment
+  mode.
 - Logs with secrets redacted.
 
-## Public Release Boundary
+## Self-Hosted Scope
 
-The private source tree may contain SaaS/operator code that is stripped from
-the public tree. If you add cloud-only files, update `.ossexclude` in the same
-change. If OSS runtime code imports a helper, keep that helper public and gate
-only the private behavior behind `DEPLOYMENT_MODE=cloud`.
+Contributions should remain usable by operators running Manor AI on their own
+infrastructure. Avoid adding dependencies on hosted Manor AI services unless the
+feature also has a self-hosted path or degrades clearly when optional
+credentials are absent.
 
-Hosted Skill Marketplace, Agent Marketplace, and Apps Marketplace catalogs,
-imports, subscriptions, ratings, reviews, and rankings are Cloud-only.
-Custom/local skills and agents remain public self-hosted core features.
-
-Use [`docs/OSS_CLOUD_FEATURE_BOUNDARY.md`](docs/OSS_CLOUD_FEATURE_BOUNDARY.md)
-to classify new work as OSS, Cloud-only, or shared-core-cloud-gated.
+Local skills, agents, integrations, workflows, browser automation, documents,
+and knowledge features should remain operable in self-hosted mode.
 
 ## Secrets
 
@@ -82,4 +95,4 @@ tokens. Use `.env.example` for placeholders only.
 ## Community
 
 By participating, you agree to follow the project
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

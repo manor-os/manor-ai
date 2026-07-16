@@ -896,9 +896,7 @@ async def resolve_chat_action(
         choice = (req.choice or "").lower()
         if choice in {"provide_answers", "submit", "ok"}:
             # Caller's payload is the answers dict — merge under
-            # 'answers' key so wrappers (linkedin_browser etc.) can
-            # find them. Wrapper needs to start consuming this on
-            # retry; that's a follow-up tweak per tool.
+            # 'answers' key so tools can find them on retry.
             answers = (req.payload or {}).get("answers") or req.payload or {}
             await _resume_step_for_retry(
                 db, user,
@@ -922,9 +920,8 @@ async def resolve_chat_action(
         #   choice="cancel" → fail the step
         choice = (req.choice or "").lower()
         if choice in {"confirm", "ok", "yes", "approve"}:
-            # generic_browser uses 'confirm_destructive', LinkedIn L4
-            # tools use 'confirm'. Set both — extras are ignored by
-            # tools that don't recognize them.
+            # Set both legacy and current confirmation flags — extras are
+            # ignored by tools that don't recognize them.
             await _resume_step_for_retry(
                 db, user,
                 step_id=pa["step_id"],

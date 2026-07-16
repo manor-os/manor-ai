@@ -25,7 +25,10 @@ build/
 
 # ── Node ──
 node_modules/
+.tmp-npm-cache/
 apps/web/dist/
+docs-site/.docusaurus/
+docs-site/build/
 .next/
 *.tsbuildinfo
 

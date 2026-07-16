@@ -4,6 +4,8 @@ import pytest
 from httpx import AsyncClient
 from fastapi.routing import APIRoute
 
+pytestmark = pytest.mark.oss_regression
+
 
 @pytest.mark.asyncio
 async def test_openapi_schema_accessible(client: AsyncClient):

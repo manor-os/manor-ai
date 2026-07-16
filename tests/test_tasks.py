@@ -8,6 +8,8 @@ from httpx import AsyncClient
 
 from packages.core.models.base import generate_ulid
 
+pytestmark = pytest.mark.oss_regression
+
 
 async def _auth(client: AsyncClient, username: str = "taskuser") -> dict:
     resp = await client.post(

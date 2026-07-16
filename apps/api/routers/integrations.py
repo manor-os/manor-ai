@@ -457,35 +457,6 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "setup_hint": "Sign in to jimeng.jianying.com → DevTools → Cookies → copy ``sessionid``.",
                        "color_hex": "#FF2C55",
                        "supports_multi_account": True},
-    "midjourney_web": {"category": "Browser Automation", "tagline": "Midjourney via the web app.",
-                       "docs_url": "https://www.midjourney.com",
-                       "setup_hint": "Sign in once with your Discord-linked Midjourney account.",
-                       "color_hex": "#000000"},
-    "notebooklm":     {"category": "Browser Automation", "tagline": "NotebookLM — research notebooks via web automation (cookies, not API).",
-                       "docs_url": "https://notebooklm.google.com",
-                       "setup_hint": "Sign in to notebooklm.google.com → use a cookie-export extension (Cookie-Editor) → paste the JSON here.",
-                       "color_hex": "#1A73E8",
-                       "supports_multi_account": True},
-    "claude_ai_web":  {"category": "Browser Automation", "tagline": "Claude.ai web — agents use your Claude Pro/Max subscription, not API credits.",
-                       "docs_url": "https://claude.ai",
-                       "setup_hint": "Sign in to claude.ai → export cookies (Cookie-Editor → JSON) → paste here.",
-                       "color_hex": "#D97757",
-                       "supports_multi_account": True},
-    "chatgpt_web":    {"category": "Browser Automation", "tagline": "ChatGPT web — uses your Plus/Team subscription quota, no API spend.",
-                       "docs_url": "https://chatgpt.com",
-                       "setup_hint": "Sign in to chatgpt.com → export cookies (Cookie-Editor → JSON) → paste here.",
-                       "color_hex": "#10A37F",
-                       "supports_multi_account": True},
-    "gemini_web":     {"category": "Browser Automation", "tagline": "Gemini web — leverages your Gemini Advanced subscription.",
-                       "docs_url": "https://gemini.google.com",
-                       "setup_hint": "Sign in to gemini.google.com → export Google session cookies → paste here.",
-                       "color_hex": "#4285F4",
-                       "supports_multi_account": True},
-    "perplexity_web": {"category": "Browser Automation", "tagline": "Perplexity Pro — unlimited Sonar + research without API metering.",
-                       "docs_url": "https://www.perplexity.ai",
-                       "setup_hint": "Sign in to perplexity.ai (Pro account) → export cookies → paste here.",
-                       "color_hex": "#0F766E",
-                       "supports_multi_account": True},
     "producthunt":    {"category": "Marketing", "tagline": "Product Hunt — launch-day stats, comments, and posting.",
                        "docs_url": "https://api.producthunt.com/v2/docs",
                        "setup_hint": "Create a PH OAuth app at api.producthunt.com → API → Applications, then connect.",
@@ -608,23 +579,6 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "example_prompts": [
                            "List my orders from the last 24h that aren't shipped yet.",
                            "Lower the price on ASIN B0XXXX by 5% via a listing patch.",
-                       ]},
-    "linkedin_browser": {"category": "Browser Automation",
-                       "tagline": "LinkedIn search / messaging / jobs — covers what the official API doesn't.",
-                       "docs_url": "https://www.linkedin.com",
-                       "setup_hint": "Click Connect → sign in once in the embedded Chromium. Use a DEDICATED account; this path violates LinkedIn ToS §8.2.",
-                       "color_hex": "#0A66C2",
-                       "supports_multi_account": True,
-                       "capabilities": [
-                           "Search people / companies / jobs",
-                           "View third-party profiles + posts",
-                           "Send DMs and post comments (with confirm gate)",
-                           "Easy Apply automation (with confirm gate)",
-                       ],
-                       "example_prompts": [
-                           "Find 5 series A founders in fintech and summarise their LinkedIn headlines.",
-                           "Watch jobs/search for 'staff engineer remote' and email me new posts daily.",
-                           "Reply to my last 10 unread messages with a friendly acknowledgement.",
                        ]},
     # Remote MCP servers (transport=http, vendor-hosted)
     "paypal":     {"category": "Finance", "tagline": "Connect your PayPal account — agent creates orders, invoices, handles disputes, manages subscriptions.",
@@ -1888,6 +1842,13 @@ async def oauth_callback(
         if refresh_token:
             existing.refresh_token = refresh_token
         existing.token_expires_at = token_expires_at
+        profile = dict(existing.profile or {})
+        # A user just completed OAuth again, so any previous "auth failed /
+        # reconnect required" health result is stale. The async health probe
+        # below will write a fresh result after it validates the new token.
+        profile.pop("last_health_check", None)
+        profile.pop("oauth_refresh", None)
+        existing.profile = profile
         oauth_row_id = existing.id
     else:
         new_row = OAuthAccount(
