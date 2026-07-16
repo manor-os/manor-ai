@@ -1,9 +1,13 @@
-"""Knowledge-path → signed URL conversion for local-worker downloads.
+"""Knowledge-path → signed URL conversion for browser-runner inputs.
 
-Local workers do not share the API / JuiceFS knowledge filesystem mount.
-When a tool needs to hand a user-visible Knowledge file to the paired local
-worker, the API rewrites the path into a short-lived **signed URL** that
-resolves through the existing ``GET /api/v1/fs/public/{token}`` endpoint.
+Browser-runner runs in its own container and has no shared mount with
+the api / JuiceFS knowledge filesystem. When an agent passes a
+knowledge path (e.g. ``/Photos/foo.jpg``) to a browser tool that needs
+the file (e.g. ``browser.publish_media``), the wrapper
+on the api side rewrites those paths into short-lived **signed URLs**
+that resolve back through the api's existing
+``GET /api/v1/fs/public/{token}`` endpoint. Runner then fetches with
+its existing ``_fetch_to_tempfile`` helper — no new IO surface needed.
 
 Tenant safety
 ─────────────
@@ -39,8 +43,9 @@ Usage
     #    "https://example.com/dog.png"]
 
 URLs already starting with ``http://`` / ``https://`` pass through
-unchanged. Local temporary paths are rejected — agents should pass
-knowledge-relative paths.
+unchanged. Local /tmp paths from inside the runner container are
+rejected — agents shouldn't be passing those, only knowledge-relative
+paths.
 """
 from __future__ import annotations
 
@@ -59,9 +64,11 @@ from packages.core.services.knowledge_visibility import (
 logger = logging.getLogger(__name__)
 
 
-# URL local workers can use to reach back to the API for signed-file fetches.
-# Defaults to the docker-compose service hostname; callers can pass paired
-# public/local origins as candidates in mixed staging/local deployments.
+# URL the browser-runner uses to reach back to the api for signed-file
+# fetches. Defaults to the docker-compose service hostname; override for
+# multi-host deployments. The PUBLIC api hostname (e.g. manor.ai) would
+# also work but is slower (extra TLS hop) and exposes intermediate
+# routers to the file traffic.
 _INTERNAL_API_URL = os.environ.get(
     "MANOR_INTERNAL_API_URL", "http://api:8000",
 ).rstrip("/")
@@ -84,7 +91,7 @@ def paths_to_signed_urls(
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
     base_url: str | None = None,
 ) -> List[str]:
-    """Convert a mixed list of paths/URLs into URLs a worker can GET.
+    """Convert a mixed list of paths/URLs into URLs the runner can GET.
 
     - ``http://`` / ``https://`` URLs pass through.
     - Knowledge-relative paths (``/Photos/foo.jpg`` or ``Photos/foo.jpg``)
@@ -180,7 +187,7 @@ def safe_paths_to_signed_urls(
     if not entity_id:
         return None, (
             "Internal: entity_id is missing in the call context; "
-            "knowledge files cannot be signed for local-worker download."
+            "knowledge files cannot be signed for browser-runner."
         )
     try:
         return paths_to_signed_urls(
@@ -211,7 +218,7 @@ def safe_paths_to_signed_url_candidates(
     if not entity_id:
         return None, (
             "Internal: entity_id is missing in the call context; "
-            "knowledge files cannot be signed for local-worker download."
+            "knowledge files cannot be signed for browser-runner."
         )
     normalized_paths = list(paths or [])
     candidates: List[List[str]] = [[] for _ in normalized_paths]

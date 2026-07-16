@@ -32,6 +32,8 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "chrome_browser",
     "local_browser",
     "web_browser",
+    "midjourney",
+    "midjourney_web",
     "instagram",
     "instagram_browser",
     "threads",
@@ -42,10 +44,12 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "kuaishou_browser",
     "boss_zhipin",
     "boss",
+    "linkedin_browser",
 }
 
 _PREFERRED_PROVIDER_BY_DUPLICATE = {
     "local_browser": _BROWSER_PROVIDER,
+    "midjourney_web": _BROWSER_PROVIDER,
 }
 
 

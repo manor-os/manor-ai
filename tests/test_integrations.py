@@ -9,8 +9,6 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Channel, Integration
 
-pytestmark = pytest.mark.oss_regression
-
 
 async def _auth(client: AsyncClient, username: str = "intuser") -> dict:
     resp = await client.post(

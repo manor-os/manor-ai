@@ -1,10 +1,11 @@
-"""Tenant-safety tests for the Knowledge → local-worker URL signer.
+"""Tenant-safety tests for the knowledge → browser URL signer.
 
 Threat model
 ────────────
-When a Knowledge path is rewritten to a signed URL for a local worker to
-fetch over HTTP, the signature MUST be the only thing deciding which tenant's
-file is served. We test:
+The browser-runner is a single shared container that handles requests
+for every tenant. When a knowledge path is rewritten to a signed URL
+the runner fetches over HTTP, the signature MUST be the only thing
+deciding which tenant's file is served. We test:
 
   1. Signing requires entity_id (no anonymous reads).
   2. A token signed for entity-A is rejected when verified as entity-B
@@ -12,7 +13,7 @@ file is served. We test:
   3. Expired tokens are rejected.
   4. Path-traversal payloads are rejected before signing.
   5. System / hidden paths are blocked (an agent shouldn't be able to
-     ship `.ai/` or `_meta/` files to external tools).
+     ship `.ai/` or `_meta/` files to Xiaohongshu).
   6. Already-HTTP URLs pass through untouched.
   7. ContextVar isolation: two coroutines running concurrently with
      different entity_ids never see each other's context.

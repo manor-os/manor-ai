@@ -1,4 +1,0 @@
-interface:
-  display_name: "Manor PR Prep"
-  short_description: "Prepare Manor changes for PR."
-  default_prompt: "Prepare this Manor branch for PR and list verification evidence."

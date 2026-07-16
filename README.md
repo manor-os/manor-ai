@@ -1,223 +1,408 @@
-<p align="center">
-  <img src="./docs-site/static/img/logo.svg" height="56" alt="Manor AI logo" />
-</p>
+# Manor AI -- The AI Operating System for Enterprise Management
 
-<h1 align="center">Manor AI</h1>
+> A single monorepo replacing Java Spring Boot + MySQL + Vue 2 with **Python FastAPI + PostgreSQL + React**.
+> AI-native from day one: every feature is built around autonomous agents, agentic loops, and intelligent automation.
 
-<p align="center">
-  <strong>Self-hosted AI workspace runtime for governed agents, tasks, tools, and knowledge.</strong>
-</p>
+| Metric | Value |
+|--------|-------|
+| Total lines of code | **73,485** |
+| Python files | 256 |
+| TypeScript files | 78 |
+| Frontend pages | 50 |
+| UI components | 18 |
+| Tests | Marker-layered pytest suites + frontend source checks |
+| API routes | 320 |
+| OpenAPI paths / schemas | 233 / 243 |
+| Docker services | 8 |
+| Sidebar nav items | 22 |
+| i18n locales | 4 (en, zh, es, ja) |
+| Features | 90+ |
 
-<p align="center">
-  Bring agents out of one-off chat and into accountable workspace operations:
-  BYOK models, durable tasks, scoped tools, approvals, audit trails, and local
-  data ownership.
-</p>
+---
 
-<p align="center">
-  <a href="https://manor-os.github.io/docs/manor-ai/quickstart"><strong>Quickstart</strong></a>
-  ·
-  <a href="https://manor-os.github.io/docs/manor-ai/"><strong>Docs</strong></a>
-  ·
-  <a href="https://github.com/manor-os/manor-ai"><strong>GitHub</strong></a>
-  ·
-  <a href="https://discord.gg/dS3HCZAB"><strong>Discord</strong></a>
-  ·
-  <a href="https://x.com/CalvinLin173676"><strong>Twitter</strong></a>
-  ·
-  <a href="https://manorai.xyz/"><strong>Website</strong></a>
-</p>
+## Quick Start
 
-<p align="center">
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Sustainable%20Use-lightgrey"></a>
-  <a href="https://github.com/manor-os/manor-ai/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/manor-os/manor-ai?style=flat&logo=github"></a>
-  <a href="https://discord.gg/dS3HCZAB"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white"></a>
-  <a href="https://x.com/CalvinLin173676"><img alt="Follow on X" src="https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white"></a>
-  <a href="https://manorai.xyz/"><img alt="Website" src="https://img.shields.io/badge/Website-manorai.xyz-0f766e"></a>
-</p>
+### Prerequisites
 
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/89aac5f8-3fbb-405b-81e0-6522e8df1513" width="900" controls poster="./docs-site/static/img/social-card.png"></video>
-</div>
+| Dependency     | Version |
+|----------------|---------|
+| Python         | 3.11+   |
+| Node.js        | 20+     |
+| PostgreSQL     | 16+ (with [pgvector](https://github.com/pgvector/pgvector)) |
+| Redis          | 7+      |
+| Docker Compose | v2      |
 
-## Why Manor AI
-
-Most AI products stop at chat. Real teams need an operating layer around AI:
-shared context, durable tasks, scoped tools, approvals, audit trails, and a way
-to keep sensitive data inside infrastructure they control.
-
-Manor AI is built for that layer: the product surface where model choice,
-workspace memory, tasks, permissions, and human review all meet.
-
-### Own the runtime, not just the chat box
-
-Manor AI brings the core surfaces of an AI workspace into one runtime: chat,
-documents, agents, goals, workflows, reports, integrations, settings, and the
-infrastructure around them. Self-host the app, database, files, agent runtime,
-and integration surfaces; bring your own model keys instead of handing your
-workspace to a hosted black box. Model provider keys are configured in your
-deployment, and operational data stays inside your infrastructure.
-
-### Turn prompts into accountable work
-
-Agents operate through goals, tasks, workspace context, tool permissions, and
-human approval gates. Important automation leaves durable status, evidence, and
-review points instead of disappearing into a one-off chat transcript. Goals
-break work into linked execution steps that teams can inspect and improve.
-
-### Make governance part of the product
-
-Approval gates, scoped tools, audit logs, workspace permissions, and runtime
-signals make automation inspectable before it touches critical workflows. Rules
-are visible to operators and mapped to enforcement patterns in the runtime.
-
-## How Manor AI works
-
-Manor AI is organized around a workspace. A workspace is the boundary where
-people, agents, documents, tasks, goals, tools, credentials, and governance
-rules come together.
-
-```text
-Browser workspace
-  |
-  v
-React web app
-  |
-  v
-FastAPI control plane  <----> PostgreSQL + pgvector
-  |                       |   Redis
-  |                       |   MinIO / JuiceFS
-  v
-Worker runtime
-  |
-  +-- Agent task execution
-  +-- Skills and scoped tools
-  +-- Sandbox service
-  +-- Webhooks / OAuth / Nango integrations
-  +-- Human approval checkpoints
-```
-
-| Concept | What it means in Manor AI |
-| --- | --- |
-| Workspace | The operating boundary for people, agents, documents, tasks, knowledge, credentials, and audit history. |
-| Agent | A reusable AI worker with instructions, model preferences, tool bindings, skills, and governance rules. |
-| Goal / task | Durable work objects that turn prompts into trackable execution, evidence, comments, approvals, and status. |
-| Knowledge | Uploaded documents and extracted text indexed for workspace retrieval with PostgreSQL and pgvector. |
-| Tools / skills | Bounded capabilities and instruction packages that define what an agent can do and how it should do it. |
-| HITL governance | Approval and deny policies that pause sensitive actions before agents affect external systems or critical data. |
-| Integrations | Webhooks, OAuth/Nango connectors, API keys, and external callbacks for connecting Manor AI to your stack. |
-
-## Core capabilities
-
-| Capability | What you get |
-| --- | --- |
-| AI workspace | Chat, goals, tasks, documents, knowledge, reports, agents, and settings in one self-hosted UI. |
-| Agent runtime | Tool-calling loop, model routing, skills, workspace context, task execution, and evidence logs. |
-| BYOK model access | Provider keys are configured in your deployment; Manor AI does not require a hosted model proxy. |
-| Governance | Human approval gates, scoped tools, workspace permissions, runtime signals, and audit-friendly task history. |
-| Knowledge and files | Document uploads, generated artifacts, pgvector-backed retrieval, MinIO object storage, and entity filesystem support. |
-| Integrations | Webhooks, OAuth provider configuration, optional Nango, API keys, MCP server catalog, and connector surfaces. |
-| Operations | Docker Compose stack, health checks, backup guidance, sandbox isolation, configuration docs, and upgrade notes. |
-| Extensibility | Add skills, tools, integrations, workers, model providers, and API clients without changing the core workspace model. |
-
-## Quickstart
+### Development Setup
 
 ```bash
-git clone https://github.com/manor-os/manor-ai.git && cd manor-ai
-cp .env.example .env
-docker compose up --build -d
+# 1. Clone and install
+git clone https://github.com/Manor-AI/manor-os.git && cd manor-os
+cp .env.example .env          # then set local secrets; configure model keys in Settings
+pip install ".[dev]"
+cd apps/web && npm ci && cd ../..
+
+# 2. Start infrastructure (PostgreSQL, Redis, MinIO)
+./scripts/dev.sh infra
+
+# 3. Initialize database (runs Alembic migrations + seed data)
+./scripts/dev.sh init
+
+# 4. Start API + frontend (separate terminals)
+./scripts/dev.sh api          # FastAPI on http://localhost:8000
+./scripts/dev.sh web          # Vite dev server on http://localhost:3000
+
+# 5. (Optional) Start Celery worker for background jobs
+./scripts/dev.sh worker
 ```
 
-Open **http://localhost:18080**.
+Open **http://localhost:3000** to access the application.
 
-Self-hosted mode seeds a local demo account by default:
+### Docker (Production-like)
 
-```text
-demo@manor.local / manor-demo
+```bash
+cp .env.example .env          # local defaults run; configure model keys in Settings
+docker compose up --build -d   # builds and starts the self-hosted stack
 ```
 
-After signing in, add your model provider keys in Settings. Manor AI is BYOK in
-self-hosted deployments; provider credentials stay in your deployment.
+Open **http://localhost:18080**. OSS/self-hosted mode seeds a local demo
+account by default: `demo@manor.local` / `manor-demo`.
 
-## First workflow to try
+### Running Tests
 
-Use the first run to verify the whole system, not just the login page:
+```bash
+make test             # PR smoke: excludes e2e/manual/slow/network/docker/cloud
+make test-regression  # Broader local regression: excludes manual/network/docker/cloud
+make test-cloud-regression # Cloud-only regression with DEPLOYMENT_MODE=cloud
+make test-e2e         # Opt-in e2e/runtime tests
+make test-manual      # Opt-in manual tests
+make test-all         # Everything collected by pytest
+```
 
-1. Start the Docker Compose stack and sign in with the demo account.
-2. Add a model provider key in Settings.
-3. Open the seeded workspace and inspect goals, tasks, documents, and rules.
-4. Create or run a task so an agent uses workspace context and tools.
-5. Trigger a governed action and confirm it pauses for human approval.
-6. Review the resulting task status, evidence, comments, and audit trail.
+---
 
-## What ships in the OSS self-hosted stack
+## Architecture
 
-| Area | Included |
-| --- | --- |
-| Workspace app | React + Vite web UI for chat, tasks, agents, knowledge, documents, workflows, reports, and settings. |
-| API runtime | FastAPI service with auth, RBAC, audit logging, OpenAPI docs, and workspace APIs. |
-| Worker runtime | Celery-backed worker for background jobs, agent execution, task runs, and integration callbacks. |
-| Data services | PostgreSQL 16 with pgvector, Redis, MinIO, and optional JuiceFS-backed entity storage. |
-| Agent runtime | Tool-calling loop, skills, scoped tools, HITL approvals, task runners, and goal workflows. |
-| Sandbox | Isolated execution service for code-producing tools and file-generating workflows. |
-| Integrations | Webhooks, OAuth provider configuration, optional Nango, API keys, MCP catalog, and connector surfaces. |
-| Docs and operations | Docusaurus docs, Docker Compose guide, configuration guide, security notes, backup/restore, and upgrade docs. |
+```
+                         +------------------+
+                         |   React + Vite   |  :3000
+                         |   (apps/web/)    |
+                         +--------+---------+
+                                  |
+                                  v
+                     +------------+------------+
+                     |    FastAPI + Uvicorn    |  :8000
+                     |    (apps/api/)          |
+                     +--+------+------+-------++
+                        |      |      |        |
+                   +----+  +---+  +---+---+ +--+-----+
+                   | PG |  |Redis| |MinIO | |Sandbox |
+                   | 16 |  | 7  | |      | | :8100  |
+                   +----+  +--+-+ +------++ +--------+
+                              |
+                        +-----+------+
+                        |   Celery   |
+                        |   Worker   |
+                        +------------+
+```
 
-The public OSS tree is designed for self-hosted deployments and local
-evaluation. Managed hosting, private deployment automation, and commercial
-cloud operations are separate from this repository. If you are extending Manor
-AI, start from the OSS surfaces above: tools, skills, workers, webhooks,
-OpenAPI clients, and deployment configuration.
+### Layer Breakdown
 
-## Extend Manor AI
+| Layer | Path | Description |
+|-------|------|-------------|
+| **Core library** | `packages/core/` | AI engine, models, services, tools, sandbox SDK |
+| **Cloud extensions** | private release tree | Multi-tenant billing, hosted marketplaces, and platform operations stripped from the public source |
+| **API server** | `apps/api/` | FastAPI routers, middleware, dependency injection |
+| **Web frontend** | `apps/web/` | React 18 SPA with TypeScript, Tailwind CSS, shadcn/ui |
 
-- **Add skills** to teach agents domain-specific workflows and tool usage
-  boundaries.
-- **Bind tools** to agents so each worker has only the capabilities it needs.
-- **Connect systems** through webhooks, OAuth provider configuration, Nango, API
-  keys, and MCP servers.
-- **Use the API** through the same FastAPI surface that powers the web app; see
-  the [API reference](https://manor-os.github.io/docs/manor-ai/api-reference).
-- **Customize deployment** with `.env`, Docker Compose profiles, storage,
-  sandbox settings, and provider credentials.
+---
 
-## Deploy and operate
+## Features (90+)
 
-Before sharing a deployment with real users:
+### Security & Auth
+- JWT authentication with refresh tokens
+- OAuth2 login (Google)
+- SAML SSO integration
+- TOTP two-factor authentication (2FA) with QR code setup
+- RBAC with 29 granular permissions
+- API key management (per-user scoped)
+- Browser session management
+- Audit logging
 
-- Replace default secrets in `.env`.
-- Use HTTPS for `APP_URL` and `PUBLIC_BASE_URL`.
-- Keep PostgreSQL, Redis, MinIO, and sandbox services on private networks.
-- Back up PostgreSQL and object storage together.
-- Treat shell/code execution as sensitive and pair it with HITL governance.
-- Start with narrow agent tool scopes, then loosen only after workflows are
-  trusted.
+### Tasks & Projects
+- Task CRUD with categories, priorities, due dates, assignments
+- Kanban board with 5 views (board, list, calendar, timeline, table)
+- Task templates for repeatable workflows
+- Recurring / scheduled tasks
+- Task collections (project grouping)
+- Bulk operations (batch create, update, delete)
+- CSV import / export
+- Goals and OKR tracking
+- Tags and favorites
 
-Useful docs:
+### Chat & Conversations
+- SSE streaming for real-time AI responses
+- Conversation management (create, rename, archive)
+- Conversation sharing and export
+- Human-in-the-loop (HITL) approval flow
+- Tool call cards with expandable results
+- Sub-agent cards (agent delegation visualization)
+- Knowledge sidebar (contextual RAG results)
+- Chat history browser
 
-- [Quickstart](https://manor-os.github.io/docs/manor-ai/quickstart)
-- [Configuration guide](https://manor-os.github.io/docs/manor-ai/configuration)
-- [Docker Compose](https://manor-os.github.io/docs/manor-ai/docker-compose)
-- [Architecture overview](https://manor-os.github.io/docs/manor-ai/architecture)
-- [Security](https://manor-os.github.io/docs/manor-ai/security)
-- [Backup and restore](https://manor-os.github.io/docs/manor-ai/operations/backup-restore)
-- [Upgrades and releases](https://manor-os.github.io/docs/manor-ai/operations/upgrade-release)
+### AI Engine
+- BYOK model routing for self-hosted deployments (native provider keys configured in Settings)
+- Agentic loop with tool calling (multi-step reasoning)
+- Goal runner (autonomous goal decomposition)
+- Task runner (AI-driven task execution)
+- 18+ tools: bash, file, document, knowledge, RAG, web, system, skill, task, code, goal, MCP, manor, search, browser, calendar, email, data tools
+- Agent skills system with visibility controls
+- Agent memory (per-conversation context persistence)
+- Sandboxed code execution (Docker-based)
 
-## Contributing
+### Knowledge & Documents
+- Document management with version history
+- pgvector RAG pipeline (semantic search + embeddings)
+- Trash and restore (soft delete)
+- Text extraction (PDF, DOCX, etc.)
+- Knowledge groups for organization
+- Rich text document editor
+- File viewer (PDF, images, code)
 
-For code changes, local development setup, tests, and style guidance, start
-with [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[development docs](https://manor-os.github.io/docs/manor-ai/development). Keep
-changes focused, add tests for behavior changes, and update documentation when
-setup or user-facing behavior changes.
+### Agents
+- Agent CRUD with system prompt editor
+- Local/custom agent templates
+- Agent import and reuse within the self-hosted workspace
+- Agent tool bindings (strict per-agent tool access)
+- Agent dashboard (usage stats, performance)
+- Agent detail view with tabs
 
-## Community
+### Workflows
+- Visual flow builder (drag-and-drop)
+- 6 step types (action, condition, loop, parallel, human, end)
+- Conditional branching with expression engine
+- Workflow execution engine with step-by-step logging
 
-- Join the [Discord](https://discord.gg/dS3HCZAB).
-- Follow updates on [Twitter / X](https://x.com/CalvinLin173676).
-- Visit the [Manor AI website](https://manorai.xyz/).
-- Use GitHub issues for bugs and feature requests.
-- Report suspected vulnerabilities privately through [SECURITY.md](SECURITY.md).
+### People & Organization
+- Client management (CRM-like contacts)
+- Staff management with roles
+- Team management (departments, roles, hierarchy)
+- Client portal (external-facing pages)
+- Multi-workspace support
+- Custom fields on any entity
+- Entity-scoped data isolation
+
+### Integrations
+- 11+ self-hosted connectors (Slack, GitHub, Jira, Linear, HubSpot, Salesforce, Zendesk, Twilio, SendGrid, Google, and more)
+- Webhooks with HMAC signature verification (inbound + outbound)
+- Channels (multi-channel message routing)
+- OAuth/Nango configuration with user-provided provider credentials
+
+### Analytics & Reporting
+- Dashboard with key metrics and trends
+- Local usage accounting
+- Scheduled reports with HTML / email delivery
+- Activity feed with change tracking
+- Operations overview
+
+### Platform
+- Redis cache layer with TTL management
+- Internationalization -- i18n with 4 locales (en, zh, es, ja)
+- Toast notification system
+- Presence indicators (online / offline via WebSocket)
+- Comments and threaded discussions
+- Tags and favorites on any entity
+- Global search across all entities
+- Announcements system
+- Onboarding flow
+- Notifications (in-app + email)
+- Health checks and monitoring
+- Backup and restore
+- Settings management
+
+### Infrastructure
+- Docker Compose with 8 services (postgres, redis, minio, juicefs-init, api, worker, sandbox, web)
+- JuiceFS + MinIO for entity-scoped filesystem storage
+- GitHub Actions CI (lint + test on push/PR, Docker build + deploy on release)
+- Alembic database migrations
+- Makefile with dev, test, lint, build, db commands
+- Celery + Redis task queue for background jobs
+
+---
+
+## Frontend Pages
+
+The public self-hosted app focuses on the core workspace runtime:
+Chat, Dashboard, Agents, Skills, Tasks, Workspaces, Knowledge, Documents,
+Flows, Reports, Integrations, Settings, API keys, Webhooks, Search, Notifications,
+Activity, Goals, Memories, Messages, and file/document viewers.
+
+---
+
+## API Documentation
+
+The API exposes **320 routes** across 37 router modules.
+
+OpenAPI spec: **233 paths**, **243 schemas**.
+
+| Resource | URL |
+|----------|-----|
+| Swagger UI | http://localhost:8000/api/docs |
+| ReDoc | http://localhost:8000/api/redoc |
+| OpenAPI spec | Generate locally with `make openapi` |
+
+Regenerate the spec:
+
+```bash
+make openapi
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Backend | Python 3.12, FastAPI, SQLAlchemy 2.0 (async), Pydantic v2 |
+| Database | PostgreSQL 16 + pgvector |
+| Cache / Broker | Redis 7 |
+| Frontend | React 18, TypeScript, Vite, Tailwind CSS, shadcn/ui |
+| AI | OpenRouter / OpenAI SDK, pgvector RAG, agentic tool-calling loop |
+| Queue | Celery + Redis |
+| Auth | JWT + OAuth2 + SAML SSO + TOTP 2FA |
+| Storage | MinIO (object storage) + JuiceFS (entity filesystem) |
+| Sandbox | Docker-based isolated code execution |
+| Infra | Docker Compose, GitHub Actions CI |
+| Linting | Ruff (Python), TypeScript strict mode |
+
+---
+
+## Project Structure
+
+```
+manor-os/
++-- apps/
+|   +-- api/                  # FastAPI application
+|   |   +-- main.py           # App entry point
+|   |   +-- deps.py           # Dependency injection
+|   |   +-- middleware/        # CORS, auth, rate-limiting
+|   |   +-- routers/          # 37 route modules (agents, chat, tasks, ...)
+|   +-- web/                  # React + Vite + TypeScript frontend
+|       +-- src/
+|           +-- pages/        # 50 route pages (Dashboard, Chat, Agents, Tasks, ...)
+|           +-- components/   # 18 shared UI components (shadcn/ui)
+|           +-- stores/       # State management
+|           +-- lib/          # Utilities
++-- packages/
+|   +-- core/                 # Shared business logic
+|   |   +-- ai/              # LLM client, agentic loop, goal/task runners
+|   |   |   +-- tools/       # 18+ tool modules (bash, file, doc, web, code, mcp, ...)
+|   |   +-- models/          # SQLAlchemy ORM models (30 modules)
+|   |   +-- services/        # Business logic services (57 modules)
+|   |   +-- tasks/           # Celery background tasks
+|   |   +-- sandbox/         # Sandboxed execution SDK
+|   |   +-- migrations/      # Alembic database migrations
+|   |   +-- config.py        # Pydantic settings
+|   |   +-- database.py      # Async engine + session factory
+|   |   +-- cache.py         # Redis cache layer
+|   |   +-- celery_app.py    # Celery configuration
+|   |   +-- i18n.py          # Internationalization
+|   |   +-- permissions.py   # RBAC permission checks
++-- tests/                   # Marker-layered pytest suites
++-- scripts/
+|   +-- dev.sh               # Development helper (api|web|worker|infra|init)
+|   +-- init_db.py           # Database initialization + seeding
+|   +-- export_openapi.py    # OpenAPI spec generator
+|   +-- generate_ts_client.sh
++-- docker/
+|   +-- Dockerfile.api       # API container
+|   +-- Dockerfile.web       # Nginx + static build
+|   +-- Dockerfile.sandbox   # Sandboxed execution container
+|   +-- nginx.conf
++-- .github/workflows/
+|   +-- ci.yml               # Lint + test on push/PR
+|   +-- release.yml          # Docker build + deploy
++-- docker-compose.yml       # 8 services: postgres, redis, minio, juicefs-init, api, worker, sandbox, web
++-- pyproject.toml           # Python project config (PEP 621)
++-- alembic.ini              # Alembic migration config
++-- Makefile                 # dev, test, lint, build, db commands
++-- .env.example             # Configuration template
++-- LICENSE                  # Manor Sustainable Use License 1.0
+```
+
+---
+
+## Configuration
+
+All configuration is via environment variables. Copy `.env.example` to `.env` and set the required values.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LLM_MODEL` | No | `anthropic/claude-sonnet-4` | Default LLM model identifier |
+| `DATABASE_URL` | Yes | (see .env.example) | PostgreSQL async connection string |
+| `REDIS_URL` | Yes | `redis://redis:6379/0` | Redis connection URL |
+| `JWT_SECRET_KEY` | Yes | -- | Secret for JWT token signing |
+| `MINIO_ENDPOINT` | No | `minio:9000` | MinIO S3-compatible storage endpoint |
+| `MINIO_ACCESS_KEY` | No | `minioadmin` | MinIO access key |
+| `MINIO_SECRET_KEY` | No | `minioadmin` | MinIO secret key |
+| `MANOR_FS_ENABLED` | No | `true` | Enable JuiceFS entity filesystem |
+| `MANOR_FS_ROOT` | No | `/mnt/manor` | JuiceFS mount path |
+| `SANDBOX_SERVICE_URL` | No | `http://sandbox:8100` | Sandbox service endpoint |
+| `SHELL_SANDBOX_ENABLED` | No | `true` | Allow shell tool in agents |
+| `GOOGLE_CLIENT_ID` | No | -- | Google OAuth client ID (for SSO) |
+| `GOOGLE_CLIENT_SECRET` | No | -- | Google OAuth client secret |
+| `SEARCH_ENGINE` | No | `serper` | Web search provider (`serper` or `tavily`) |
+| `SEARCH_API_KEY` | No | -- | API key for web search tool |
+| `DEPLOYMENT_MODE` | No | `oss` | Public self-hosted mode. The private Cloud tree uses `cloud`. |
+
+---
+
+## Development
+
+### Useful Commands
+
+```bash
+make dev-api         # Start API with hot reload
+make dev-web         # Start frontend dev server
+make lint            # Ruff check + TypeScript type check
+make format          # Auto-format Python with Ruff
+make db-migrate      # Run pending Alembic migrations
+make db-init         # Initialize database with seed data
+make docker-up       # Build and start the Docker compose stack
+make build-docker    # Build Docker images without starting services
+make oss-check       # Validate the private-to-public source boundary
+make oss-export      # Export the public source tree to /tmp/manor-os-oss
+make clean           # Remove __pycache__, .pytest_cache, build artifacts
+```
+
+### Adding a New Feature
+
+1. **Model** -- Add SQLAlchemy model in `packages/core/models/`
+2. **Service** -- Add business logic in `packages/core/services/`
+3. **Router** -- Add API endpoints in `apps/api/routers/`
+4. **Tests** -- Add test file in `tests/`
+5. **Migration** -- Generate with `alembic revision --autogenerate -m "description"`
+6. **Frontend** -- Add page/components in `apps/web/src/`
+
+### Code Style
+
+- Python: enforced by [Ruff](https://docs.astral.sh/ruff/) (line length 120, target Python 3.11)
+- TypeScript: strict mode, no implicit any
+- Async everywhere: all database and HTTP calls use `async`/`await`
+
+---
+
+## Deployment Modes
+
+| Mode | `DEPLOYMENT_MODE` | Description |
+|------|-------------------|-------------|
+| **OSS** | `oss` | Public self-hosted mode: single tenant, BYOK-only model keys, no hosted billing or marketplace code |
+| **Cloud** | `cloud` | Private Manor SaaS mode: multi-tenant billing, hosted marketplace, and platform operations |
+
+Cloud-only source is stripped from the public repository by the release export
+process. The private repository keeps detailed operator docs under `docs/`;
+the public OSS export intentionally omits that directory.
+
+---
 
 ## License
 
@@ -226,4 +411,4 @@ setup or user-facing behavior changes.
 The public source may be self-hosted, modified, and used internally. Reselling,
 white-labeling, or offering a hosted/managed competing service requires a
 separate written commercial agreement with Manor AI. The Manor AI name and
-marks are governed separately by [TRADEMARKS.md](TRADEMARKS.md).
+marks are governed separately by [`TRADEMARKS.md`](TRADEMARKS.md).

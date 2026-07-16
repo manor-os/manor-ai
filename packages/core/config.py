@@ -61,6 +61,9 @@ class Settings:
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "mxbai-embed-large")
     EMBEDDING_DIMENSIONS: int = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
 
+    # Live dashboard market data
+    FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
+
     # Storage
     MANOR_FS_ENABLED: bool = os.getenv("MANOR_FS_ENABLED", "false").lower() in ("true", "1")
     MANOR_FS_ROOT: str = os.getenv("MANOR_FS_ROOT", "/mnt/manor")

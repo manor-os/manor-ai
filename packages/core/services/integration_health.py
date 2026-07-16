@@ -726,6 +726,181 @@ async def test_jimeng(creds: dict) -> HealthResult:
     return _fail(f"Gateway HTTP {resp.status_code}", t0)
 
 
+# ── Browser-session integrations (cookie auth, no API to ping) ─────────────
+
+# Each browser-session provider stores a Playwright ``storage_state``
+# JSON in ``credentials.api_key``. We can't cheaply prove the session
+# is "alive" without spinning up a full headed Chromium, but we CAN
+# statically verify:
+#   * the JSON is well-formed
+#   * a known session-cookie name is present
+#   * that cookie's ``expires`` field is in the future (or session-only)
+#
+# That catches the two failure modes that 95% of expired-session
+# breakages fall into: user pasted garbage, or the platform's session
+# cookie hit its TTL. Real liveness verification still happens at
+# tool-call time (each provider's ``_ensure_logged_in``).
+
+# Map server_key → cookie names that prove "still signed in".
+_BROWSER_SESSION_COOKIES: Dict[str, tuple[str, ...]] = {
+    "notebooklm":         ("__Secure-1PSID", "SAPISID", "SID"),
+    "claude_ai_web":      ("sessionKey", "lastActiveOrg"),
+    "chatgpt_web":        ("__Secure-next-auth.session-token", "_puid"),
+    "gemini_web":         ("__Secure-1PSID", "SAPISID", "SID"),
+    "perplexity_web":     ("__Secure-next-auth.session-token", "session-token"),
+    "linkedin_browser":   ("li_at", "JSESSIONID"),
+}
+_BROWSER_SESSION_COOKIE_GROUPS: Dict[str, tuple[tuple[str, ...], ...]] = {}
+
+
+def _cookie_expiry_failure(name: str, cookie: dict) -> str | None:
+    expires = cookie.get("expires")
+    # Playwright uses -1 for session cookies (no expiry on disk; gone on
+    # browser close). Cookie-Editor uses null / 0. Treat all as "session
+    # cookie, OK".
+    if expires in (None, -1, 0, "session"):
+        return None
+
+    try:
+        expires_ts = float(expires)
+    except (TypeError, ValueError):
+        return None
+
+    now_ts = time.time()
+    if expires_ts > now_ts:
+        return None
+
+    secs_ago = int(now_ts - expires_ts)
+    days_ago = secs_ago // 86400
+    when = f"{days_ago} day(s) ago" if days_ago > 0 else f"{secs_ago // 3600} hour(s) ago"
+    return f"Session cookie '{name}' expired {when}. Reconnect via the Connect button."
+
+
+async def test_browser_session(creds: dict, *, provider: str = "") -> HealthResult:
+    """Static liveness check for cookie-paste / headed-login providers.
+
+    Avoids spinning up a real Chromium (which would take 5-10s per
+    check). Instead parses the storage_state and looks for the
+    platform-specific session cookie.
+    """
+    t0 = time.monotonic()
+    raw = (creds.get("api_key") or "").strip()
+    if not raw:
+        return _fail("No cookies stored — click Connect on the integration card to sign in.", t0)
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return _fail(f"Stored credentials are not valid JSON: {exc}", t0)
+
+    # Accept both Playwright storage_state shape and Cookie-Editor lists.
+    cookies: list[dict] = []
+    if isinstance(parsed, dict) and "cookies" in parsed:
+        cookies = list(parsed.get("cookies") or [])
+    elif isinstance(parsed, list):
+        cookies = parsed
+    else:
+        return _fail(
+            "Cookie blob is missing a 'cookies' field — re-export via "
+            "Cookie-Editor (Export → JSON) or reconnect via the "
+            "Connect button.",
+            t0,
+        )
+
+    if not cookies:
+        return _fail("Cookie list is empty — sign in again via the Connect button.", t0)
+
+    cookie_by_name = {c.get("name"): c for c in cookies if isinstance(c, dict) and c.get("name")}
+
+    required_cookie_groups = _BROWSER_SESSION_COOKIE_GROUPS.get(provider) or ()
+    if required_cookie_groups:
+        matched_names: list[str] = []
+        for group in required_cookie_groups:
+            group_found = [name for name in group if name in cookie_by_name]
+            if not group_found:
+                label = "required session cookies"
+                return _fail(
+                    f"Missing {label} ({' or '.join(group)}). Reconnect via the "
+                    "Connect button so Manor can capture both www and creator-center sessions.",
+                    t0,
+                )
+
+            valid_found = [
+                name
+                for name in group_found
+                if not _cookie_expiry_failure(name, cookie_by_name[name])
+            ]
+            if not valid_found:
+                failure = _cookie_expiry_failure(group_found[0], cookie_by_name[group_found[0]])
+                return _fail(failure or (
+                    f"Required session cookies expired ({' or '.join(group)}). "
+                    "Reconnect via the Connect button."
+                ), t0)
+            matched_names.append(valid_found[0])
+
+        return _ok(
+            f"Required session cookie groups present: {', '.join(matched_names)}.",
+            t0,
+        )
+
+    expected_cookie_names = _BROWSER_SESSION_COOKIES.get(provider) or ()
+    if not expected_cookie_names:
+        # Provider not in the map — best-effort: just confirm JSON shape.
+        return _ok(
+            f"Stored {len(cookies)} cookie(s); session-name validation deferred "
+            "to first tool call.",
+            t0,
+        )
+
+    found = [n for n in expected_cookie_names if n in cookie_by_name]
+    if not found:
+        return _fail(
+            f"None of the expected session cookies found "
+            f"({', '.join(expected_cookie_names)}). Reconnect via the "
+            "Connect button so Manor can capture a fresh session.",
+            t0,
+        )
+
+    # Check expires on the first matching cookie.
+    primary = cookie_by_name[found[0]]
+    expires = primary.get("expires")
+    # Playwright uses -1 for session cookies (no expiry on disk; gone on
+    # browser close). Cookie-Editor uses null / 0. Treat all as "session
+    # cookie, OK".
+    if expires in (None, -1, 0, "session"):
+        return _ok(f"Session cookie '{found[0]}' present (session-scoped).", t0)
+
+    try:
+        expires_ts = float(expires)
+    except (TypeError, ValueError):
+        return _ok(f"Session cookie '{found[0]}' present (expiry unparseable, deferred to first call).", t0)
+
+    now_ts = time.time()
+    if expires_ts <= now_ts:
+        secs_ago = int(now_ts - expires_ts)
+        days_ago = secs_ago // 86400
+        when = f"{days_ago} day(s) ago" if days_ago > 0 else f"{secs_ago // 3600} hour(s) ago"
+        return _fail(
+            f"Session cookie '{found[0]}' expired {when}. Reconnect via the Connect button.",
+            t0,
+        )
+
+    days_left = int((expires_ts - now_ts) / 86400)
+    return _ok(
+        f"Session cookie '{found[0]}' valid (~{days_left} day(s) until expiry).",
+        t0,
+    )
+
+
+# Per-provider thin wrappers so the dispatcher's plain `await fn(creds)`
+# signature still works (the generic helper needs the provider name to
+# pick the right session-cookie list).
+def _browser_session_check_for(provider: str):
+    async def _wrapped(creds: dict) -> HealthResult:
+        return await test_browser_session(creds, provider=provider)
+    return _wrapped
+
+
 # ── Registry ────────────────────────────────────────────────────────────────
 
 _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
@@ -751,6 +926,14 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "elevenlabs":       test_elevenlabs,
     "tavily":           test_tavily,
     "jimeng":           test_jimeng,
+    # Browser-session integrations — same generic check, parameterised
+    # by the per-provider session-cookie names defined above.
+    "notebooklm":         _browser_session_check_for("notebooklm"),
+    "claude_ai_web":      _browser_session_check_for("claude_ai_web"),
+    "chatgpt_web":        _browser_session_check_for("chatgpt_web"),
+    "gemini_web":         _browser_session_check_for("gemini_web"),
+    "perplexity_web":     _browser_session_check_for("perplexity_web"),
+    "linkedin_browser":   _browser_session_check_for("linkedin_browser"),
 }
 
 

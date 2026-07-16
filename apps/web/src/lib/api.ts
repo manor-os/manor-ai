@@ -1276,6 +1276,16 @@ function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitD
   };
 }
 
+function isAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      (error as { name?: unknown }).name === "AbortError")
+  );
+}
+
 async function request<T>(
   path: string,
   options: RequestInit = {},
@@ -1298,6 +1308,7 @@ async function request<T>(
       cache: options.cache ?? "no-store",
     });
   } catch (error) {
+    if (isAbortError(error)) throw error;
     showBackendUnavailableToast();
     captureClientError(error, {
       handled: true,
@@ -3195,33 +3206,158 @@ export const api = {
       request<{
         version: number;
         widgets: Array<{ id: string; visible: boolean }>;
+        modules: Array<{
+          id: string;
+          title: string;
+          description?: string | null;
+          visible: boolean;
+          size: "compact" | "wide";
+          conversation_id?: string | null;
+          code: any;
+        }>;
       }>("/dashboard/layout"),
-    updateLayout: (widgets: Array<{ id: string; visible: boolean }>) =>
-      request<{
-        version: number;
-        widgets: Array<{ id: string; visible: boolean }>;
-      }>("/dashboard/layout", {
-        method: "PUT",
-        body: JSON.stringify({ widgets }),
-      }),
-    suggestLayout: (
-      prompt: string,
+    updateLayout: (
       widgets: Array<{ id: string; visible: boolean }>,
+      modules: Array<{
+        id: string;
+        title: string;
+        description?: string | null;
+        visible: boolean;
+        size: "compact" | "wide";
+        conversation_id?: string | null;
+        code: any;
+      }>,
     ) =>
       request<{
         version: number;
         widgets: Array<{ id: string; visible: boolean }>;
+        modules: any[];
+      }>("/dashboard/layout", {
+        method: "PUT",
+        body: JSON.stringify({ widgets, modules }),
+      }),
+    suggestLayout: (
+      prompt: string,
+      widgets: Array<{ id: string; visible: boolean }>,
+      modules: Array<{
+        id: string;
+        title: string;
+        description?: string | null;
+        visible: boolean;
+        size: "compact" | "wide";
+        conversation_id?: string | null;
+        code: any;
+      }>,
+      options?: {
+        targetModuleId?: string;
+        conversationId?: string;
+        signal?: AbortSignal;
+      },
+    ) =>
+      request<{
+        version: number;
+        widgets: Array<{ id: string; visible: boolean }>;
+        modules: any[];
+        assistant_message?: string | null;
+        changed_module_id?: string | null;
+        conversation_id?: string | null;
+        tool_calls: string[];
+        hitl_requests: Array<Record<string, unknown>>;
+        preview_created: boolean;
       }>("/dashboard/layout/suggest", {
         method: "POST",
-        body: JSON.stringify({ prompt, widgets }),
+        body: JSON.stringify({
+          prompt,
+          widgets,
+          modules,
+          target_module_id: options?.targetModuleId,
+          conversation_id: options?.conversationId,
+        }),
+        signal: options?.signal,
       }),
+    moduleConversation: (moduleId: string) =>
+      request<{
+        conversation_id?: string | null;
+        messages: Array<{
+          role: "user" | "assistant";
+          content: string;
+          tool_calls: string[];
+        }>;
+      }>(`/dashboard/modules/${encodeURIComponent(moduleId)}/conversation`),
+    httpData: (url: string, refreshSeconds = 300) =>
+      request<{
+        url: string;
+        result: unknown;
+        cached: boolean;
+      }>("/dashboard/http-data", {
+        method: "POST",
+        body: JSON.stringify({
+          url,
+          refresh_seconds: refreshSeconds,
+        }),
+      }),
+    toolData: (
+      toolName: string,
+      args: Record<string, unknown>,
+      conversationId?: string | null,
+      refreshSeconds = 300,
+    ) =>
+      request<{
+        tool_name: string;
+        result: unknown;
+        cached: boolean;
+      }>("/dashboard/tool-data", {
+        method: "POST",
+        body: JSON.stringify({
+          tool_name: toolName,
+          arguments: args,
+          conversation_id: conversationId,
+          refresh_seconds: refreshSeconds,
+        }),
+      }),
+    news: (query?: string, days = 1, limit = 8) => {
+      const params = new URLSearchParams({
+        days: String(days),
+        limit: String(limit),
+      });
+      if (query) params.set("query", query);
+      return request<Array<{
+        id: string;
+        title: string;
+        url: string;
+        source?: string | null;
+        published_at?: string | null;
+        language?: string | null;
+      }>>(`/dashboard/news?${params}`);
+    },
+    stocks: (symbols: string[]) => {
+      const params = new URLSearchParams({ symbols: symbols.join(",") });
+      return request<Array<{
+        symbol: string;
+        price?: number | null;
+        change?: number | null;
+        change_percent?: number | null;
+        open?: number | null;
+        high?: number | null;
+        low?: number | null;
+        previous_close?: number | null;
+        currency?: string | null;
+        updated_at?: string | null;
+        status: "ok" | "unavailable";
+        provider?: string | null;
+      }>>(`/dashboard/stocks?${params}`);
+    },
     stats: (wsId?: string) => request<any>(`/dashboard/stats${wsId ? `?workspace_id=${wsId}` : ""}`),
     taskTrends: (days = 30, wsId?: string) =>
       request<any[]>(`/dashboard/task-trends?days=${days}${wsId ? `&workspace_id=${wsId}` : ""}`),
     usageTrends: (days = 30) =>
       request<any[]>(`/dashboard/usage-trends?days=${days}`),
-    recentActivity: (limit = 10, wsId?: string) =>
-      request<any[]>(`/dashboard/recent-activity?limit=${limit}${wsId ? `&workspace_id=${wsId}` : ""}`),
+    recentActivity: (limit = 10, wsId?: string, since?: string | null) => {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (wsId) params.set("workspace_id", wsId);
+      if (since) params.set("since", since);
+      return request<any[]>(`/dashboard/recent-activity?${params.toString()}`);
+    },
     activeGoals: (limit = 5, wsId?: string) =>
       request<any[]>(`/dashboard/active-goals?limit=${limit}${wsId ? `&workspace_id=${wsId}` : ""}`),
   },

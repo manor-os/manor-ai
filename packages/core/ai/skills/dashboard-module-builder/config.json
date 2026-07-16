@@ -1,0 +1,22 @@
+{
+  "id": "dashboard-module-builder",
+  "name": "dashboard-module-builder",
+  "type": "runtime_guidance",
+  "description": "Builds and edits private Dashboard modules through a Manor Agent conversation. Use for requests to add, change, remove, or rearrange Dashboard content and generated modules.",
+  "category": "dashboard-builder",
+  "output_format": "json",
+  "tags": [
+    "dashboard",
+    "module-builder",
+    "code-generation",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "dashboard_submit_module",
+    "code",
+    "search_tools",
+    "web_search",
+    "web_event_search"
+  ]
+}

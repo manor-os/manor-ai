@@ -1,13 +1,10 @@
 import asyncio
 import os
 
-import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from packages.core.services.mcp_seed import seed_mcp_catalog
-
-pytestmark = pytest.mark.oss_smoke
 
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",

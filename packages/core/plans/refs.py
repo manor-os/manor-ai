@@ -14,7 +14,6 @@ Walks dicts + lists recursively. Strings without refs pass through.
 from __future__ import annotations
 
 import json
-import logging
 import re
 from typing import Any
 
@@ -26,29 +25,6 @@ _BARE_REF_RE = re.compile(r"^\s*" + _REF_RE.pattern + r"\s*$")
 
 class ReferenceError(Exception):
     """Raised when a ${{ steps.X.result.Y }} ref doesn't resolve."""
-
-
-logger = logging.getLogger(__name__)
-
-# When a ref reads a field a producer never emitted (e.g. `.text` off a
-# free-form subagent/search step that returns a bare object), fall back to a
-# text-ish sibling before stringifying, so the consumer gets usable content
-# instead of the whole task dying with a ReferenceError.
-_TEXT_ALIAS_KEYS = (
-    "text", "content", "output", "markdown", "summary",
-    "answer", "message", "body", "value", "result",
-)
-
-
-def _degrade_missing_field(obj: dict) -> Any:
-    """A referenced field is absent on a dict result — return a usable fallback
-    instead of raising: the first non-empty text-ish sibling field, else the
-    whole object as JSON so the consumer still receives the content."""
-    for k in _TEXT_ALIAS_KEYS:
-        v = obj.get(k)
-        if isinstance(v, str) and v.strip():
-            return v
-    return json.dumps(obj, ensure_ascii=False, default=str)
 
 
 def extract_step_refs(value: Any) -> list[tuple[str, str | None]]:
@@ -146,26 +122,14 @@ def _lookup(
                 ) from None
         elif isinstance(cursor, dict):
             if part not in cursor:
-                # The producer (often a free-form subagent / search step) returned
-                # an object without the referenced field — historically a hard
-                # ReferenceError that killed the whole task. Degrade to a usable
-                # value instead so the consumer can proceed.
-                logger.warning(
-                    "ref step %s path .%s: key %r missing on dict result; "
-                    "degrading instead of raising ReferenceError",
-                    step_key, path, part,
+                raise ReferenceError(
+                    f"step {step_key} path .{path}: key {part!r} missing"
                 )
-                return _degrade_missing_field(cursor)
             cursor = cursor[part]
         else:
-            # A scalar where the ref expected a structured object — degrade to
-            # its string form rather than crash the consumer.
-            logger.warning(
-                "ref step %s path .%s: cannot descend into %s; "
-                "degrading to string form",
-                step_key, path, type(cursor).__name__,
+            raise ReferenceError(
+                f"step {step_key} path .{path}: cannot descend into {type(cursor).__name__}"
             )
-            return str(cursor)
     return cursor
 
 

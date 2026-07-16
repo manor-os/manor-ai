@@ -1,4 +1,0 @@
-interface:
-  display_name: "Manor Docs Maintenance"
-  short_description: "Keep Manor public docs release-ready."
-  default_prompt: "Audit Manor docs for this change and make minimal corrections."

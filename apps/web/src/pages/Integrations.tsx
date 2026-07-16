@@ -55,6 +55,7 @@ import { t } from "../lib/i18n";
 const UNCHANGED = "__unchanged__";
 
 
+
 import {
   IconCalendar,
   IconFolder,
@@ -175,6 +176,12 @@ const INTEGRATION_SERVER_CATEGORY_OVERRIDES: Record<
   replicate: "ai_media",
   elevenlabs: "ai_media",
   jimeng: "ai_media",
+  midjourney_web: "ai_media",
+  notebooklm: "ai_media",
+  claude_ai_web: "ai_media",
+  chatgpt_web: "ai_media",
+  gemini_web: "ai_media",
+  perplexity_web: "ai_media",
 };
 
 /* ------------------------------------------------------------------ */
@@ -273,6 +280,7 @@ const MCP_LOGO_COLOR: Record<string, string> = {
   whatsapp: "#25D366",
   twilio: "#F22F46",
   linkedin: "#0A66C2",
+  linkedin_browser: "#0A66C2", // same brand colour as the OAuth card
   twitter_x: "#111111",
   github: "#181717",
   webhook: "#57534e",
@@ -319,6 +327,7 @@ const MCP_ICON: Record<string, (p: IconProps) => JSX.Element> = {
   whatsapp: IconWhatsApp,
   twilio: IconTwilio,
   linkedin: IconLinkedIn,
+  linkedin_browser: IconLinkedIn, // same logo as the OAuth card
   twitter_x: IconTwitter,
   github: IconGitHub,
   webhook: IconWebhook,
@@ -1113,7 +1122,7 @@ function MCPAgentsPanel({
       : baseRowsRaw
   ).filter((s) => !HIDDEN_INTERNAL_AUTOMATION_KEYS.has(s.server_key));
   let baseRows: McpServerRow[] = filteredRows.filter(
-    (s) => s.auth_type !== "cli_worker",
+    (s) => s.auth_type !== "cli_worker" && s.auth_type !== "browser_session",
   );
   const rowsWithWorkerEntry: McpServerRow[] = baseRows;
 
@@ -1137,7 +1146,7 @@ function MCPAgentsPanel({
   // Runtime-managed cards are hidden from the OSS catalog fallback.
   // SaaS/API cards are the inverse.
   const isRuntimeManagedCard = (s: McpServerRow) =>
-    s.auth_type === "cli_worker";
+    s.auth_type === "cli_worker" || s.auth_type === "browser_session";
   const matchesSearch = (s: McpServerRow, value: string) => {
     const hay = [s.name, s.tagline, s.description, s.category]
       .filter(Boolean)
@@ -1410,19 +1419,6 @@ type McpServerRow = {
     expires_at: string | null;
     is_default: boolean;
     connected_at: string | null;
-    health: {
-      ok: boolean | null;
-      detail: string | null;
-      checked_at: string | null;
-      wiring?: {
-        ok: boolean | null;
-        detail: string | null;
-        configured_url?: string | null;
-        expected_url?: string | null;
-        last_error?: string | null;
-        pending_update_count?: number | null;
-      } | null;
-    } | null;
   }>;
   entity_accounts: Array<{
     id: string;
@@ -1612,21 +1608,10 @@ function GoogleWorkspaceCard({
   ).length;
   const total = subs.length;
   const hasAnyConnection = connectedCount > 0;
-  const hasAuthFailure = subs.some(
-    (s) =>
-      s.connections.some((connection) => connection.health?.ok === false) ||
-      (s.entity_accounts ?? []).some((account) => account.health?.ok === false),
-  );
-  const statusColor = hasAuthFailure
-    ? "#d65f59"
-    : hasAnyConnection
-      ? "#168a5b"
-      : "#d6d3d1";
+  const statusColor = hasAnyConnection ? "#168a5b" : "#d6d3d1";
   const statusLabel = isComingSoon
     ? t("page.integrations.coming_soon")
-    : hasAuthFailure
-      ? t("page.integrations.reconnect_required")
-      : connectedCount === total
+    : connectedCount === total
       ? t("page.integrations.ready")
       : connectedCount > 0
         ? t("page.integrations.connected_count_of_total")
@@ -1654,11 +1639,11 @@ function GoogleWorkspaceCard({
             width: 7,
             height: 7,
             borderRadius: "50%",
-            background: hasAuthFailure ? statusColor : "currentColor",
+            background: "currentColor",
           }}
         />
       }
-      metaTone={hasAnyConnection && !hasAuthFailure ? "connected" : "muted"}
+      metaTone={hasAnyConnection ? "connected" : "muted"}
       onClick={() =>
         openDetail({
           icon: (
@@ -1703,13 +1688,6 @@ function GoogleWorkspaceCard({
                 const hasConn =
                   s.connections.length > 0 ||
                   (s.entity_accounts?.length ?? 0) > 0;
-                const subAuthFailed =
-                  s.connections.some(
-                    (connection) => connection.health?.ok === false,
-                  ) ||
-                  (s.entity_accounts ?? []).some(
-                    (account) => account.health?.ok === false,
-                  );
                 const Icon = MCP_ICON[s.server_key];
                 const friendlyName =
                   s.server_key === "gmail"
@@ -1779,9 +1757,7 @@ function GoogleWorkspaceCard({
                         <div style={{ fontSize: 10, color: "#a8a29e" }}>
                           {isComingSoon
                             ? t("page.integrations.coming_soon")
-                            : subAuthFailed
-                              ? t("page.integrations.reconnect_required")
-                              : hasConn
+                            : hasConn
                               ? t("status.connected")
                               : s.oauth_configured
                                 ? t("page.integrations.ready_to_connect")
@@ -1794,7 +1770,7 @@ function GoogleWorkspaceCard({
                         </Chip>
                       ) : hasConn ? (
                         <Chip size="sm" variant="slate">
-                          {subAuthFailed ? "!" : "✓"}
+                          ✓
                         </Chip>
                       ) : s.oauth_configured ? (
                         <Button
@@ -2821,6 +2797,84 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
       },
     ],
     docs_hint: t("page.integrations.docs_hint_18"),
+  },
+  notebooklm: {
+    fields: [
+      {
+        key: "api_key",
+        label: t("page.integrations.cookie_jar_json"),
+        type: "textarea",
+        placeholder: t("page.integrations.name_nid_value_domain_google_com"),
+        required: true,
+        rows: 8,
+        help: t("page.integrations.field_help_19"),
+      },
+    ],
+    docs_hint: t("page.integrations.docs_hint_20"),
+  },
+  claude_ai_web: {
+    fields: [
+      {
+        key: "api_key",
+        label: t("page.integrations.cookie_jar_json"),
+        type: "textarea",
+        placeholder: t(
+          "page.integrations.name_sessionkey_value_domain_claude_ai",
+        ),
+        required: true,
+        rows: 8,
+        help: t("page.integrations.field_help_21"),
+      },
+    ],
+    docs_hint: t("page.integrations.docs_hint_22"),
+  },
+  chatgpt_web: {
+    fields: [
+      {
+        key: "api_key",
+        label: t("page.integrations.cookie_jar_json"),
+        type: "textarea",
+        placeholder: t(
+          "page.integrations.name_secure_next_auth_session_token_value_domain_chatg",
+        ),
+        required: true,
+        rows: 8,
+        help: t("page.integrations.field_help_23"),
+      },
+    ],
+    docs_hint: t("page.integrations.docs_hint_24"),
+  },
+  gemini_web: {
+    fields: [
+      {
+        key: "api_key",
+        label: t("page.integrations.cookie_jar_json"),
+        type: "textarea",
+        placeholder: t(
+          "page.integrations.name_secure_1psid_value_domain_google_com",
+        ),
+        required: true,
+        rows: 8,
+        help: t("page.integrations.field_help_25"),
+      },
+    ],
+    docs_hint: t("page.integrations.docs_hint_26"),
+  },
+  perplexity_web: {
+    fields: [
+      {
+        key: "api_key",
+        label: t("page.integrations.cookie_jar_json"),
+        type: "textarea",
+        placeholder: t(
+          "page.integrations.name_secure_next_auth_session_token_value_domain_perpl",
+        ),
+        required: true,
+        rows: 8,
+        help: t("page.integrations.field_help_27"),
+      },
+    ],
+    docs_hint: t("page.integrations.docs_hint_28"),
   },
 };
 
@@ -4122,15 +4176,8 @@ function ConnectionRow({
 
   const expired =
     connection.expires_at && new Date(connection.expires_at) < new Date();
+  const label = connectionLabel(connection, t("status.connected"));
   const authFailed = connection.health?.ok === false;
-  const label = connectionLabel(
-    connection,
-    authFailed
-      ? t("page.integrations.reconnect_required")
-      : expired
-        ? t("page.integrations.expired")
-        : t("status.connected"),
-  );
   const needsReconnect = Boolean(onReconnect && (authFailed || expired));
 
   return (
@@ -4153,7 +4200,7 @@ function ConnectionRow({
           width: 8,
           height: 8,
           borderRadius: "50%",
-          background: authFailed ? "#d65f59" : expired ? "#a8a29e" : "#54a176",
+          background: expired ? "#a8a29e" : "#54a176",
           flexShrink: 0,
         }}
       />

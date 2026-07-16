@@ -1,4 +1,0 @@
-interface:
-  display_name: "Manor Release"
-  short_description: "Coordinate Manor OSS release work."
-  default_prompt: "Prepare a Manor release plan and run the safe release checks."

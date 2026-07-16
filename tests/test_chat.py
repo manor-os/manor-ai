@@ -12,8 +12,6 @@ from packages.core.models.user import User
 from packages.core.services.auth_service import create_access_token, hash_password
 from packages.core.services.hitl_requests import user_visible_hitl_action_text
 
-pytestmark = pytest.mark.oss_regression
-
 
 async def _auth(client: AsyncClient, username: str = "chatuser") -> dict:
     resp = await client.post(

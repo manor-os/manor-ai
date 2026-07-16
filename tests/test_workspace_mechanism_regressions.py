@@ -1061,7 +1061,7 @@ async def test_get_skill_by_slug_prefers_entity_skill_over_global_duplicate(db_s
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["twitter_x", "stripe", "facebook", "analytics"])
+@pytest.mark.parametrize("provider", ["twitter_x", "stripe", "linkedin_browser", "analytics"])
 async def test_external_goal_measurement_requires_provider_evidence(
     client: AsyncClient,
     db_session,
@@ -1786,7 +1786,7 @@ async def test_workspace_operation_capability_binding_overlays_runtime_tool_scop
     entity_id = create.json()["entity_id"]
     agent = await client.post("/api/v1/agents", headers=headers, json={"name": "Tool Scoped Agent"})
     tool_name = "test_leasing_unit_search"
-    mcp_tool_name = "mcp__linkedin__create_post"
+    mcp_tool_name = "mcp__linkedin_browser__send_message"
 
     draft = await client.post(
         f"/api/v1/workspaces/{ws_id}/operation/drafts",
@@ -1835,8 +1835,8 @@ async def test_workspace_operation_capability_binding_overlays_runtime_tool_scop
                             "owner_scope": "service",
                             "owner_service_key": "leasing_consultant",
                             "capability_type": "mcp",
-                            "integration_key": "linkedin",
-                            "allowed_tools": ["create_post"],
+                            "integration_key": "linkedin_browser",
+                            "allowed_tools": ["send_message"],
                         },
                     },
                 },
@@ -2475,7 +2475,7 @@ async def test_workspace_operation_allows_mcp_binding_without_allowed_tools(clie
                         "binding": {
                             "owner_scope": "workspace_agent",
                             "capability_type": "mcp",
-                            "integration_key": "linkedin",
+                            "integration_key": "linkedin_browser",
                         },
                     },
                 }

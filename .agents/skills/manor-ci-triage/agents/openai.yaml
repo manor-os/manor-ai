@@ -1,4 +1,0 @@
-interface:
-  display_name: "Manor CI Triage"
-  short_description: "Diagnose Manor CI failures."
-  default_prompt: "Triage the Manor CI failure and recommend the smallest safe fix."

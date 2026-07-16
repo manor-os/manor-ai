@@ -7,7 +7,7 @@ from packages.core.models.user import User
 from packages.core.services.auth_service import authenticate_user
 from packages.core.services.demo_account import demo_account_config, ensure_demo_account
 
-pytestmark = [pytest.mark.oss, pytest.mark.oss_smoke]
+pytestmark = pytest.mark.oss
 
 
 @pytest.mark.asyncio
