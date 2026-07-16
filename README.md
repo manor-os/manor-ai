@@ -21,7 +21,7 @@
   ·
   <a href="https://github.com/manor-os/manor-ai"><strong>GitHub</strong></a>
   ·
-  <a href="https://discord.gg/dS3HCZAB"><strong>Discord</strong></a>
+  <a href="https://discord.gg/De6fg5Swnw"><strong>Discord</strong></a>
   ·
   <a href="https://x.com/CalvinLin173676"><strong>Twitter</strong></a>
   ·
@@ -31,7 +31,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Sustainable%20Use-lightgrey"></a>
   <a href="https://github.com/manor-os/manor-ai/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/manor-os/manor-ai?style=flat&logo=github"></a>
-  <a href="https://discord.gg/dS3HCZAB"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white"></a>
+  <a href="https://discord.gg/De6fg5Swnw"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white"></a>
   <a href="https://x.com/CalvinLin173676"><img alt="Follow on X" src="https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white"></a>
   <a href="https://manorai.xyz/"><img alt="Website" src="https://img.shields.io/badge/Website-manorai.xyz-0f766e"></a>
 </p>
@@ -213,7 +213,7 @@ setup or user-facing behavior changes.
 
 ## Community
 
-- Join the [Discord](https://discord.gg/dS3HCZAB).
+- Join the [Discord](https://discord.gg/De6fg5Swnw).
 - Follow updates on [Twitter / X](https://x.com/CalvinLin173676).
 - Visit the [Manor AI website](https://manorai.xyz/).
 - Use GitHub issues for bugs and feature requests.
