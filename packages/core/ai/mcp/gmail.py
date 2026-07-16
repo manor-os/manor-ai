@@ -35,6 +35,13 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
             "query": {"type": "string", "description": "Gmail search query, e.g. 'from:tenant@example.com newer_than:7d'"},
             "max_results": {"type": "integer", "description": "Max messages to return (default 20, max 100)."},
             "page_token": {"type": "string", "description": "Pagination cursor returned by a prior list_messages call."},
+            "include_details": {
+                "type": "boolean",
+                "description": (
+                    "When true, enrich each listed message with read-only metadata "
+                    "(from, subject, date, snippet, labels). Capped to the requested page."
+                ),
+            },
         },
     },
     "get_message": {
@@ -303,6 +310,25 @@ def _sim_list_messages(args: Dict) -> str:
     briefing has signal to triage."""
     n = min(int(args.get("max_results") or 10), 10)
     fixtures = _DEMO_INBOX[:n]
+    if args.get("include_details"):
+        return json.dumps({
+            "messages": [
+                {
+                    "id": m["id"],
+                    "threadId": m["thread_id"],
+                    "from": m["from"],
+                    "subject": m["subject"],
+                    "date": m["date"],
+                    "snippet": m["snippet"],
+                    "labelIds": ["INBOX", "UNREAD"],
+                    "internalDate": "1776183262000",
+                }
+                for m in fixtures
+            ],
+            "resultSizeEstimate": len(fixtures),
+            "detailsIncluded": True,
+            "_simulated": True,
+        })
     return json.dumps({
         "messages": [{"id": m["id"], "threadId": m["thread_id"]} for m in fixtures],
         "resultSizeEstimate": len(fixtures),
@@ -474,13 +500,70 @@ async def _api(
 # ── Tool handlers ────────────────────────────────────────────────────────────
 
 async def _list_messages(token: str, args: Dict) -> str:
+    max_results = min(int(args.get("max_results") or 20), 100)
     params = {
         "q": args["query"],
-        "maxResults": min(int(args.get("max_results") or 20), 100),
+        "maxResults": max_results,
     }
     if args.get("page_token"):
         params["pageToken"] = args["page_token"]
-    return await _api(token, "GET", "users/me/messages", params=params)
+    raw = await _api(token, "GET", "users/me/messages", params=params)
+    if not args.get("include_details"):
+        return raw
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        payload["messages"] = []
+        payload["detailsIncluded"] = True
+        return json.dumps(payload)
+
+    enriched: List[Dict[str, Any]] = []
+    for item in messages[:max_results]:
+        if not isinstance(item, dict):
+            continue
+        message_id = item.get("id")
+        if not message_id:
+            continue
+        detail_text = await _api(
+            token,
+            "GET",
+            f"users/me/messages/{message_id}",
+            params={
+                "format": "metadata",
+                "metadataHeaders": ["From", "Subject", "Date"],
+            },
+        )
+        detail = json.loads(detail_text)
+        headers = (
+            detail.get("payload", {}).get("headers", [])
+            if isinstance(detail.get("payload"), dict)
+            else []
+        )
+        header_map = {
+            str(header.get("name") or "").lower(): str(header.get("value") or "")
+            for header in headers
+            if isinstance(header, dict)
+        }
+        enriched.append(
+            {
+                "id": detail.get("id") or item.get("id"),
+                "threadId": detail.get("threadId") or item.get("threadId"),
+                "snippet": detail.get("snippet") or "",
+                "labelIds": detail.get("labelIds") or [],
+                "internalDate": detail.get("internalDate"),
+                "from": header_map.get("from", ""),
+                "subject": header_map.get("subject", ""),
+                "date": header_map.get("date", ""),
+                "headers": headers,
+            }
+        )
+    payload["messages"] = enriched
+    payload["detailsIncluded"] = True
+    return json.dumps(payload)
 
 
 async def _get_message(token: str, args: Dict) -> str:

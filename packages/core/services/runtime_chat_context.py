@@ -52,6 +52,19 @@ async def resolve_runtime_chat_context(
 
     metadata = dict(runtime_metadata or {})
     blocked_tool_names = runtime_normalize_tool_name_set(blocked_tools)
+    extra_tool_names = runtime_normalize_tool_name_set(
+        metadata.get("extra_tool_names")
+    )
+    if extra_tool_names:
+        from packages.core.ai.runtime.tool_registry import (
+            runtime_tool_schemas_for_names,
+        )
+
+        extra_tool_schemas = runtime_tool_schemas_for_names(
+            sorted(extra_tool_names)
+        )
+    else:
+        extra_tool_schemas = []
 
     runtime = await resolve_workspace_runtime(
         db,
@@ -123,6 +136,8 @@ async def resolve_runtime_chat_context(
         initial_extra_context=runtime.extra_context,
         tool_schemas=[] if (disable_tools or not db) else None,
         allowed_tool_names=set() if (disable_tools or not db) else None,
+        extra_tool_schemas=extra_tool_schemas,
+        extra_allowed_tool_names=extra_tool_names,
         blocked_tool_names=blocked_tool_names,
         skill_refs=manual_skill_refs,
         disable_tools=disable_tools or not db,

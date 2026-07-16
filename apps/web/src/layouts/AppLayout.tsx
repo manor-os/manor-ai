@@ -719,6 +719,11 @@ function ContextSwitcher({
     <div className="workspace-context-switcher">
       {/* Input */}
       <div className="workspace-context-input-wrap">
+        {selected === "all" && !open && (
+          <span className="workspace-context-scope-icon" aria-hidden="true">
+            <IconGrid4 />
+          </span>
+        )}
         <input
           ref={inputRef}
           value={open ? query : selectedName}
@@ -732,7 +737,7 @@ function ContextSwitcher({
             setQuery("");
           }}
           onBlur={() => setTimeout(() => setOpen(false), 200)}
-          className={`workspace-context-input ${open ? "workspace-context-input--open" : ""}`}
+          className={`workspace-context-input ${selected === "all" && !open ? "workspace-context-input--all" : ""} ${open ? "workspace-context-input--open" : ""}`}
         />
         {/* Chevron */}
         <svg
@@ -763,7 +768,7 @@ function ContextSwitcher({
               setQuery("");
               onSelect("all");
             }}
-            className={`workspace-context-option ${selected === "all" ? "workspace-context-option--active" : ""}`}
+            className={`workspace-context-option workspace-context-option--all-scope ${selected === "all" ? "workspace-context-option--active" : ""}`}
           >
             <span className="workspace-context-option-icon workspace-context-option-icon--all">
               <svg
@@ -1513,7 +1518,7 @@ function ManorHelpModal({
                           borderRadius: 10,
                           display: "grid",
                           placeItems: "center",
-                          background: "var(--accent-soft)",
+                          background: "var(--sidebar-nav-active-bg)",
                           color: "var(--accent)",
                         }}
                       >
@@ -2169,7 +2174,7 @@ export default function AppLayout() {
               top: sidebarCollapsed ? "50%" : "24%",
               height: sidebarCollapsed ? 22 : "52%",
               width: 3,
-              background: "var(--accent)",
+              background: "var(--sidebar-nav-active-indicator, var(--accent))",
               borderRadius: "0 4px 4px 0",
               transform: sidebarCollapsed ? "translateY(-50%)" : undefined,
             }}
@@ -2250,13 +2255,13 @@ export default function AppLayout() {
           width: 36,
           height: 36,
           padding: 0,
-          border: active
-            ? "1px solid var(--accent-soft-border)"
-            : "1px solid transparent",
+          border: "1px solid transparent",
           borderRadius: 12,
-          background: active ? "var(--accent-soft)" : "transparent",
-          boxShadow: active ? "var(--glass-highlight)" : "none",
-          color: active ? "var(--accent)" : "var(--text-muted)",
+          background: active ? "var(--sidebar-nav-active-bg)" : "transparent",
+          boxShadow: "none",
+          color: active
+            ? "var(--sidebar-nav-active-text)"
+            : "var(--sidebar-nav-text)",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -2265,7 +2270,7 @@ export default function AppLayout() {
         }}
         onMouseEnter={(e) => {
           if (!active) {
-            e.currentTarget.style.background = "var(--surface-muted)";
+            e.currentTarget.style.background = "var(--sidebar-nav-hover-bg)";
           }
         }}
         onMouseLeave={(e) => {
@@ -2283,7 +2288,7 @@ export default function AppLayout() {
               width: 3,
               height: 22,
               borderRadius: "0 4px 4px 0",
-              background: "var(--accent)",
+              background: "var(--sidebar-nav-active-indicator, var(--accent))",
               transform: "translateY(-50%)",
             }}
           />
@@ -2447,53 +2452,46 @@ export default function AppLayout() {
                   Manor AI
                 </span>
               )}
-              {/* Collapse button */}
-              <button
-                onClick={() => {
-                  if (mobileOpen) {
-                    setMobileOpen(false);
-                  } else {
-                    setCollapsed(!collapsed);
-                  }
-                }}
-                style={{
-                  marginLeft: sidebarCollapsed ? 0 : "auto",
-                  position: sidebarCollapsed ? "absolute" : undefined,
-                  right: sidebarCollapsed ? -8 : undefined,
-                  top: sidebarCollapsed ? 13 : undefined,
-                  width: sidebarCollapsed ? 32 : 36,
-                  height: sidebarCollapsed ? 32 : 36,
-                  borderRadius: "50%",
-                  background: "var(--sidebar-control-bg)",
-                  border: "1px solid var(--sidebar-control-border)",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: "pointer",
-                  flexShrink: 0,
-                  transition: "all 0.2s",
-                  color: "var(--text-muted)",
-                }}
-              >
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+              {!sidebarCollapsed && (
+                <button
+                  onClick={() => {
+                    if (mobileOpen) {
+                      setMobileOpen(false);
+                    } else {
+                      setCollapsed(!collapsed);
+                    }
+                  }}
                   style={{
-                    transition: "transform 0.3s",
-                    transform: sidebarCollapsed
-                      ? "rotate(180deg)"
-                      : "rotate(0deg)",
+                    marginLeft: "auto",
+                    width: 36,
+                    height: 36,
+                    borderRadius: "50%",
+                    background: "var(--sidebar-control-bg)",
+                    border: "1px solid var(--sidebar-control-border)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    cursor: "pointer",
+                    flexShrink: 0,
+                    transition: "all 0.2s",
+                    color: "var(--sidebar-nav-text)",
                   }}
                 >
-                  <polyline points="15 18 9 12 15 6" />
-                </svg>
-              </button>
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    style={{ transition: "transform 0.3s" }}
+                  >
+                    <polyline points="15 18 9 12 15 6" />
+                  </svg>
+                </button>
+              )}
             </div>
 
             {/* ── MODE SWITCHER ── */}
@@ -3076,6 +3074,7 @@ export default function AppLayout() {
                       </div>
                       <Link
                         to="/workspaces/new"
+                        className="sidebar-workspace-create"
                         title={t("page.workspaces.create_workspace")}
                         aria-label={t("page.workspaces.create_workspace")}
                         style={{
@@ -3086,9 +3085,6 @@ export default function AppLayout() {
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          color: "var(--accent)",
-                          background: "var(--sidebar-control-bg)",
-                          border: "1px solid var(--sidebar-control-border)",
                           textDecoration: "none",
                           flexShrink: 0,
                         }}
@@ -3111,6 +3107,7 @@ export default function AppLayout() {
                     {sidebarCollapsed && (
                       <Link
                         to="/workspaces/new"
+                        className="sidebar-workspace-create sidebar-workspace-create--collapsed"
                         title={t("page.workspaces.create_workspace")}
                         aria-label={t("page.workspaces.create_workspace")}
                         style={{
@@ -3121,9 +3118,6 @@ export default function AppLayout() {
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          color: "var(--accent)",
-                          background: "var(--accent-soft)",
-                          border: "1px solid var(--sidebar-control-border)",
                           textDecoration: "none",
                         }}
                       >

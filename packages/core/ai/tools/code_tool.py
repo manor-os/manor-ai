@@ -31,13 +31,22 @@ import subprocess
 import time
 from typing import Any
 
-from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
+from packages.core.ai.runtime.tool_context import (
+    RUNTIME_TOOL_CONTEXT_KEYS,
+    runtime_manual_skill_slugs_from_context,
+)
 
 logger = logging.getLogger(__name__)
 
 # ── Action catalog ──────────────────────────────────────────────────────────
 
 _ACTIONS: dict[str, list[tuple[str, str]]] = {
+    "Dashboard Module": [
+        (
+            "dashboard_module_validate",
+            "Validate Dashboard HTML, CSS, JavaScript, data requests, and Manor UI styling",
+        ),
+    ],
     "Planning": [
         ("plan_create", "Create implementation plan from task description with steps and dependencies"),
         ("plan_show", "Show current plan — goal, steps, progress"),
@@ -188,6 +197,33 @@ def _get_plan(entity_id: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # Action handlers
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _handle_dashboard_module_validate(params: dict, _entity_id: str) -> str:
+    from packages.core.ai.runtime.dashboard_module_validation import (
+        validate_dashboard_module_code,
+    )
+    from packages.core.ai.runtime.dashboard_submission import (
+        runtime_record_dashboard_validation,
+    )
+
+    code = params.get("code")
+    result = validate_dashboard_module_code(code)
+    recorded = False
+    if result.get("platform_ready") and isinstance(code, dict):
+        recorded = runtime_record_dashboard_validation(code)
+    return json.dumps(
+        {
+            **result,
+            "recorded_for_dashboard_submission": recorded,
+            "next_step": (
+                "Submit this exact code bundle with dashboard_submit_module."
+                if result.get("platform_ready")
+                else "Revise every error and warning, then validate the complete bundle again."
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 # ── Planning ─────────────────────────────────────────────────────────────────
 
@@ -1320,6 +1356,7 @@ async def _handle_notebook_add(params: dict, entity_id: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DISPATCH: dict[str, Any] = {
+    "dashboard_module_validate": _handle_dashboard_module_validate,
     # Planning
     "plan_create": _handle_plan_create,
     "plan_show": _handle_plan_show,
@@ -1436,6 +1473,20 @@ async def _code_handler(entity_id: str = "", **kwargs: Any) -> str:
 
     if not action:
         return json.dumps({"error": "action is required"})
+
+    manual_skill_slugs = runtime_manual_skill_slugs_from_context(kwargs)
+    if (
+        "dashboard-module-builder" in manual_skill_slugs
+        and action != "dashboard_module_validate"
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    "Dashboard module conversations may only use the code tool's "
+                    "dashboard_module_validate action."
+                )
+            }
+        )
 
     # Search mode
     if action == "search":

@@ -6,6 +6,7 @@ from packages.core.ai.runtime.scheduling import (
     runtime_cancel_scheduled_job_action,
     runtime_create_scheduled_job_action,
     runtime_list_scheduled_jobs_action,
+    runtime_query_scheduled_jobs_action,
     runtime_run_scheduled_job_now_action,
     runtime_toggle_scheduled_job_action,
 )
@@ -46,6 +47,17 @@ async def _create_job_handler(
 async def _list_jobs_handler(entity_id: str = "", **kwargs):
     """List all scheduled jobs for this entity."""
     return await runtime_list_scheduled_jobs_action(entity_id=entity_id)
+
+
+async def _query_jobs_handler(entity_id: str = "", **kwargs):
+    """Return structured scheduled-job data for read-only consumers."""
+    return await runtime_query_scheduled_jobs_action(
+        entity_id=entity_id,
+        query=str(kwargs.get("query") or ""),
+        workspace_id=str(kwargs.get("workspace_id") or ""),
+        enabled_only=bool(kwargs.get("enabled_only", False)),
+        limit=int(kwargs.get("limit") or 50),
+    )
 
 
 async def _cancel_job_handler(entity_id: str = "", job_id: str = "", **kwargs):
@@ -121,6 +133,41 @@ def get_tools():
                 },
             },
             _list_jobs_handler,
+        ),
+        (
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_scheduled_jobs",
+                    "description": (
+                        "Return structured, read-only scheduled automation data for the current entity, "
+                        "including schedule, enabled state, recent status, and error count."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Optional name or job ID filter.",
+                            },
+                            "workspace_id": {
+                                "type": "string",
+                                "description": "Optional workspace ID filter.",
+                            },
+                            "enabled_only": {
+                                "type": "boolean",
+                                "description": "Return only enabled automations when true.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 200,
+                            },
+                        },
+                    },
+                },
+            },
+            _query_jobs_handler,
         ),
         (
             {

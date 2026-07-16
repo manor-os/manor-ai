@@ -530,6 +530,7 @@ apps/web/src/components/chat/MessageBubble.tsx
 apps/web/src/components/chat/MessageRow.tsx
 apps/web/src/components/chat/PanelComposer.tsx
 apps/web/src/components/chat/PanelHeader.tsx
+apps/web/src/components/dashboard/GeneratedDashboardModule.tsx
 apps/web/src/components/diagram/DiagramCanvas.tsx
 apps/web/src/components/icons.tsx
 apps/web/src/components/integrations/NangoConnectButton.tsx
@@ -852,6 +853,8 @@ packages/core/ai/runtime/chat_turns.py
 packages/core/ai/runtime/chrome_routing.py
 packages/core/ai/runtime/completions.py
 packages/core/ai/runtime/context_blocks.py
+packages/core/ai/runtime/dashboard_module_validation.py
+packages/core/ai/runtime/dashboard_submission.py
 packages/core/ai/runtime/document_actions.py
 packages/core/ai/runtime/document_prompts.py
 packages/core/ai/runtime/entrypoints.py
@@ -921,6 +924,8 @@ packages/core/ai/runtime/workspace_operation_actions.py
 packages/core/ai/runtime/workspace_search.py
 packages/core/ai/runtime/workspace_setup.py
 packages/core/ai/runtime/workspace_task_actions.py
+packages/core/ai/skills/dashboard-module-builder/SKILL.md
+packages/core/ai/skills/dashboard-module-builder/config.json
 packages/core/ai/skills/docx/LICENSE.txt
 packages/core/ai/skills/docx/SKILL.md
 packages/core/ai/skills/docx/config.json
@@ -13119,6 +13124,7 @@ packages/core/ai/tools/bash_tool.py
 packages/core/ai/tools/browser_tools.py
 packages/core/ai/tools/code_tool.py
 packages/core/ai/tools/cron_tools.py
+packages/core/ai/tools/dashboard_tools.py
 packages/core/ai/tools/document_tools.py
 packages/core/ai/tools/extended_tools.py
 packages/core/ai/tools/file_tools.py
@@ -13374,6 +13380,10 @@ packages/core/services/conversation_records.py
 packages/core/services/credit_reservations.py
 packages/core/services/credit_service.py
 packages/core/services/custom_field_service.py
+packages/core/services/dashboard_agent.py
+packages/core/services/dashboard_http.py
+packages/core/services/dashboard_market.py
+packages/core/services/dashboard_news.py
 packages/core/services/default_workspace_skills.py
 packages/core/services/demo_account.py
 packages/core/services/docgen_service.py
@@ -13627,6 +13637,7 @@ scripts/smoke_chrome_runtime_skill_contract.py
 scripts/smoke_chrome_zhihu_sequence_contract.py
 tests/auth_helpers.py
 tests/conftest.py
+tests/dashboard_example_scenarios.py
 tests/e2e/__init__.py
 tests/e2e/conftest.py
 tests/e2e/test_ai_runtime_docker_smoke.py
@@ -13690,6 +13701,11 @@ tests/test_conversations.py
 tests/test_credential_service_mcp.py
 tests/test_custom_fields.py
 tests/test_dashboard.py
+tests/test_dashboard_examples_e2e.py
+tests/test_dashboard_http.py
+tests/test_dashboard_module_builder_skill.py
+tests/test_dashboard_module_code_tool.py
+tests/test_dashboard_module_validation.py
 tests/test_dispatcher_advisory_output_schema.py
 tests/test_dispatcher_output_coercion.py
 tests/test_dispatcher_ref_resolution.py
@@ -13841,6 +13857,7 @@ tests/test_video_adapters.py
 tests/test_video_auto_wait.py
 tests/test_video_duration_constraints.py
 tests/test_video_image_as_reference.py
+tests/test_web_event_search.py
 tests/test_web_i18n.py
 tests/test_webhooks.py
 tests/test_wechat_personal_runner_api.py

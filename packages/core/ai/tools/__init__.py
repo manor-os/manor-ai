@@ -30,6 +30,7 @@ def register_all_tools(pool) -> None:
         workspace_agent_tools,
         agent_provisioning_tools,
         notification_tools,
+        dashboard_tools,
     )
 
     # invoke_skill is always-loaded since any agent may call skills at runtime.
@@ -72,6 +73,7 @@ def register_all_tools(pool) -> None:
         workspace_agent_tools,
         agent_provisioning_tools,
         notification_tools,
+        dashboard_tools,
     ]:
         for schema, handler in module.get_tools():
             pool.register(schema["function"]["name"], schema, handler)
