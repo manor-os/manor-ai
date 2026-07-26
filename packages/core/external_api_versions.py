@@ -82,8 +82,8 @@ META_GRAPH = APIVersion(
 
 LINKEDIN = APIVersion(
     name="LinkedIn API",
-    value="202509",
-    released=date(2025, 9, 1),
+    value="202607",
+    released=date(2026, 7, 1),
     eol_months=12,
     notes="https://learn.microsoft.com/en-us/linkedin/marketing/versioning",
 )
