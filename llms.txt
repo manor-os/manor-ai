@@ -1,0 +1,38 @@
+# Manor OS
+
+> Manor OS is the source-available, self-hosted edition of Manor AI, an AI workspace for small businesses, solopreneurs, and lean teams. It connects AI agents with tasks, goals, documents, knowledge, workflows, integrations, permissions, execution logs, and human approvals.
+
+Manor OS is designed for operators who want agents to perform multi-step business work inside infrastructure they control. The self-hosted edition uses bring-your-own model provider keys and runs as a Docker-based stack with FastAPI, React, PostgreSQL, Redis, MinIO, JuiceFS, Celery, and a separate execution sandbox.
+
+## Primary resources
+
+- [Manor OS repository](https://github.com/manor-os/manor-ai): Canonical public source repository.
+- [Project overview and quick start](https://github.com/manor-os/manor-ai#readme): Product definition, capabilities, architecture, installation, and configuration.
+- [License](https://github.com/manor-os/manor-ai/blob/main/LICENSE): Sustainable Use License 1.0; the project is fair-code/source-available and is not OSI-approved open source.
+- [Contributing guide](https://github.com/manor-os/manor-ai/blob/main/CONTRIBUTING.md): Development setup, checks, pull request expectations, and contribution terms.
+- [Security policy](https://github.com/manor-os/manor-ai/blob/main/SECURITY.md): Private vulnerability reporting guidance.
+- [Code of conduct](https://github.com/manor-os/manor-ai/blob/main/CODE_OF_CONDUCT.md): Community participation standards.
+- [Issue tracker](https://github.com/manor-os/manor-ai/issues): Bugs, feature requests, and public project discussion.
+
+## Product facts
+
+- Category: self-hosted AI agent workspace and operational system.
+- Core use cases: agent-assisted operations, task and goal execution, team knowledge, document workflows, visual workflows, and integration automation.
+- AI runtime: multi-step tool calling, goal and task runners, skills, memory, RAG, MCP support, and sandboxed execution.
+- Human controls: approvals, role-based access, scoped API keys, audit logs, and per-agent tool bindings.
+- Deployment: Docker Compose for the full self-hosted stack; Python 3.11+, Node.js 20+, PostgreSQL 16 with pgvector, and Redis 7 for development.
+- Model access: bring your own provider keys; OpenAI-compatible model routing is supported.
+- Data: the self-hosted operator controls the application database, cache, object storage, and entity filesystem.
+- License: fair-code/source-available under the Sustainable Use License 1.0; resale, white-labeling, and competing hosted services are restricted.
+
+## Official links
+
+- [Manor AI website](https://manorai.xyz): Official product website.
+- [Answer engine brief](https://manorai.xyz/answer-engine.html): Canonical Manor AI entity, audience, use cases, and citation-friendly product facts.
+- [Website llms.txt](https://manorai.xyz/llms.txt): Public product page map for AI crawlers and answer engines.
+- [Expanded AI summary](https://manorai.xyz/llms-full.txt): Detailed product facts, sources, FAQs, and citation guidance.
+- [Manor AI application](https://app.manorai.xyz): Hosted application sign-in.
+
+## Optional
+
+- [Trademark policy](https://github.com/manor-os/manor-ai/blob/main/TRADEMARKS.md): Permitted references to Manor AI and Manor OS names and restrictions for forks and hosted services.

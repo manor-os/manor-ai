@@ -61,10 +61,13 @@ npm run build
 
 ## Contribution License
 
-Unless a separate contributor agreement applies, contributions intentionally
-submitted to Manor AI are submitted under the
-[Manor Sustainable Use License 1.0](LICENSE). Do not submit code, assets, or
-documents unless you have the right to contribute them under that license.
+Contributions intentionally submitted to Manor AI are subject to the
+[Contributor License Agreement](CONTRIBUTOR_LICENSE_AGREEMENT.md) and are made
+available to users under the [Sustainable Use License 1.0](LICENSE). By opening
+a pull request, you agree to that contributor license agreement and confirm
+that you have the right to contribute the submitted code, assets, and documents
+under those terms. Maintainers may request separate written acceptance before
+merging a contribution.
 
 ## Issues
 

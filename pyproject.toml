@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Self-hosted AI workspace runtime for agents, tools, documents, workflows, and integrations"
 requires-python = ">=3.11"
 license = { text = "Manor Sustainable Use License 1.0" }
-
+keywords = ["ai-agents", "agentic-ai", "self-hosted", "workflow-automation", "rag"]
 dependencies = [
     # Web
     "fastapi>=0.115",
@@ -33,6 +33,7 @@ dependencies = [
     "stripe>=8.0",
     # Office docs
     "openpyxl>=3.1",
+    "Markdown>=3.5",
     "python-pptx>=1.0",
     "python-docx>=1.1",
     # PDF text extraction — used by chat-attachment + RAG ingest. ``pypdf``
@@ -57,6 +58,12 @@ dependencies = [
     # set TEMPORAL_ENABLED=true to use)
     "temporalio>=1.7",
 ]
+
+[project.urls]
+Homepage = "https://manorai.xyz"
+Repository = "https://github.com/manor-os/manor-ai"
+Issues = "https://github.com/manor-os/manor-ai/issues"
+Documentation = "https://github.com/manor-os/manor-ai#readme"
 
 [project.optional-dependencies]
 dev = [

@@ -1,0 +1,19 @@
+# Manor AI Application
+
+> This host is the authenticated Manor AI application. Public product information is available at https://manorai.xyz and public source is available at https://github.com/manor-os/manor-ai.
+
+Manor OS is the source-available, self-hosted edition of Manor AI, an AI workspace for small businesses, solopreneurs, and lean teams. It connects agents with tasks, goals, documents, knowledge, workflows, integrations, permissions, execution logs, and human approvals.
+
+## Primary resources
+
+- [Official website](https://manorai.xyz): Public product overview.
+- [Answer engine brief](https://manorai.xyz/answer-engine.html): Canonical entity, audience, use cases, and citation-friendly product facts.
+- [Expanded AI summary](https://manorai.xyz/llms-full.txt): Detailed product facts, sources, FAQs, and citation guidance.
+- [Public source repository](https://github.com/manor-os/manor-ai): Canonical source, installation instructions, architecture, and project documentation.
+- [Project overview and quick start](https://github.com/manor-os/manor-ai#readme): Definition, use cases, deployment, and configuration.
+- [License](https://github.com/manor-os/manor-ai/blob/main/LICENSE): Sustainable Use License 1.0; the project is fair-code/source-available and is not OSI-approved open source.
+- [Security policy](https://github.com/manor-os/manor-ai/blob/main/SECURITY.md): Vulnerability reporting guidance.
+
+## Application indexing
+
+The application routes on this host are authenticated or user-specific and should not be indexed. Crawlers should use the public website and repository above as authoritative sources.

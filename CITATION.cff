@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use Manor OS in research or a published project, please cite the software using this metadata."
+title: "Manor OS"
+abstract: "The source-available, self-hosted edition of Manor AI, connecting agents with tasks, documents, knowledge, workflows, integrations, and human approvals for small businesses and lean teams."
+type: software
+authors:
+  - name: "Manor AI"
+version: 0.1.0
+repository-code: "https://github.com/manor-os/manor-ai"
+url: "https://manorai.xyz"
+keywords:
+  - artificial intelligence
+  - AI agents
+  - agentic workflows
+  - self-hosting
+  - workflow automation
+license-url: "https://github.com/manor-os/manor-ai/blob/main/LICENSE"

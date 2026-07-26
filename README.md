@@ -42,14 +42,34 @@
 
 ## Why Manor AI
 
-Every other AI product stops at the chat box. You're left stitching together agents, skills, and workflows by hand — then babysitting every run. That's not an operating layer. That's a toolkit.
+Most AI products stop at chat. Real teams need an operating layer around AI:
+shared context, durable tasks, scoped tools, approvals, audit trails, and a way
+to keep sensitive data inside infrastructure they control.
 
-**Manor AI is the ultimate answer to that problem.** It's a workspace that runs an entire business end to end, autonomously. You hand it an outcome; it organizes the agents, decomposes the work into tasks, calls the tools, enforces the rules, and keeps everything running — with zero manual agent-building, skill config, or workflow wiring.
-This is the AI workspace as it was meant to be:
+Manor AI is built for that layer: the product surface where model choice,
+workspace memory, tasks, permissions, and human review all meet.
 
-* **One runtime, not a pile of parts.** Chat, documents, goals, tasks, reports, and integrations operate as a single system — the whole workspace, in one place.
-* **Autonomous work with a paper trail.** Every goal becomes linked tasks that execute themselves and leave durable status, evidence, and review points. Nothing disappears into a transcript.
-* **Yours, end to end.** Self-host the app, database, files, and agent runtime; bring your own model keys. Data and logs stay in your infrastructure. Approvals, scoped tools, and audit logs keep every action inspectable.
+### Own the runtime, not just the chat box
+
+Manor AI brings the core surfaces of an AI workspace into one runtime: chat,
+documents, agents, goals, workflows, reports, integrations, settings, and the
+infrastructure around them. Self-host the app, database, files, agent runtime,
+and integration surfaces; bring your own model keys instead of handing your
+workspace to a hosted black box. Model provider keys are configured in your
+deployment, and operational data stays inside your infrastructure.
+
+### Turn prompts into accountable work
+
+Agents operate through goals, tasks, workspace context, tool permissions, and
+human approval gates. Important automation leaves durable status, evidence, and
+review points instead of disappearing into a one-off chat transcript. Goals
+break work into linked execution steps that teams can inspect and improve.
+
+### Make governance part of the product
+
+Approval gates, scoped tools, audit logs, workspace permissions, and runtime
+signals make automation inspectable before it touches critical workflows. Rules
+are visible to operators and mapped to enforcement patterns in the runtime.
 
 ## How Manor AI works
 
@@ -201,9 +221,15 @@ setup or user-facing behavior changes.
 
 ## License
 
-[Manor Sustainable Use License 1.0](LICENSE) -- Copyright (c) 2026 Manor AI.
+[Sustainable Use License 1.0](LICENSE) -- Copyright (c) 2026 Manor AI.
 
-The public source may be self-hosted, modified, and used internally. Reselling,
-white-labeling, or offering a hosted/managed competing service requires a
-separate written commercial agreement with Manor AI. The Manor AI name and
+Manor AI is fair-code: source-available, self-hostable, and extensible under the
+Sustainable Use License 1.0. Internal business, personal, and non-commercial use
+are permitted. White-labeling Manor AI, charging others for access to a hosted
+Manor AI service, or otherwise providing the software commercially requires a
+separate written agreement with Manor AI. Commercial consulting and support
+around a customer's internal deployment are permitted. The Manor AI name and
 marks are governed separately by [TRADEMARKS.md](TRADEMARKS.md).
+
+The license text follows
+[n8n's published Sustainable Use License 1.0](https://github.com/n8n-io/n8n/blob/master/LICENSE.md).
