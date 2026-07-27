@@ -2,20 +2,28 @@
   <img src="./docs-site/static/img/content.png" width="750" alt="Manor AI logo" style="max-width: 100%" />
 </p>
 
-<!-- <h1 align="center">Manor AI</h1>
+<h1 align="center">Manor AI</h1>
 
 <p align="center">
-  <strong>Self-hosted AI workspace runtime for governed agents, tasks, tools, and knowledge.</strong>
-</p> -->
-
-<p align="center">
-  Bring agents out of one-off chat and into accountable workspace operations:
-  BYOK models, durable tasks, scoped tools, approvals, audit trails, and local
-  data ownership.
+  <strong>Self-hosted AI workspace for governed agents, tasks, tools, and knowledge.</strong>
 </p>
 
 <p align="center">
-  <a href="https://manor-os.github.io/docs/manor-ai/quickstart"><strong>Quickstart</strong></a>
+  Run agents against team knowledge and scoped tools, require human approval
+  before sensitive actions, and keep operational data inside infrastructure
+  you control.
+</p>
+
+<p align="center">
+  <a href="https://github.com/manor-os/manor-ai"><strong>⭐ Star Manor AI</strong></a>
+  ·
+  <a href="#5-minute-quickstart"><strong>🚀 Run with Docker Compose</strong></a>
+  ·
+  <a href="https://github.com/manor-os/manor-ai/issues/new/choose"><strong>💬 Open an issue</strong></a>
+</p>
+
+<p align="center">
+  <a href="https://manor-os.github.io/docs/manor-ai/quickstart"><strong>5-minute Quickstart</strong></a>
   ·
   <a href="https://manor-os.github.io/docs/manor-ai/"><strong>Docs</strong></a>
   ·
@@ -120,7 +128,7 @@ Worker runtime
 | Operations | Docker Compose stack, health checks, backup guidance, sandbox isolation, configuration docs, and upgrade notes. |
 | Extensibility | Add skills, tools, integrations, workers, model providers, and API clients without changing the core workspace model. |
 
-## Quickstart
+## 5-minute Quickstart
 
 ```bash
 git clone https://github.com/manor-os/manor-ai.git && cd manor-ai
