@@ -47,7 +47,6 @@ celery_app.conf.include = [
     "packages.core.tasks.scheduler_tasks",
     "packages.core.tasks.oauth_refresh",
     "packages.core.tasks.channel_tasks",
-    "packages.core.tasks.billing_tasks",
     "packages.core.tasks.ops_tasks",
     "packages.core.tasks.deletion_tasks",
     "packages.core.tasks.maintenance_tasks",
@@ -95,17 +94,6 @@ celery_app.conf.beat_schedule = {
         "task": "integrations.health_tick",
         "schedule": crontab(hour=4, minute=15),  # once daily at 04:15 UTC
     },
-    "billing-cycle-check": {
-        "task": "billing.cycle_check",
-        "schedule": crontab(hour=0, minute=5),  # daily at 00:05 UTC — resets AI budgets on billing anniversary
-    },
-    "plan-renewals": {
-        # Daily at 00:30 UTC — issues monthly plan-grant credits to
-        # active paying tenants whose monthly anniversary has rolled over.
-        # No-op for tenants already granted this cycle.
-        "task": "billing.plan_renewals",
-        "schedule": crontab(hour=0, minute=30),
-    },
     "refresh-plans-cache": {
         # Every 5 min — keeps each worker's in-process PLANS cache fresh
         # so admin-side edits propagate across processes within 5 min
@@ -116,7 +104,7 @@ celery_app.conf.beat_schedule = {
     "sync-openrouter-pricing": {
         # Keep runtime pricing aligned with OpenRouter changes.
         # Override cadence with OPENROUTER_PRICING_SYNC_SECONDS.
-        "task": "billing.sync_openrouter_pricing",
+        "task": "maintenance.sync_openrouter_pricing",
         "schedule": float(os.getenv("OPENROUTER_PRICING_SYNC_SECONDS", "43200")),
     },
     # M3 Worker / Dispatcher layer
