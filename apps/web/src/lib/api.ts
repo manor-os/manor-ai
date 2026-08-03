@@ -79,6 +79,69 @@ import { captureClientError } from "./clientErrors";
 const API_BASE = "/api/v1";
 const BACKEND_UNAVAILABLE_TOAST_ID = "backend-unavailable";
 
+export type DashboardAppliedModuleChange = {
+  action: "create" | "update" | "remove";
+  module?: Record<string, unknown> | null;
+  module_id?: string | null;
+};
+
+export type DashboardSuggestLayoutResult = {
+  version: number;
+  widgets: Array<{ id: string; visible: boolean }>;
+  modules: any[];
+  assistant_message?: string | null;
+  changed_module_id?: string | null;
+  conversation_id?: string | null;
+  tool_calls: string[];
+  hitl_requests: Array<Record<string, unknown>>;
+  preview_created: boolean;
+  applied_module_changes?: DashboardAppliedModuleChange[];
+  widgets_changed?: boolean;
+};
+
+export type DashboardSuggestJobResponse = {
+  job_id: string;
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  error?: string | null;
+  error_code?: string | null;
+  result?: DashboardSuggestLayoutResult | null;
+};
+
+export type TaskBoardPreferences = {
+  mode: "kanban" | "list";
+  visible_columns: string[];
+  column_order: string[];
+  configured: boolean;
+};
+
+type PaginatedMessagesResponse<T> = {
+  items: T[];
+  has_more: boolean;
+  next_cursor?: string | null;
+  /** Workspace chat only: server-counted actions still waiting on a human. */
+  open_action_count?: number;
+  /** True when `items` carries every open action card, so absent == answered. */
+  open_actions_complete?: boolean;
+};
+
+export type WorkspaceChatEntrypoint = {
+  binding_id: string;
+  workflow_id: string;
+  title: string;
+  description: string;
+  placeholder: string;
+  order: number;
+  intent_enabled: boolean;
+  inputs: Array<{
+    key: string;
+    label: string;
+    type: "string" | "number" | "boolean" | "json";
+    required: boolean;
+    placeholder: string;
+    default?: unknown;
+  }>;
+};
+
 type DocumentListParams = {
   search?: string;
   folder_id?: string;
@@ -99,6 +162,8 @@ type DocumentBrowseResponse = DocumentListResponse & {
   documents: Document[];
   total_folders: number;
   total_documents: number;
+  direct_total_files?: number;
+  direct_total_size?: number;
 };
 
 function listDocuments(params?: DocumentListParams) {
@@ -406,6 +471,17 @@ export interface BlueprintSetupPreview {
   rules: string[];
 }
 
+export interface BlueprintShowcaseAsset {
+  id: string;
+  kind: "image" | "video";
+  url: string;
+  caption: string | null;
+  alt_text: string | null;
+  mime_type: string | null;
+  size_bytes: number | null;
+  uploaded_at: string | null;
+}
+
 export interface BlueprintSummary {
   id: string;
   slug: string;
@@ -417,6 +493,14 @@ export interface BlueprintSummary {
   payload_version: string;
   source_workspace_id: string | null;
   cover_image_url: string | null;
+  showcase_assets: BlueprintShowcaseAsset[];
+  author_handle: string | null;
+  author_display_name: string | null;
+  author_avatar_url: string | null;
+  remixed_from_id: string | null;
+  favorite_count: number;
+  is_favorited: boolean;
+  remix_count: number;
   setup_preview: BlueprintSetupPreview;
   created_at: string;
   updated_at: string | null;
@@ -424,6 +508,7 @@ export interface BlueprintSummary {
   // Server-computed / read-only marketplace fields. Pricing is changed via
   // api.blueprints.setPricing, never via update().
   price_cents?: number | null;
+  list_price_cents?: number | null;
   currency?: string;
   purchase_count?: number;
   has_share_token?: boolean;
@@ -489,6 +574,213 @@ export interface GovernancePolicyResponse {
   updated_at?: string | null;
 }
 
+// Mirrors backend StandingGrantsResponse (apps/api/routers/governance.py).
+export interface StandingGrantsResponse {
+  actions: string[];
+  capabilities: string[];
+}
+
+// Mirrors backend ApprovalMatrixResponse (apps/api/routers/governance.py) —
+// one row per Strategist proposal type + the non-Strategist standing grants.
+export interface ApprovalMatrixRow {
+  action_key: string;
+  kind: string;
+  operation: string;
+  label: string;
+  risk_level: string;
+  auto_approved: boolean;
+}
+
+export interface ApprovalMatrixResponse {
+  rows: ApprovalMatrixRow[];
+  other_grants: Array<{ kind: "action" | "capability"; value: string }>;
+}
+
+// ── M14 observability (apps/api/routers/observability.py) ─────────────
+
+export interface TimelineEventDigest {
+  id: string;
+  event_type: string;
+  source_kind: string;
+  source_id: string;
+  run_id?: string | null;
+  status?: string | null;
+  actor_kind?: string | null;
+  actor_id?: string | null;
+  root_execution_id?: string | null;
+  causation_id?: string | null;
+  correlation_id?: string | null;
+  occurred_at?: string | null;
+  payload?: Record<string, any>;
+  payload_keys?: string[];
+}
+
+export interface StrategyReviewDigest {
+  id: string;
+  trigger_kind: string;
+  status: string;
+  skip_reason?: string | null;
+  window_start?: string | null;
+  window_end?: string | null;
+  watermark_start?: string | null;
+  watermark_end?: string | null;
+  workspace_revision?: number | null;
+  policy_revision?: number | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface StrategyReviewListEntry extends StrategyReviewDigest {
+  reports: { complete: number; partial: number; failed: number };
+  proposal_id?: string | null;
+  item_counts: { kind: string; status: string; count: number }[];
+}
+
+export interface StrategyProposalItem {
+  id: string;
+  item_key: string;
+  kind: string;
+  status: string;
+  risk_level: string;
+  action_key: string;
+  decision?: { decision?: string; decided_by?: string; reason_code?: string; comment?: string } | null;
+  execution_root_id?: string | null;
+  created_at?: string | null;
+  decided_at?: string | null;
+  payload?: Record<string, any>;
+  basis?: { report_refs?: string[]; evidence_refs?: string[] } | null;
+}
+
+export interface StrategyReviewDetail {
+  review: StrategyReviewDigest & { briefing?: Record<string, any> | null; error?: string | null };
+  reports: {
+    id: string;
+    domain: string;
+    status: string;
+    summary?: string | null;
+    metrics?: Record<string, any> | null;
+    observations?: any[] | null;
+    uncertainties?: any[] | null;
+    coverage?: Record<string, any> | null;
+    created_at?: string | null;
+  }[];
+  proposal?: {
+    id: string;
+    summary: string;
+    notes?: string | null;
+    status: string;
+    created_at?: string | null;
+    resolved_at?: string | null;
+    items: StrategyProposalItem[];
+  } | null;
+}
+
+export interface WorkspaceTimelineResponse {
+  selector: Record<string, string>;
+  events?: TimelineEventDigest[];
+  causes?: Record<string, string[]>;
+  review?: StrategyReviewDigest;
+  reports?: StrategyReviewDetail["reports"];
+  proposal?: StrategyReviewDetail["proposal"];
+  executions?: Record<string, TimelineEventDigest[]>;
+}
+
+export interface AutomationHealthEntry {
+  id: string;
+  name: string;
+  kind: "scheduled_job" | "workflow_binding";
+  schedule: {
+    kind?: string | null;
+    cron_expr?: string | null;
+    every_seconds?: number | null;
+    run_at?: string | null;
+    timezone?: string | null;
+  };
+  revision: number;
+  consecutive_errors: number;
+  last_run_at?: string | null;
+  last_status?: string | null;
+  runs_30d: { dispatched: number; completed: number; failed: number; missed: number };
+  active_experiment?: { id: string; status?: string | null } | null;
+}
+
+// Mirrors backend HumanParticipationResponse (apps/api/routers/humans.py).
+// M9.6 privacy boundary: participants carry declared facts + an open-work
+// count only — never a per-person timing / efficiency metric — and
+// contributions carry changed FIELD NAMES only.
+export interface HumanQueueCommitment {
+  id: string;
+  request_kind: string;
+  participant_id?: string | null;
+  role_required?: string | null;
+  source_kind: string;
+  source_id: string;
+  expected_input?: string | null;
+  status: string;
+  requested_at?: string | null;
+  expected_by?: string | null;
+  blocking: boolean;
+  blocking_execution_ids: string[];
+  age_hours?: number | null;
+}
+
+export interface HumanBlockingEntry {
+  commitment_id: string;
+  request_kind: string;
+  expected_by?: string | null;
+  execution_ids: string[];
+  blocked: { id: string; kind: string; title?: string | null; status?: string | null }[];
+}
+
+export interface HumanParticipantDigest {
+  user_id: string;
+  display_name?: string | null;
+  roles: string[];
+  declared_capabilities: string[];
+  availability: { timezone?: string | null; out_of_office: boolean };
+  open_commitments_count: number;
+}
+
+export interface HumanContributionDigest {
+  kind: string;
+  target_kind: string;
+  target_id: string;
+  fields_changed: string[];
+  created_at?: string | null;
+}
+
+export interface HumanDecisionDigest {
+  item_id: string;
+  kind?: string | null;
+  decision: string;
+  reason_code?: string | null;
+  decided_at?: string | null;
+}
+
+export interface HumanParticipationResponse {
+  queue: HumanQueueCommitment[];
+  blocking: HumanBlockingEntry[];
+  participants: HumanParticipantDigest[];
+  recent_contributions: HumanContributionDigest[];
+  decisions: HumanDecisionDigest[];
+}
+
+// Mirrors the provenance endpoint (apps/api/routers/observability.py).
+export interface ProvenanceStep {
+  kind: string;
+  id?: string | null;
+  label?: string | null;
+}
+
+export interface TaskProvenanceResponse {
+  task: { id: string; title: string; status: string };
+  root_execution_id: string;
+  trigger: ProvenanceStep;
+  causation_chain: ProvenanceStep[];
+  config_versions: Record<string, number | string>;
+  events: TimelineEventDigest[];
+}
+
 export interface InstallBlueprintRequest {
   mode?: InstallMode;
   workspace_name?: string;
@@ -530,6 +822,29 @@ export interface MerchantSalesResponse {
   gross_cents: number;
   fees_cents: number;
   net_cents: number;
+}
+
+export interface BillingPayment {
+  id: string;
+  amount_cents: number;
+  /** @deprecated Use amount_cents. */
+  amount: number;
+  currency: string;
+  credits: number;
+  status: string;
+  kind: "credit_topup" | "subscription" | "payment";
+  action: "credit_purchase" | "plan_upgrade" | "subscription_renewal" | "payment";
+  plan_id?: string | null;
+  event_type?: string | null;
+  description?: string | null;
+  stripe_payment_intent_id?: string | null;
+  created_at: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface BillingPaymentsResponse {
+  items: BillingPayment[];
+  total: number;
 }
 
 export interface InstallTodo {
@@ -1296,6 +1611,9 @@ async function request<T>(
     "X-Language": getStoredLocale(),
     ...((options.headers as Record<string, string>) || {}),
   };
+  if (typeof FormData !== "undefined" && options.body instanceof FormData) {
+    delete headers["Content-Type"];
+  }
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const suppressErrorToast = headers["X-Silent-Error"] === "1";
   if (suppressErrorToast) delete headers["X-Silent-Error"];
@@ -1446,12 +1764,13 @@ async function streamSseResult<T>(
 async function streamWorkflowRun(
   path: string,
   onNode: (id: string, status: string) => void,
+  data?: Record<string, unknown>,
 ): Promise<any> {
   const token = getAuthToken();
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({}),
+    body: JSON.stringify(data || {}),
   });
   if (!response.ok || !response.body) {
     const errBody = await response.json().catch(() => ({ detail: response.statusText }));
@@ -1870,6 +2189,10 @@ export const api = {
       request<{ detail: string; models: Record<string, string>; masked: string }>("/auth/me/models/custom", {
         method: "PUT", body: JSON.stringify(data),
       }),
+    saveCatalogModel: (data: { role: string; model: string; api_key?: string; use_saved_api_key?: boolean; clear_api_key?: boolean; base_url?: string }) =>
+      request<{ detail: string; models: Record<string, string>; masked: string }>("/auth/me/models/catalog", {
+        method: "PUT", body: JSON.stringify(data),
+      }),
     getModelCatalog: () =>
       request<{ catalog: Record<string, any[]>; defaults: Record<string, string> }>("/auth/models/catalog"),
     getMyModels: () =>
@@ -1915,6 +2238,13 @@ export const api = {
 
   tasks: {
     constants: () => request<TaskConstantsResponse>("/tasks/constants"),
+    getBoardPreferences: () =>
+      request<TaskBoardPreferences>("/tasks/board-preferences"),
+    updateBoardPreferences: (data: Omit<TaskBoardPreferences, "configured">) =>
+      request<TaskBoardPreferences>("/tasks/board-preferences", {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
     list: (params?: { status?: string; limit?: number; offset?: number; parent_task_id?: string; workspace_id?: string; category_id?: string }) => {
       const q = new URLSearchParams();
       if (params?.status) q.set("status", params.status);
@@ -2169,6 +2499,20 @@ export const api = {
       request<Message[]>(`/chat/conversations/${convId}/messages?limit=${encodeURIComponent(String(opts?.limit ?? 500))}`, {
         headers: opts?.silent ? { "X-Silent-Error": "1" } : undefined,
       }),
+    getMessagesPage: (
+      convId: string,
+      opts?: { silent?: boolean; limit?: number; before?: string | null },
+    ) => {
+      const q = new URLSearchParams();
+      q.set("limit", String(opts?.limit ?? 75));
+      if (opts?.before) q.set("before", opts.before);
+      return request<PaginatedMessagesResponse<Message>>(
+        `/chat/conversations/${convId}/messages/page?${q}`,
+        {
+          headers: opts?.silent ? { "X-Silent-Error": "1" } : undefined,
+        },
+      );
+    },
     feedback: (
       convId: string,
       messageId: string,
@@ -2482,7 +2826,7 @@ export const api = {
       ),
   },
 
-  // ── permissions_v1: classify / visibility / legal-hold / request-access
+  // ── permissions_v1: classify / visibility / request-access
   // Lives at /api/v1/permissions/... (separate router; uses authorize()).
   permissionsV1: {
     classify: (docId: string, classification: string, note?: string) =>
@@ -2499,11 +2843,6 @@ export const api = {
       request<{ id: string; client_visible: boolean }>(
         `/permissions/documents/${docId}/client-visible`,
         { method: "POST", body: JSON.stringify({ client_visible: clientVisible }) },
-      ),
-    setLegalHold: (docId: string, enabled: boolean, reason?: string) =>
-      request<{ id: string; legal_hold: boolean }>(
-        `/permissions/documents/${docId}/legal-hold`,
-        { method: "POST", body: JSON.stringify({ enabled, reason }) },
       ),
     requestAccess: (data: {
       resource_type: string;
@@ -2652,6 +2991,20 @@ export const api = {
       request<void>(`/agents/subscriptions/${subscriptionId}`, { method: "DELETE" }),
     deployments: (agentId: string) =>
       request<AgentDeploymentResponse[]>(`/agents/${agentId}/deployments`),
+    runtimeEvidence: (agentId: string, params?: { limit?: number; evidence_type?: string; status?: string }) => {
+      const q = new URLSearchParams();
+      if (params?.limit) q.set("limit", String(params.limit));
+      if (params?.evidence_type) q.set("evidence_type", params.evidence_type);
+      if (params?.status) q.set("status", params.status);
+      return request<RuntimeEvidence[]>(`/agents/${agentId}/runtime/evidence?${q}`);
+    },
+    learningCandidates: (agentId: string, params?: { limit?: number; status?: string | null; candidate_type?: string }) => {
+      const q = new URLSearchParams();
+      if (params?.limit) q.set("limit", String(params.limit));
+      if (params && params.status !== undefined) q.set("status", params.status === null ? "" : params.status);
+      if (params?.candidate_type) q.set("candidate_type", params.candidate_type);
+      return request<AgentLearningCandidate[]>(`/agents/${agentId}/learning-candidates?${q}`);
+    },
     subscriptionWorkers: (subscriptionId: string) =>
       request<SubscriptionWorkerBinding[]>(`/agents/subscriptions/${subscriptionId}/workers`),
     bindSubscriptionWorker: (
@@ -2763,6 +3116,35 @@ export const api = {
   workspaces: {
     list: () => request<Workspace[]>("/workspaces"),
     get: (id: string) => request<Workspace>(`/workspaces/${id}`),
+    blueprintUpgradePlan: (id: string) =>
+      request<{
+        workspace_id: string;
+        workspace_name: string;
+        blueprint_slug: string | null;
+        can_revert: boolean;
+        items: Array<{
+          kind: "skill" | "agent";
+          slug: string;
+          name: string;
+          id?: string;
+          action: "update" | "keep_yours" | "unchanged" | "missing";
+          changes: string[];
+          /** The new version's actual content, per field, for reading before
+           *  agreeing to overwrite what the agents currently run. */
+          new_content: Record<string, string>;
+        }>;
+      }>(`/workspaces/${id}/blueprint/upgrade`),
+    applyBlueprintUpgrade: (id: string) =>
+      request<{
+        workspace_id: string;
+        updated: Array<{ kind: string; name: string; changes: string[] }>;
+        kept_yours: Array<{ kind: string; name: string }>;
+        can_revert: boolean;
+      }>(`/workspaces/${id}/blueprint/upgrade`, { method: "POST" }),
+    revertBlueprintUpgrade: (id: string) =>
+      request<{ workspace_id: string; reverted: Array<{ kind: string; name: string }> }>(
+        `/workspaces/${id}/blueprint/revert`, { method: "POST" },
+      ),
     create: (data: Partial<Workspace>) => request<Workspace>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
     sandbox: (data?: { kind?: string; name?: string; seed_task_title?: string }) =>
       request<{
@@ -2804,7 +3186,41 @@ export const api = {
         }),
       revisions: (wsId: string, limit = 20) =>
         request<any[]>(`/workspaces/${wsId}/governance/revisions?limit=${limit}`),
+      standingGrants: (wsId: string) =>
+        request<StandingGrantsResponse>(`/workspaces/${wsId}/governance/standing-grants`),
+      revokeStandingGrant: (wsId: string, kind: "action" | "capability", value: string) =>
+        request<StandingGrantsResponse>(
+          `/workspaces/${wsId}/governance/standing-grants/${kind}/${encodeURIComponent(value)}`,
+          { method: "DELETE" },
+        ),
+      approvalMatrix: (wsId: string) =>
+        request<ApprovalMatrixResponse>(`/workspaces/${wsId}/governance/approval-matrix`),
+      setApprovalMatrix: (wsId: string, action_key: string, auto_approved: boolean) =>
+        request<ApprovalMatrixResponse>(`/workspaces/${wsId}/governance/approval-matrix`, {
+          method: "PUT",
+          body: JSON.stringify({ action_key, auto_approved }),
+        }),
     },
+    observability: {
+      timeline: (wsId: string, selector: { root_execution_id?: string; review_id?: string; correlation_id?: string }, limit = 100) => {
+        const q = new URLSearchParams();
+        if (selector.root_execution_id) q.set("root_execution_id", selector.root_execution_id);
+        if (selector.review_id) q.set("review_id", selector.review_id);
+        if (selector.correlation_id) q.set("correlation_id", selector.correlation_id);
+        q.set("limit", String(limit));
+        return request<WorkspaceTimelineResponse>(`/workspaces/${wsId}/timeline?${q}`);
+      },
+      strategyReviews: (wsId: string, limit = 10) =>
+        request<{ reviews: StrategyReviewListEntry[] }>(`/workspaces/${wsId}/strategy/reviews?limit=${limit}`),
+      strategyReviewDetail: (wsId: string, reviewId: string) =>
+        request<StrategyReviewDetail>(`/workspaces/${wsId}/strategy/reviews/${reviewId}`),
+      automationHealth: (wsId: string) =>
+        request<{ automations: AutomationHealthEntry[] }>(`/workspaces/${wsId}/automation-health`),
+      taskProvenance: (wsId: string, taskId: string) =>
+        request<TaskProvenanceResponse>(`/workspaces/${wsId}/tasks/${taskId}/provenance`),
+    },
+    humanParticipation: (wsId: string) =>
+      request<HumanParticipationResponse>(`/workspaces/${wsId}/human-participation`),
     goals: (wsId: string, goals: any[]) => request<any>(`/workspaces/${wsId}/goals`, { method: "PUT", body: JSON.stringify({ goals }) }),
     rules: (wsId: string, rules: any[]) => request<any>(`/workspaces/${wsId}/rules`, { method: "PUT", body: JSON.stringify({ rules }) }),
     activity: (wsId: string, params?: { limit?: number; event_type?: string }) => {
@@ -2938,12 +3354,79 @@ export const api = {
       request<SimulationReport>(`/workspaces/${wsId}/simulation-report`),
     // ── Workspace Chat ──────────────────────────────────────────────
     chat: {
+      listEntrypoints: (wsId: string) =>
+        request<WorkspaceChatEntrypoint[]>(`/workspaces/${wsId}/chat/entrypoints`),
+      streamEntrypoint: async (
+        wsId: string,
+        bindingId: string,
+        message: string,
+        conversationId?: string,
+        opts?: { files?: File[]; documentIds?: string[] },
+      ): Promise<Response> => {
+        const token = getAuthToken();
+        const form = new FormData();
+        form.append("message", message);
+        if (conversationId) form.append("conversation_id", conversationId);
+        if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
+        if (opts?.files) opts.files.forEach((file) => form.append("files", file));
+        const response = await fetch(
+          `${API_BASE}/workspaces/${wsId}/chat/entrypoints/${bindingId}/stream`,
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+            body: form,
+          },
+        );
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({ detail: response.statusText }));
+          const detail = body.detail;
+          if (response.status === 402) {
+            const limitDetail = normalizePlanLimitDetail(
+              detail,
+              body.error || t("component.upgrade_prompt.default_message"),
+            );
+            const err = new ApiError(response.status, limitDetail.message);
+            err.detail = limitDetail as unknown as Record<string, unknown>;
+            throw err;
+          }
+          const message = (typeof detail === "string" ? detail : (detail as any)?.message)
+            || response.statusText;
+          const coded = _extractCodedDetail(detail);
+          const displayMessage = coded.code
+            ? t(coded.code, coded.vars) || message
+            : message;
+          if (response.status !== 401) {
+            useToastStore.getState().error(t("lib.api.chat_failed"), displayMessage);
+          }
+          const err = new ApiError(response.status, message);
+          if (coded.code) err.code = coded.code;
+          if (coded.vars) err.vars = coded.vars;
+          throw err;
+        }
+        return response;
+      },
       listMessages: (wsId: string, opts?: { thread_ref_kind?: string; thread_ref_id?: string; limit?: number }) => {
         const q = new URLSearchParams();
         if (opts?.thread_ref_kind) q.set("thread_ref_kind", opts.thread_ref_kind);
         if (opts?.thread_ref_id) q.set("thread_ref_id", opts.thread_ref_id);
         if (opts?.limit) q.set("limit", String(opts.limit));
         return request<any[]>(`/workspaces/${wsId}/chat/messages?${q}`);
+      },
+      listMessagesPage: (
+        wsId: string,
+        opts?: {
+          thread_ref_kind?: string;
+          thread_ref_id?: string;
+          limit?: number;
+          before?: string | null;
+        },
+      ) => {
+        const q = new URLSearchParams();
+        if (opts?.thread_ref_kind) q.set("thread_ref_kind", opts.thread_ref_kind);
+        if (opts?.thread_ref_id) q.set("thread_ref_id", opts.thread_ref_id);
+        q.set("limit", String(opts?.limit ?? 75));
+        if (opts?.before) q.set("before", opts.before);
+        return request<PaginatedMessagesResponse<any>>(`/workspaces/${wsId}/chat/messages/page?${q}`);
       },
       postMessage: (wsId: string, body: string, threadRef?: { kind: string; id: string }) =>
         request<any>(`/workspaces/${wsId}/chat/messages`, {
@@ -3044,6 +3527,30 @@ export const api = {
         `/blueprints/${id}`,
         { method: "PUT", body: JSON.stringify(data) },
       ),
+    uploadShowcaseAsset: (
+      id: string,
+      file: File,
+      metadata: { caption?: string; alt_text?: string } = {},
+    ) => {
+      const form = new FormData();
+      form.append("file", file);
+      if (metadata.caption) form.append("caption", metadata.caption);
+      if (metadata.alt_text) form.append("alt_text", metadata.alt_text);
+      return request<BlueprintSummary>(`/blueprints/${id}/showcase-assets`, {
+        method: "POST",
+        body: form,
+      });
+    },
+    deleteShowcaseAsset: (id: string, assetId: string) =>
+      request<BlueprintSummary>(
+        `/blueprints/${id}/showcase-assets/${assetId}`,
+        { method: "DELETE" },
+      ),
+    toggleFavorite: (id: string) =>
+      request<{ is_favorited: boolean; favorite_count: number }>(
+        `/blueprints/${id}/favorite`,
+        { method: "POST" },
+      ),
     submitReview: (id: string, data?: { note?: string }) =>
       request<BlueprintSummary>(
         `/blueprints/${id}/submit-review`,
@@ -3069,7 +3576,10 @@ export const api = {
       ),
     governancePresets: () =>
       request<GovernancePresetSummary[]>("/blueprints/governance-presets"),
-    setPricing: (id: string, data: { price_cents: number }) =>
+    setPricing: (id: string, data: {
+      price_cents: number;
+      list_price_cents?: number | null;
+    }) =>
       request<BlueprintSummary>(`/blueprints/${id}/pricing`, {
         method: "PUT",
         body: JSON.stringify(data),
@@ -3147,6 +3657,7 @@ export const api = {
         claimed_at?: string | null;
       }>(`/notifications/preferences/link/${encodeURIComponent(token)}`),
   },
+
 
   admin: {
     // Settings/preferences have dynamic shape per entity, so we use Record<string, any>
@@ -3275,6 +3786,45 @@ export const api = {
         }),
         signal: options?.signal,
       }),
+    suggestLayoutJobStart: (
+      prompt: string,
+      widgets: Array<{ id: string; visible: boolean }>,
+      modules: Array<{
+        id: string;
+        title: string;
+        description?: string | null;
+        visible: boolean;
+        size: "compact" | "wide";
+        conversation_id?: string | null;
+        code: any;
+      }>,
+      options?: {
+        targetModuleId?: string;
+        conversationId?: string;
+        signal?: AbortSignal;
+      },
+    ) =>
+      request<DashboardSuggestJobResponse>("/dashboard/layout/suggest/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt,
+          widgets,
+          modules,
+          target_module_id: options?.targetModuleId,
+          conversation_id: options?.conversationId,
+        }),
+        signal: options?.signal,
+      }),
+    suggestLayoutJobStatus: (jobId: string, signal?: AbortSignal) =>
+      request<DashboardSuggestJobResponse>(
+        `/dashboard/layout/suggest/jobs/${encodeURIComponent(jobId)}`,
+        { signal },
+      ),
+    suggestLayoutJobCancel: (jobId: string) =>
+      request<DashboardSuggestJobResponse>(
+        `/dashboard/layout/suggest/jobs/${encodeURIComponent(jobId)}/cancel`,
+        { method: "POST" },
+      ),
     moduleConversation: (moduleId: string) =>
       request<{
         conversation_id?: string | null;
@@ -3544,12 +4094,34 @@ export const api = {
   },
 
   jobs: {
-    list: (params?: { enabled_only?: boolean; workspace_id?: string; limit?: number }) => {
+    list: (params?: {
+      enabled_only?: boolean;
+      workspace_id?: string;
+      limit?: number;
+      offset?: number;
+      search?: string;
+      status?: "all" | "enabled" | "paused" | "attention";
+      agent_id?: string;
+      include_workflows?: boolean;
+    }) => {
       const q = new URLSearchParams();
       if (params?.enabled_only) q.set("enabled_only", "true");
       if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
       if (params?.limit) q.set("limit", String(params.limit));
-      return request<{ items: any[]; total: number }>(`/jobs?${q}`);
+      if (params?.offset) q.set("offset", String(params.offset));
+      if (params?.search) q.set("search", params.search);
+      if (params?.status && params.status !== "all") q.set("status", params.status);
+      if (params?.agent_id) q.set("agent_id", params.agent_id);
+      if (params?.include_workflows !== undefined) {
+        q.set("include_workflows", String(params.include_workflows));
+      }
+      return request<{
+        items: any[];
+        total: number;
+        summary_total: number;
+        enabled_total: number;
+        attention_total: number;
+      }>(`/jobs?${q}`);
     },
     create: (data: any) =>
       request<any>("/jobs", { method: "POST", body: JSON.stringify(data) }),
@@ -3587,6 +4159,7 @@ export const api = {
     create: (data: any) =>
       request<any>("/workflows", { method: "POST", body: JSON.stringify(data) }),
     get: (id: string) => request<any>(`/workflows/${id}`),
+    metadata: (id: string) => request<any>(`/workflows/${id}/metadata`),
     update: (id: string, data: any) =>
       request<any>(`/workflows/${id}`, { method: "PUT", body: JSON.stringify(data) }),
     delete: (id: string) =>
@@ -3594,15 +4167,55 @@ export const api = {
     startRun: (id: string, data?: any) =>
       request<any>(`/workflows/${id}/run`, { method: "POST", body: JSON.stringify(data || {}) }),
     // Streaming run — lights up the canvas node-by-node as it executes.
-    runStream: (id: string, onNode: (nodeId: string, status: string) => void) =>
-      streamWorkflowRun(`/workflows/${id}/run-stream`, onNode),
+    runStream: (
+      id: string,
+      onNode: (nodeId: string, status: string) => void,
+      data?: { variables?: Record<string, any>; trigger_data?: Record<string, any> },
+    ) => streamWorkflowRun(`/workflows/${id}/run-stream`, onNode, data),
     runs: (id: string) => request<any[]>(`/workflows/${id}/runs`),
-    getRun: (runId: string) => request<any>(`/workflows/runs/${runId}`),
+    listRuns: (params?: { workspace_id?: string; binding_id?: string; status?: string; limit?: number }) => {
+      const q = new URLSearchParams();
+      if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
+      if (params?.binding_id) q.set("binding_id", params.binding_id);
+      if (params?.status) q.set("status", params.status);
+      if (params?.limit) q.set("limit", String(params.limit));
+      return request<any[]>(`/workflows/runs${q.toString() ? `?${q}` : ""}`, {
+        headers: { "X-Silent-Error": "1" },
+      });
+    },
+    getRun: (runId: string, detail = true) => request<any>(
+      `/workflows/runs/${runId}${detail ? "" : "?detail=false"}`,
+    ),
+    getRunFamily: (runId: string) => request<any[]>(`/workflows/runs/${runId}/family`),
+    cancelRun: (runId: string) => request<void>(`/workflows/runs/${runId}/cancel`, { method: "POST" }),
+    retryRun: (runId: string, data: {
+      from_step_id?: string;
+      variables?: Record<string, any>;
+      execute?: boolean;
+    }) => request<any>(`/workflows/runs/${runId}/retry`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+    resumeRun: (runId: string, variables?: Record<string, any>) =>
+      request<any>(`/workflows/runs/${runId}/resume`, {
+        method: "POST",
+        body: JSON.stringify({ variables: variables ?? null }),
+      }),
     executeStep: (runId: string) =>
       request<any>(`/workflows/runs/${runId}/step`, { method: "POST" }),
     // Run a single node standalone (test a node's config without the workflow).
     runNode: (step: any, variables?: Record<string, any>) =>
-      request<{ status: string; output: any; error?: string }>("/workflows/run-node", {
+      request<{
+        status: string;
+        output?: any;
+        error?: string;
+        step_id?: string;
+        inputs?: Record<string, any>;
+        duration_ms?: number;
+        cached?: boolean;
+        skipped?: boolean;
+        [key: string]: any;
+      }>("/workflows/run-node", {
         method: "POST",
         body: JSON.stringify({ step, variables: variables ?? null }),
       }),
@@ -3633,7 +4246,7 @@ export const api = {
     }) =>
       request<any>("/workflows/import", { method: "POST", body: JSON.stringify(data) }),
     // Bindings (deploy a workflow into a workspace / business line) + triggers
-    listBindings: (params?: { workspace_id?: string; business_line?: string }) => {
+    listBindings: (params?: { workspace_id?: string; business_line?: string; workflow_id?: string }) => {
       const q = new URLSearchParams(
         Object.entries(params || {}).filter(([, v]) => v) as [string, string][],
       ).toString();
@@ -3641,6 +4254,16 @@ export const api = {
     },
     createBinding: (data: any) =>
       request<any>("/workflows/bindings", { method: "POST", body: JSON.stringify(data) }),
+    updateBinding: (bindingId: string, data: any) =>
+      request<any>(`/workflows/bindings/${bindingId}`, { method: "PUT", body: JSON.stringify(data) }),
+    deleteBinding: (bindingId: string) =>
+      request<void>(`/workflows/bindings/${bindingId}`, { method: "DELETE" }),
+    runBinding: (bindingId: string, data?: any) =>
+      request<any>(`/workflows/bindings/${bindingId}/run`, {
+        method: "POST",
+        headers: { "X-Silent-Error": "1" },
+        body: JSON.stringify(data || {}),
+      }),
     trigger: (data: {
       trigger_type?: string;
       event_name?: string;
@@ -3658,6 +4281,15 @@ export const api = {
       return request<any[]>(`/skills${suffix}`);
     },
     store: () => request<any[]>("/skills/store"),
+    getFiles: (id: string) =>
+      request<{
+        skill_id: string;
+        prompt: string;
+        extra_files: Record<string, string>;
+        requirements: string;
+        files: Record<string, string>;
+        skipped_files: { path: string; reason: string; size?: number }[];
+      }>(`/skills/${id}/files`),
     create: (data: any) =>
       request<any>("/skills", { method: "POST", body: JSON.stringify(data) }),
     update: (id: string, data: any) =>
@@ -3980,9 +4612,13 @@ export const api = {
         created_at: string;
       }>>(`/integrations/logs?${q}`);
     },
-    oauthStart: (serverKey: string, opts?: { returnTo?: string }) => {
+    oauthStart: (
+      serverKey: string,
+      opts?: { returnTo?: string; connectionId?: string },
+    ) => {
       const q = new URLSearchParams();
       if (opts?.returnTo) q.set("return_to", opts.returnTo);
+      if (opts?.connectionId) q.set("connection_id", opts.connectionId);
       return request<{
         authorize_url: string;
         state: string;

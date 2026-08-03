@@ -79,6 +79,75 @@ async def test_workspace_create_persists_extended_fields(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
+async def test_workspace_chat_messages_page_loads_older_messages(client: AsyncClient, db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Message
+
+    headers = await _register(client, "ws_chat_page")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    ws = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Paged Workspace Chat"},
+    )
+    ws_body = ws.json()
+    conv_id = generate_ulid()
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=me["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Workspace",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    for index in range(6):
+        db_session.add(
+            Message(
+                id=generate_ulid(),
+                conversation_id=conv_id,
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"workspace-message-{index}",
+                author_kind="user" if index % 2 == 0 else "agent",
+                message_kind="text",
+                created_at=base + timedelta(minutes=index),
+            )
+        )
+    await db_session.commit()
+
+    first = await client.get(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/page?limit=2",
+        headers=headers,
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    assert [row["body"] for row in first_body["items"]] == [
+        "workspace-message-4",
+        "workspace-message-5",
+    ]
+    assert first_body["has_more"] is True
+    assert first_body["next_cursor"]
+
+    second = await client.get(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/page",
+        headers=headers,
+        params={"limit": 2, "before": first_body["next_cursor"]},
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert [row["body"] for row in second_body["items"]] == [
+        "workspace-message-2",
+        "workspace-message-3",
+    ]
+    assert second_body["has_more"] is True
+    assert second_body["next_cursor"]
+
+
+@pytest.mark.asyncio
 async def test_workspace_metadata_and_activity_resolve_actor(client: AsyncClient):
     headers = await _register(client, "ws_actor_meta")
     me = (await client.get("/api/v1/auth/me", headers=headers)).json()
@@ -512,14 +581,20 @@ async def test_workspace_agent_request_strategist_review_enqueues_and_records_ac
 
     assert payload["requested"] is True
     assert payload["workspace_id"] == workspace["id"]
-    assert payload["trigger"].startswith("user_request:")
+    # Typed kind on the wire; the reason survives as inert detail prose.
+    assert payload["trigger_kind"] == "human_requested"
+    assert payload["trigger_detail"].startswith("User asked for a new plan")
     assert payload["countdown_seconds"] == 0
     assert payload["celery_task_id"] == "celery-manual-strategist"
     assert calls == [
         {
             "args": (),
             "kwargs": {
-                "args": [workspace["id"], payload["trigger"]],
+                "args": [workspace["id"]],
+                "kwargs": {
+                    "trigger_kind": "human_requested",
+                    "trigger_detail": payload["trigger_detail"],
+                },
                 "countdown": 0,
             },
         }
@@ -534,7 +609,8 @@ async def test_workspace_agent_request_strategist_review_enqueues_and_records_ac
         )
     ).scalar_one()
     assert activity.user_id == user_id
-    assert activity.details["trigger"] == payload["trigger"]
+    assert activity.details["trigger_kind"] == "human_requested"
+    assert activity.details["trigger_detail"] == payload["trigger_detail"]
     assert activity.details["celery_task_id"] == "celery-manual-strategist"
 
 
@@ -1525,57 +1601,24 @@ async def test_strategist_context_marks_missing_declared_provider_when_only_othe
     assert "no_integrations" in ctx.missing_setup
 
 
-def test_strategist_integration_scope_drops_out_of_scope_social_tasks():
+def test_strategist_provider_scope_ignores_free_text_platform_mentions():
     from types import SimpleNamespace
-    from packages.core.strategist.proposal import Deliverable, Proposal, ProposedTask
-    from packages.core.strategist.service import _enforce_integration_scope
+    from packages.core.strategist.context import _workspace_declared_provider_keys
 
-    proposal = Proposal(
-        review_id="rv_test",
-        summary="Review",
-        tasks=[
-            ProposedTask(
-                deliverables=[
-                    Deliverable(
-                        name="result",
-                        kind="value",
-                        shape="TextResult",
-                        acceptance="task output produced",
-                        usage="reviewed by operator",
-                    )
-                ],
-                task_key="linkedin_post",
-                title="Publish LinkedIn founder story",
-                owner_service_key="content_creation",
-            ),
-            ProposedTask(
-                deliverables=[
-                    Deliverable(
-                        name="result",
-                        kind="value",
-                        shape="TextResult",
-                        acceptance="task output produced",
-                        usage="reviewed by operator",
-                    )
-                ],
-                task_key="x_post",
-                title="Publish X post",
-                description="Draft a tweet for the founder's X account.",
-                owner_service_key="content_creation",
-                depends_on_task_keys=["linkedin_post"],
-            ),
-        ],
+    workspace = SimpleNamespace(
+        settings={},
+        operating_model={
+            "primary_work": "Publish a LinkedIn story and an X post.",
+            "services": [
+                {
+                    "service_key": "content_creation",
+                    "description": "Draft tweets and LinkedIn posts.",
+                }
+            ],
+        },
     )
 
-    _enforce_integration_scope(
-        proposal,
-        SimpleNamespace(configured_integrations=["twitter_x"]),
-    )
-
-    assert [task.task_key for task in proposal.tasks] == ["x_post"]
-    assert proposal.tasks[0].depends_on_task_keys == []
-    assert "LinkedIn" in (proposal.notes or "")
-    assert "X/Twitter" in (proposal.notes or "")
+    assert _workspace_declared_provider_keys(workspace, []) == set()
 
 
 @pytest.mark.asyncio
@@ -1774,6 +1817,57 @@ async def test_workspace_heartbeat_endpoint_advances_operation_revision(client: 
         json={"user_confirmation": True},
     )
     assert stale_apply.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_workspace_pause_resume_cannot_bypass_needs_setup(client: AsyncClient, db_session):
+    from sqlalchemy import select
+
+    from packages.core.models.workspace import Workspace
+
+    headers = await _register(client, "ws_pause_needs_setup")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Pause State Guard"},
+    )
+    workspace_id = created.json()["id"]
+
+    assert (await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+    )).status_code == 200
+    assert (await client.post(
+        f"/api/v1/workspaces/{workspace_id}/pause",
+        headers=headers,
+    )).status_code == 200
+    assert (await client.post(
+        f"/api/v1/workspaces/{workspace_id}/pause",
+        headers=headers,
+    )).status_code == 200
+    assert (await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+    )).status_code == 200
+
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    workspace.status = "needs_setup"
+    await db_session.commit()
+
+    assert (await client.post(
+        f"/api/v1/workspaces/{workspace_id}/pause",
+        headers=headers,
+    )).status_code == 409
+    assert (await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+    )).status_code == 409
+    assert (await client.post(
+        f"/api/v1/workspaces/{workspace_id}/heartbeat/enable",
+        headers=headers,
+    )).status_code == 409
 
 
 @pytest.mark.asyncio
@@ -2696,7 +2790,11 @@ async def test_workspace_work_batch_triggers_strategist_after_all_tasks_terminal
     assert batch.status == "completed"
     assert batch.completed_at is not None
     assert len(calls) == 1
-    assert calls[0]["kwargs"]["args"] == [workspace_id, f"work_batch_completed:{batch_id}"]
+    assert calls[0]["kwargs"]["args"] == [workspace_id]
+    assert calls[0]["kwargs"]["kwargs"] == {
+        "trigger_kind": "event",
+        "trigger_detail": f"work batch completed: {batch_id}",
+    }
 
 
 @pytest.mark.asyncio
@@ -2779,10 +2877,11 @@ async def test_task_details_update_preserves_workspace_batch_runtime(
     ).scalar_one()
     assert batch.status == "completed"
     assert len(calls) == 1
-    assert calls[0]["kwargs"]["args"] == [
-        workspace_id,
-        "work_batch_completed:batch_details_merge",
-    ]
+    assert calls[0]["kwargs"]["args"] == [workspace_id]
+    assert calls[0]["kwargs"]["kwargs"] == {
+        "trigger_kind": "event",
+        "trigger_detail": "work batch completed: batch_details_merge",
+    }
 
 
 @pytest.mark.asyncio
@@ -3915,7 +4014,7 @@ async def test_chat_runtime_context_ignores_workspace_id_on_plain_channel_conver
     db_session,
 ):
     from packages.core.ai.runtime.profiles import (
-        LEGACY_WORKSPACE_TOOL_PROFILE as TOOL_PROFILE_WORKSPACE_AGENT,
+        WORKSPACE_AGENT_TOOL_PROFILE,
         RuntimeProfile,
     )
     from packages.core.models.base import generate_ulid
@@ -3967,7 +4066,7 @@ async def test_chat_runtime_context_ignores_workspace_id_on_plain_channel_conver
     )
     assert explicit_runtime.workspace_id == ws_body["id"]
     assert explicit_runtime.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
-    assert explicit_runtime.legacy_runtime_profile == TOOL_PROFILE_WORKSPACE_AGENT
+    assert explicit_runtime.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
 
 
 @pytest.mark.asyncio
@@ -4041,7 +4140,7 @@ async def test_chat_runtime_context_resolves_workspace_task_thread(client: Async
 @pytest.mark.asyncio
 async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncClient, db_session):
     from packages.core.ai.runtime.profiles import (
-        LEGACY_WORKSPACE_TOOL_PROFILE as TOOL_PROFILE_WORKSPACE_AGENT,
+        WORKSPACE_AGENT_TOOL_PROFILE,
         RuntimeProfile,
     )
     from packages.core.services.runtime_chat_context import resolve_runtime_chat_context
@@ -4059,7 +4158,7 @@ async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncCli
     eager_names = {tool["function"]["name"] for tool in tools}
 
     assert ctx.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
-    assert ctx.legacy_runtime_profile == TOOL_PROFILE_WORKSPACE_AGENT
+    assert ctx.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
     assert {"search_tools", "workspace_agent", "workspace_resolve_hitl", "workspace_search", "rag"} <= eager_names
     assert "bash" in eager_names
     assert "bash" in ctx.allowed_tool_names
@@ -4070,7 +4169,7 @@ async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncCli
 @pytest.mark.asyncio
 async def test_workspace_chat_master_surface_includes_mcp(client: AsyncClient, db_session):
     from packages.core.ai.runtime.profiles import (
-        LEGACY_WORKSPACE_TOOL_PROFILE as TOOL_PROFILE_WORKSPACE_AGENT,
+        WORKSPACE_AGENT_TOOL_PROFILE,
         RuntimeProfile,
     )
     from packages.core.services.runtime_chat_context import resolve_runtime_chat_context
@@ -4087,7 +4186,7 @@ async def test_workspace_chat_master_surface_includes_mcp(client: AsyncClient, d
     )
 
     assert ctx.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
-    assert ctx.legacy_runtime_profile == TOOL_PROFILE_WORKSPACE_AGENT
+    assert ctx.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
     assert any(name.startswith("mcp__") for name in ctx.allowed_tool_names)
 
 
@@ -4144,7 +4243,7 @@ async def test_workspace_chat_context_includes_task_runtime_context(client: Asyn
 @pytest.mark.asyncio
 async def test_workspace_runtime_resolves_explicit_task_without_conversation(client: AsyncClient, db_session):
     from packages.core.ai.runtime.profiles import (
-        LEGACY_WORKSPACE_TOOL_PROFILE as TOOL_PROFILE_WORKSPACE_AGENT,
+        WORKSPACE_AGENT_TOOL_PROFILE,
         RuntimeProfile,
     )
     from packages.core.models.base import generate_ulid
@@ -4180,8 +4279,8 @@ async def test_workspace_runtime_resolves_explicit_task_without_conversation(cli
     )
 
     assert runtime.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
-    assert runtime.legacy_tool_profile == TOOL_PROFILE_WORKSPACE_AGENT
-    assert runtime.legacy_runtime_profile == TOOL_PROFILE_WORKSPACE_AGENT
+    assert runtime.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
+    assert runtime.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
     assert runtime.task_id == task_id
     assert runtime.thread_ref_kind == "task"
     assert "Prepare prospect follow-up" in runtime.extra_context
@@ -4193,7 +4292,7 @@ async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: 
     import json
 
     from packages.core.ai.runtime.profiles import (
-        LEGACY_WORKSPACE_TOOL_PROFILE as TOOL_PROFILE_WORKSPACE_AGENT,
+        WORKSPACE_AGENT_TOOL_PROFILE,
         RuntimeProfile,
     )
     from packages.core.ai.tool_pool import tool_pool
@@ -4283,14 +4382,14 @@ async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: 
             bound_tool_names=runtime.bound_tool_names,
             is_master=runtime.is_master,
             mcp_allowed_names=runtime.mcp_allowed_names,
-            legacy_tool_profile=runtime.legacy_tool_profile,
+            tool_profile=runtime.tool_profile,
         )
         allowed = set(surface.visible_tool_names)
         search_result = json.loads(
             await tool_pool.execute(
                 "search_tools",
                 {"query": "leasing unit", "max_results": 5},
-                legacy_tool_profile=runtime.legacy_tool_profile,
+                tool_profile=runtime.tool_profile,
                 allowed_tool_names=allowed,
             )
         )
@@ -4301,7 +4400,7 @@ async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: 
             tool_pool._tools.pop(tool_name, None)
 
     assert runtime.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
-    assert runtime.legacy_tool_profile == TOOL_PROFILE_WORKSPACE_AGENT
+    assert runtime.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
     assert runtime.is_master is True
     assert runtime.service_agent_ids == [agent_id]
     assert runtime.bound_tool_names is not None
@@ -4437,11 +4536,11 @@ async def test_attachment_only_task_comment_does_not_schedule_workspace_agent(
 
 
 @pytest.mark.asyncio
-async def test_channel_gateway_workspace_subscription_uses_legacy_tool_profile(monkeypatch):
+async def test_channel_gateway_workspace_subscription_uses_tool_profile(monkeypatch):
     from types import SimpleNamespace
 
     from packages.core.ai.runtime.profiles import (
-        LEGACY_WORKSPACE_TOOL_PROFILE as TOOL_PROFILE_WORKSPACE_AGENT,
+        WORKSPACE_AGENT_TOOL_PROFILE,
     )
     from packages.core.constants.agents import MANOR_AGENT_ID
     from packages.core.services.agent_subscription_service import ResolvedSubscription
@@ -4460,7 +4559,7 @@ async def test_channel_gateway_workspace_subscription_uses_legacy_tool_profile(m
 
     async def fake_resolve_workspace_runtime(*_args, **_kwargs):
         return SimpleNamespace(
-            legacy_tool_profile=TOOL_PROFILE_WORKSPACE_AGENT,
+            tool_profile=WORKSPACE_AGENT_TOOL_PROFILE,
             workspace_id="workspace-runtime-channel",
             task_id=None,
             thread_ref_kind=None,
@@ -4509,8 +4608,8 @@ async def test_channel_gateway_workspace_subscription_uses_legacy_tool_profile(m
     )
 
     assert result and result.content == "ok"
-    assert captured["appendix_kwargs"]["legacy_runtime_profile"] == TOOL_PROFILE_WORKSPACE_AGENT
-    assert captured["loop_kwargs"]["legacy_tool_profile"] == TOOL_PROFILE_WORKSPACE_AGENT
+    assert captured["appendix_kwargs"]["tool_profile"] == WORKSPACE_AGENT_TOOL_PROFILE
+    assert captured["loop_kwargs"]["tool_profile"] == WORKSPACE_AGENT_TOOL_PROFILE
     assert captured["loop_kwargs"]["allowed_tool_names"] == set()
 
 
@@ -4916,13 +5015,23 @@ async def test_workspace_agent_delegates_to_service_bound_agent(
             tools=[{"type": "function", "function": {"name": "mcp__twitter_x__post_tweet"}}],
             allowed_tool_names={"mcp__twitter_x__post_tweet"},
             task_id=None,
-            legacy_runtime_profile="workspace_agent",
+            tool_profile="workspace_agent",
             model="gpt-test",
             llm_metadata=None,
         )
 
     async def fake_execute_chat_agent_loop(**kwargs):
         seen["loop_kwargs"] = kwargs
+        kwargs["on_tool_start"](
+            "mcp__twitter_x__post_tweet",
+            {"text": "Launch update"},
+        )
+        kwargs["on_tool_end"](
+            "mcp__twitter_x__post_tweet",
+            '{"status":"ok"}',
+            25,
+            {"text": "Launch update"},
+        )
         return SimpleNamespace(
             content="Tweet drafted and queued.",
             rounds=2,
@@ -4938,22 +5047,40 @@ async def test_workspace_agent_delegates_to_service_bound_agent(
         fake_execute_chat_agent_loop,
     )
 
-    result = json.loads(
-        await _workspace_agent_handler(
-            entity_id=ws_body["entity_id"],
-            user_id="USERWORKSPACEAGENTDELEGATE",
-            workspace_id=ws_body["id"],
-            conversation_id="CONVWORKSPACEAGENTDELEGATE",
-            action="delegate_service",
-            params={
-                "service_key": "social_publisher",
-                "prompt": "Publish the launch update on X.",
-                "max_rounds": 5,
-            },
-        )
+    from packages.core.ai.runtime.streams import (
+        RuntimeToolStreamSink,
+        runtime_record_sub_agent_event_for_chat,
+        runtime_tool_stream_sink_var,
     )
 
+    delegated_runs: list[dict] = []
+    stream_token = runtime_tool_stream_sink_var.set(RuntimeToolStreamSink(
+        record_sub_agent_event=lambda event: runtime_record_sub_agent_event_for_chat(
+            delegated_runs,
+            event,
+        ),
+    ))
+    try:
+        result = json.loads(
+            await _workspace_agent_handler(
+                entity_id=ws_body["entity_id"],
+                user_id="USERWORKSPACEAGENTDELEGATE",
+                workspace_id=ws_body["id"],
+                conversation_id="CONVWORKSPACEAGENTDELEGATE",
+                action="delegate_service",
+                params={
+                    "service_key": "social_publisher",
+                    "prompt": "Publish the launch update on X.",
+                    "max_rounds": 5,
+                },
+            )
+        )
+    finally:
+        runtime_tool_stream_sink_var.reset(stream_token)
+
     assert result["delegated"] is True
+    assert result["run_id"]
+    assert result["status"] == "completed"
     assert result["service"]["agent_subscription_id"] == sub_id
     assert result["service"]["agent_id"] == agent_id
     assert result["content"] == "Tweet drafted and queued."
@@ -4964,6 +5091,20 @@ async def test_workspace_agent_delegates_to_service_bound_agent(
     assert seen["loop_kwargs"]["agent_id"] == agent_id
     assert seen["loop_kwargs"]["allowed_tool_names"] == {"mcp__twitter_x__post_tweet"}
     assert seen["loop_kwargs"]["max_rounds"] == 5
+    assert len(delegated_runs) == 1
+    assert delegated_runs[0]["run_id"] == result["run_id"]
+    assert delegated_runs[0]["agent_name"] == "Social Publisher"
+    assert delegated_runs[0]["objective"] == "Publish the launch update on X."
+    assert delegated_runs[0]["status"] == "completed"
+    assert delegated_runs[0]["tools"] == [
+        {
+            "seq": 1,
+            "name": "mcp__twitter_x__post_tweet",
+            "status": "completed",
+            "duration_ms": 25,
+            "arguments": {"text": "Launch update"},
+        }
+    ]
 
     missing = json.loads(
         await _workspace_agent_handler(
@@ -5105,7 +5246,16 @@ async def test_plan_finalize_updates_waiting_task_after_successful_replan(db_ses
     from packages.core.plans.executor import PlanExecutor
 
     async def _completed_supervisor(_db, _plan, _status):
-        return "completed"
+        from packages.core.constants.supervisor import (
+            SupervisorDecision,
+            SupervisorDecisionSource,
+            SupervisorVerdict,
+        )
+        return SupervisorDecision(
+            verdict=SupervisorVerdict.COMPLETED,
+            evidence="test double",
+            source=SupervisorDecisionSource.MODEL,
+        )
 
     monkeypatch.setattr(PlanExecutor, "_supervise_outcome", staticmethod(_completed_supervisor))
 
@@ -5263,6 +5413,7 @@ async def test_task_detail_keeps_open_supervisor_input_request_waiting(client: A
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
     from packages.core.models.task import Task
+    from packages.core.constants.task_actors import TaskActor
     from packages.core.services.task_service import add_task_log
 
     headers = await _register(client, "task_detail_open_supervisor_hitl")
@@ -5318,6 +5469,7 @@ async def test_task_detail_keeps_open_supervisor_input_request_waiting(client: A
         task_id,
         "ai_hitl_requested",
         "The plan ran into issues and needs your input.",
+        actor=TaskActor.SUPERVISOR,
         created_by="AI Supervisor",
         metadata={"verdict": "needs_human", "plan_id": plan_id, "artifact_required": True},
     )
@@ -5411,7 +5563,7 @@ async def test_plan_finalize_asks_supervisor_before_marking_text_output_complete
     assert task.actual_output["supervisor_verdict"] == "needs_human"
     assert task.actual_output["needs_input"] is True
     assert supervisor_prompts
-    assert "Before the parent task status is changed" in supervisor_prompts[-1]
+    assert "judge the task itself, not the subject it reports on" in supervisor_prompts[-1]
     assert logs and logs[-1].meta["structured_blocker"] is False
     assert event["event_type"] == "task.hitl_requested"
 
@@ -5856,7 +6008,11 @@ async def test_workspace_agent_add_rule_updates_operating_model_and_governance(c
             workspace_id=ws_body["id"],
             conversation_id=conversation_id,
             action="add_rule",
-            params={"description": "发 post 必须先给用户审核内容，得到用户同意才能发布。"},
+            params={
+                "description": "发 post 必须先给用户审核内容，得到用户同意才能发布。",
+                "rule_type": "approval_required",
+                "action_patterns": ["social_post.publish"],
+            },
         )
     )
 
@@ -6391,6 +6547,111 @@ async def test_workspace_chat_feedback_resolution_posts_feedback_message(client:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("choice", "pre_resolved"),
+    [
+        ("approve", False),
+        ("approve_all", False),
+        ("approve_all", True),
+    ],
+    ids=["canonical", "legacy", "legacy-stuck-card"],
+)
+async def test_workspace_chat_approve_all_starts_proposed_tickets(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    choice: str,
+    pre_resolved: bool,
+):
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Message, Task
+    from packages.core.tasks import ai_tasks
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "delay",
+        lambda task_id: dispatched.append(task_id),
+    )
+
+    headers = await _register(
+        client,
+        f"ws_chat_approve_all_proposals_{choice}_{int(pre_resolved)}",
+    )
+    ws = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Approve All Proposals"},
+    )
+    ws_body = ws.json()
+    conv_id = generate_ulid()
+    message_id = generate_ulid()
+    task_id = generate_ulid()
+    review_id = "rv_test_approve_all"
+
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Proposal approval",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conv_id,
+            role="assistant",
+            content="Review this proposal",
+            author_kind="agent",
+            message_kind="proposal",
+            pending_action={
+                "kind": "approve_proposals",
+                "review_id": review_id,
+                "task_ids": [task_id],
+                "task_titles": ["Create today's stickman video"],
+                "options": (
+                    ["approve", "always_approve", "reject"]
+                    if choice == "approve"
+                    else ["approve_all", "reject_all"]
+                ),
+            },
+            resolved_at=datetime.now(timezone.utc) if pre_resolved else None,
+            resolution={"choice": choice} if pre_resolved else None,
+        )
+    )
+    db_session.add(
+        Task(
+            id=task_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Create today's stickman video",
+            status="proposed",
+            owner_service_key="stickman.production",
+            details={"strategist_review_id": review_id},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/resolve",
+        headers=headers,
+        json={"choice": choice},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["resolution"]["payload"]["approved_task_ids"] == [task_id]
+    db_session.expire_all()
+    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
+    assert task.status == "in_progress"
+    assert dispatched == [task_id]
+
+
+@pytest.mark.asyncio
 async def test_workspace_chat_always_approve_proposals_persists_workspace_preference(
     client: AsyncClient,
     db_session,
@@ -6521,6 +6782,72 @@ async def test_plan_completed_notifications_include_task_ref(monkeypatch):
         {"type": "plan", "id": "plan_1"},
         {"type": "task", "id": "task_1"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_plan_attention_notification_does_not_claim_task_complete(monkeypatch):
+    from packages.core.workspace_chat import notifiers
+
+    posted: list[dict] = []
+
+    async def fake_safe_post(**kwargs):
+        posted.append(kwargs)
+
+    monkeypatch.setattr(notifiers, "_safe_post", fake_safe_post)
+
+    await notifiers.notify_plan_needs_attention(
+        entity_id="entity_1",
+        workspace_id="workspace_1",
+        plan_id="plan_1",
+        task_id="task_1",
+        task_title="Produce final video",
+        issue="The final MP4 is still missing.",
+        steps=[],
+    )
+
+    assert len(posted) == 2
+    assert all("Task needs attention" in item["body"] for item in posted)
+    assert all("Task complete" not in item["body"] for item in posted)
+
+
+@pytest.mark.asyncio
+async def test_plan_announce_uses_attention_copy_when_supervisor_holds_task(monkeypatch):
+    from packages.core.plans.executor import PlanExecutor
+    from packages.core.workspace_chat import notifiers
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_completed(**kwargs):
+        calls.append(("completed", kwargs))
+
+    async def fake_attention(**kwargs):
+        calls.append(("attention", kwargs))
+
+    monkeypatch.setattr(notifiers, "notify_plan_completed", fake_completed)
+    monkeypatch.setattr(notifiers, "notify_plan_needs_attention", fake_attention)
+
+    await PlanExecutor._announce(
+        "entity_1",
+        "workspace_1",
+        "plan_1",
+        task_id="task_1",
+        started=False,
+        step_count=1,
+        execution_mode="live",
+        chat_events=[],
+        plan_done="completed",
+        plan_started_at=None,
+        plan_completed_at=None,
+        plan_cost=None,
+        plan_error=None,
+        task_title="Produce final video",
+        step_snapshots=[],
+        task_status="waiting_on_customer",
+        task_issue="The final MP4 is still missing.",
+    )
+
+    assert [kind for kind, _ in calls] == ["attention"]
+    assert calls[0][1]["issue"] == "The final MP4 is still missing."
 
 
 @pytest.mark.asyncio
@@ -7681,40 +8008,49 @@ async def test_workspace_architect_can_remove_explicit_integration_warning(db_se
     assert [flag["provider"] for flag in draft.fields["flagged_integrations"]] == ["wechat"]
 
 
+
+
+
+
 @pytest.mark.asyncio
-async def test_workspace_architect_missing_integrations_use_supported_catalog_and_chrome(db_session):
+async def test_workspace_architect_lint_requires_goal_and_materializable_agent_bindings(db_session):
     import copy
     import json
 
-    from sqlalchemy import select
-    from packages.core.ai.tools.workspace_arch_tools import _flag_missing_integration
-    from packages.core.models.mcp import MCPServer
+    from packages.core.ai.tools.workspace_arch_tools import _lint_draft
     from packages.core.models.base import generate_ulid
     from packages.core.models.workspace_draft import WorkspaceDraft
     from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
-    existing_chrome = (
-        await db_session.execute(select(MCPServer).where(MCPServer.server_key == "chrome"))
-    ).scalar_one_or_none()
-    if existing_chrome is None:
-        db_session.add(
-            MCPServer(
-                id=generate_ulid(),
-                server_key="chrome",
-                name="Chrome",
-                description="Local Chrome browser",
-                transport="builtin",
-                endpoint="packages.core.ai.mcp.chrome",
-                auth_type="cli_worker",
-                status="active",
-            )
-        )
-
     entity_id = generate_ulid()
     fields = copy.deepcopy(DEFAULT_FIELDS)
+    fields.update({
+        "name": "Executable Draft",
+        "kind": "operations",
+        "operating_context": "Run a verified content workflow.",
+        "primary_work": "Produce reviewed launch material.",
+        "services": [{
+            "service_key": "content_ops",
+            "name": "Content Operations",
+            "description": "Produce and review launch material.",
+            "autonomy_level": "supervised",
+            "owner_role": "operator",
+        }],
+        "agent_mappings": [{
+            "service_key": "content_ops",
+            "strategy": "create_custom",
+            "create_agent_draft": {
+                "agent_name": "Content Operations Agent",
+                "system_prompt": "Produce reviewed launch material and stay within content operations.",
+                "tool_bindings": ["definitely_missing_tool"],
+                "skill_bindings": ["definitely_missing_skill"],
+                "mcp_bindings": ["definitely_missing_mcp"],
+            },
+        }],
+        "goals": [],
+    })
     draft = WorkspaceDraft(
         entity_id=entity_id,
-        user_id=None,
         fields=fields,
         messages=[],
         missing=[],
@@ -7724,44 +8060,104 @@ async def test_workspace_architect_missing_integrations_use_supported_catalog_an
     db_session.add(draft)
     await db_session.flush()
 
-    unsupported = json.loads(
-        await _flag_missing_integration(
-            db_session,
-            entity_id=entity_id,
-            draft_id=draft.id,
-            provider="openai",
-            purpose="Model key should not be treated as an Integration card.",
-        )
-    )
-    assert unsupported["ok"] is True
-    assert unsupported["skipped"] is True
+    result = json.loads(await _lint_draft(
+        db_session,
+        entity_id=entity_id,
+        draft_id=draft.id,
+    ))
+    p0_locations = {
+        issue["where"]
+        for issue in result["issues"]
+        if issue["severity"] == "P0"
+    }
 
-    browser_platform = json.loads(
-        await _flag_missing_integration(
-            db_session,
-            entity_id=entity_id,
-            draft_id=draft.id,
-            provider="instagram",
-            purpose="Use the Instagram web UI for review work.",
-            linked_service_keys=["social_ops"],
-        )
-    )
-    assert browser_platform["ok"] is True
-    assert browser_platform["provider"] == "chrome"
-    assert browser_platform["covered_provider"] == "instagram"
+    assert "goals" in p0_locations
+    assert "agent_mappings.content_ops.tool_bindings" in p0_locations
+    assert "agent_mappings.content_ops.skill_bindings" in p0_locations
+    assert "agent_mappings.content_ops.mcp_bindings" in p0_locations
 
+
+@pytest.mark.asyncio
+async def test_workspace_architect_agent_inventory_exposes_bindings_and_respects_entity_scope(db_session):
+    import json
+
+    from packages.core.ai.tools.workspace_arch_tools import _search_entity_agents
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.mcp import AgentMCPBinding, MCPServer
+    from packages.core.models.skill import AgentSkillBinding, Skill
+    from packages.core.models.workspace import Agent, AgentToolBinding, ToolDefinition
+
+    entity_id = generate_ulid()
+    agent = Agent(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Inventory Agent",
+        system_prompt="Operate the inventory test capability.",
+        status="active",
+    )
+    other_entity_agent = Agent(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        name="Other Entity Agent",
+        system_prompt="Must not be visible across entity boundaries.",
+        status="active",
+    )
+    tool = ToolDefinition(
+        id=generate_ulid(),
+        name=f"inventory_tool_{generate_ulid().lower()}",
+        status="active",
+    )
+    skill = Skill(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Inventory Skill",
+        slug=f"inventory-skill-{generate_ulid().lower()}",
+        system_prompt="Run the inventory skill.",
+        is_public=False,
+        status="active",
+    )
+    server = MCPServer(
+        id=generate_ulid(),
+        server_key=f"inventory_mcp_{generate_ulid().lower()}",
+        name="Inventory MCP",
+        transport="builtin",
+        endpoint="packages.core.ai.mcp.inventory",
+        auth_type="none",
+        status="active",
+    )
+    db_session.add_all([agent, other_entity_agent, tool, skill, server])
     await db_session.flush()
-    await db_session.refresh(draft)
-    assert draft.fields["flagged_integrations"] == [
-        {
-            "provider": "chrome",
-            "purpose": "Use the Instagram web UI for review work.",
-            "required": True,
-            "linked_service_keys": ["social_ops"],
-            "source": "explicit",
-            "covered_provider": "instagram",
-        }
-    ]
+    db_session.add_all([
+        AgentToolBinding(agent_id=agent.id, tool_id=tool.id),
+        AgentSkillBinding(
+            id=generate_ulid(),
+            agent_id=agent.id,
+            skill_id=skill.id,
+            status="active",
+        ),
+        AgentMCPBinding(
+            id=generate_ulid(),
+            agent_id=agent.id,
+            mcp_server_id=server.id,
+            status="active",
+        ),
+    ])
+    await db_session.flush()
+
+    result = json.loads(await _search_entity_agents(
+        db_session,
+        entity_id=entity_id,
+    ))
+    by_id = {candidate["id"]: candidate for candidate in result["agents"]}
+
+    assert other_entity_agent.id not in by_id
+    assert by_id[agent.id]["tool_bindings"] == [tool.name]
+    assert by_id[agent.id]["skill_bindings"] == [{
+        "id": skill.id,
+        "slug": skill.slug,
+        "name": skill.name,
+    }]
+    assert by_id[agent.id]["mcp_bindings"] == [server.server_key]
 
 
 @pytest.mark.asyncio
@@ -8114,6 +8510,62 @@ async def test_finalize_setup_materializes_architect_goal_target(db_session):
     assert measurement_jobs[0].job_id == f"gm:{goal.id}"
     assert measurement_jobs[0].enabled is True
     assert measurement_jobs[0].every_seconds == 604800.0
+
+
+@pytest.mark.asyncio
+async def test_finalize_draft_serializes_concurrent_requests(db_session, monkeypatch):
+    import asyncio
+
+    from packages.core.database import async_session
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_draft_service
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    draft = WorkspaceDraft(
+        entity_id=entity_id,
+        fields={
+            "name": "Concurrent Finalize",
+            "kind": "operations",
+            "operating_context": "Verify finalize serialization.",
+            "primary_work": "Create one workspace exactly once.",
+            "services": [],
+            "agent_mappings": [],
+            "channel_config": {},
+        },
+        messages=[],
+        missing=[],
+        ready=True,
+        status="ready",
+    )
+    db_session.add(draft)
+    await db_session.commit()
+
+    materialization_calls = 0
+
+    async def _fake_finalize_setup(session, db, *, progress=None):
+        nonlocal materialization_calls
+        materialization_calls += 1
+        await asyncio.sleep(0.1)
+        return workspace_id
+
+    monkeypatch.setattr(workspace_draft_service, "finalize_setup", _fake_finalize_setup)
+
+    async def _finalize_once() -> str:
+        async with async_session() as session:
+            result, _ = await workspace_draft_service.finalize_draft(
+                session,
+                draft_id=draft.id,
+                entity_id=entity_id,
+            )
+            await session.commit()
+            return result
+
+    results = await asyncio.gather(_finalize_once(), _finalize_once())
+
+    assert results == [workspace_id, workspace_id]
+    assert materialization_calls == 1
 
 
 @pytest.mark.asyncio
@@ -8487,7 +8939,12 @@ async def test_finalize_setup_starter_doc_generation_is_explicit_for_template_cl
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
-    from packages.core.services.workspace_setup_service import WorkspaceSetupSession, finalize_setup
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_setup_service import (
+        WorkspaceSetupSession,
+        dispatch_workspace_post_commit,
+        finalize_setup,
+    )
     from packages.core.tasks import ai_tasks
 
     dispatched: list[tuple] = []
@@ -8551,12 +9008,45 @@ async def test_finalize_setup_starter_doc_generation_is_explicit_for_template_cl
 
     first_workspace_id = await _finalize_clone("Template Clone")
     await db_session.commit()
+    first_workspace = (
+        await db_session.execute(select(Workspace).where(Workspace.id == first_workspace_id))
+    ).scalar_one()
+    first_workspace.status = "active"
+    await db_session.commit()
+    await dispatch_workspace_post_commit(
+        db_session,
+        workspace_id=first_workspace_id,
+        entity_id=entity_id,
+    )
+    await db_session.commit()
     assert dispatched == []
+    await db_session.refresh(first_workspace)
+    assert first_workspace.settings["provisioning"]["post_commit_dispatch"] == "dispatched"
 
     second_workspace_id = await _finalize_clone("Template Clone With Starter", True)
     await db_session.commit()
+    second_workspace = (
+        await db_session.execute(select(Workspace).where(Workspace.id == second_workspace_id))
+    ).scalar_one()
+    second_workspace.status = "active"
+    await db_session.commit()
+    await dispatch_workspace_post_commit(
+        db_session,
+        workspace_id=second_workspace_id,
+        entity_id=entity_id,
+    )
+    await db_session.commit()
     assert len(dispatched) == 1
     assert dispatched[0][1] == second_workspace_id
+    await db_session.refresh(second_workspace)
+    assert second_workspace.settings["provisioning"]["post_commit_dispatch"] == "dispatched"
+    await dispatch_workspace_post_commit(
+        db_session,
+        workspace_id=second_workspace_id,
+        entity_id=entity_id,
+    )
+    await db_session.commit()
+    assert len(dispatched) == 1
 
     first_groups = (
         (await db_session.execute(select(DocumentGroup).where(DocumentGroup.workspace_id == first_workspace_id)))
@@ -8639,6 +9129,8 @@ async def test_finalize_setup_materializes_runtime_governance_from_rules(db_sess
                 {
                     "rule_key": "review_social_posts",
                     "description": "发任何社媒 post 前，必须给用户审核完整内容，得到同意才能发布。",
+                    "rule_type": "approval_required",
+                    "action_patterns": ["social_post.publish"],
                 }
             ],
             "channel_config": {},
@@ -8668,6 +9160,15 @@ async def test_finalize_setup_materializes_runtime_governance_from_rules(db_sess
     summary = await chat_context.get_summary(db_session, workspace_id, "ENTGOVRULES000000000000")
     assert "Runtime guardrails:" in summary
     assert "approval required for social_post.publish" in summary
+
+
+def test_governance_rule_description_is_not_interpreted_as_runtime_policy() -> None:
+    from packages.core.services.workspace_setup_service import _infer_rule_enforcement
+
+    assert _infer_rule_enforcement({
+        "rule_key": "review_social_posts",
+        "description": "发任何社媒 post 前，必须给用户审核完整内容，得到同意才能发布。",
+    }) is None
 
 
 @pytest.mark.asyncio

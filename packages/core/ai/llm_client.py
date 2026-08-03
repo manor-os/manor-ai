@@ -29,6 +29,7 @@ from packages.core.services.model_gateway import (
     GENERIC_SK_PROVIDERS,
     ModelGatewayRoute,
     PROVIDER_HANDLERS,
+    adapt_native_chat_completion_payload,
     detect_provider_from_key as _detect_provider_from_key,
     normalize_model_for_provider as _normalize_model_for_provider,
     provider_for_model_id,
@@ -55,6 +56,21 @@ LLM_MODEL_ALIASES: Dict[str, str] = {
     # etc.) are intentionally excluded — see CATALOG inclusion rule
     # in packages/core/constants/models.py for the reasoning.
     "gpt5": "openai/gpt-5",
+    "gpt56": "openai/gpt-5.6-sol",
+    "gpt5.6": "openai/gpt-5.6-sol",
+    "gpt-5.6": "openai/gpt-5.6-sol",
+    "chatgpt56": "openai/gpt-5.6-sol",
+    "chatgpt5.6": "openai/gpt-5.6-sol",
+    "chatgpt-5.6": "openai/gpt-5.6-sol",
+    "gpt56-sol": "openai/gpt-5.6-sol",
+    "gpt5.6-sol": "openai/gpt-5.6-sol",
+    "gpt-5.6-sol": "openai/gpt-5.6-sol",
+    "gpt56-terra": "openai/gpt-5.6-terra",
+    "gpt5.6-terra": "openai/gpt-5.6-terra",
+    "gpt-5.6-terra": "openai/gpt-5.6-terra",
+    "gpt56-luna": "openai/gpt-5.6-luna",
+    "gpt5.6-luna": "openai/gpt-5.6-luna",
+    "gpt-5.6-luna": "openai/gpt-5.6-luna",
     "gpt55": "openai/gpt-5.5",
     "gpt5.5": "openai/gpt-5.5",
     "gpt-5.5": "openai/gpt-5.5",
@@ -66,7 +82,7 @@ LLM_MODEL_ALIASES: Dict[str, str] = {
     "gpt-5.5-pro": "openai/gpt-5.5-pro",
     "gpt4o": "openai/gpt-4o",
     "gpt4o-mini": "openai/gpt-4o-mini",
-    "gpt4": "openai/gpt-4-turbo",
+    "gpt4": "openai/gpt-4",
     "openai-40": "openai/gpt-4o",
     "claude": "anthropic/claude-sonnet-4",
     "claude-sonnet": "anthropic/claude-sonnet-4",
@@ -101,9 +117,32 @@ def _resolve_llm_model(raw: str) -> str:
     return raw.strip() if raw else DEFAULT_LLM_MODEL
 
 
+def _apply_chat_completion_tool_compatibility(
+    payload: Dict[str, Any],
+    *,
+    model: str,
+    tools: List[Dict[str, Any]],
+) -> None:
+    """Apply model-specific defaults required by Chat Completions tools.
+
+    GPT-5.6 defaults to medium reasoning, while function tools on the Chat
+    Completions endpoint require effective reasoning ``none``. Manor's agent
+    runtime still uses Chat Completions, so make that endpoint constraint
+    explicit without changing reasoning for ordinary text-only calls.
+    """
+
+    bare_model = str(model or "").strip().lower().split("/", 1)[-1]
+    if tools and (bare_model == "gpt-5.6" or bare_model.startswith("gpt-5.6-")):
+        payload.setdefault("reasoning_effort", "none")
+
+
 _is_byok_call: contextvars.ContextVar[bool] = contextvars.ContextVar("_is_byok_call", default=False)
 _llm_route_provider: contextvars.ContextVar[str] = contextvars.ContextVar("_llm_route_provider", default="")
 _llm_pricing_source: contextvars.ContextVar[str] = contextvars.ContextVar("_llm_pricing_source", default="")
+_official_gateway_override: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_official_gateway_override",
+    default="",
+)
 
 
 ResolvedLLMRouting = ModelGatewayRoute
@@ -133,9 +172,9 @@ def _missing_llm_key_detail() -> str:
         )
     return (
         "No usable LLM API key found. A user-provided native provider key was "
-        "not configured for this request, and no platform official provider "
-        "token or OpenRouter fallback is configured in admin or the API process "
-        "environment."
+        "not configured for this request, and neither the platform Vercel AI "
+        "Gateway token nor the OpenRouter fallback is configured in admin or "
+        "the API process environment."
     )
 
 
@@ -395,7 +434,7 @@ def _metadata_model_id(metadata: Optional[Dict[str, Any]]) -> str:
 def _provider_matches_model(provider: str | None, model_provider: str | None) -> bool:
     if not provider or not model_provider:
         return True
-    if provider == "openrouter":
+    if provider in {"openrouter", "vercel"}:
         return True
     return provider == model_provider
 
@@ -461,8 +500,10 @@ def _validate_llm_key_model_compatibility(api_key: str, base_url: str, model_id:
 
     model_provider = _model_provider_prefix(model_id)
     base_provider = _provider_from_base_url(base_url)
+    if base_provider in {"openrouter", "vercel"}:
+        return
 
-    if base_provider and model_provider and base_provider != "openrouter" and model_provider != base_provider:
+    if base_provider and model_provider and model_provider != base_provider:
         raise LLMAuthConfigurationError(
             f"The selected model {model_id} is a {model_provider} model, but the request is routed to {base_provider}. "
             "Choose a model/base URL from the same provider."
@@ -576,7 +617,7 @@ async def resolve_llm_routing_for_model(
 
     Order:
       1. Native user BYOK from metadata
-      2. Platform official token for the model provider, configured in admin
+      2. Platform Vercel AI Gateway
       3. Platform OpenRouter fallback
       4. Legacy env fallback for bare/custom model ids
     """
@@ -638,8 +679,9 @@ async def resolve_llm_routing_for_model(
         try:
             route = await resolve_official_model_route(
                 model_id,
-                reason="llm.chat.official_provider_key",
+                vercel_reason="llm.chat.vercel_gateway_key",
                 openrouter_reason="llm.chat.openrouter_fallback_key",
+                gateway_provider=_official_gateway_override.get("") or None,
             )
             if route and route.api_key:
                 _is_byok_call.set(False)
@@ -665,6 +707,34 @@ async def resolve_llm_routing_for_model(
         provider=model_provider,
         source="missing",
     )
+
+
+async def _retry_manor_official_call_via_openrouter(
+    routing: ResolvedLLMRouting,
+    *,
+    model: str,
+    call_type: str,
+    retry: Callable[[], Awaitable[Any]],
+) -> Any | None:
+    """Retry a failed Manor-managed Vercel call through OpenRouter once."""
+
+    if (
+        routing.provider != "vercel"
+        or routing.source == "byok"
+        or _official_gateway_override.get("") == "openrouter"
+    ):
+        return None
+
+    logger.warning(
+        "%s failed through Vercel AI Gateway for model %s; retrying through OpenRouter.",
+        call_type,
+        model,
+    )
+    token = _official_gateway_override.set("openrouter")
+    try:
+        return await retry()
+    finally:
+        _official_gateway_override.reset(token)
 
 
 def get_llm_timeout() -> float:
@@ -874,12 +944,6 @@ _MAX_LLM_TOOLS = 128
 _StreamHandler = Optional[Callable[[str, Dict[str, Any]], Any]]
 
 
-_VISION_MODEL_PREFIXES = (
-    "openai/gpt-4o",
-    "openai/gpt-4.1",
-    "google/gemini-",
-    "anthropic/claude-",
-)
 _LLM_ROUTING_METADATA_FIELDS = (
     "llm_api_key",
     "api_key",
@@ -902,14 +966,49 @@ def _messages_include_image(messages: List[Dict[str, Any]]) -> bool:
     return any(_walk(m.get("content")) for m in messages)
 
 
-def _model_supports_image_input(model: str) -> bool:
-    m = (model or "").strip()
-    return any(m.startswith(prefix) for prefix in _VISION_MODEL_PREFIXES)
+def _model_supports_image_input(model: str) -> bool | None:
+    from packages.core.constants.models import model_input_modalities
+
+    modalities = model_input_modalities(model)
+    if modalities is None:
+        return None
+    return "image" in modalities
+
+
+def _log_vision_model_route(
+    *,
+    requested_model: str,
+    canonical_model: str,
+    resolved_model: str,
+    reason: str,
+) -> None:
+    logger.info(
+        "Vision model route requested_model=%s canonical_model=%s resolved_model=%s "
+        "vision_fallback_reason=%s provider_changed=%s",
+        requested_model,
+        canonical_model,
+        resolved_model,
+        reason,
+        _model_provider_prefix(canonical_model) != _model_provider_prefix(resolved_model),
+    )
 
 
 def _resolve_vision_model_if_needed(model: str, messages: List[Dict[str, Any]]) -> str:
-    if not _messages_include_image(messages) or _model_supports_image_input(model):
-        return model
+    requested_model = str(model or "").strip()
+    canonical_model = _resolve_llm_model(requested_model)
+    if not _messages_include_image(messages):
+        return canonical_model
+
+    supports_image = _model_supports_image_input(canonical_model)
+    if supports_image is not False:
+        _log_vision_model_route(
+            requested_model=requested_model,
+            canonical_model=canonical_model,
+            resolved_model=canonical_model,
+            reason="native_image_input" if supports_image else "capability_unknown",
+        )
+        return canonical_model
+
     from packages.core.constants.models import DEFAULTS
 
     system_default = str(DEFAULTS.get("primary") or "").strip()
@@ -919,9 +1018,15 @@ def _resolve_vision_model_if_needed(model: str, messages: List[Dict[str, Any]]) 
         or system_default
         or "openai/gpt-4o"
     ).strip()
-    if not _model_supports_image_input(fallback):
+    fallback = _resolve_llm_model(fallback)
+    if _model_supports_image_input(fallback) is not True:
         fallback = "openai/gpt-4o"
-    logger.info("Switching model for image input: %s -> %s", model, fallback)
+    _log_vision_model_route(
+        requested_model=requested_model,
+        canonical_model=canonical_model,
+        resolved_model=fallback,
+        reason="image_input_explicitly_unsupported",
+    )
     return fallback
 
 
@@ -1488,6 +1593,31 @@ def _cache_creation_tokens_from_usage(usage: Dict[str, Any]) -> int:
     )
 
 
+def _audio_tokens_from_usage(usage: Dict[str, Any]) -> tuple[int, int]:
+    """Return (audio_input_tokens, audio_output_tokens) when reported.
+
+    OpenAI audio-capable chat models report these in
+    ``prompt_tokens_details.audio_tokens`` / ``completion_tokens_details.audio_tokens``
+    (Responses-API shape: ``input_tokens_details.audio_tokens``). Audio tokens
+    bill at their own, much higher rate than text tokens.
+    """
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    input_details = usage.get("input_tokens_details") or usage.get("input_token_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    output_details = usage.get("output_tokens_details") or usage.get("output_token_details") or {}
+    audio_in = _first_int_usage_value(
+        usage.get("audio_input_tokens"),
+        prompt_details.get("audio_tokens"),
+        input_details.get("audio_tokens"),
+    )
+    audio_out = _first_int_usage_value(
+        usage.get("audio_output_tokens"),
+        completion_details.get("audio_tokens"),
+        output_details.get("audio_tokens"),
+    )
+    return audio_in, audio_out
+
+
 def _usage_from_response(data: Dict[str, Any], model: Optional[str] = None) -> Dict[str, Any]:
     """Extract token usage from LLM response data.
 
@@ -1499,6 +1629,7 @@ def _usage_from_response(data: Dict[str, Any], model: Optional[str] = None) -> D
     usage = data.get("usage") or {}
     cache_read = _cache_read_tokens_from_usage(usage)
     cache_creation = _cache_creation_tokens_from_usage(usage)
+    audio_in, audio_out = _audio_tokens_from_usage(usage)
     reported_cost = (
         usage.get("cost_usd")
         if usage.get("cost_usd") is not None
@@ -1510,6 +1641,8 @@ def _usage_from_response(data: Dict[str, Any], model: Optional[str] = None) -> D
         "total": usage.get("total_tokens", 0),
         "cache_read": cache_read,
         "cache_creation": cache_creation,
+        "audio_in": audio_in,
+        "audio_out": audio_out,
         "model": model or usage.get("model"),
         "cost_usd": reported_cost,
     }
@@ -2290,6 +2423,8 @@ def _usage_to_credit_estimate(usage: dict, model: str | None) -> int:
             provider=str(usage.get("provider") or ""),
             cache_read_tokens=int(usage.get("cache_read") or usage.get("cache_read_input_tokens") or 0),
             cache_creation_tokens=int(usage.get("cache_creation") or usage.get("cache_creation_input_tokens") or 0),
+            audio_input_tokens=int(usage.get("audio_in") or usage.get("audio_input_tokens") or 0),
+            audio_output_tokens=int(usage.get("audio_out") or usage.get("audio_output_tokens") or 0),
         ))
     except Exception:
         logger.debug("Failed to estimate LLM usage credits", exc_info=True)
@@ -3036,7 +3171,7 @@ async def chat_completion(
     usage_dict includes "finish_reason" key alongside token counts.
     If metadata is provided, user-level API key and base URL take priority.
     """
-    requested_model = model or get_llm_model()
+    requested_model = _resolve_llm_model(model or get_llm_model())
     resolved_model = _resolve_vision_model_if_needed(requested_model, messages)
     metadata_for_call = _route_metadata_for_resolved_model(metadata, requested_model, resolved_model)
     routing = await resolve_llm_routing_for_model(resolved_model, metadata_for_call)
@@ -3073,6 +3208,11 @@ async def chat_completion(
         payload["response_format"] = response_format
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    adapt_native_chat_completion_payload(
+        payload,
+        model_id=resolved_model,
+        base_url=base_url,
+    )
     provider_block = _openrouter_provider_block(base_url)
     if provider_block:
         payload["provider"] = provider_block
@@ -3201,6 +3341,8 @@ async def chat_completion(
         _attach_reasoning_to_usage(usage, _extract_reasoning_content(msg))
         if _is_empty_provider_response(content, finish_reason, usage):
             detail = "Empty LLM response: provider returned no content, finish_reason, or usage."
+            if routing.provider == "vercel":
+                raise RuntimeError(detail)
             _record_llm_call(
                 call_type="chat_completion",
                 model=resolved_model,
@@ -3237,6 +3379,22 @@ async def chat_completion(
             success=False,
             error=detail,
         )
+        fallback_result = await _retry_manor_official_call_via_openrouter(
+            routing,
+            model=resolved_model,
+            call_type="chat_completion",
+            retry=lambda: chat_completion(
+                messages,
+                temperature=temperature,
+                response_format=response_format,
+                max_tokens=max_tokens,
+                model=resolved_model,
+                stream_handler=stream_handler,
+                metadata=metadata_for_call,
+            ),
+        )
+        if fallback_result is not None:
+            return fallback_result
         logger.exception("chat_completion failed: %s", detail)
         # Return empty content (callers like supervisor prefer empty over
         # canned text) but propagate the error in the usage dict so it
@@ -3286,7 +3444,7 @@ async def chat_completion_with_tools(
       - The model/provider does not return tool_calls (graceful degradation)
     Retries on 429 with exponential back-off.
     """
-    requested_model = model or get_llm_model()
+    requested_model = _resolve_llm_model(model or get_llm_model())
     model = _resolve_vision_model_if_needed(requested_model, messages)
     metadata_for_call = _route_metadata_for_resolved_model(metadata, requested_model, model)
     routing = await resolve_llm_routing_for_model(model, metadata_for_call)
@@ -3322,6 +3480,16 @@ async def chat_completion_with_tools(
         "tool_choice": tool_choice if tool_choice is not None else "auto",
         "max_tokens": effective_max_tokens,
     }
+    _apply_chat_completion_tool_compatibility(
+        payload,
+        model=model,
+        tools=normalized_tools,
+    )
+    adapt_native_chat_completion_payload(
+        payload,
+        model_id=model,
+        base_url=base_url,
+    )
     provider_block = _openrouter_provider_block(base_url)
     if provider_block:
         payload["provider"] = provider_block
@@ -3562,6 +3730,8 @@ async def chat_completion_with_tools(
         if _is_empty_provider_response(content, finish_reason, usage):
             detail = "Empty LLM response: provider returned no content, finish_reason, tool calls, or usage."
             logger.warning("chat_completion_with_tools buffered path returned empty provider response")
+            if routing.provider == "vercel":
+                raise RuntimeError(detail)
             _record_llm_call(
                 call_type="chat_completion_with_tools",
                 model=model,
@@ -3601,17 +3771,45 @@ async def chat_completion_with_tools(
             success=False,
             error=detail,
         )
+        fallback_result = await _retry_manor_official_call_via_openrouter(
+            routing,
+            model=model,
+            call_type="chat_completion_with_tools",
+            retry=lambda: chat_completion_with_tools(
+                messages,
+                tools,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                model=model,
+                stream_handler=stream_handler,
+                metadata=metadata_for_call,
+                max_tokens=max_tokens,
+            ),
+        )
+        if fallback_result is not None:
+            return fallback_result
 
         # Fallback: try a different model if primary fails on tool-calling
         fallback = os.getenv("LLM_FALLBACK_MODEL", "").strip()
         if fallback and fallback != model and e.response.status_code == 500 and not _is_anthropic_messages_api(base_url):
             logger.warning("Primary model %s failed on tool-calling, trying fallback %s", model, fallback)
             try:
-                payload["model"] = fallback
+                fallback_payload = {**payload, "model": fallback}
+                fallback_payload.pop("reasoning_effort", None)
+                _apply_chat_completion_tool_compatibility(
+                    fallback_payload,
+                    model=fallback,
+                    tools=normalized_tools,
+                )
+                adapt_native_chat_completion_payload(
+                    fallback_payload,
+                    model_id=fallback,
+                    base_url=base_url,
+                )
                 fb_response = await _post_with_retry(
                     f"{base_url}/chat/completions",
                     headers=dict(request_headers),
-                    payload=payload,
+                    payload=fallback_payload,
                 )
                 fb_data = _parse_llm_response_json(fb_response, call_type="chat_completion_with_tools(fallback)")
                 fb_usage = _usage_from_response(fb_data, fallback)
@@ -3665,6 +3863,23 @@ async def chat_completion_with_tools(
             success=False,
             error=str(e),
         )
+        fallback_result = await _retry_manor_official_call_via_openrouter(
+            routing,
+            model=model,
+            call_type="chat_completion_with_tools",
+            retry=lambda: chat_completion_with_tools(
+                messages,
+                tools,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                model=model,
+                stream_handler=stream_handler,
+                metadata=metadata_for_call,
+                max_tokens=max_tokens,
+            ),
+        )
+        if fallback_result is not None:
+            return fallback_result
         logger.exception("chat_completion_with_tools timed out: %s", e)
         return (
             "The request timed out. Please try again -- large tool sets can take longer to process.",
@@ -3682,6 +3897,23 @@ async def chat_completion_with_tools(
             success=False,
             error=str(e),
         )
+        fallback_result = await _retry_manor_official_call_via_openrouter(
+            routing,
+            model=model,
+            call_type="chat_completion_with_tools",
+            retry=lambda: chat_completion_with_tools(
+                messages,
+                tools,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                model=model,
+                stream_handler=stream_handler,
+                metadata=metadata_for_call,
+                max_tokens=max_tokens,
+            ),
+        )
+        if fallback_result is not None:
+            return fallback_result
         logger.exception("chat_completion_with_tools failed: %s", e)
         return (
             _failure_message(f"{type(e).__name__}: {e}", model=model),

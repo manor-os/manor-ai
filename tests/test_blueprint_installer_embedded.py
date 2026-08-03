@@ -26,13 +26,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.blueprints.installer import InstallError, InstallMode, install_blueprint
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import DocumentGroup
+from packages.core.models.mcp import AgentMCPBinding, MCPServer
 from packages.core.models.memory import AgentMemory
 from packages.core.models.skill import AgentSkillBinding, Skill
 from packages.core.models.workspace import (
     Agent,
+    AgentSubscription,
     AgentToolBinding,
     ToolDefinition,
 )
+from packages.core.models.worker import SubscriptionWorker
 
 
 @pytest.fixture
@@ -209,6 +212,123 @@ async def test_embedded_agent_creates_with_tool_bindings(
     assert agent.source == "blueprint"
     assert len(bindings) == 1
     assert bindings[0].tool_id == td.id
+
+
+async def test_existing_agent_reconciles_all_bindings_and_subscription_worker(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    tool_name = f"tool.workspace.copy.{entity_id}"
+    skill_slug = f"workspace-copy-skill-{entity_id}"
+    agent_slug = f"workspace-copy-agent-{entity_id}"
+    server_slug = f"workspace-copy-mcp-{entity_id}"
+    tool = ToolDefinition(
+        id=generate_ulid(),
+        name=tool_name,
+        display_name="Workspace Copy",
+    )
+    skill = Skill(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Existing Skill",
+        slug=skill_slug,
+        system_prompt="Existing prompt.",
+        tools=[],
+        is_public=False,
+        status="active",
+    )
+    agent = Agent(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Existing Agent",
+        slug=agent_slug,
+        system_prompt="Existing prompt.",
+        config={},
+        is_public=False,
+        status="active",
+    )
+    server = MCPServer(
+        id=generate_ulid(),
+        server_key=server_slug,
+        name="Workspace Copy MCP",
+        transport="builtin",
+        auth_type="none",
+        status="active",
+    )
+    db_session.add_all([tool, skill, agent, server])
+    await db_session.commit()
+
+    payload = _base_payload(
+        **{
+            "contract.requires": {
+                "manor_min_version": None,
+                "tools": [tool_name],
+                "mcp_servers": [{"slug": server_slug}],
+                "skills": [],
+                "agents": [],
+            },
+            "embedded.skills": [{
+                "slug": skill_slug,
+                "name": "Existing Skill",
+                "system_prompt": "Blueprint prompt.",
+                "tools": [tool_name],
+            }],
+            "embedded.agents": [{
+                "slug": agent_slug,
+                "name": "Existing Agent",
+                "system_prompt": "Blueprint prompt.",
+                "config": {},
+                "business_capabilities": ["workspace.search"],
+                "tool_bindings": [tool_name],
+                "mcp_bindings": [{
+                    "server_slug": server_slug,
+                    "allowed_tools": None,
+                    "config_override_allowlist": [],
+                }],
+                "skill_bindings": [skill_slug],
+                "starter_memory": [],
+            }],
+            "recipe.subscriptions": [{
+                "service_key": "workspace_copy",
+                "agent_slug": agent_slug,
+                "config": {},
+            }],
+        }
+    )
+    result = await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        payload=payload,
+        mode=InstallMode.LIVE,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(agent)
+    await db_session.refresh(skill)
+    assert agent.config["business_capabilities"] == ["workspace.search"]
+    assert skill.tools == [tool_name]
+    assert len((await db_session.execute(
+        select(AgentToolBinding).where(AgentToolBinding.agent_id == agent.id)
+    )).scalars().all()) == 1
+    assert len((await db_session.execute(
+        select(AgentSkillBinding).where(AgentSkillBinding.agent_id == agent.id)
+    )).scalars().all()) == 1
+    assert len((await db_session.execute(
+        select(AgentMCPBinding).where(AgentMCPBinding.agent_id == agent.id)
+    )).scalars().all()) == 1
+
+    [subscription] = list((await db_session.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.workspace_id == result.workspace_id,
+            AgentSubscription.agent_id == agent.id,
+        )
+    )).scalars().all())
+    worker_binding = (await db_session.execute(
+        select(SubscriptionWorker).where(
+            SubscriptionWorker.subscription_id == subscription.id,
+        )
+    )).scalar_one_or_none()
+    assert worker_binding is not None
 
 
 async def test_embedded_agent_missing_tool_raises_install_error(

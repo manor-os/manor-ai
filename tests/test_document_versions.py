@@ -140,3 +140,25 @@ async def test_empty_trash(client: AsyncClient):
     # Normal list also empty (docs permanently deleted)
     list_resp = await client.get("/api/v1/documents", headers=headers)
     assert list_resp.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_permanently_delete_single_document_from_trash(client: AsyncClient):
+    headers = await _auth(client, "veruser6")
+    doc = await _upload(client, headers, "delete-from-trash.txt")
+
+    trashed = await client.post(
+        f"/api/v1/documents/{doc['id']}/trash",
+        headers=headers,
+    )
+    assert trashed.status_code == 200, trashed.text
+
+    deleted = await client.delete(
+        f"/api/v1/documents/{doc['id']}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    trash = await client.get("/api/v1/documents/trash", headers=headers)
+    assert trash.status_code == 200, trash.text
+    assert all(item["id"] != doc["id"] for item in trash.json())

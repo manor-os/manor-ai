@@ -22,7 +22,7 @@ def test_dashboard_module_builder_is_a_fixed_builtin_skill() -> None:
     config = json.loads((SKILL_DIR / "config.json").read_text(encoding="utf-8"))
 
     assert frontmatter["name"] == "dashboard-module-builder"
-    assert frontmatter["version"] == "1.2.1"
+    assert frontmatter["version"] == "1.3.0"
     assert config["type"] == "runtime_guidance"
     assert config["tools"] == [
         "dashboard_submit_module",

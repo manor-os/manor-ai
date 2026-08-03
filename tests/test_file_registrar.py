@@ -65,8 +65,12 @@ async def test_register_generated_files_passes_origin_and_refreshes_files_cache(
     monkeypatch.setattr(file_registrar, "_register_url", fake_register_url)
     monkeypatch.setattr(file_registrar, "_refresh_workspace_file_cache", fake_refresh_workspace_file_cache)
 
+    image_url = "https://replicate.delivery/pbxt/generated_file.png"
     count = await file_registrar.register_generated_files(
-        json.dumps({"image_url": "https://replicate.delivery/pbxt/generated_file.png"}),
+        json.dumps({
+            "outputs": [image_url],
+            "primary": image_url,
+        }),
         entity_id="ent_1",
         user_id="user_1",
         source="replicate",
@@ -77,6 +81,7 @@ async def test_register_generated_files_passes_origin_and_refreshes_files_cache(
             "agent_id": "agent_1",
             "tool_name": "mcp__replicate__generate_image",
         },
+        knowledge_artifacts=[{"url": image_url, "kind": "image"}],
     )
 
     assert count == 1
@@ -84,4 +89,87 @@ async def test_register_generated_files_passes_origin_and_refreshes_files_cache(
     refresh_call = next(call for call in calls if call[0] == "refresh")
     assert url_call[2]["origin"]["workspace_id"] == "ws_1"
     assert url_call[2]["origin"]["task_id"] == "task_1"
+    assert [call[1] for call in calls if call[0] == "url"] == [image_url]
     assert refresh_call[1]["origin"]["workspace_id"] == "ws_1"
+
+
+@pytest.mark.asyncio
+async def test_register_generated_files_ignores_remote_images_embedded_in_page_content(
+    monkeypatch,
+) -> None:
+    registered_urls: list[str] = []
+
+    async def fake_register_url(url: str, **_kwargs):
+        registered_urls.append(url)
+        return True
+
+    monkeypatch.setattr(file_registrar, "_register_url", fake_register_url)
+
+    count = await file_registrar.register_generated_files(
+        json.dumps(
+            {
+                "content": (
+                    '<img src="https://media.licdn.com/media/'
+                    'AAYABATzAAwAAQAAAAAAAMf6E0TuucIkSYGFrDoCICokGw.png">'
+                )
+            }
+        ),
+        entity_id="ent_1",
+        user_id="user_1",
+        source="chrome",
+        origin={"tool_name": "mcp__chrome__get_web_content"},
+    )
+
+    assert count == 0
+    assert registered_urls == []
+
+
+@pytest.mark.asyncio
+async def test_register_generated_files_accepts_declared_logo_artifact(monkeypatch) -> None:
+    registered_urls: list[str] = []
+
+    async def fake_register_url(url: str, **_kwargs):
+        registered_urls.append(url)
+        return True
+
+    monkeypatch.setattr(file_registrar, "_register_url", fake_register_url)
+
+    url = "https://replicate.delivery/pbxt/final-brand-logo.png"
+    count = await file_registrar.register_generated_files(
+        json.dumps({"outputs": [url]}),
+        entity_id="ent_1",
+        source="replicate",
+        knowledge_artifacts=[{"url": url, "kind": "image"}],
+    )
+
+    assert count == 1
+    assert registered_urls == [url]
+
+
+@pytest.mark.asyncio
+async def test_register_generated_files_ignores_model_visible_artifacts_without_sidecar(
+    monkeypatch,
+) -> None:
+    registered_urls: list[str] = []
+
+    async def fake_register_url(url: str, **_kwargs):
+        registered_urls.append(url)
+        return True
+
+    monkeypatch.setattr(file_registrar, "_register_url", fake_register_url)
+
+    count = await file_registrar.register_generated_files(
+        json.dumps({
+            "artifacts": [
+                {
+                    "url": "https://media.licdn.com/media/page-evidence.png",
+                    "kind": "image",
+                }
+            ]
+        }),
+        entity_id="ent_1",
+        source="chrome",
+    )
+
+    assert count == 0
+    assert registered_urls == []

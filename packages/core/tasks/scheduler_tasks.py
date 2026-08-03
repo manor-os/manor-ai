@@ -6,7 +6,7 @@ the appropriate execution task.
 """
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from packages.core.celery_app import celery_app
@@ -16,6 +16,19 @@ logger = logging.getLogger(__name__)
 
 
 INTERVAL_SCHEDULE_KINDS = ("every", "interval")
+
+# Missed-run scan (M1 ledger gap): run at most every 10 minutes, and only
+# consider interval jobs of >= 1 hour — sub-hourly jobs recover on the very
+# next tick, so "missed" events for them would be pure noise.
+_MISSED_SCAN_INTERVAL_SECONDS = 600
+_MISSED_RUN_MIN_EVERY_SECONDS = 3600
+# Cron missed-run detection: how far back _previous_cron_occurrence will
+# step (minute by minute) looking for the last matching minute, and how
+# long after that occurrence we still consider a run merely "late" rather
+# than missed (the tick itself runs every 60s, dispatch is async).
+_CRON_LOOKBACK_MINUTES = 1440  # 24h
+_MISSED_CRON_GRACE_SECONDS = 300  # 5 min
+_last_missed_scan_at: datetime | None = None
 _DEFAULT_AGENT_TASK_MAX_TURNS = DEFAULT_AGENT_MAX_TURNS
 _FILE_DELIVERABLE_MIN_TURNS = DEFAULT_AGENT_MAX_TURNS
 _FILE_DELIVERABLE_KINDS = frozenset(
@@ -198,7 +211,12 @@ async def _async_tick():
         )
         candidates = list(result.scalars().all())
 
-        if not candidates:
+        # Ledger (M1): record automation_run_missed facts BEFORE dispatching,
+        # so a job that finally fires after a silent gap still gets its missed
+        # period(s) on the ledger. Throttled to once per 10 minutes.
+        missed = await _maybe_scan_missed_runs(db, now)
+
+        if not candidates and not missed:
             return
 
         # Fine-grained check in Python + fan-out dispatch
@@ -220,6 +238,168 @@ async def _async_tick():
         await db.commit()
         if dispatched:
             logger.info("Scheduler tick: dispatched %d of %d candidates", dispatched, len(candidates))
+
+
+async def _maybe_scan_missed_runs(db, now: datetime) -> int:
+    """Throttle wrapper around :func:`_scan_missed_runs` — the scan runs at
+    most once per ``_MISSED_SCAN_INTERVAL_SECONDS`` per worker process, and
+    is best-effort: a scan failure never breaks the tick."""
+    global _last_missed_scan_at
+    now_utc = _as_aware_utc(now)
+    if (
+        _last_missed_scan_at is not None
+        and (now_utc - _last_missed_scan_at).total_seconds() < _MISSED_SCAN_INTERVAL_SECONDS
+    ):
+        return 0
+    _last_missed_scan_at = now_utc
+    try:
+        return await _scan_missed_runs(db, now_utc)
+    except Exception:  # noqa: BLE001 — ledger scan must never break the tick
+        logger.warning("missed-run scan failed (ignored)", exc_info=True)
+        return 0
+
+
+async def _scan_missed_runs(db, now: datetime) -> int:
+    """Emit ``automation_run_missed`` for enabled jobs whose scheduled period
+    elapsed with no run (the tick was down, dispatch kept failing, or the
+    worker pool stalled).
+
+    Scope:
+    * interval ("every"/"interval") jobs with ``every_seconds >= 1h`` whose
+      last run is more than 2× their interval old — sub-hourly jobs
+      self-heal next tick and would only produce noise.
+    * cron jobs: the PRIOR occurrence is computed by
+      :func:`_previous_cron_occurrence` (in the job's own timezone); the job
+      is missed when ``last_run_at`` is missing or predates that occurrence
+      and the occurrence is more than ``_MISSED_CRON_GRACE_SECONDS`` old.
+
+    Returns how many NEW missed events were recorded (per-period idempotency
+    lives in the adapter's ``sj:{id}:missed:{period_key}`` key).
+    """
+    from sqlalchemy import select
+
+    from packages.core.ledger.adapters import record_automation_run_missed
+    from packages.core.models.scheduler import ScheduledJob
+
+    now_utc = _as_aware_utc(now)
+    # DB pre-filter with the weakest possible bound (2× the 1h minimum);
+    # the exact per-job 2× every_seconds check happens in Python below.
+    threshold = now_utc - timedelta(seconds=2 * _MISSED_RUN_MIN_EVERY_SECONDS)
+    rows = (
+        await db.execute(
+            select(ScheduledJob).where(
+                ScheduledJob.enabled == True,  # noqa: E712
+                ScheduledJob.schedule_kind.in_(INTERVAL_SCHEDULE_KINDS),
+                ScheduledJob.every_seconds >= _MISSED_RUN_MIN_EVERY_SECONDS,
+                ScheduledJob.last_run_at.is_not(None),
+                ScheduledJob.last_run_at < threshold,
+            )
+        )
+    ).scalars().all()
+
+    emitted = 0
+    for job in rows:
+        try:
+            every = float(job.every_seconds or 0)
+        except (TypeError, ValueError):
+            continue
+        if every < _MISSED_RUN_MIN_EVERY_SECONDS:
+            continue
+        last_run = _as_aware_utc(job.last_run_at)
+        if (now_utc - last_run).total_seconds() < 2 * every:
+            continue  # late, but not a full missed period yet
+        expected_by = last_run + timedelta(seconds=every)
+        event = await record_automation_run_missed(db, job, expected_by=expected_by)
+        if event is not None:
+            emitted += 1
+
+    emitted += await _scan_missed_cron_runs(db, now_utc)
+    return emitted
+
+
+async def _scan_missed_cron_runs(db, now_utc: datetime) -> int:
+    """Missed-run detection for cron jobs (companion of _scan_missed_runs).
+
+    For each enabled cron job we compute the previous occurrence of its
+    expression in the job's OWN timezone (cron fields are wall-clock), then
+    compare it against ``last_run_at``:
+
+    * no previous occurrence within the lookback window → nothing to claim
+    * occurrence younger than the grace period → the run is merely late
+    * ``last_run_at`` at/after the occurrence → the job ran, nothing missed
+    * otherwise → one ``automation_run_missed`` for that occurrence
+    """
+    from sqlalchemy import or_, select
+
+    from packages.core.ledger.adapters import record_automation_run_missed
+    from packages.core.models.scheduler import ScheduledJob
+
+    grace = timedelta(seconds=_MISSED_CRON_GRACE_SECONDS)
+    rows = (
+        await db.execute(
+            select(ScheduledJob).where(
+                ScheduledJob.enabled == True,  # noqa: E712
+                ScheduledJob.schedule_kind == "cron",
+                ScheduledJob.cron_expr.is_not(None),
+                or_(
+                    ScheduledJob.last_run_at.is_(None),
+                    ScheduledJob.last_run_at < now_utc - grace,
+                ),
+            )
+        )
+    ).scalars().all()
+
+    emitted = 0
+    for job in rows:
+        tz = _job_zoneinfo(job)
+        previous_local = _previous_cron_occurrence(
+            job.cron_expr, now_utc.astimezone(tz),
+        )
+        if previous_local is None:
+            continue  # unparseable expression, or no occurrence in 24h
+        previous_utc = _as_aware_utc(previous_local)
+        if now_utc - previous_utc <= grace:
+            continue  # still inside the grace window — late, not missed
+        if job.last_run_at is not None and _as_aware_utc(job.last_run_at) >= previous_utc:
+            continue  # the occurrence was served
+        event = await record_automation_run_missed(db, job, expected_by=previous_utc)
+        if event is not None:
+            emitted += 1
+    return emitted
+
+
+def _previous_cron_occurrence(
+    cron_expr: str,
+    now: datetime,
+    *,
+    lookback_minutes: int = _CRON_LOOKBACK_MINUTES,
+) -> datetime | None:
+    """Last minute at or before ``now - 1min`` that ``cron_expr`` matches.
+
+    Deliberately naive: there is no croniter dependency, so we step
+    backwards one minute at a time reusing :func:`_cron_matches` (which
+    answers "does this expression fire in this minute"). That is at most
+    ``lookback_minutes`` pure-python field comparisons — 1440 (24h) by
+    default, which costs microseconds and runs at most once per 10-minute
+    missed-scan.
+
+    The bound is the semantic limit too: expressions that fire less often
+    than daily (weekly / monthly crons) return ``None`` rather than an
+    occurrence, so they are never reported as missed. Widening the window
+    is a matter of raising ``lookback_minutes`` at the call site.
+
+    Returns ``None`` for a malformed expression (not 5 fields) or when no
+    minute in the window matches. ``now`` must be in the job's own
+    timezone — cron fields are wall-clock.
+    """
+    if len(str(cron_expr or "").strip().split()) != 5:
+        return None
+    cursor = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+    for _ in range(max(0, int(lookback_minutes))):
+        if _cron_matches(cron_expr, cursor, None):
+            return cursor
+        cursor -= timedelta(minutes=1)
+    return None
 
 
 @celery_app.task(bind=True, name="scheduler.dispatch_job", max_retries=2)
@@ -452,7 +632,14 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
         job.last_status = "skipped"
         await db.flush()
 
-    target = job.execution_target or {}
+    # M13: resolve the per-run effective config. While the owning experiment
+    # is running its overlay patch is shallow-merged over execution_target
+    # for THIS run only (the stored config is untouched, no revision bump);
+    # a stale overlay (experiment stopped/deleted) is ignored.
+    from packages.core.experiments import effective_dispatch_config
+    target, experiment_id, experiment_patch = await effective_dispatch_config(
+        db, job.execution_target,
+    )
     workspace_id = target.get("workspace_id") or job.workspace_id
     if workspace_id:
         from sqlalchemy import select
@@ -471,9 +658,18 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
             await _mark_run_skipped(f"workspace_{workspace.status}")
             return
 
+    # An active experiment patch may override the run's payload_message /
+    # execution_script (config-level keys) without touching the job row.
+    payload_message = job.payload_message
+    execution_script = job.execution_script
+    if experiment_patch:
+        if "payload_message" in experiment_patch:
+            payload_message = experiment_patch["payload_message"]
+        if "execution_script" in experiment_patch:
+            execution_script = experiment_patch["execution_script"]
     prompt = runtime_scheduled_job_prompt(
-        execution_script=job.execution_script,
-        payload_message=job.payload_message,
+        execution_script=execution_script,
+        payload_message=payload_message,
         name=job.name,
     ).prompt
 
@@ -489,9 +685,6 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
                 "exec_type='workflow' but no workflow_id in execution_target"
             )
             return
-        from sqlalchemy import select
-        from packages.core.models.workflow import WorkflowRun as WRun
-        from packages.core.models.base import generate_ulid as _ulid
         trigger_data = dict(target)
         trigger_data.update({
             "payload_message": prompt,
@@ -503,18 +696,47 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
             trigger_data.setdefault("conversation_id", job.conversation_id)
         if job.manor_task_id:
             trigger_data.setdefault("task_id", job.manor_task_id)
-        wrun = WRun(
-            id=_ulid(), workflow_id=workflow_id,
-            entity_id=job.entity_id or "",
-            status="pending",
-            variables={"payload_message": prompt},
-            trigger_data=trigger_data,
-            started_by=job.user_id,
+        from packages.core.services.workflow_service import (
+            get_binding,
+            start_workflow,
+            start_workflow_from_binding,
         )
-        db.add(wrun)
+
+        try:
+            binding_id = target.get("binding_id")
+            binding = await get_binding(db, binding_id, job.entity_id or "") if binding_id else None
+            if binding_id and binding is None:
+                raise ValueError("Workspace workflow binding not found")
+            if binding and binding.workflow_id != workflow_id:
+                raise ValueError("Scheduled workflow does not match its workspace binding")
+            if binding and workspace_id and binding.workspace_id != workspace_id:
+                raise ValueError("Scheduled workflow binding belongs to another workspace")
+            if binding:
+                wrun = await start_workflow_from_binding(
+                    db,
+                    binding,
+                    variables={"payload_message": prompt},
+                    trigger_data=trigger_data,
+                    started_by=job.user_id,
+                    trigger_source="schedule",
+                )
+            else:
+                wrun = await start_workflow(
+                    db,
+                    entity_id=job.entity_id or "",
+                    workflow_id=workflow_id,
+                    variables={"payload_message": prompt},
+                    trigger_data=trigger_data,
+                    started_by=job.user_id,
+                    workspace_id=workspace_id,
+                    trigger_source="schedule",
+                )
+        except ValueError as exc:
+            await _mark_run_error(str(exc))
+            return
         await db.flush()
         from packages.core.tasks.ai_tasks import run_workflow
-        run_workflow.delay(wrun.id)
+        run_workflow.delay(wrun.id, run_id, job.job_id)
         logger.info("Dispatched workflow run %s for job %s", wrun.id, job.job_id)
 
     elif exec_type == "skill":
@@ -608,8 +830,16 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
         )
         finalise_kwargs = {"run_id": run_id, "job_id_str": job.job_id}
         if exec_type == "strategist_review":
+            from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
             run_strategist_review.apply_async(
-                args=[workspace_id, "scheduled"], kwargs=finalise_kwargs,
+                args=[workspace_id],
+                kwargs={
+                    **finalise_kwargs,
+                    **ReviewTrigger(
+                        kind=ReviewTriggerKind.SCHEDULED,
+                        detail="workspace cadence",
+                    ).celery_kwargs(),
+                },
             )
         elif exec_type == "briefing":
             briefing_timezone = target.get("timezone") or job.timezone
@@ -643,6 +873,14 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
     # Handle delete_after_run (one-shot jobs)
     if job.delete_after_run:
         job.enabled = False
+
+    # Ledger (M1): every successful dispatch is a workspace fact.
+    from packages.core.ledger.adapters import record_automation_dispatched
+    await record_automation_dispatched(
+        db, job, run_id=run_id, now=now,
+        revision=getattr(job, "revision", None),
+        experiment_id=experiment_id,
+    )
 
     logger.info("Dispatched job %s (type=%s, task=%s)", job.job_id, exec_type, job.manor_task_id)
 

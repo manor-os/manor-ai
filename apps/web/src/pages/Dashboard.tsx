@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { api } from "../lib/api";
+import {
+  api,
+  ApiError,
+  type DashboardAppliedModuleChange,
+} from "../lib/api";
 import { t } from "../lib/i18n";
 import type { Task, Workspace } from "../lib/types";
 import { currentZonedHour, formatTodayFull, isDeadlineOverdue, relativeTime } from "../lib/format";
@@ -9,6 +13,8 @@ import TrendChart from "../components/ui/TrendChart";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
 import Button from "../components/ui/Button";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
+import PageHeader from "../components/ui/PageHeader";
+import { ListRowsSkeleton, SkeletonLine } from "../components/ui/Skeleton";
 import Tooltip from "../components/ui/Tooltip";
 import GeneratedDashboardModule, {
   normalizeGeneratedModules,
@@ -86,8 +92,41 @@ const DASHBOARD_WIDGET_IDS = [
   "task_trend",
 ] as const;
 
-const DASHBOARD_AI_REQUEST_TIMEOUT_MS = 120_000;
+// Generation runs as a backend job; the server enforces its own deadline
+// (480s). This client cap is a safety net slightly above it.
+const DASHBOARD_AI_REQUEST_TIMEOUT_MS = 540_000;
+const DASHBOARD_AI_POLL_INTERVAL_MS = 2_500;
+const DASHBOARD_AI_POLL_MAX_CONSECUTIVE_FAILURES = 3;
+// Mirrors DASHBOARD_GENERATION_MAX_CONCURRENT on the backend.
+const DASHBOARD_AI_MAX_CONCURRENT = 3;
+import {
+  awayWindowStart,
+  shouldAdvanceAfterReturn,
+} from "./dashboard-away-window.mjs";
+
 const DASHBOARD_LAST_SEEN_STORAGE_KEY = "manor_dashboard_last_seen_at";
+
+function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort);
+  });
+}
 
 type DashboardWidgetId = (typeof DASHBOARD_WIDGET_IDS)[number];
 
@@ -173,6 +212,51 @@ function normalizeDashboardLayout(value: unknown): DashboardLayoutPreference {
     widgets,
     modules: normalizeGeneratedModules((value as any)?.modules),
   };
+}
+
+function dashboardModuleTitleKey(title: unknown): string {
+  return String(title || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/* Concurrent generations each start from their own layout snapshot, so job
+ * results are applied to the live draft as deltas — a full replace would
+ * silently drop modules finished by other jobs in the meantime. */
+function applyGeneratedModuleChanges(
+  current: DashboardGeneratedModule[],
+  changes: DashboardAppliedModuleChange[],
+): DashboardGeneratedModule[] {
+  let next = [...current];
+  for (const change of changes) {
+    if (change.action === "remove") {
+      if (change.module_id) {
+        next = next.filter((module) => module.id !== change.module_id);
+      }
+      continue;
+    }
+    if (!change.module) continue;
+    const [incoming] = normalizeGeneratedModules([change.module]);
+    if (!incoming) continue;
+    const byId = next.findIndex((module) => module.id === incoming.id);
+    if (byId >= 0) {
+      next[byId] = incoming;
+      continue;
+    }
+    // Mirror the server's create dedupe: an equivalent title replaces the
+    // existing module in place instead of adding a duplicate.
+    const titleKey = dashboardModuleTitleKey(incoming.title);
+    const byTitle =
+      change.action === "create"
+        ? next.findIndex(
+            (module) => dashboardModuleTitleKey(module.title) === titleKey,
+          )
+        : -1;
+    if (byTitle >= 0) {
+      next[byTitle] = { ...incoming, id: next[byTitle].id };
+    } else {
+      next.push(incoming);
+    }
+  }
+  return next.slice(0, 12);
 }
 
 function cloneGeneratedModules(
@@ -328,6 +412,7 @@ function DashboardInlineEditor({
   aiPrompt,
   saving,
   suggesting,
+  atGenerationLimit,
   previewPending,
   aiStatusMessage,
   aiStatusTone,
@@ -344,6 +429,7 @@ function DashboardInlineEditor({
   aiPrompt: string;
   saving: boolean;
   suggesting: boolean;
+  atGenerationLimit?: boolean;
   previewPending: boolean;
   aiStatusMessage?: string | null;
   aiStatusTone?: "loading" | "error";
@@ -357,7 +443,10 @@ function DashboardInlineEditor({
 }) {
   const hiddenWidgets = widgets.filter((widget) => !widget.visible);
   const hiddenModules = modules.filter((module) => !module.visible);
-  const canApplyAi = aiPrompt.trim().length > 0 && !suggesting && !previewPending;
+  // Generations run in the background, so the bar stays usable while jobs
+  // are in flight — it only locks once the concurrency limit is reached.
+  const canApplyAi =
+    aiPrompt.trim().length > 0 && !previewPending && !atGenerationLimit;
 
   return (
     <section className="dashboard-inline-editor" aria-label={t("page.dashboard.editing_dashboard")}>
@@ -368,10 +457,20 @@ function DashboardInlineEditor({
             value={aiPrompt}
             placeholder={t("page.dashboard.ai_prompt_placeholder")}
             aria-label={t("page.dashboard.ai_prompt_label")}
-            disabled={suggesting || previewPending}
+            disabled={previewPending || atGenerationLimit}
             onChange={(event) => onAiPromptChange(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && canApplyAi) onApplyAi();
+              // Never send while an IME composition is active — Enter then
+              // only confirms the candidate (e.g. Chinese/Japanese input).
+              if (
+                event.key === "Enter" &&
+                !event.nativeEvent.isComposing &&
+                (event.nativeEvent as any).keyCode !== 229 &&
+                canApplyAi
+              ) {
+                event.preventDefault();
+                onApplyAi();
+              }
             }}
           />
           <button
@@ -382,7 +481,11 @@ function DashboardInlineEditor({
             aria-label={t("page.dashboard.apply_ai")}
             onClick={onApplyAi}
           >
-            {suggesting ? <LoadingSpinner size={13} /> : <IconSend size={14} />}
+            {atGenerationLimit ? (
+              <LoadingSpinner size={13} />
+            ) : (
+              <IconSend size={14} />
+            )}
           </button>
         </div>
         {aiStatusMessage && (
@@ -448,7 +551,13 @@ function DashboardInlineEditor({
   );
 }
 
-function DashboardGeneratingModule({ request }: { request: string }) {
+function DashboardGeneratingModule({
+  request,
+  onStop,
+}: {
+  request: string;
+  onStop?: () => void;
+}) {
   return (
     <article
       className="dashboard-generated-module dashboard-generated-module--wide dashboard-generated-module--generating"
@@ -466,10 +575,17 @@ function DashboardGeneratingModule({ request }: { request: string }) {
             <p>{request}</p>
           </div>
         </div>
-        <span className="dashboard-generating-code-label">
-          <IconCode size={13} />
-          {t("page.dashboard.code_and_tools")}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span className="dashboard-generating-code-label">
+            <IconCode size={13} />
+            {t("page.dashboard.code_and_tools")}
+          </span>
+          {onStop && (
+            <Button variant="outline" size="sm" onClick={onStop}>
+              {t("page.dashboard.stop_generation")}
+            </Button>
+          )}
+        </div>
       </header>
       <div className="dashboard-generating-module-body">
         <div className="dashboard-generating-module-copy">
@@ -542,44 +658,61 @@ export default function Dashboard() {
   >(null);
   const [layoutGenerationError, setLayoutGenerationError] = useState<string | null>(null);
   const [draggedWidget, setDraggedWidget] = useState<DashboardWidgetId | null>(null);
+  const [draggedModuleId, setDraggedModuleId] = useState<string | null>(null);
   const preSuggestionLayoutRef = useRef<DashboardLayoutPreference | null>(null);
-  const suggestLayoutAbortRef = useRef<AbortController | null>(null);
-  const suggestLayoutAbortReasonRef = useRef<"timeout" | "user" | null>(null);
-  const [dashboardLastSeenAt, setDashboardLastSeenAt] = useState<string | null>(() =>
-    typeof window === "undefined"
-      ? null
-      : window.localStorage.getItem(DASHBOARD_LAST_SEEN_STORAGE_KEY),
+  const [activeGenerations, setActiveGenerations] = useState<
+    Array<{ key: string; prompt: string; targetModuleId?: string }>
+  >([]);
+  const generationControlsRef = useRef(
+    new Map<
+      string,
+      {
+        controller: AbortController;
+        reason: "timeout" | "user" | null;
+        jobId: string | null;
+      }
+    >(),
+  );
+  // The window this visit shows. Fixed at mount: reading the digest must not
+  // be what erases it. See dashboard-away-window.mjs for the rules.
+  const [dashboardLastSeenAt, setDashboardLastSeenAt] = useState<string>(() =>
+    awayWindowStart(
+      typeof window === "undefined"
+        ? null
+        : window.localStorage.getItem(DASHBOARD_LAST_SEEN_STORAGE_KEY),
+      Date.now(),
+    ),
   );
 
   useEffect(() => {
     if (typeof window === "undefined") return;
 
-    const readLastSeen = () =>
-      window.localStorage.getItem(DASHBOARD_LAST_SEEN_STORAGE_KEY);
     const markDashboardSeen = () => {
       window.localStorage.setItem(
         DASHBOARD_LAST_SEEN_STORAGE_KEY,
         new Date().toISOString(),
       );
     };
+    // Only a real departure advances anything. Switching apps fires `focus`
+    // with no absence behind it, so that event is deliberately not handled.
+    let hiddenAt: number | null = null;
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
         markDashboardSeen();
-      } else {
-        setDashboardLastSeenAt(readLastSeen());
+        return;
       }
+      if (shouldAdvanceAfterReturn(hiddenAt, Date.now())) {
+        setDashboardLastSeenAt(new Date(hiddenAt as number).toISOString());
+      }
+      hiddenAt = null;
     };
-    const handleFocus = () => setDashboardLastSeenAt(readLastSeen());
 
-    const markSeenTimer = window.setTimeout(markDashboardSeen, 1500);
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("focus", handleFocus);
     window.addEventListener("pagehide", markDashboardSeen);
 
     return () => {
-      window.clearTimeout(markSeenTimer);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("focus", handleFocus);
       window.removeEventListener("pagehide", markDashboardSeen);
       markDashboardSeen();
     };
@@ -655,53 +788,98 @@ export default function Dashboard() {
   });
 
   const suggestLayoutMutation = useMutation({
-    mutationFn: ({
+    mutationFn: async ({
       prompt,
       widgets,
       modules,
       targetModuleId,
       conversationId,
+      clientKey,
     }: {
       prompt: string;
       widgets: DashboardWidgetPreference[];
       modules: DashboardGeneratedModule[];
       targetModuleId?: string;
       conversationId?: string;
+      clientKey: string;
     }) => {
-      suggestLayoutAbortRef.current?.abort();
       const controller = new AbortController();
-      suggestLayoutAbortRef.current = controller;
-      suggestLayoutAbortReasonRef.current = null;
+      const control = {
+        controller,
+        reason: null as "timeout" | "user" | null,
+        jobId: null as string | null,
+      };
+      generationControlsRef.current.set(clientKey, control);
       const timeoutId = window.setTimeout(() => {
-        suggestLayoutAbortReasonRef.current = "timeout";
+        control.reason = "timeout";
         controller.abort();
       }, DASHBOARD_AI_REQUEST_TIMEOUT_MS);
-      return api.dashboard
-        .suggestLayout(prompt, widgets, modules, {
-          targetModuleId,
-          conversationId,
-          signal: controller.signal,
-        })
-        .catch((error: unknown) => {
-          if (isAbortError(error)) {
-            throw new Error(
-              suggestLayoutAbortReasonRef.current === "user"
-                ? t("page.dashboard.ai_update_cancelled")
-                : t("page.dashboard.ai_update_timeout"),
+      try {
+        const job = await api.dashboard.suggestLayoutJobStart(
+          prompt,
+          widgets,
+          modules,
+          {
+            targetModuleId,
+            conversationId,
+            signal: controller.signal,
+          },
+        );
+        control.jobId = job.job_id;
+        let status = job;
+        let pollFailures = 0;
+        while (status.status === "running") {
+          await sleepWithAbort(DASHBOARD_AI_POLL_INTERVAL_MS, controller.signal);
+          try {
+            status = await api.dashboard.suggestLayoutJobStatus(
+              job.job_id,
+              controller.signal,
             );
+            pollFailures = 0;
+          } catch (pollError) {
+            if (isAbortError(pollError)) throw pollError;
+            pollFailures += 1;
+            if (pollFailures >= DASHBOARD_AI_POLL_MAX_CONSECUTIVE_FAILURES) {
+              throw pollError;
+            }
           }
-          throw error;
-        })
-        .finally(() => {
-          window.clearTimeout(timeoutId);
-          if (suggestLayoutAbortRef.current === controller) {
-            suggestLayoutAbortRef.current = null;
+        }
+        if (status.status === "cancelled") {
+          throw new Error(t("page.dashboard.ai_update_cancelled"));
+        }
+        if (status.status !== "succeeded" || !status.result) {
+          throw new Error(
+            status.error_code === "timeout"
+              ? t("page.dashboard.ai_update_timeout")
+              : status.error || t("page.dashboard.ai_update_failed"),
+          );
+        }
+        return status.result;
+      } catch (error) {
+        if (isAbortError(error)) {
+          if (control.jobId) {
+            void api.dashboard
+              .suggestLayoutJobCancel(control.jobId)
+              .catch(() => {});
           }
-          suggestLayoutAbortReasonRef.current = null;
-        });
+          throw new Error(
+            control.reason === "user"
+              ? t("page.dashboard.ai_update_cancelled")
+              : t("page.dashboard.ai_update_timeout"),
+          );
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timeoutId);
+        generationControlsRef.current.delete(clientKey);
+      }
     },
-    onMutate: ({ widgets, modules, targetModuleId }) => {
+    onMutate: ({ widgets, modules, targetModuleId, prompt, clientKey }) => {
       setLayoutGenerationError(null);
+      setActiveGenerations((current) => [
+        ...current,
+        { key: clientKey, prompt, targetModuleId },
+      ]);
       if (!preSuggestionLayoutRef.current) {
         preSuggestionLayoutRef.current = {
           version: 2,
@@ -745,10 +923,16 @@ export default function Dashboard() {
           toolCalls: value.tool_calls ?? [],
         });
       }
-      if (!value.preview_created) {
-        setPendingPreviewModuleId(null);
-        preSuggestionLayoutRef.current = null;
+      const moduleChanges = value.applied_module_changes ?? [];
+      if (
+        !value.preview_created ||
+        (moduleChanges.length === 0 && !value.widgets_changed)
+      ) {
         if (!variables.targetModuleId) {
+          setPendingPreviewModuleId(null);
+          if (activeGenerations.length <= 1) {
+            preSuggestionLayoutRef.current = null;
+          }
           toast.warning(
             t("page.dashboard.ai_no_changes"),
             value.assistant_message || t("page.dashboard.ai_no_changes_detail"),
@@ -756,43 +940,37 @@ export default function Dashboard() {
         }
         return;
       }
-      const normalized = normalizeDashboardLayout(value);
-      const currentDraft = normalizeDashboardLayout({
-        widgets: draftWidgets,
-        modules: draftModules,
-      });
-      if (JSON.stringify(normalized) === JSON.stringify(currentDraft)) {
-        if (!variables.targetModuleId) {
-          setPendingPreviewModuleId(null);
-          preSuggestionLayoutRef.current = null;
-        }
-        toast.warning(
-          t("page.dashboard.ai_no_changes"),
-          t("page.dashboard.ai_no_changes_detail"),
+      // Apply the job's deltas to the live draft — other generations may
+      // have landed since this job snapshotted the layout.
+      const changedModule =
+        moduleChanges.find(
+          (change) => change.action !== "remove" && change.module,
+        )?.module ?? null;
+      const changedModuleId = changedModule
+        ? String((changedModule as { id?: unknown }).id || "") || null
+        : null;
+      if (value.widgets_changed) {
+        setDraftWidgets(
+          normalizeDashboardLayout({ widgets: value.widgets }).widgets,
         );
-        return;
       }
-      const changedModule = normalized.modules.find((module) => {
-        const existing = draftModules.find((candidate) => candidate.id === module.id);
-        return !existing || JSON.stringify(existing) !== JSON.stringify(module);
-      });
-      setDraftWidgets(normalized.widgets);
-      setDraftModules(normalized.modules);
+      setDraftModules((current) =>
+        applyGeneratedModuleChanges(current, moduleChanges),
+      );
       if (variables.targetModuleId) {
         setPendingPreviewModuleId(variables.targetModuleId);
       } else {
-        setLayoutPrompt("");
-        setPendingPreviewModuleId(changedModule?.id ?? null);
+        setPendingPreviewModuleId(changedModuleId);
         toast.success(
           t("page.dashboard.ai_preview_updated"),
           t("page.dashboard.ai_preview_updated_detail"),
         );
       }
-      if (changedModule) {
+      if (changedModuleId) {
         window.requestAnimationFrame(() => {
           window.requestAnimationFrame(() => {
             document
-              .querySelector(`[data-module-id="${changedModule.id}"]`)
+              .querySelector(`[data-module-id="${changedModuleId}"]`)
               ?.scrollIntoView({ behavior: "smooth", block: "center" });
           });
         });
@@ -800,27 +978,90 @@ export default function Dashboard() {
     },
     onError: (error: Error, variables) => {
       const wasStopped = error.message === t("page.dashboard.ai_update_cancelled");
-      setLayoutGenerationError(wasStopped ? null : error.message);
+      const conflict = error instanceof ApiError && error.status === 409;
+      const message =
+        conflict && error instanceof ApiError && error.code
+          ? t(error.code)
+          : error.message;
+      setLayoutGenerationError(wasStopped ? null : message);
       if (variables.targetModuleId) {
         appendModuleConversationMessage(variables.targetModuleId, {
           role: "assistant",
-          content: error.message,
+          content: message,
         });
-      } else {
+      } else if (activeGenerations.length <= 1) {
         setPendingPreviewModuleId(null);
         preSuggestionLayoutRef.current = null;
       }
       if (wasStopped) {
         toast.warning(t("page.dashboard.ai_update_cancelled"));
-      } else {
-        toast.error(t("page.dashboard.ai_update_failed"), error.message);
+      } else if (!conflict) {
+        // 409 conflicts already produced a translated toast in request().
+        toast.error(t("page.dashboard.ai_update_failed"), message);
       }
     },
-    onSettled: () => {
-      suggestLayoutAbortRef.current = null;
-      suggestLayoutAbortReasonRef.current = null;
+    onSettled: (_data, _error, variables) => {
+      setActiveGenerations((current) =>
+        current.filter((generation) => generation.key !== variables.clientKey),
+      );
     },
   });
+
+  const dashboardLevelGenerations = activeGenerations.filter(
+    (generation) => !generation.targetModuleId,
+  );
+  const generatingModuleIds = new Set(
+    activeGenerations
+      .map((generation) => generation.targetModuleId)
+      .filter((moduleId): moduleId is string => Boolean(moduleId)),
+  );
+  const atGenerationLimit =
+    activeGenerations.length >= DASHBOARD_AI_MAX_CONCURRENT;
+
+  const cancelGeneration = (clientKey: string) => {
+    const control = generationControlsRef.current.get(clientKey);
+    if (!control) return;
+    control.reason = "user";
+    control.controller.abort();
+  };
+
+  const cancelAllGenerations = () => {
+    for (const clientKey of Array.from(generationControlsRef.current.keys())) {
+      cancelGeneration(clientKey);
+    }
+  };
+
+  const startGeneration = (input: {
+    prompt: string;
+    targetModuleId?: string;
+    conversationId?: string;
+  }): boolean => {
+    if (input.targetModuleId && generatingModuleIds.has(input.targetModuleId)) {
+      toast.warning(t("page.dashboard.ai_target_busy"));
+      return false;
+    }
+    if (atGenerationLimit) {
+      toast.warning(
+        t("page.dashboard.ai_update_failed"),
+        t("page.dashboard.ai_concurrency_limit"),
+      );
+      return false;
+    }
+    suggestLayoutMutation.mutate({
+      prompt: input.prompt,
+      widgets: draftWidgets,
+      modules: draftModules,
+      targetModuleId: input.targetModuleId,
+      conversationId: input.conversationId,
+      clientKey: `gen_${Date.now().toString(36)}_${Math.random()
+        .toString(36)
+        .slice(2, 8)}`,
+    });
+    // The input stays usable while jobs run, so clear it at start; a
+    // discarded preview restores it from the job's variables.
+    if (!input.targetModuleId) setLayoutPrompt("");
+    return true;
+  };
 
   const startDashboardEditing = (conversationModuleId?: string) => {
     setDraftWidgets(dashboardLayout.widgets.map((widget) => ({ ...widget })));
@@ -894,6 +1135,31 @@ export default function Dashboard() {
     );
   };
 
+  const dropDraftModule = (targetId: string) => {
+    const draggedId = draggedModuleId;
+    setDraggedModuleId(null);
+    if (!draggedId || draggedId === targetId) return;
+    setDraftModules((current) => {
+      const fromIndex = current.findIndex((module) => module.id === draggedId);
+      const targetIndex = current.findIndex((module) => module.id === targetId);
+      if (fromIndex < 0 || targetIndex < 0) return current;
+      const next = [...current];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const toggleDraftModuleSize = (moduleId: string) => {
+    setDraftModules((current) =>
+      current.map((module) =>
+        module.id === moduleId
+          ? { ...module, size: module.size === "wide" ? "compact" : "wide" }
+          : module,
+      ),
+    );
+  };
+
   const moveDraftModule = (moduleId: string, offset: -1 | 1) => {
     setDraftModules((current) => {
       const index = current.findIndex((module) => module.id === moduleId);
@@ -953,19 +1219,18 @@ export default function Dashboard() {
 
   const submitModuleConversation = (moduleId: string) => {
     const prompt = moduleConversationPrompt.trim();
-    if (!prompt || suggestLayoutMutation.isPending) return;
-    appendModuleConversationMessage(moduleId, { role: "user", content: prompt });
-    setModuleConversationPrompt("");
-    suggestLayoutMutation.mutate({
+    if (!prompt) return;
+    const started = startGeneration({
       prompt,
-      widgets: draftWidgets,
-      modules: draftModules,
       targetModuleId: moduleId,
       conversationId:
         moduleConversationIds[moduleId] ||
         draftModules.find((module) => module.id === moduleId)?.conversation_id ||
         undefined,
     });
+    if (!started) return;
+    appendModuleConversationMessage(moduleId, { role: "user", content: prompt });
+    setModuleConversationPrompt("");
   };
 
   const saveDraftLayout = () => {
@@ -1014,13 +1279,10 @@ export default function Dashboard() {
 
   const { data: recentActivity, isLoading: activityLoading } = useQuery({
     queryKey: ["dashboard-recent-activity", wsFilter, dashboardLastSeenAt],
-    enabled: Boolean(dashboardLastSeenAt),
+    // Always runs: a first-ever visit has no stored timestamp and used to
+    // disable the query outright, which is a guaranteed empty panel.
     queryFn: () =>
-      api.dashboard.recentActivity(
-        100,
-        wsFilter,
-        dashboardLastSeenAt ?? undefined,
-      ),
+      api.dashboard.recentActivity(100, wsFilter, dashboardLastSeenAt),
   });
 
   const { data: activeGoals } = useQuery({
@@ -1028,7 +1290,7 @@ export default function Dashboard() {
     queryFn: () => api.dashboard.activeGoals(5, wsFilter),
   });
 
-  const { data: workspaces } = useQuery({
+  const { data: workspaces, isLoading: workspacesLoading } = useQuery({
     queryKey: ["workspaces"],
     queryFn: () => api.workspaces.list(),
   });
@@ -1063,7 +1325,7 @@ export default function Dashboard() {
 
   const hasTaskAttention =
     tasksWaiting > 0 || tasksProposed > 0 || tasksOverdue > 0 || tasksFailed > 0;
-  const { data: attentionTargets } = useQuery({
+  const { data: attentionTargets, isLoading: attentionTargetsLoading } = useQuery({
     queryKey: [
       "dashboard-attention-targets",
       wsFilter,
@@ -1180,6 +1442,7 @@ export default function Dashboard() {
       link: "/workspaces",
     });
   const actionCount = attentionItems.length;
+  const attentionLoading = statsLoading || (hasTaskAttention && attentionTargetsLoading);
 
   /* KPI cards */
   const kpis: KpiDef[] = [
@@ -1286,9 +1549,7 @@ export default function Dashboard() {
   const showTaskTrend = isWidgetVisible("task_trend");
   const showContextRail = showWorkspaces || showTaskTrend;
   const hasGeneratedModules = visibleGeneratedModules.length > 0;
-  const editingModuleWithAiId = suggestLayoutMutation.variables?.targetModuleId;
-  const isGeneratingModule =
-    suggestLayoutMutation.isPending && !editingModuleWithAiId;
+  const isGeneratingModule = dashboardLevelGenerations.length > 0;
   const showInlineGeneratingPlaceholder = editingDashboard && isGeneratingModule;
   const showGeneratedSection =
     hasGeneratedModules || (isGeneratingModule && !showInlineGeneratingPlaceholder);
@@ -1313,7 +1574,6 @@ export default function Dashboard() {
         (widgetOrder.get(right) ?? Number.MAX_SAFE_INTEGER),
     )[0];
   const dashboardRows = [
-    "auto",
     editingDashboard ? "auto" : null,
     showInlineGeneratingPlaceholder ? "auto" : null,
     showDailyBrief ? "auto" : null,
@@ -1431,60 +1691,30 @@ export default function Dashboard() {
           minHeight: "100%",
           height: showGeneratedSection ? "auto" : "100%",
           boxSizing: "border-box",
-          padding: "12px 24px",
+          padding: 0,
           gap: 10,
           overflowY: showGeneratedSection ? "auto" : "hidden",
           overflowX: "hidden",
         }}
       >
       {/* ── Greeting Header ──────────────────────────── */}
-      <div className="dashboard-heading-row">
-        <div style={{ minWidth: 0 }}>
-          <h1
-            className="dashboard-title"
-            style={{
-              fontSize: 26,
-              fontWeight: 800,
-              color: "#292524",
-              lineHeight: 1.12,
-              margin: 0,
-            }}
-          >
+      <PageHeader
+        title={(
+          <>
             {greetingWord()}
             {greetingName ? `, ${greetingName}` : ""}{" "}
             <span role="img" aria-label={t("page.dashboard.wave")}>
               {t("page.dashboard.and_x1f44b")}
             </span>
-          </h1>
-          {selectedWs && (
-            <p
-              className="dashboard-selected-workspace"
-              style={{
-                fontSize: 14,
-                fontWeight: 600,
-                color: "#436b65",
-                marginTop: 4,
-                marginBottom: 0,
-              }}
-            >
-              {(selectedWs as any).name}
-            </p>
-          )}
-          <p
-            className="dashboard-subtitle"
-            style={{
-              fontSize: 13,
-              fontWeight: 400,
-              color: "#a8a29e",
-              margin: "4px 0 0",
-            }}
-          >
-            {actionCount > 0
-              ? `${actionCount} ${actionCount > 1 ? t("page.dashboard.actions") : t("page.dashboard.action")} ${t("page.dashboard.need_attention")}`
-              : t("page.dashboard.all_clear")}
-          </p>
-        </div>
-        {!editingDashboard && (
+          </>
+        )}
+        subtitle={actionCount > 0
+          ? `${actionCount} ${actionCount > 1 ? t("page.dashboard.actions") : t("page.dashboard.action")} ${t("page.dashboard.need_attention")}`
+          : t("page.dashboard.all_clear")}
+        meta={selectedWs ? (
+          <span className="text-manor-700">{(selectedWs as any).name}</span>
+        ) : undefined}
+        actions={!editingDashboard ? (
           <Tooltip content={t("page.dashboard.customize_tooltip")} position="left">
             <button
               type="button"
@@ -1496,8 +1726,8 @@ export default function Dashboard() {
               <IconSettings size={16} />
             </button>
           </Tooltip>
-        )}
-      </div>
+        ) : undefined}
+      />
 
       {editingDashboard && (
         <DashboardInlineEditor
@@ -1505,30 +1735,41 @@ export default function Dashboard() {
           modules={draftModules}
           aiPrompt={layoutPrompt}
           saving={saveLayoutMutation.isPending}
-          suggesting={suggestLayoutMutation.isPending}
+          suggesting={activeGenerations.length > 0}
+          atGenerationLimit={atGenerationLimit}
           previewPending={pendingPreviewModuleId !== null}
           aiStatusMessage={
-            suggestLayoutMutation.isPending
-              ? t("page.dashboard.ai_generating_inline")
-              : layoutGenerationError
+            atGenerationLimit
+              ? t("page.dashboard.ai_concurrency_limit")
+              : activeGenerations.length > 1
+                ? t("page.dashboard.ai_generating_count", {
+                    count: activeGenerations.length,
+                  })
+                : activeGenerations.length === 1
+                  ? t("page.dashboard.ai_generating_inline")
+                  : layoutGenerationError
           }
-          aiStatusTone={suggestLayoutMutation.isPending ? "loading" : "error"}
+          aiStatusTone={
+            atGenerationLimit
+              ? "error"
+              : activeGenerations.length > 0
+                ? "loading"
+                : "error"
+          }
           onAiPromptChange={(value) => {
             setLayoutPrompt(value);
             if (layoutGenerationError) setLayoutGenerationError(null);
           }}
           onApplyAi={() =>
-            suggestLayoutMutation.mutate({
+            startGeneration({
               prompt: layoutPrompt.trim(),
-              widgets: draftWidgets,
-              modules: draftModules,
               conversationId: layoutConversationId ?? undefined,
             })
           }
           onShow={(widgetId) => setDraftWidgetVisibility(widgetId, true)}
           onShowModule={(moduleId) => setDraftModuleVisibility(moduleId, true)}
           onRestore={() => {
-            suggestLayoutAbortRef.current?.abort();
+            cancelAllGenerations();
             setDraftWidgets(
               DEFAULT_DASHBOARD_WIDGETS.map((widget) => ({ ...widget })),
             );
@@ -1544,9 +1785,8 @@ export default function Dashboard() {
             preSuggestionLayoutRef.current = null;
           }}
           onCancel={() => {
-            if (suggestLayoutMutation.isPending) {
-              suggestLayoutAbortReasonRef.current = "user";
-              suggestLayoutAbortRef.current?.abort();
+            if (activeGenerations.length > 0) {
+              cancelAllGenerations();
               return;
             }
             setEditingDashboard(false);
@@ -1561,15 +1801,22 @@ export default function Dashboard() {
             setLoadingModuleConversationId(null);
             preSuggestionLayoutRef.current = null;
             setDraggedWidget(null);
+            setDraggedModuleId(null);
           }}
           onSave={saveDraftLayout}
         />
       )}
 
       {showInlineGeneratingPlaceholder && (
-        <DashboardGeneratingModule
-          request={suggestLayoutMutation.variables?.prompt || layoutPrompt}
-        />
+        <div style={{ display: "grid", gap: 12 }}>
+          {dashboardLevelGenerations.map((generation) => (
+            <DashboardGeneratingModule
+              key={generation.key}
+              request={generation.prompt}
+              onStop={() => cancelGeneration(generation.key)}
+            />
+          ))}
+        </div>
       )}
 
       {/* ── Daily Brief Panel ────────────────────────── */}
@@ -1630,7 +1877,9 @@ export default function Dashboard() {
             {fullDate()}
           </span>
           <div style={{ marginLeft: "auto" }}>
-            {actionCount > 0 ? (
+            {attentionLoading ? (
+              <SkeletonLine width={96} height={23} radius={999} />
+            ) : actionCount > 0 ? (
               <span
                 className="dashboard-attention-pill"
                 style={{
@@ -1818,7 +2067,9 @@ export default function Dashboard() {
               )}
             </div>
 
-            {attentionItems.length === 0 ? (
+            {attentionLoading ? (
+              <ListRowsSkeleton rows={3} avatar={false} />
+            ) : attentionItems.length === 0 ? (
               <p style={{ fontSize: 13, color: "#a8a29e", margin: 0 }}>
                 {t("page.dashboard.no_actions_needed")}
               </p>
@@ -1922,11 +2173,15 @@ export default function Dashboard() {
 
       {showGeneratedSection && (
         <section className="dashboard-generated-grid">
-          {isGeneratingModule && !showInlineGeneratingPlaceholder && (
-            <DashboardGeneratingModule
-              request={suggestLayoutMutation.variables?.prompt || layoutPrompt}
-            />
-          )}
+          {isGeneratingModule &&
+            !showInlineGeneratingPlaceholder &&
+            dashboardLevelGenerations.map((generation) => (
+              <DashboardGeneratingModule
+                key={generation.key}
+                request={generation.prompt}
+                onStop={() => cancelGeneration(generation.key)}
+              />
+            ))}
           {visibleGeneratedModules.map((module) => {
             const moduleIndex = draftModules.findIndex((item) => item.id === module.id);
             return (
@@ -1940,15 +2195,19 @@ export default function Dashboard() {
                 conversationPrompt={
                   moduleConversationId === module.id ? moduleConversationPrompt : ""
                 }
-                conversationUpdating={
-                  suggestLayoutMutation.isPending && editingModuleWithAiId === module.id
-                }
+                conversationUpdating={generatingModuleIds.has(module.id)}
                 conversationLoading={loadingModuleConversationId === module.id}
                 previewPending={pendingPreviewModuleId === module.id}
                 confirming={saveLayoutMutation.isPending}
                 canMoveUp={moduleIndex > 0}
                 canMoveDown={moduleIndex >= 0 && moduleIndex < draftModules.length - 1}
+                dragging={draggedModuleId === module.id}
+                moduleDragActive={draggedModuleId !== null}
                 onMove={(offset) => moveDraftModule(module.id, offset)}
+                onDragStart={() => setDraggedModuleId(module.id)}
+                onDragEnd={() => setDraggedModuleId(null)}
+                onDropModule={() => dropDraftModule(module.id)}
+                onToggleSize={() => toggleDraftModuleSize(module.id)}
                 onHide={() => setDraftModuleVisibility(module.id, false)}
                 onOpenConversation={() => openModuleConversation(module.id)}
                 onCloseConversation={() => {
@@ -2346,7 +2605,9 @@ export default function Dashboard() {
             >
               {t("nav.workspaces")}
             </h2>
-            {latestWorkspaces.length > 0 ? (
+            {workspacesLoading ? (
+              <ListRowsSkeleton rows={4} action />
+            ) : latestWorkspaces.length > 0 ? (
               <div
                 style={{
                   display: "flex",

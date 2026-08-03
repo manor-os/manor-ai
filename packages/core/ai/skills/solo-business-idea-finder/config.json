@@ -1,0 +1,38 @@
+{
+  "id": "solo-business-idea-finder",
+  "name": "solo-business-idea-finder",
+  "display_name": "Solo Business Idea Finder",
+  "type": "runtime_guidance",
+  "description": "Generate and rank practical one-person business ideas from founder fit, reachable buyers, evidence, operating constraints, and cheap first tests.",
+  "category": "one-person-company",
+  "output_format": "guidance",
+  "tags": [
+    "business-ideas",
+    "one-person-business",
+    "solo-founder",
+    "side-project",
+    "idea-generation",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "invoke_skill",
+    "read_file",
+    "list_files",
+    "generate_file",
+    "web_search",
+    "web_fetch",
+    "browse_web",
+    "search_tools",
+    "manor"
+  ],
+  "bundle_roots": [
+    "references",
+    "examples"
+  ],
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the user asks for new business ideas or asks to generate, discover, brainstorm, or suggest side projects, productized services, digital products, niche tools, creator offers, or other one-person company opportunities that should fit their experience, customer access, assets, time, budget, risk limits, or income goals, rather than evaluating one or more already-described ideas, regardless of language",
+    "result_authority": "primary_source"
+  }
+}

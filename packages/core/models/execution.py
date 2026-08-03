@@ -198,5 +198,14 @@ class ExecutionStep(Base, TimestampMixin):
     # {llm_tokens_input, llm_tokens_output, api_calls, usd}
     error: Mapped[Optional[dict]] = mapped_column(JSONB)
 
+    last_execution_error: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    """The last REAL execution failure, kept separate from ``error``.
+
+    ``error`` is overwritten every time the step re-enters the approval gate
+    (it holds "why this is currently gated"). Before this column existed, that
+    overwrite destroyed the only record of why the step actually failed — the
+    2026-07-30 incident, where an operator approved the same steps 15 times
+    without ever being told the CLI worker was offline."""
+
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

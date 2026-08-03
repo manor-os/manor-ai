@@ -36,6 +36,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
+from packages.core.constants.execution import (
+    ExecutionStepStatus,
+)
 from packages.core.blueprints import (
     InstallMode,
     PayloadError,
@@ -609,7 +612,7 @@ async def main() -> None:
                 entity_id="ent_demo", workspace_id=sim_ws_id,
                 step_key=f"step-{kind}-{action or 'llm'}",
                 kind=kind, action_key=action, risk_level="low",
-                step_status="done", started_at=now, finished_at=now,
+                step_status=ExecutionStepStatus.DONE.value, started_at=now, finished_at=now,
                 cost={"usd": cost_usd}, params={},
             ))
         # 1 HITL-paused step.
@@ -618,7 +621,7 @@ async def main() -> None:
             entity_id="ent_demo", workspace_id=sim_ws_id,
             step_key="step-hitl",
             kind="action", action_key="x.delete_post", risk_level="medium",
-            step_status="paused", started_at=now,
+            step_status=ExecutionStepStatus.PAUSED.value, started_at=now,
             cost={"usd": 0},
             error={"type": "GovernancePolicyHITL",
                    "message": "x.delete_* requires approval",
@@ -631,7 +634,7 @@ async def main() -> None:
             entity_id="ent_demo", workspace_id=sim_ws_id,
             step_key="step-blocked",
             kind="action", action_key="billing.refund", risk_level="high",
-            step_status="failed", started_at=now, finished_at=now,
+            step_status=ExecutionStepStatus.FAILED.value, started_at=now, finished_at=now,
             cost={"usd": 0},
             error={"type": "GovernancePolicy",
                    "message": "billing.* blocked",

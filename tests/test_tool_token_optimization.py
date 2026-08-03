@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -112,6 +113,40 @@ async def test_read_file_returns_bounded_slice_with_continuation(tmp_path):
         assert continuation["mode"] == "char"
         assert continuation["char_offset"] == result["next_char_offset"]
         assert continuation["source_sha256"] == result["source_sha256"]
+    finally:
+        settings.MANOR_FS_ENABLED = old_enabled
+        settings.MANOR_FS_ROOT = old_root
+
+
+@pytest.mark.asyncio
+async def test_read_file_returns_images_for_ephemeral_multimodal_delivery(tmp_path):
+    settings = get_settings()
+    old_enabled = settings.MANOR_FS_ENABLED
+    old_root = settings.MANOR_FS_ROOT
+    settings.MANOR_FS_ENABLED = True
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    try:
+        entity_id = "ent_image"
+        entity_root = tmp_path / entity_id
+        entity_root.mkdir()
+        image_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        (entity_root / "frame.png").write_bytes(image_bytes)
+
+        result = json.loads(
+            await _read_file(entity_id=entity_id, path="frame.png")
+        )
+
+        assert result["path"] == "frame.png"
+        assert result["size"] == len(image_bytes)
+        assert len(result["source_sha256"]) == 64
+        assert result["image"]["mime_type"] == "image/png"
+        assert result["image"]["bytes"] == len(image_bytes)
+        assert result["image"]["delivery"] == "ephemeral_multimodal"
+        assert result["image"]["data_url"].startswith("data:image/png;base64,")
+        assert "content" not in result
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
@@ -599,6 +634,45 @@ async def test_write_file_scopes_new_workspace_files_to_workspace_folder(tmp_pat
         assert guard_call["paths"] == [expected_path]
         assert sync_call["workspace_id"] == "ws_1"
         assert sync_call["abs_path"] == str(scoped_file)
+    finally:
+        settings.MANOR_FS_ENABLED = old_enabled
+        settings.MANOR_FS_ROOT = old_root
+
+
+@pytest.mark.asyncio
+async def test_read_file_falls_back_to_current_workspace_artifact_path(tmp_path, monkeypatch):
+    settings = get_settings()
+    old_enabled = settings.MANOR_FS_ENABLED
+    old_root = settings.MANOR_FS_ROOT
+    settings.MANOR_FS_ENABLED = True
+    settings.MANOR_FS_ROOT = str(tmp_path)
+
+    async def fake_workspace_base_dir(**kwargs):
+        assert kwargs["workspace_id"] == "ws_1"
+        return "Workspaces/_by_id/folder_1"
+
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir",
+        fake_workspace_base_dir,
+    )
+    try:
+        entity_id = "ent_1"
+        project_path = "Product Video Studio/project-1/technical/shot-list.json"
+        target = tmp_path / entity_id / "Workspaces" / "_by_id" / "folder_1" / project_path
+        target.parent.mkdir(parents=True)
+        target.write_text('{"assets": []}\n', encoding="utf-8")
+
+        result = json.loads(
+            await _read_file(
+                entity_id=entity_id,
+                path=project_path,
+                workspace_id="ws_1",
+            )
+        )
+
+        assert result["path"] == project_path
+        assert result["resolved_path"] == f"Workspaces/_by_id/folder_1/{project_path}"
+        assert result["content"] == '{"assets": []}\n'
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
@@ -1156,8 +1230,18 @@ def test_master_always_loaded_tool_schema_budget():
     schema_size = sum(len(json.dumps(schema, ensure_ascii=False)) for schema in schemas)
     names = {schema["function"]["name"] for schema in schemas}
 
-    assert schema_size < 16_500
+    # Nudged from 16_500: restoring generate_file's description keywords
+    # (see commit "fix(generate_file): restore keyword-rich schema
+    # descriptions") fixed a real search-reachability regression — without
+    # "videos/mp4" etc. in its top-level description, generate_file couldn't
+    # be found by a "video" search, defeating its role as the preferred
+    # composite tool over generate_image/generate_video. That legitimate
+    # content pushes the always-loaded total ~17 bytes past the old ceiling;
+    # this still guards against uncontrolled growth, just with headroom for
+    # the now-correct content.
+    assert schema_size < 16_650
     assert "generate_file" in names
+    assert "rag" in names
     assert "search_tools" in names
 
 

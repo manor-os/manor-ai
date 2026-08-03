@@ -3,19 +3,27 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
+from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
+from packages.core.ai.runtime.skill_invocation_policy import (
+    retain_required_skill_invocation_policies,
+    trusted_skill_invocation_policy,
+)
+
 _EXTERNAL_PLATFORM_ALIASES = (
     "xiaohongshu", "xhs", "rednote", "red note", "小红书",
     "linkedin", "linked in", "领英",
     "twitter", "x.com", "tweet", "推特",
+    "youtube", "you tube", "youtu.be", "youtube.com", "yt", "油管",
     "facebook", "instagram", "ig",
     "wechat", "weixin", "微信", "公众号",
     "telegram", "whatsapp", "tiktok", "douyin", "抖音", "微博",
 )
+_YOUTUBE_PLATFORM_ALIASES = ("youtube", "you tube", "youtu.be", "youtube.com", "yt", "油管")
 _EXTERNAL_ACTION_TERMS = (
     "publish", "send", "share", "comment", "like", "reply", "upload",
-    "save to draft", "save draft",
+    "save to draft", "save draft", "draft box", "draftbox",
     "发布", "发到", "发在", "发送", "发帖", "评论", "点赞", "转发", "上传",
-    "保存到", "保存至", "存到", "存入",
+    "保存到", "保存至", "存到", "存入", "草稿箱",
 )
 _EXTERNAL_DRAFT_TERMS = (
     "draft", "caption", "copy", "creative", "image", "cover", "visual",
@@ -25,6 +33,13 @@ _LOCAL_CODING_SKILL_SLUGS = {
     "local-coding-operations",
     "local_coding_operations",
 }
+_CHROME_SKILL_SLUGS = {"chrome"}
+_YOUTUBE_PUBLISHER_SKILL_SLUGS = {
+    "youtube-studio-publisher",
+    "youtube_studio_publisher",
+}
+_YOUTUBE_MCP_SKILL_SLUGS = {"mcp-youtube", "mcp_youtube", "youtube"}
+_YOUTUBE_ROUTE_SKILL_SLUGS = _YOUTUBE_PUBLISHER_SKILL_SLUGS | _YOUTUBE_MCP_SKILL_SLUGS
 _LOCAL_CODING_PROVIDER_ORDER = ("codex_cli", "claude_code", "gemini_cli", "aider", "cursor")
 _LOCAL_CODING_PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
     "claude_code": ("claude code", "claude_code", "claude cli", "本地claude", "本地 claude"),
@@ -50,6 +65,8 @@ _LOCAL_CODING_PATH_RE = re.compile(
     r"(?:~?/|/users/|downloads/|desktop/|documents/|[a-z0-9_.-]+/[a-z0-9_.-]+)",
     re.IGNORECASE,
 )
+_REMOTE_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_KNOWLEDGE_PATH_RE = re.compile(r"\bknowledge(?:[/\\][^\s]*)?", re.IGNORECASE)
 _LOCAL_CODE_FILE_RE = re.compile(
     r"\.(?:md|go|py|js|jsx|ts|tsx|json|yaml|yml|toml|rs|java|kt|swift|rb|php|"
     r"c|cc|cpp|h|hpp|css|scss|html|vue|svelte|sql|sh)\b",
@@ -86,6 +103,25 @@ def is_local_coding_skill(slug: str | None, name: str | None = None) -> bool:
     return bool(_skill_variants(slug, name).intersection(_LOCAL_CODING_SKILL_SLUGS))
 
 
+def is_chrome_skill(slug: str | None, name: str | None = None) -> bool:
+    return bool(_skill_variants(slug, name).intersection(_CHROME_SKILL_SLUGS))
+
+
+def is_youtube_publisher_skill(slug: str | None, name: str | None = None) -> bool:
+    return bool(
+        _skill_variants(slug, name).intersection(_YOUTUBE_PUBLISHER_SKILL_SLUGS)
+    )
+
+
+def is_youtube_mcp_skill(slug: str | None, name: str | None = None) -> bool:
+    return bool(_skill_variants(slug, name).intersection(_YOUTUBE_MCP_SKILL_SLUGS))
+
+
+def is_youtube_route_skill(slug: str | None, name: str | None = None) -> bool:
+    variants = _skill_variants(slug, name)
+    return bool(variants.intersection(_YOUTUBE_ROUTE_SKILL_SLUGS | _CHROME_SKILL_SLUGS))
+
+
 def explicit_skill_reference(active_user_message: str | None, skill: str) -> bool:
     """Return True when the user explicitly named the requested skill."""
     if not active_user_message or not skill:
@@ -94,11 +130,24 @@ def explicit_skill_reference(active_user_message: str | None, skill: str) -> boo
     return any(variant and variant in text for variant in _skill_variants(skill))
 
 
+def _contains_platform_alias(text: str, aliases: Iterable[str]) -> bool:
+    lowered = text.lower()
+    for alias in aliases:
+        normalized = alias.lower()
+        if re.search(r"[a-z0-9]", normalized):
+            pattern = rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])"
+            if re.search(pattern, lowered):
+                return True
+        elif normalized in lowered:
+            return True
+    return False
+
+
 def external_platform_action_intent(text: str | None) -> bool:
     if not text or runtime_approval_resume_intent(text):
         return False
     lowered = text.lower()
-    has_platform = any(alias in lowered for alias in _EXTERNAL_PLATFORM_ALIASES)
+    has_platform = _contains_platform_alias(lowered, _EXTERNAL_PLATFORM_ALIASES)
     has_action = (
         any(term in lowered for term in _EXTERNAL_ACTION_TERMS)
         or bool(_ENGLISH_POST_TO_PLATFORM_RE.search(lowered))
@@ -107,11 +156,24 @@ def external_platform_action_intent(text: str | None) -> bool:
     return has_platform and has_action
 
 
+def youtube_platform_action_intent(text: str | None) -> bool:
+    if not text or runtime_approval_resume_intent(text):
+        return False
+    lowered = text.lower()
+    has_platform = _contains_platform_alias(lowered, _YOUTUBE_PLATFORM_ALIASES)
+    if not has_platform:
+        return False
+    return (
+        any(term in lowered for term in _EXTERNAL_ACTION_TERMS)
+        or bool(_ENGLISH_POST_TO_PLATFORM_RE.search(lowered))
+    )
+
+
 def external_platform_draft_intent(text: str | None) -> bool:
     if not text or external_platform_action_intent(text):
         return False
     lowered = text.lower()
-    has_platform = any(alias in lowered for alias in _EXTERNAL_PLATFORM_ALIASES)
+    has_platform = _contains_platform_alias(lowered, _EXTERNAL_PLATFORM_ALIASES)
     has_draft_term = any(term in lowered for term in _EXTERNAL_DRAFT_TERMS)
     return has_platform and has_draft_term
 
@@ -133,7 +195,9 @@ def local_coding_cli_intent(text: str | None) -> bool:
         or "local" in lowered
         or any(term in lowered for term in _LOCAL_CODING_HINT_TERMS)
     )
-    has_path = bool(_LOCAL_CODING_PATH_RE.search(lowered))
+    path_candidate = _REMOTE_URL_RE.sub(" ", lowered)
+    path_candidate = _KNOWLEDGE_PATH_RE.sub(" ", path_candidate)
+    has_path = bool(_LOCAL_CODING_PATH_RE.search(path_candidate))
     has_code_file = bool(_LOCAL_CODE_FILE_RE.search(text))
     return (has_local_hint or has_path) and (has_code_file or has_path)
 
@@ -163,7 +227,15 @@ def should_route_external_action_to_integration(
     """Return True when an accidental skill route should yield to integrations."""
     if manual_skill_selected or explicit_skill_reference(active_user_message, skill):
         return False
+    if youtube_platform_action_intent(active_user_message) and is_youtube_route_skill(skill):
+        return False
     if external_platform_action_intent(active_user_message):
+        if youtube_platform_action_intent(active_user_message):
+            return not (
+                is_youtube_publisher_skill(skill, skill)
+                or is_youtube_mcp_skill(skill, skill)
+                or is_chrome_skill(skill, skill)
+            )
         return True
     return False
 
@@ -260,12 +332,23 @@ def rank_skills_for_runtime_turn(
 
     items = list(skills or [])
     scored = [
-        (runtime_skill_relevance_score(skill, active_user_message), index, skill)
+        (
+            trusted_skill_invocation_policy(skill) is not None,
+            runtime_skill_relevance_score(skill, active_user_message),
+            index,
+            skill,
+        )
         for index, skill in enumerate(items)
     ]
-    if not any(score > 0 for score, _, _ in scored):
+    if not any(pinned or score > 0 for pinned, score, _, _ in scored):
         return items
-    return [skill for _, _, skill in sorted(scored, key=lambda item: (-item[0], item[1]))]
+    return [
+        skill
+        for _, _, _, skill in sorted(
+            scored,
+            key=lambda item: (-int(item[0]), -item[1], item[2]),
+        )
+    ]
 
 
 def filter_skills_for_runtime_turn(
@@ -278,6 +361,34 @@ def filter_skills_for_runtime_turn(
     items = list(skills or [])
     if manual_skill_selected:
         return items
+    if detect_chrome_local_browser_route(active_user_message):
+        selected = [
+            skill for skill in items
+            if is_chrome_skill(*skill_slug_and_name(skill))
+            or (
+                youtube_platform_action_intent(active_user_message)
+                and (
+                    is_youtube_publisher_skill(*skill_slug_and_name(skill))
+                    or is_youtube_mcp_skill(*skill_slug_and_name(skill))
+                )
+            )
+        ]
+        return retain_required_skill_invocation_policies(items, selected)
+    if youtube_platform_action_intent(active_user_message):
+        selected = [
+            skill
+            for skill in items
+            if is_youtube_publisher_skill(*skill_slug_and_name(skill))
+            or is_youtube_mcp_skill(*skill_slug_and_name(skill))
+            or is_chrome_skill(*skill_slug_and_name(skill))
+        ]
+        return retain_required_skill_invocation_policies(items, selected)
+    if youtube_platform_action_intent(active_user_message):
+        selected = [
+            skill for skill in items
+            if is_youtube_route_skill(*skill_slug_and_name(skill))
+        ]
+        return retain_required_skill_invocation_policies(items, selected)
     return rank_skills_for_runtime_turn(
         items,
         active_user_message=active_user_message,

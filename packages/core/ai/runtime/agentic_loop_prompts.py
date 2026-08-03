@@ -84,3 +84,14 @@ def runtime_agentic_max_rounds_final_prompt() -> str:
         "You've used all available tool rounds. Please provide your final "
         "response based on everything you've gathered so far."
     )
+
+
+def runtime_agentic_output_schema_retry_message(validation_error: str) -> str:
+    """Build the no-tools repair prompt for a schema-invalid final response."""
+
+    return (
+        "[System: Your previous final response failed JSON Schema validation: "
+        f"{validation_error}. Return a corrected, complete JSON value only. "
+        "Do not call tools, repeat side effects, add markdown fences, or include "
+        "explanatory prose.]"
+    )

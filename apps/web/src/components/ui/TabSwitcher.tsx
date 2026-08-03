@@ -74,6 +74,7 @@ export default function TabSwitcher({ tabs, value, onChange, size = "md", classN
         return (
           <button
             key={tab.key}
+            data-tab={tab.key}
             ref={(node) => {
               tabRefs.current[tab.key] = node;
             }}

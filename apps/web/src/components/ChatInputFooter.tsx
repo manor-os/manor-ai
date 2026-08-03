@@ -25,6 +25,7 @@ import UserAvatar from "./ui/UserAvatar";
 import { type ChatMessage, useDebounced } from "../lib/chatStream";
 import { getSkillDescription } from "../pages/skills/skillTypes";
 import { shouldHandleComposerEnter } from "../lib/composerKeyboard";
+import { InlineRowsSkeleton } from "./ui/Skeleton";
 import {
   IconCalendar,
   IconChat,
@@ -402,8 +403,10 @@ interface ChatInputFooterProps {
   onMentionSelect?: (mention: MentionOption) => void;
   onMentionRemove?: (mention: MentionOption) => void;
   textareaRef?: React.RefObject<HTMLTextAreaElement>;
+  editorRef?: React.RefObject<HTMLDivElement>;
   seedAttachments?: AttachedItem[];
   seedAttachmentsKey?: string;
+  attachmentButtonIcon?: "plus" | "paperclip";
   /** Optional className for the outer footer wrapper. */
   className?: string;
 }
@@ -728,15 +731,18 @@ export default function ChatInputFooter({
   onMentionSelect,
   onMentionRemove,
   textareaRef: externalTextareaRef,
+  editorRef: externalEditorRef,
   seedAttachments,
   seedAttachmentsKey,
+  attachmentButtonIcon = "plus",
   className,
 }: ChatInputFooterProps) {
   const queryClient = useQueryClient();
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
   const privateApiEnabled = !authLoading && Boolean(authToken);
-  const editorRef = useRef<HTMLDivElement>(null);
+  const internalEditorRef = useRef<HTMLDivElement>(null);
+  const editorRef = externalEditorRef || internalEditorRef;
   const internalTextareaRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = externalTextareaRef || internalTextareaRef;
   const pendingCursorRef = useRef<number | null>(null);
@@ -1043,7 +1049,7 @@ export default function ChatInputFooter({
     .slice(0, 12);
 
   /* KB picker */
-  const { data: kbDocs } = useQuery({
+  const { data: kbDocs, isLoading: kbDocsLoading } = useQuery({
     queryKey: ["documents", "kb-picker-shared", kbSearch],
     queryFn: () =>
       api.documents.list({
@@ -2151,8 +2157,9 @@ export default function ChatInputFooter({
             </button>
             <div className="chat-composer-menu-divider" />
             {integrationsLoading && (
-              <div className="chat-composer-menu-empty">
-                {t("component.chat_input_footer.loading_connectors")}</div>
+              <div className="chat-composer-menu-empty" style={{ textAlign: "left" }}>
+                <InlineRowsSkeleton rows={3} dense />
+              </div>
             )}
             {!integrationsLoading &&
               readyAuthIntegrationServers.slice(0, 8).map((server: any) => (
@@ -2264,7 +2271,11 @@ export default function ChatInputFooter({
             </button>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: "0 12px 8px" }}>
-            {(kbDocs?.items || []).length === 0 && (
+            {kbDocsLoading ? (
+              <div style={{ padding: "8px 4px" }}>
+                <InlineRowsSkeleton rows={4} dense />
+              </div>
+            ) : (kbDocs?.items || []).length === 0 ? (
               <div
                 style={{
                   textAlign: "center",
@@ -2274,8 +2285,8 @@ export default function ChatInputFooter({
                 }}
               >
                 {t("component.chat_input_footer.no_documents_found")}</div>
-            )}
-            {(kbDocs?.items || []).map((doc: any) => {
+            ) : null}
+            {!kbDocsLoading && (kbDocs?.items || []).map((doc: any) => {
               const ext = (
                 doc.file_type ||
                 doc.name?.split(".").pop() ||
@@ -2513,8 +2524,9 @@ export default function ChatInputFooter({
                   </button>
                 </div>
                 {skillsLoading ? (
-                  <div className="chat-composer-hash-empty">
-                    {t("page.skills.loading_skills")}</div>
+                  <div className="chat-composer-hash-empty" style={{ textAlign: "left" }}>
+                    <InlineRowsSkeleton rows={4} dense />
+                  </div>
                 ) : skillFiltered.length === 0 ? (
                   <div className="chat-composer-hash-empty">
                     {skillQuery ? t("component.chat_input_footer.no_matching_skills") : t("component.chat_input_footer.no_skills_available")}
@@ -2630,11 +2642,36 @@ export default function ChatInputFooter({
                 ref={attachMenuButtonRef}
                 onClick={() => setAttachMenuOpen(!attachMenuOpen)}
                 disabled={streaming || disabled}
-                title={t("component.chat_input_footer.add_context_or_tools")}
+                title={
+                  attachmentButtonIcon === "paperclip"
+                    ? t("page.task_detail.attachments")
+                    : t("component.chat_input_footer.add_context_or_tools")
+                }
+                aria-label={
+                  attachmentButtonIcon === "paperclip"
+                    ? t("page.task_detail.attachments")
+                    : t("component.chat_input_footer.add_context_or_tools")
+                }
                 className={`chat-composer-icon-btn ${attachMenuOpen ? "chat-composer-icon-btn--active" : ""}`}
                 type="button"
               >
-                <IconPlus size={18} />
+                {attachmentButtonIcon === "paperclip" ? (
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1.8}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 1 1-2.83-2.83l8.49-8.48" />
+                  </svg>
+                ) : (
+                  <IconPlus size={18} />
+                )}
               </button>
             </div>
 

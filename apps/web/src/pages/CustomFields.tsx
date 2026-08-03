@@ -155,7 +155,7 @@ export default function CustomFields() {
   }
 
   return (
-    <div style={{ maxWidth: 1060, margin: "0 auto" }}>
+    <div style={{ maxWidth: 1060 }}>
       <PageHeader
         title={t("page.custom_fields.title")}
         subtitle={t("page.custom_fields.subtitle")}

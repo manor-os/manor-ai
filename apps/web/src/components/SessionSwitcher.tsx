@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { relativeTime } from "../lib/format";
 import { t } from "../lib/i18n";
+import { InlineRowsSkeleton } from "./ui/Skeleton";
 
 
 interface SessionSwitcherProps {
@@ -28,7 +29,7 @@ export default function SessionSwitcher({ currentConvId, disabled, onNewChat, on
     return () => document.removeEventListener("mousedown", handler);
   }, [open]);
 
-  const { data: conversations } = useQuery({
+  const { data: conversations, isLoading: conversationsLoading } = useQuery({
     queryKey: ["conversations", "session-switcher"],
     queryFn: () => api.chat.listConversations(),
     enabled: open,
@@ -148,7 +149,15 @@ export default function SessionSwitcher({ currentConvId, disabled, onNewChat, on
             {t("component.session_switcher.new_chat_2")}</button>
 
           {/* Recent sessions */}
-          {conversations && conversations.length > 0 && (
+          {conversationsLoading && (
+            <>
+              <div style={{ height: 1, background: "var(--border-subtle)" }} />
+              <div style={{ padding: "10px 16px 12px" }}>
+                <InlineRowsSkeleton rows={4} dense />
+              </div>
+            </>
+          )}
+          {!conversationsLoading && conversations && conversations.length > 0 && (
             <>
               <div style={{ height: 1, background: "var(--border-subtle)" }} />
               <div style={{ padding: "8px 16px 4px", fontSize: 10, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: "0.05em" }}>

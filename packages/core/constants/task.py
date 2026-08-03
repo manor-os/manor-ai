@@ -27,7 +27,39 @@ TASK_STATUSES = {
     "failed":               {"label": "Failed",               "color": "#dc2626", "order": 10},
 }
 
-VALID_STATUSES = set(TASK_STATUSES.keys())
+from enum import Enum
+
+
+class TaskStatus(str, Enum):
+    """Every state a Task row takes — one member per TASK_STATUSES key.
+
+    The dict above stays the presentation metadata (label/color/order); this
+    enum is what code BRANCHES on, so a status comparison can never typo its
+    way past review. The assert below keeps the two from drifting.
+    """
+
+    CREATED = "created"
+    PROPOSED = "proposed"
+    PENDING = "pending"
+    SCHEDULED = "scheduled"
+    IN_PROGRESS = "in_progress"
+    WAITING_ON_CUSTOMER = "waiting_on_customer"
+    ON_HOLD = "on_hold"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        return [member.value for member in cls]
+
+
+assert set(TaskStatus.values()) == set(TASK_STATUSES.keys()), (
+    "TaskStatus and TASK_STATUSES drifted apart"
+)
+
+VALID_STATUSES = set(TaskStatus.values())
 
 # Board columns (kanban view groups)
 BOARD_COLUMNS = ["pending", "scheduled", "in_progress", "waiting_on_customer", "on_hold", "blocked", "completed"]
@@ -102,3 +134,86 @@ TASK_TYPES = [
     "follow_up",        # Follow-up from previous task
     "approval",         # Requires approval workflow
 ]
+
+
+class TaskLogType(str, Enum):
+    """Every log type the backend writes to task_logs — one member per
+    write site, plus the step/plan lifecycle types the dispatcher and
+    executor emit. The frontend icon map (TaskLogItem.tsx LOG_ICONS) keys
+    on these same strings; a cross-check test ties the two together.
+    """
+
+    CREATE = "create"
+    COMMENT = "comment"
+    STATUS_CHANGE = "status_change"
+    ASSIGNMENT_CHANGE = "assignment_change"
+    APPROVAL_DECISION = "approval_decision"
+    MANUAL_RETRY = "manual_retry"
+    DEPENDENCY_WAIT = "dependency_wait"
+    ESCALATION = "escalation"
+    REASSIGN = "reassign"
+    RUNTIME_CONTEXT = "runtime_context"
+    CLIENT_COMMENT = "client_comment"
+    EVALUATION = "evaluation"
+    AI_HITL_REQUESTED = "ai_hitl_requested"
+    AI_HITL_REMINDER = "ai_hitl_reminder"
+    AI_HITL_RESUMED = "ai_hitl_resumed"
+    AI_SUPERVISOR_VERDICT = "ai_supervisor_verdict"
+    AI_NEEDS_REPLAN = "ai_needs_replan"
+    AI_EXECUTION_STARTED = "ai_execution_started"
+    AI_EXECUTION_COMPLETED = "ai_execution_completed"
+    AI_EXECUTION_FAILED = "ai_execution_failed"
+    AI_AGENT_TURN = "ai_agent_turn"
+    WORKSPACE_AGENT_RESPONSE = "workspace_agent_response"
+    WORKSPACE_AGENT_ERROR = "workspace_agent_error"
+    STEP_COMPLETED = "step_completed"
+    STEP_FAILED = "step_failed"
+    STEP_RETRYING = "step_retrying"
+    PLAN_STARTED = "plan_started"
+    PLAN_COMPLETED = "plan_completed"
+    PLAN_FAILED = "plan_failed"
+    PLAN_CANCELLED = "plan_cancelled"
+    PLAN_REPLANNED = "plan_replanned"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        return [member.value for member in cls]
+
+    @classmethod
+    def coerce(cls, value: object, *, default: "TaskLogType") -> "TaskLogType":
+        """The member for a value an agent or API caller supplied.
+
+        Model-supplied log types are suggestions, not identifiers — an
+        unknown one falls back to ``default`` rather than raising, per the
+        StepResult-envelope rule (offer a vocabulary, then validate; never
+        fail a task on the model's spelling).
+        """
+        try:
+            return cls(str(value or "").strip())
+        except ValueError:
+            return default
+
+
+#: Log types an AI agent writes. Derived from the enum by prefix once, here,
+#: instead of every reader re-deciding with ``startswith("ai_")`` — a prefix
+#: test silently adopts any future member whose name happens to start "ai".
+AI_LOG_TYPES = frozenset(m for m in TaskLogType if m.value.startswith("ai_"))
+
+#: What counts as conversation on a task: the agent's own entries plus the
+#: comments people leave. Used to build agent-facing timelines.
+CONVERSATION_LOG_TYPES = AI_LOG_TYPES | {TaskLogType.COMMENT}
+
+#: The open/close pair for a human-input request. ``AI_HITL_RESUMED`` closes
+#: whatever the other two opened.
+HITL_REQUEST_LOG_TYPES = frozenset(
+    {TaskLogType.AI_HITL_REQUESTED, TaskLogType.AI_HITL_REMINDER}
+)
+HITL_LOG_TYPES = HITL_REQUEST_LOG_TYPES | {TaskLogType.AI_HITL_RESUMED}
+
+
+def plan_terminal_log_type(plan_status: str) -> str:
+    """The log type for a plan reaching ``plan_status`` — the typed form of
+    the old f"plan_{status}" string construction. Raises if a plan status has
+    no log type, which is the point: a new terminal status must declare one.
+    """
+    return TaskLogType(f"plan_{plan_status}").value

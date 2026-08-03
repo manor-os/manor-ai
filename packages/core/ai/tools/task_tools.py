@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from packages.core.ai.runtime import runtime_tool_call_context_from_kwargs
 from packages.core.ai.runtime.task_actions import (
     runtime_create_task_action,
     runtime_get_task_details_action,
@@ -178,7 +179,13 @@ async def _search_tasks(entity_id: str, **kwargs: Any) -> str:
 
 
 async def _create_task(entity_id: str, **kwargs: Any) -> str:
-    return await runtime_create_task_action(entity_id=entity_id, params=kwargs)
+    # The runtime always knows which agent is calling; passing it through is
+    # what lets the creation log name that agent instead of a placeholder.
+    return await runtime_create_task_action(
+        entity_id=entity_id,
+        params=kwargs,
+        actor_agent_id=runtime_tool_call_context_from_kwargs(kwargs).agent_id,
+    )
 
 
 async def _update_task(entity_id: str, **kwargs: Any) -> str:

@@ -5,10 +5,12 @@ import { t } from "../../lib/i18n";
 import type { Task, Workspace } from "../../lib/types";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import {
+  IconAspectRatio,
   IconChatBubble,
   IconChevronDown,
   IconClose,
   IconDashboard,
+  IconDragHandle,
   IconEyeOff,
   IconSend,
   IconTrash,
@@ -582,7 +584,13 @@ export default function GeneratedDashboardModule({
   confirming,
   canMoveUp,
   canMoveDown,
+  dragging = false,
+  moduleDragActive = false,
   onMove,
+  onDragStart,
+  onDragEnd,
+  onDropModule,
+  onToggleSize,
   onHide,
   onDelete,
   onOpenConversation,
@@ -604,7 +612,13 @@ export default function GeneratedDashboardModule({
   confirming: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
+  dragging?: boolean;
+  moduleDragActive?: boolean;
   onMove: (offset: -1 | 1) => void;
+  onDragStart?: () => void;
+  onDragEnd?: () => void;
+  onDropModule?: () => void;
+  onToggleSize?: () => void;
   onHide: () => void;
   onDelete: () => void;
   onOpenConversation: () => void;
@@ -815,11 +829,35 @@ export default function GeneratedDashboardModule({
 
   return (
     <article
-      className={`dashboard-generated-module${module.size === "wide" ? " dashboard-generated-module--wide" : ""}${editing ? " is-editing" : ""}`}
+      className={`dashboard-generated-module${module.size === "wide" ? " dashboard-generated-module--wide" : ""}${editing ? " is-editing" : ""}${dragging ? " is-dragging" : ""}`}
       data-module-id={module.id}
+      onDragOver={(event) => {
+        if (moduleDragActive) event.preventDefault();
+      }}
+      onDrop={(event) => {
+        if (!moduleDragActive) return;
+        event.preventDefault();
+        onDropModule?.();
+      }}
     >
       <header className="dashboard-generated-module-header">
         <div className="dashboard-generated-module-heading">
+          {editing && (
+            <span
+              className="dashboard-generated-module-drag"
+              draggable
+              title={t("page.dashboard.drag_module")}
+              aria-label={`${t("page.dashboard.drag_module")} ${module.title}`}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", module.id);
+                onDragStart?.();
+              }}
+              onDragEnd={() => onDragEnd?.()}
+            >
+              <IconDragHandle size={13} />
+            </span>
+          )}
           <span className="dashboard-generated-module-icon" aria-hidden="true">
             <IconDashboard size={15} />
           </span>
@@ -839,6 +877,22 @@ export default function GeneratedDashboardModule({
               onClick={onOpenConversation}
             >
               <IconChatBubble size={13} />
+            </button>
+            <button
+              type="button"
+              title={
+                module.size === "wide"
+                  ? t("page.dashboard.module_size_compact")
+                  : t("page.dashboard.module_size_wide")
+              }
+              aria-label={`${
+                module.size === "wide"
+                  ? t("page.dashboard.module_size_compact")
+                  : t("page.dashboard.module_size_wide")
+              } ${module.title}`}
+              onClick={() => onToggleSize?.()}
+            >
+              <IconAspectRatio size={13} />
             </button>
             <button
               type="button"
@@ -962,7 +1016,16 @@ export default function GeneratedDashboardModule({
               aria-label={t("page.dashboard.module_conversation_placeholder")}
               onChange={(event) => onConversationPromptChange(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
+                // Enter sends; Shift+Enter is a newline. Never send while an
+                // IME composition is active (Enter then only confirms the
+                // candidate — e.g. Chinese/Japanese input), matching the
+                // Manor AI chat composer.
+                if (
+                  event.key === "Enter" &&
+                  !event.shiftKey &&
+                  !event.nativeEvent.isComposing &&
+                  (event.nativeEvent as any).keyCode !== 229
+                ) {
                   event.preventDefault();
                   if (
                     conversationPrompt.trim() &&

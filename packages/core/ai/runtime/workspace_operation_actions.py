@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any
 
-from packages.core.services.hitl_options import approval_options
+from packages.core.services.hitl_options import one_time_approval_options
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +49,20 @@ def _operation_review_payload(
     prompt: str,
     content: Any,
 ) -> dict[str, Any]:
+    from packages.core.constants.approvals import HitlType
+    from packages.core.services.workspace_operation_service import (
+        operation_review_hitl_payload,
+    )
+
     diff = draft_data.get("diff") if isinstance(draft_data.get("diff"), dict) else {}
     validation = draft_data.get("validation") if isinstance(draft_data.get("validation"), dict) else {}
     changed_keys = _as_clean_list((diff or {}).get("changed_keys"))
+    # A REVIEW of this draft's contents, not an authorization of a capability.
+    # The typed payload is what lets the card say a hard block is being
+    # removed; without it the card said only "Apply this workspace operation
+    # draft?" while the draft rebuilt never_allow underneath it.
+    review_payload = operation_review_hitl_payload(draft_data)
+    review_diff = review_payload["diff"]
     operation = {
         "kind": "workspace_operation_review",
         "draft_id": draft_data.get("id"),
@@ -63,6 +74,10 @@ def _operation_review_payload(
         "diff": diff,
         "validation": validation,
         "patches": draft_data.get("patches") or [],
+        # Surfaced on the operation blob too: the card reads the operation for
+        # everything else it renders, and a warning the renderer has to go
+        # looking for in a second place is a warning that gets missed.
+        "removed_hard_blocks": review_diff.get("removed_hard_blocks") or [],
     }
     return {
         "__hitl__": True,
@@ -71,12 +86,17 @@ def _operation_review_payload(
         "hitl": {
             "id": draft_data.get("id"),
             "type": "approval",
+            "hitl_type": HitlType.REVIEW.value,
+            "payload": review_payload,
             "prompt": prompt,
             "action": "workspace.operation.apply",
             "tool": "workspace_operation",
             "content": content,
             "operation": operation,
-            "options": approval_options(),
+            # No "Always" on a review: the answer is a verdict on THIS diff.
+            # A standing grant over "whatever the next draft happens to say"
+            # is not a thing a person can consent to.
+            "options": one_time_approval_options(),
         },
         "operation": operation,
         "message": (
@@ -316,6 +336,13 @@ async def runtime_workspace_add_rule_action(
         action_patterns = _as_clean_list(raw_params.get("action_patterns"))
         if action_patterns:
             rule["action_patterns"] = action_patterns
+        capability_patterns = _as_clean_list(raw_params.get("capability_patterns"))
+        if capability_patterns:
+            rule["capability_patterns"] = capability_patterns
+        runtime_enforceable = bool(
+            rule.get("rule_type")
+            and (rule.get("action_patterns") or rule.get("capability_patterns"))
+        )
         if conversation_id:
             rule["created_from_conversation_id"] = conversation_id
         if user_id:
@@ -340,8 +367,10 @@ async def runtime_workspace_add_rule_action(
                     content={
                         "rule": rule,
                         "effect": (
-                            "Future matching workspace tool calls will follow this rule "
-                            "after the draft is approved."
+                            "Future matching workspace tool calls will enforce this structured rule "
+                            "after approval."
+                            if runtime_enforceable
+                            else "This remains agent-visible operating guidance; it is not converted into a runtime policy."
                         ),
                     },
                 )
@@ -363,7 +392,7 @@ async def runtime_workspace_add_rule_action(
             "updated": True,
             "rule": applied_rules[-1] if applied_rules else rule,
             "draft_id": draft.id,
-            "governance_synced": True,
+            "governance_synced": runtime_enforceable,
             "workspace_id": workspace_id,
         })
     except Exception as exc:  # noqa: BLE001

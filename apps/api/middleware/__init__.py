@@ -15,6 +15,7 @@ from apps.api.middleware_core import (  # noqa: F401
     setup_middleware as _setup_core_middleware,
 )
 from apps.api.middleware.degraded import DegradedModeMiddleware
+from apps.api.middleware.http_stats import HttpStatsMiddleware
 from apps.api.middleware.rate_limit import ChatRateLimitMiddleware
 
 
@@ -29,3 +30,10 @@ def setup_middleware(app: FastAPI) -> None:
     # Emergency high-cost route shedding. Added last so it runs first and can
     # short-circuit before auth/DB work when an operator enables DEGRADED_MODE.
     app.add_middleware(DegradedModeMiddleware)
+
+    # HTTP traffic counters (Redis HINCRBY, fire-and-forget). Added after
+    # DegradedModeMiddleware so it runs OUTERMOST: requests short-circuited
+    # by degraded-mode shedding or the global rate limiter are still counted
+    # (as "unmatched", since routing never ran) — admins want to see rejected
+    # traffic during an incident, not have it vanish from the dashboard.
+    app.add_middleware(HttpStatsMiddleware)

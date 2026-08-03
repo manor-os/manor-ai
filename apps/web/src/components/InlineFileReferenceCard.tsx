@@ -10,12 +10,53 @@ function normalize(value: string): string {
   return value.trim().toLowerCase().replace(/^\/+/, "");
 }
 
+function decodeUrlPathPart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function pathWithoutQuery(reference: string): string {
+  return reference.split(/[?#]/)[0] || reference;
+}
+
+function sameOriginPath(reference: string): string {
+  try {
+    const url = new URL(reference, window.location.origin);
+    if (url.origin === window.location.origin) return url.pathname;
+  } catch {
+    // Treat plain relative paths as already being path-like.
+  }
+  return pathWithoutQuery(reference);
+}
+
+function fsPathFromReference(reference: string): string | null {
+  const pathname = sameOriginPath(reference);
+  const apiMatch = pathname.match(/^\/api\/v1\/fs\/[^/]+\/(.+)$/);
+  if (apiMatch?.[1]) return decodeUrlPathPart(apiMatch[1]).replace(/^\/+/, "");
+  const trimmed = decodeUrlPathPart(pathWithoutQuery(reference)).replace(/^\/+/, "");
+  return trimmed && looksLikeFileReference(trimmed) ? trimmed : null;
+}
+
+function documentMatchCandidates(reference: string, fileName: string): string[] {
+  return Array.from(new Set([
+    reference,
+    pathWithoutQuery(reference),
+    decodeUrlPathPart(pathWithoutQuery(reference)),
+    fsPathFromReference(reference) || "",
+    fileName,
+  ].filter(Boolean).map(normalize)));
+}
+
 function documentMatchesReference(doc: Document, reference: string, fileName: string): boolean {
-  const ref = normalize(reference.split(/[?#]/)[0] || reference);
-  const name = normalize(fileName);
+  const refs = documentMatchCandidates(reference, fileName);
   const docName = normalize(doc.name || "");
   const docPath = normalize(doc.fs_path || "");
-  return doc.id === reference || docName === name || docPath === ref || docPath.endsWith(`/${name}`);
+  return doc.id === reference || refs.some((ref) => (
+    docName === ref || docPath === ref || (docName && ref.endsWith(`/${docName}`)) || (docPath && ref.endsWith(`/${docPath}`))
+  ));
 }
 
 function getDocumentsFromResponse(response: any): Document[] {
@@ -38,16 +79,10 @@ function sameOriginViewerPath(reference: string): string | null {
   return null;
 }
 
-function sameOriginFileApiPath(reference: string): string | null {
-  try {
-    const url = new URL(reference, window.location.origin);
-    if (url.origin === window.location.origin && url.pathname.startsWith("/api/v1/fs/")) {
-      return `${url.pathname}${url.search}${url.hash}`;
-    }
-  } catch {
-    return null;
-  }
-  return null;
+function displayNameFromReference(referenceName: string, label?: string): string {
+  if (!label) return referenceName;
+  const cleaned = label.trim().replace(/^(download|open|下载|打开)[:：\s]+/i, "").trim();
+  return cleaned || referenceName;
 }
 
 export default function InlineFileReferenceCard({
@@ -65,9 +100,13 @@ export default function InlineFileReferenceCard({
   const location = useLocation();
   const [isResolving, setIsResolving] = useState(false);
   const decoded = decodeFileReferenceHref(reference) || reference;
-  const fileName = label || fileNameFromReference(decoded);
   const currentReturnTo = returnTo || `${location.pathname}${location.search}${location.hash}`;
   const isExternal = useMemo(() => /^https?:\/\//i.test(decoded), [decoded]);
+  const decodedFsPath = useMemo(() => fsPathFromReference(decoded), [decoded]);
+  const fileName = useMemo(() => fileNameFromReference(decodedFsPath || decoded), [decoded, decodedFsPath]);
+  const resolvedFileName = useMemo(() => {
+    return displayNameFromReference(fileName, label);
+  }, [fileName, label]);
 
   async function openReference() {
     const viewerPath = sameOriginViewerPath(decoded);
@@ -89,10 +128,14 @@ export default function InlineFileReferenceCard({
       return;
     }
 
-    const apiFilePath = sameOriginFileApiPath(decoded);
     setIsResolving(true);
     try {
-      const terms = Array.from(new Set([fileName, decoded].filter(Boolean)));
+      const terms = Array.from(new Set([
+        decodedFsPath,
+        decodedFsPath ? fileNameFromReference(decodedFsPath) : "",
+        fileName,
+        decoded,
+      ].filter((term): term is string => Boolean(term))));
       for (const term of terms) {
         const response = await api.documents.list({ search: term, include_generated_assets: true, limit: 20 });
         const docs = getDocumentsFromResponse(response);
@@ -107,13 +150,8 @@ export default function InlineFileReferenceCard({
         window.open(decoded, "_blank", "noopener,noreferrer");
         return;
       }
-      if (apiFilePath) {
-        preserveReturnToInHistory(currentReturnTo);
-        window.location.assign(apiFilePath);
-        return;
-      }
       preserveReturnToInHistory(currentReturnTo);
-      navigate(`/knowledge?search=${encodeURIComponent(fileName)}`, { state: { returnTo: currentReturnTo } });
+      navigate(`/knowledge?search=${encodeURIComponent(fileNameFromReference(decodedFsPath || fileName))}`, { state: { returnTo: currentReturnTo } });
     } finally {
       setIsResolving(false);
     }
@@ -128,10 +166,10 @@ export default function InlineFileReferenceCard({
         event.stopPropagation();
         void openReference();
       }}
-      title={decoded}
+      title={decodedFsPath || decoded}
     >
       <span className="inline-file-reference-card__icon"><IconDocument size={12} /></span>
-      <span className="inline-file-reference-card__name">{fileName}</span>
+      <span className="inline-file-reference-card__name">{resolvedFileName}</span>
       {isExternal && <IconExternalLink size={10} className="inline-file-reference-card__external" />}
     </button>
   );

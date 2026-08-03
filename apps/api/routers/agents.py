@@ -9,10 +9,17 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
+from packages.core.models.permission import Capability, ResourceType, Visibility
 from packages.core.models.skill import AgentSkillBinding
 from packages.core.models.user import User
 from packages.core.models.worker import SubscriptionWorker, Worker
-from packages.core.models.workspace import AgentSubscription, AgentToolBinding, Workspace
+from packages.core.models.workspace import Agent, AgentSubscription, AgentToolBinding, Workspace
+from packages.core.services.resource_access import (
+    ResourceDescriptor,
+    is_read_capability,
+    user_can_access_resource,
+)
+from packages.core.services.workspace_access import user_can_write_workspace_id
 from packages.core.services.agent_service import (
     list_agents, get_agent, create_agent,
     update_agent, delete_agent, subscribe_agent, list_subscriptions,
@@ -20,9 +27,66 @@ from packages.core.services.agent_service import (
     list_tool_definitions,
 )
 from packages.core.services.agent_prompt_preview import preview_agent_prompt
+from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 from apps.api.deps import get_current_user
+from apps.api.routers.workspaces import (
+    LearningCandidateResponse,
+    RuntimeEvidenceResponse,
+    _learning_candidate_response,
+    _runtime_evidence_response,
+)
+from packages.core.constants.execution import WorkerStatus
 
 router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
+
+
+async def _require_agent(
+    db: AsyncSession,
+    user: User,
+    agent_id: str,
+    capability: str = Capability.VIEW,
+) -> Agent:
+    """Load an agent and authorize the caller through the unified gateway.
+
+    Platform templates (``entity_id IS NULL``) stay readable by everyone and
+    editable by no one — they belong to the catalog, not to any entity.
+
+    A failed read yields 404 so the endpoint never confirms that an agent the
+    caller cannot see exists; a failed write on an otherwise-readable agent
+    yields 403, which is the honest answer and matches ``require_workspace_*``.
+    """
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+
+    if not agent.entity_id:
+        if agent.is_template and agent.is_public and is_read_capability(capability):
+            return agent
+        raise HTTPException(404, "Agent not found")
+
+    descriptor = ResourceDescriptor.from_row(agent, ResourceType.AGENT)
+    if await user_can_access_resource(
+        db,
+        descriptor=descriptor,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+        capability=capability,
+    ):
+        return agent
+
+    if is_read_capability(capability):
+        raise HTTPException(404, "Agent not found")
+    if await user_can_access_resource(
+        db,
+        descriptor=descriptor,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+        capability=Capability.VIEW,
+    ):
+        raise HTTPException(403, "Insufficient permissions for this agent")
+    raise HTTPException(404, "Agent not found")
 
 
 class AgentResponse(BaseModel):
@@ -54,6 +118,11 @@ class AgentCreateRequest(BaseModel):
     tags: list[str] = []
     config: dict = {}
     source: str = "custom"
+    # Scope. A null workspace keeps the agent shared entity-wide; naming one
+    # binds it to that workspace's membership rules. Visibility defaults to
+    # ``entity`` so behaviour matches agents created before this existed.
+    workspace_id: str | None = None
+    visibility: str = Visibility.ENTITY
 
 
 class PromptPreviewRequest(BaseModel):
@@ -146,7 +215,7 @@ class ToolResponse(BaseModel):
 
 
 def _agent_resp(a, tool_count: int = 0, skill_count: int = 0) -> AgentResponse:
-    config = a.config or {}
+    config = normalize_agent_runtime_config(a.config)
     description_i18n = (
         config.get("description_i18n")
         if isinstance(config.get("description_i18n"), dict)
@@ -303,6 +372,24 @@ async def list_my_agents(
     db: AsyncSession = Depends(get_db),
 ):
     agents = await list_agents(db, user.entity_id, include_templates=include_templates)
+    # Platform templates carry no entity and are catalog-public; entity-owned
+    # agents go through the gateway so private and workspace-scoped ones stay
+    # out of the list.
+    visible: list[Agent] = []
+    for candidate in agents:
+        if not candidate.entity_id:
+            visible.append(candidate)
+            continue
+        if await user_can_access_resource(
+            db,
+            descriptor=ResourceDescriptor.from_row(candidate, ResourceType.AGENT),
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=getattr(user, "role", None),
+            capability=Capability.VIEW,
+        ):
+            visible.append(candidate)
+    agents = visible
     agent_ids = [a.id for a in agents]
     tool_counts, skill_counts = await _agent_binding_counts(db, agent_ids)
     return [
@@ -321,12 +408,23 @@ async def create_new_agent(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if req.workspace_id and not await user_can_write_workspace_id(
+        db,
+        workspace_id=req.workspace_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+    ):
+        raise HTTPException(403, "Cannot create an agent in this workspace")
     agent = await create_agent(
         db, user.entity_id,
         name=req.name, description=req.description,
         system_prompt=req.system_prompt, avatar_url=req.avatar_url,
         category=req.category, tags=req.tags,
         config=req.config, source=req.source,
+        owner_user_id=user.id,
+        workspace_id=req.workspace_id,
+        visibility=req.visibility,
     )
     return _agent_resp(agent)
 
@@ -456,6 +554,7 @@ async def ai_update_agent_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Apply a natural-language change to an existing agent."""
+    await _require_agent(db, user, agent_id, Capability.EDIT)
     from packages.core.services.agent_generator import update_agent_via_ai
 
     try:
@@ -471,19 +570,64 @@ async def get_one_agent(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent = await get_agent(db, agent_id)
-    if not agent:
-        raise HTTPException(404, "Agent not found")
-    # Allow access if: own entity, or public template
-    if agent.entity_id and agent.entity_id != user.entity_id:
-        if not (agent.is_template and agent.is_public):
-            raise HTTPException(404, "Agent not found")
+    agent = await _require_agent(db, user, agent_id, Capability.VIEW)
     tool_counts, skill_counts = await _agent_binding_counts(db, [agent.id])
     return _agent_resp(
         agent,
         tool_count=tool_counts.get(agent.id, 0),
         skill_count=skill_counts.get(agent.id, 0),
     )
+
+
+@router.get("/{agent_id}/runtime/evidence", response_model=list[RuntimeEvidenceResponse])
+async def list_agent_runtime_evidence(
+    agent_id: str,
+    limit: int = Query(default=30, ge=1, le=100),
+    evidence_type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List runtime evidence attributed to one visible agent."""
+    from packages.core.services.runtime_learning import list_runtime_evidence
+
+    await _require_agent(db, user, agent_id, Capability.VIEW)
+    rows = await list_runtime_evidence(
+        db,
+        entity_id=user.entity_id,
+        agent_id=agent_id,
+        evidence_type=evidence_type,
+        status=status,
+        limit=limit,
+    )
+    return [_runtime_evidence_response(row) for row in rows]
+
+
+@router.get("/{agent_id}/learning-candidates", response_model=list[LearningCandidateResponse])
+async def list_agent_learning_candidates(
+    agent_id: str,
+    limit: int = Query(default=30, ge=1, le=100),
+    status: str | None = Query(default=None),
+    candidate_type: str | None = Query(default=None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List proposed, reviewed, and applied learning attributed to an agent."""
+    from packages.core.services.runtime_learning import list_learning_candidates
+
+    await _require_agent(db, user, agent_id, Capability.VIEW)
+    status_filter = (status or "").strip()
+    if status_filter.lower() in {"", "all", "*"}:
+        status_filter = None
+    rows = await list_learning_candidates(
+        db,
+        entity_id=user.entity_id,
+        agent_id=agent_id,
+        status=status_filter,
+        candidate_type=candidate_type,
+        limit=limit,
+    )
+    return [_learning_candidate_response(row) for row in rows]
 
 
 @router.put("/{agent_id}", response_model=AgentResponse)
@@ -493,6 +637,7 @@ async def update_one_agent(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_agent(db, user, agent_id, Capability.EDIT)
     agent = await update_agent(db, agent_id, user.entity_id, **req.model_dump(exclude_none=True))
     if not agent:
         raise HTTPException(404, "Agent not found")
@@ -510,6 +655,7 @@ async def delete_one_agent(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_agent(db, user, agent_id, Capability.DELETE)
     ok = await delete_agent(db, agent_id, user.entity_id)
     if not ok:
         raise HTTPException(404, "Agent not found")
@@ -597,7 +743,7 @@ async def bind_subscription_worker_endpoint(
         await db.execute(
             _user_visible_worker_scope(select(Worker), user).where(
                 Worker.id == req.worker_id,
-                Worker.status != "revoked",
+                Worker.status != WorkerStatus.REVOKED,
             )
         )
     ).scalar_one_or_none()
@@ -672,12 +818,7 @@ async def agent_deployments(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent = await get_agent(db, agent_id)
-    if not agent:
-        raise HTTPException(404, "Agent not found")
-    if agent.entity_id and agent.entity_id != user.entity_id:
-        if not (agent.is_template and agent.is_public):
-            raise HTTPException(404, "Agent not found")
+    await _require_agent(db, user, agent_id, Capability.VIEW)
 
     rows = (
         await db.execute(
@@ -722,6 +863,7 @@ async def agent_tools(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_agent(db, user, agent_id, Capability.VIEW)
     tools = await get_agent_tools(db, agent_id)
     return [ToolResponse(id=t.id, name=t.name, display_name=t.display_name, description=t.description, category=t.category) for t in tools]
 
@@ -733,6 +875,7 @@ async def bind_agent_tools(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_agent(db, user, agent_id, Capability.EDIT)
     count = await bind_tools(db, agent_id, req.tool_ids)
     return {"bound": count}
 
@@ -744,6 +887,7 @@ async def unbind_agent_tools(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_agent(db, user, agent_id, Capability.EDIT)
     count = await unbind_tools(db, agent_id, req.tool_ids)
     return {"unbound": count}
 

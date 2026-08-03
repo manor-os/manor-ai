@@ -102,6 +102,155 @@ async def test_list_scheduled_jobs_filters_by_workspace(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_list_scheduled_jobs_supports_filters_and_pagination(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import update
+
+    from packages.core.models.scheduler import ScheduledJob
+
+    headers = await _auth(client, "sched_list_controls")
+    jobs = [
+        {
+            "job_id": "alpha-enabled",
+            "name": "Alpha enabled",
+            "payload_message": "Prepare the alpha report",
+            "workspace_id": "ws-controls",
+            "agent_id": "agent-one",
+        },
+        {
+            "job_id": "alpha-paused",
+            "name": "Alpha paused",
+            "workspace_id": "ws-controls",
+            "agent_id": "agent-one",
+        },
+        {
+            "job_id": "beta-attention",
+            "name": "Beta attention",
+            "workspace_id": "ws-controls",
+            "agent_id": "agent-two",
+        },
+        {
+            "job_id": "other-workspace",
+            "name": "Alpha elsewhere",
+            "workspace_id": "ws-other",
+            "agent_id": "agent-one",
+        },
+    ]
+    for job in jobs:
+        response = await client.post("/api/v1/jobs", headers=headers, json=job)
+        assert response.status_code == 201
+
+    await db_session.execute(
+        update(ScheduledJob)
+        .where(ScheduledJob.job_id == "alpha-paused")
+        .values(enabled=False)
+    )
+    await db_session.execute(
+        update(ScheduledJob)
+        .where(ScheduledJob.job_id == "beta-attention")
+        .values(consecutive_errors=2, last_status="error")
+    )
+    await db_session.commit()
+
+    first_page = await client.get(
+        "/api/v1/jobs",
+        headers=headers,
+        params={
+            "workspace_id": "ws-controls",
+            "agent_id": "agent-one",
+            "search": "alpha",
+            "limit": 1,
+            "offset": 0,
+        },
+    )
+    second_page = await client.get(
+        "/api/v1/jobs",
+        headers=headers,
+        params={
+            "workspace_id": "ws-controls",
+            "agent_id": "agent-one",
+            "search": "alpha",
+            "limit": 1,
+            "offset": 1,
+        },
+    )
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    assert first_page.json()["total"] == 2
+    assert first_page.json()["summary_total"] == 2
+    assert first_page.json()["enabled_total"] == 1
+    assert first_page.json()["attention_total"] == 0
+    assert len(first_page.json()["items"]) == 1
+    assert len(second_page.json()["items"]) == 1
+    assert first_page.json()["items"][0]["id"] != second_page.json()["items"][0]["id"]
+
+    paused = await client.get(
+        "/api/v1/jobs",
+        headers=headers,
+        params={"workspace_id": "ws-controls", "status": "paused"},
+    )
+    attention = await client.get(
+        "/api/v1/jobs",
+        headers=headers,
+        params={"workspace_id": "ws-controls", "status": "attention"},
+    )
+
+    assert paused.status_code == 200
+    assert [item["job_id"] for item in paused.json()["items"]] == ["alpha-paused"]
+    assert attention.status_code == 200
+    assert [item["job_id"] for item in attention.json()["items"]] == ["beta-attention"]
+
+
+@pytest.mark.asyncio
+async def test_list_scheduled_jobs_includes_latest_failure_reason(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.services.scheduler_service import create_job_run
+
+    headers = await _auth(client, "sched_latest_error")
+    await client.post(
+        "/api/v1/jobs",
+        headers=headers,
+        json={
+            "job_id": "job-with-error",
+            "name": "Job With Error",
+        },
+    )
+    await create_job_run(
+        db_session,
+        "job-with-error",
+        "error",
+        error="Latest automation failure",
+    )
+    await db_session.commit()
+    await create_job_run(
+        db_session,
+        "job-with-error",
+        "error",
+        error="Newest automation failure",
+    )
+    from packages.core.models.scheduler import ScheduledJob
+    from sqlalchemy import update
+
+    await db_session.execute(
+        update(ScheduledJob)
+        .where(ScheduledJob.job_id == "job-with-error")
+        .values(consecutive_errors=2, last_status="error")
+    )
+    await db_session.commit()
+
+    response = await client.get("/api/v1/jobs", headers=headers)
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["last_error"] == "Newest automation failure"
+
+
+@pytest.mark.asyncio
 async def test_update_scheduled_job(client: AsyncClient):
     headers = await _auth(client)
     create = await client.post(

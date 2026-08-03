@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -137,26 +138,62 @@ async def runtime_rag_action(
             "source_count": 0,
             "scope": scope,
             "net_ids": net_ids,
+            "evidence_mode": "none",
+            "content_evidence_available": False,
             "message": f"No indexed content found for: {question!r}.",
         })
 
     context_parts = []
     sources = []
+    content_evidence_available = any(
+        _runtime_rag_result_has_content(result)
+        for result in results
+    )
     for index, result in enumerate(results, 1):
+        content_preview = str(result.get("content_preview") or "").strip()
         score_str = f" (relevance: {result['score']})" if result.get("score") else ""
-        context_parts.append(
-            f"[Document {index}: {result['name']}{score_str}]\n"
-            f"{result.get('content_preview', '')}"
-        )
-        sources.append({"document_id": result["document_id"], "name": result["name"]})
+        if _runtime_rag_result_has_content(result):
+            context_parts.append(
+                f"[Document {index}: {result['name']}{score_str}]\n"
+                f"{content_preview}"
+            )
+        else:
+            context_parts.append(f"[Document metadata {index}: {result['name']}]")
+        document_id = str(result["document_id"])
+        sources.append({
+            "document_id": document_id,
+            "name": result["name"],
+            "url": f"/viewer/{quote(document_id, safe='')}",
+            "evidence_type": (
+                "content" if _runtime_rag_result_has_content(result) else "metadata"
+            ),
+        })
 
-    return json.dumps({
+    payload = {
         "context": "\n\n---\n\n".join(context_parts),
         "sources": sources,
         "source_count": len(results),
         "scope": scope,
         "net_ids": net_ids,
-    })
+        "evidence_mode": (
+            "hybrid_content" if content_evidence_available else "document_metadata_fallback"
+        ),
+        "content_evidence_available": content_evidence_available,
+    }
+    if not content_evidence_available:
+        payload["message"] = (
+            "Only document metadata matched; no indexed document excerpts were "
+            "available. Do not infer document contents from filenames."
+        )
+    return json.dumps(payload)
+
+
+def _runtime_rag_result_has_content(result: dict[str, Any]) -> bool:
+    """Distinguish extracted excerpts from filename-only search fallbacks."""
+
+    preview = str(result.get("content_preview") or "").strip()
+    name = str(result.get("name") or "").strip()
+    return bool(preview) and preview != name
 
 
 def _runtime_rag_id_list(value: Any) -> list[str]:

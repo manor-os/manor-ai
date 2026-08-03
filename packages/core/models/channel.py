@@ -189,6 +189,18 @@ class ChannelLinkToken(Base, TimestampMixin):
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+
+    # Migration 20260520_04 builds updated_at as NOT NULL DEFAULT now().
+    # TimestampMixin.updated_at is nullable with no insert default, so the ORM
+    # emits explicit NULL on INSERT — a NOT NULL violation against the
+    # migration-built schema. Declaring server_default here makes SQLAlchemy
+    # omit the column on INSERT so the DB default populates it. Mirrors the
+    # affiliate / approval_request fix for the identical drift.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+        onupdate=func.now(), nullable=False,
+    )
+
     token: Mapped[str] = mapped_column(String(64), nullable=False)
     user_id: Mapped[str] = mapped_column(String(26), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)

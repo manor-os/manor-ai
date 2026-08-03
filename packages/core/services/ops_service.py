@@ -179,12 +179,18 @@ def _calc_cpu_pct(stats: dict[str, Any]) -> float:
 def collect_celery_queues() -> dict[str, int]:
     """Queue depths from Celery's broker. Best-effort — returns {} if
     the broker is unreachable. Reuses the existing ``celery_app``
-    connection rather than opening a new Redis client."""
+    connection rather than opening a new Redis client.
+
+    Probes every queue Manor declares (packages/core/queues.py) so the control
+    plane and the work queue are visible separately — a backlog on ``work``
+    means "steps are queueing", a backlog on ``celery`` means "the orchestration
+    loop is behind", and they call for different responses."""
     try:
         from packages.core.celery_app import celery_app
+        from packages.core.queues import CeleryQueue
         with celery_app.connection_or_acquire() as conn:
             depths: dict[str, int] = {}
-            for q in ("celery", "default"):
+            for q in [queue.value for queue in CeleryQueue]:
                 try:
                     info = conn.default_channel.queue_declare(queue=q, passive=True)
                     depths[q] = info.message_count

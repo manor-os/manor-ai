@@ -5,7 +5,9 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
 from packages.core.ai.runtime.skill_routing import (
+    is_chrome_skill,
     is_local_coding_skill,
     local_coding_cli_intent,
 )
@@ -273,8 +275,12 @@ async def runtime_auto_skill_forced_tool_calls(
         return []
     if "invoke_skill" not in set(getattr(ctx, "tool_names", None) or []):
         return []
-    if not local_coding_cli_intent(getattr(ctx, "active_user_message", None)):
+    active_user_message = getattr(ctx, "active_user_message", None)
+    chrome_route = detect_chrome_local_browser_route(active_user_message)
+    local_coding_route = local_coding_cli_intent(active_user_message)
+    if not chrome_route and not local_coding_route:
         return []
+    skill_matches_route = is_chrome_skill if chrome_route else is_local_coding_skill
     try:
         if getattr(ctx, "agent_id", None):
             from packages.core.services.skill_service import list_skills_for_agent
@@ -293,7 +299,7 @@ async def runtime_auto_skill_forced_tool_calls(
     for skill in skills:
         slug = getattr(skill, "slug", "") or ""
         name = getattr(skill, "name", "") or getattr(skill, "display_name", "") or ""
-        if not is_local_coding_skill(slug, name):
+        if not skill_matches_route(slug, name):
             continue
         skill_ref = slug or name
         if not skill_ref:

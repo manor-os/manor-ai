@@ -16,6 +16,14 @@ Expired overrides are ignored. Unknown keys never raise — they return
 the fallback so a code path gated on an as-yet-unregistered flag fails
 closed.
 
+Because unknown keys fail closed, a flag the code gates on is invisible
+in the admin Flags page until somebody types its exact key by hand.
+``KNOWN_FLAGS`` closes that gap: every key the code actually checks is
+declared here, and ``seed_known_flags`` inserts the missing rows at
+their safe default on boot (and on demand from the admin API). Seeding
+only ever CREATES — an ops-set default or an archived status always
+wins over the registry.
+
 To keep this cheap on hot paths, evaluations use a 60s in-process LRU
 cache keyed by ``(flag_key, entity_id, user_id)``. Admin mutations
 bump the global cache version which invalidates everything — no need
@@ -31,6 +39,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
@@ -48,6 +57,89 @@ def _bump_cache() -> None:
     global _cache_version, _cache
     _cache_version += 1
     _cache.clear()
+
+
+# ── Known-flag registry ──────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class KnownFlag:
+    """A flag key the code gates on, declared so ops can see it.
+
+    ``default_enabled`` is the SAFE default used only when the row does
+    not exist yet. It is never applied to an existing row.
+    """
+    key: str
+    description: str
+    default_enabled: bool = False
+
+
+KNOWN_FLAGS: tuple[KnownFlag, ...] = (
+    KnownFlag(
+        key="require_invitation_code",
+        description=(
+            "On: public registration rejects signups without a valid invite "
+            "code. Off (default): codes are optional bonus carriers."
+        ),
+        default_enabled=False,
+    ),
+    KnownFlag(
+        key="strategist_review_v2",
+        description=(
+            "On: strategist uses the decision-layer v2 review path — "
+            "frozen-snapshot reviews, consolidator briefing, typed proposal "
+            "items. Off (default): the legacy review path."
+        ),
+        default_enabled=False,
+    ),
+    KnownFlag(
+        key="tool_discovery_v2",
+        description=(
+            "On: agents use server-first tool search plus intent-path memory "
+            "when picking tools. Off (default): the legacy tool catalog."
+        ),
+        default_enabled=False,
+    ),
+)
+
+
+async def seed_known_flags(db: AsyncSession) -> int:
+    """Insert a registry row for every ``KNOWN_FLAGS`` key that is missing.
+
+    Idempotent and non-destructive. This is the whole safety property:
+    an EXISTING row is never touched. If ops flipped ``default_enabled``
+    on, or archived a flag they no longer want evaluated, a re-seed (on
+    every boot, or from the admin sync endpoint) must not undo that.
+    The registry only supplies the initial safe default.
+
+    Returns the number of rows created. Caller commits.
+    """
+    existing = set((await db.execute(select(FeatureFlag.key))).scalars().all())
+
+    created = 0
+    for known in KNOWN_FLAGS:
+        if known.key in existing:
+            continue
+        try:
+            # SAVEPOINT: another booting worker may insert the same key
+            # concurrently. The unique-key failure rolls back only this
+            # insert, leaving the caller's transaction usable.
+            async with db.begin_nested():
+                db.add(FeatureFlag(
+                    id=generate_ulid(),
+                    key=known.key,
+                    description=known.description,
+                    default_enabled=known.default_enabled,
+                    status="active",
+                ))
+                await db.flush()
+        except IntegrityError:
+            logger.debug("feature flag %r already registered concurrently", known.key)
+            continue
+        created += 1
+
+    if created:
+        _bump_cache()
+    return created
 
 
 # ── Reads ────────────────────────────────────────────────────────────

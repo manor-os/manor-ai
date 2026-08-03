@@ -170,6 +170,42 @@ function extractOutputSummary(result?: Record<string, any> | null) {
   };
 }
 
+function fullDetailText(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return "";
+    const jsonText = text
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+    if (
+      (jsonText.startsWith("{") && jsonText.endsWith("}")) ||
+      (jsonText.startsWith("[") && jsonText.endsWith("]"))
+    ) {
+      try {
+        return JSON.stringify(JSON.parse(jsonText), null, 2);
+      } catch {
+        return formatUserFacingStructuredText(text);
+      }
+    }
+    return formatUserFacingStructuredText(text);
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return formatUserFacingStructuredText(value);
+  }
+}
+
+function stepDetailSections(step: ExecutionStep) {
+  return [
+    { label: "Result", text: fullDetailText(step.result) },
+    { label: "Review prompt", text: fullDetailText(step.human_input_prompt) },
+    { label: "Review response", text: fullDetailText(step.human_input_response) },
+  ].filter((section) => section.text);
+}
+
 function isLocalCodeStep(step: ExecutionStep) {
   return step.kind === "code" || step.action_key === "code.run" || step.provider === "codex_cli" || step.provider === "claude_code";
 }
@@ -496,6 +532,7 @@ export default function TaskExecutionTimeline({
               const canRetryStep = RETRYABLE_STEP_STATUSES.has(step.step_status) && !TERMINAL_PLAN_STATUSES.has(plan.status) && !!onRetryStep;
               const isWaitingRetryStep = WAITING_RETRYABLE_STEP_STATUSES.has(step.step_status);
               const output = extractOutputSummary(step.result);
+              const detailSections = stepDetailSections(step);
               const executor = stepExecutor(step);
               return (
                 <div
@@ -639,6 +676,57 @@ export default function TaskExecutionTimeline({
                       </div>
                     )}
                     {isLocalCodeStep(step) && <LocalCodeRunPanel step={step} />}
+                    {detailSections.length > 0 && (
+                      <details
+                        style={{
+                          marginTop: 8,
+                          border: "1px solid rgba(67,107,101,0.14)",
+                          borderRadius: 10,
+                          background: "#fff",
+                          overflow: "hidden",
+                        }}
+                      >
+                        <summary
+                          style={{
+                            padding: "7px 9px",
+                            cursor: "pointer",
+                            color: "#436b65",
+                            fontSize: 11,
+                            fontWeight: 800,
+                            userSelect: "none",
+                          }}
+                        >
+                          Full result and review details
+                        </summary>
+                        <div style={{ padding: "0 9px 9px", display: "flex", flexDirection: "column", gap: 8 }}>
+                          {detailSections.map((section) => (
+                            <div key={section.label}>
+                              <div style={{ marginBottom: 4, color: "#78716c", fontSize: 10, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                                {section.label}
+                              </div>
+                              <pre
+                                style={{
+                                  margin: 0,
+                                  maxHeight: 420,
+                                  overflow: "auto",
+                                  whiteSpace: "pre-wrap",
+                                  wordBreak: "break-word",
+                                  color: "#44403c",
+                                  background: "#fafaf9",
+                                  border: "1px solid rgba(28,25,23,0.06)",
+                                  borderRadius: 8,
+                                  padding: "8px 9px",
+                                  fontSize: 10.5,
+                                  lineHeight: 1.45,
+                                }}
+                              >
+                                {section.text}
+                              </pre>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
                     {step.error && (
                       <div style={{
                         marginTop: 6, padding: "6px 8px", borderRadius: 8,

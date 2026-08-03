@@ -69,6 +69,12 @@ _READ_ONLY_TOOLS = {
     "sandbox_read_file",
     "list_skills",
     "get_skill_details",
+    "list_workflows",
+    "list_workflow_definitions",
+    "get_workflow",
+    "validate_workflow",
+    "list_workflow_runs",
+    "get_workflow_run",
 }
 _FILE_CREATE_TOOLS = {"sandbox_save_result"}
 _FILE_MUTATION_BASE_CMDS = {"mv", "chmod", "sed"}
@@ -140,48 +146,6 @@ _WORKSPACE_OPERATION_ACTION_MAP = {
     "apply_draft": ("workspace.operation.apply", "high", "apply workspace operation draft", "workspace_operation", "modify"),
     "discard_draft": ("workspace.operation.discard", "medium", "discard workspace operation draft", "workspace_operation", "modify"),
 }
-_CHROME_FINAL_SOCIAL_PUBLISH_TOOLS = {
-    "click_element",
-    "click_point",
-    "computer",
-    "press_key",
-}
-_CHROME_SOCIAL_HOST_MARKERS = (
-    "x.com",
-    "twitter.com",
-    "linkedin.com",
-    "facebook.com",
-    "instagram.com",
-    "threads.net",
-    "tiktok.com",
-    "youtube.com",
-    "xiaohongshu.com",
-    "xhslink.com",
-)
-_CHROME_SOCIAL_PUBLISH_SURFACE_MARKERS = (
-    "compose",
-    "post",
-    "publish",
-    "creator",
-    "studio",
-    "upload",
-    "share",
-    "tweet",
-)
-_CHROME_SOCIAL_PUBLISH_INTENT_RE = re.compile(
-    r"\b(post|publish|tweet|share|send)\b|发布|发帖|发表|发送",
-    re.I,
-)
-_CHROME_FINAL_PUBLISH_LABEL_RE = re.compile(
-    r"^(post|publish|tweet|share|send|发表|发布|发帖|发送)$",
-    re.I,
-)
-_CHROME_NON_PUBLISH_LABEL_RE = re.compile(
-    r"(add|upload|photo|image|media|attach|save|draft|preview|cancel|close|back|next|"
-    r"添加|上传|图片|照片|媒体|附件|保存|草稿|预览|取消|关闭|下一步)",
-    re.I,
-)
-
 
 def classify_runtime_tool_action(
     tool_name: str,
@@ -314,6 +278,26 @@ def classify_runtime_tool_action(
         risk = "high" if operation == "delete" else "medium"
         return RuntimeApprovalAction("action", f"workspace.skill.{operation}", risk, f"{operation} skill", "skill", operation)
 
+    workflow_actions = {
+        "create_workflow": ("workspace.workflow.create", "medium", "create workflow", "create"),
+        "import_workflow": ("workspace.workflow.create", "medium", "import workflow", "create"),
+        "ai_edit_workflow": ("workspace.workflow.modify", "medium", "AI edit workflow", "modify"),
+        "update_workflow": ("workspace.workflow.modify", "medium", "update workflow", "modify"),
+        "deploy_workflow": ("workspace.workflow.deploy", "high", "deploy workflow", "publish"),
+        "delete_workflow": ("workspace.workflow.delete", "high", "delete workflow", "delete"),
+        "run_workflow": ("workspace.workflow.run", "high", "run published workflow", "execute"),
+        "test_workflow": ("workspace.workflow.run", "high", "test workflow", "execute"),
+        "test_workflow_node": ("workspace.workflow.run", "high", "test workflow node", "execute"),
+        "cancel_workflow_run": ("workspace.workflow.run", "medium", "cancel workflow run", "modify"),
+        "resume_workflow_run": ("workspace.workflow.run", "high", "resume workflow run", "execute"),
+    }
+    if name in workflow_actions:
+        key, risk, title, operation = workflow_actions[name]
+        resource_id = str(args.get("workflow") or args.get("run_id") or "").strip() or None
+        return RuntimeApprovalAction(
+            "action", key, risk, title, "workflow", operation, resource_id,
+        )
+
     if name == "write_agent_file":
         return RuntimeApprovalAction("action", "workspace.agent_file.modify", "medium", "write agent file", "agent_file", "modify")
 
@@ -352,9 +336,6 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
     if not server or not action:
         return None
 
-    if server == "chrome" and _is_chrome_final_social_publish_action(action, args):
-        return RuntimeApprovalAction("action", "social_post.publish", "high", "publish social post", "external_account", "publish")
-
     if server in {"twitter_x", "linkedin", "facebook"}:
         if action in _SOCIAL_PUBLISH_ACTIONS:
             return RuntimeApprovalAction("action", "social_post.publish", "high", "publish social post", "external_account", "publish")
@@ -374,6 +355,7 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
 
     if server in {"wechat_official", "facebook"} and action in _MESSAGE_SEND_ACTIONS:
         return RuntimeApprovalAction("action", "external_message.send", "high", "send external message", "external_account", "send")
+
 
     if action.startswith(_DESTRUCTIVE_PREFIXES):
         return RuntimeApprovalAction("action", f"{server}.{action}", "high", "run destructive external action", "external_account", "delete")
@@ -564,78 +546,6 @@ def split_mcp_tool(tool_name: str) -> tuple[str | None, str | None]:
     if len(parts) != 3 or parts[0] != "mcp":
         return None, None
     return parts[1], parts[2]
-
-
-def _is_chrome_final_social_publish_action(action: str, args: dict[str, Any]) -> bool:
-    if action not in _CHROME_FINAL_SOCIAL_PUBLISH_TOOLS:
-        return False
-    if action == "press_key":
-        key_text = _joined_arg_text(args, "key", "shortcut", "keys")
-        if key_text.strip().lower() not in {"enter", "return"}:
-            return False
-
-    context_text = _joined_arg_text(
-        args,
-        "url",
-        "current_url",
-        "page_url",
-        "href",
-        "active_user_message",
-        "_active_user_message_from_context",
-        "goal",
-        "task",
-        "instruction",
-    )
-    lower_context = context_text.lower()
-    if not any(marker in lower_context for marker in _CHROME_SOCIAL_HOST_MARKERS):
-        return False
-    if not any(marker in lower_context for marker in _CHROME_SOCIAL_PUBLISH_SURFACE_MARKERS):
-        return False
-    if not _CHROME_SOCIAL_PUBLISH_INTENT_RE.search(context_text):
-        return False
-
-    target_text = _joined_arg_text(
-        args,
-        "label",
-        "text",
-        "name",
-        "aria_label",
-        "ariaLabel",
-        "title",
-        "role",
-        "selector",
-        "description",
-        "element_text",
-        "node_text",
-        "target",
-    )
-    normalized_target = re.sub(r"\s+", " ", target_text).strip()
-    if not normalized_target:
-        return action == "press_key"
-    if _CHROME_NON_PUBLISH_LABEL_RE.search(normalized_target):
-        return False
-    if _CHROME_FINAL_PUBLISH_LABEL_RE.search(normalized_target):
-        return True
-    return bool(
-        re.search(r"\b(?:button|submit)\b", normalized_target, re.I)
-        and _CHROME_SOCIAL_PUBLISH_INTENT_RE.search(normalized_target)
-    )
-
-
-def _joined_arg_text(args: dict[str, Any], *keys: str) -> str:
-    values: list[str] = []
-    for key in keys:
-        value = args.get(key)
-        if value is None:
-            continue
-        if isinstance(value, (dict, list, tuple)):
-            try:
-                values.append(json.dumps(value, ensure_ascii=False, default=str))
-            except Exception:
-                values.append(str(value))
-        else:
-            values.append(str(value))
-    return " ".join(part for part in values if part)
 
 
 def _looks_public_or_paid(server: str, action: str, args: dict[str, Any]) -> bool:

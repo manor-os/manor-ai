@@ -60,6 +60,36 @@ def runtime_events(envelope: RuntimeEnvelope | None) -> tuple[dict[str, Any], ..
     return tuple(events)
 
 
+RUNTIME_PERSISTED_EVENT_COUNT_KEY = "runtime_events_persisted_count"
+"""How many of an envelope's runtime events already reached the database.
+
+``runtime_event_logs`` has no unique constraint and the envelope's event
+list is never cleared, so persisting one run twice would silently double
+every row. Writing only the tail past this watermark makes the persist
+idempotent per event *without* destroying the in-memory list, which
+``runtime_event_summary`` still needs for the step's result metadata.
+Deliberately absent from ``RuntimeEnvelope.to_message_meta``'s allowlist:
+it is bookkeeping, not trace content.
+"""
+
+
+def runtime_persisted_event_count(envelope: RuntimeEnvelope | None) -> int:
+    """Return the watermark — events already written for this envelope."""
+    if envelope is None:
+        return 0
+    raw = envelope.metadata.get(RUNTIME_PERSISTED_EVENT_COUNT_KEY)
+    return raw if isinstance(raw, int) and raw > 0 else 0
+
+
+def runtime_mark_events_persisted(envelope: RuntimeEnvelope | None, count: int) -> None:
+    """Advance the watermark after a successful write."""
+    if envelope is None:
+        return
+    envelope.metadata[RUNTIME_PERSISTED_EVENT_COUNT_KEY] = max(
+        runtime_persisted_event_count(envelope), count,
+    )
+
+
 def runtime_event_summary(envelope: RuntimeEnvelope | None) -> dict[str, Any] | None:
     """Return a compact, log-safe summary of runtime events."""
     events = runtime_events(envelope)

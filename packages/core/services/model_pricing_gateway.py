@@ -25,6 +25,8 @@ def estimate_token_cost_usd(
     cache_creation_tokens: int = 0,
     cache_read_multiplier: float = 0.1,
     cache_write_multiplier: float = 1.25,
+    audio_input_tokens: int = 0,
+    audio_output_tokens: int = 0,
 ) -> float:
     return model_pricing.estimate_token_cost_usd(
         input_tokens,
@@ -36,6 +38,8 @@ def estimate_token_cost_usd(
         cache_creation_tokens=cache_creation_tokens,
         cache_read_multiplier=cache_read_multiplier,
         cache_write_multiplier=cache_write_multiplier,
+        audio_input_tokens=audio_input_tokens,
+        audio_output_tokens=audio_output_tokens,
     )
 
 
@@ -65,6 +69,8 @@ def tokens_to_credits(
     cache_creation_tokens: int = 0,
     cache_read_multiplier: float = 0.1,
     cache_write_multiplier: float = 1.25,
+    audio_input_tokens: int = 0,
+    audio_output_tokens: int = 0,
 ) -> int:
     if not is_cloud():
         return 0
@@ -81,8 +87,21 @@ def model_cost_multiplier(model: str | None) -> float:
     return model_pricing.model_cost_multiplier(model)
 
 
-def estimate_video_cost_usd(model: str, duration_seconds: float, resolution: str = "720p") -> float:
-    return model_pricing.estimate_video_cost_usd(model, duration_seconds, resolution)
+def estimate_video_cost_usd(
+    model: str,
+    duration_seconds: float,
+    resolution: str = "720p",
+    *,
+    with_audio: bool = False,
+    has_video_input: bool = False,
+) -> float:
+    return model_pricing.estimate_video_cost_usd(
+        model,
+        duration_seconds,
+        resolution,
+        with_audio=with_audio,
+        has_video_input=has_video_input,
+    )
 
 
 def estimate_image_cost_usd(model: str, size: str = "1024x1024") -> float:

@@ -19,12 +19,19 @@ from packages.core.ai.runtime.skill_forcing import (
     runtime_message_text_for_intent,
 )
 from packages.core.ai.runtime.surfaces import infer_chat_surface
-from packages.core.services.conversation_history import (
-    CHARS_PER_TOKEN,
-    load_conversation_history,
-)
+from packages.core.ai.runtime.token_estimate import runtime_estimate_tokens_for_text
+from packages.core.services.conversation_history import load_conversation_history
 
 logger = logging.getLogger(__name__)
+
+def _append_extra_context(base: str | None, extra: str | None) -> str | None:
+    extra = (extra or "").strip()
+    if not extra:
+        return base
+    base = (base or "").strip()
+    if not base:
+        return extra
+    return f"{base}\n\n{extra}"
 
 
 async def resolve_runtime_chat_context(
@@ -77,7 +84,7 @@ async def resolve_runtime_chat_context(
         runtime_surface=runtime_surface,
     )
     workspace_id = runtime.workspace_id
-    legacy_tool_profile = runtime.legacy_tool_profile
+    tool_profile = runtime.tool_profile
     explicit_surface = (
         ChatSurface.FILE_EDITOR_CHAT
         if editor_context and runtime_surface is None
@@ -104,6 +111,57 @@ async def resolve_runtime_chat_context(
         except Exception:
             logger.debug("Agent workspace provisioning failed", exc_info=True)
 
+    # tool_discovery_v2 (A3 intent-path memory, spec §A3): cache-first
+    # lookup + hint, flag-gated. Reuses the SAME extra_context channel
+    # approval_resume_guidance already merges into just above (mirrors that
+    # seam) rather than threading a brand-new kwarg through
+    # runtime_assemble_prompt_for_turn's call chain. Recording
+    # (agentic_loop._maybe_record_tool_path) runs unconditionally elsewhere;
+    # only this lookup/hint/boost surface is flag-gated. Any failure
+    # degrades to "no hint" — never blocks context resolution.
+    path_hint: str | None = None
+    hinted_tool_names: set[str] = set()
+    active_user_message_text = runtime_message_text_for_intent(message)
+    if db and entity_id and user_id and active_user_message_text:
+        try:
+            from packages.core.services.feature_flags import is_enabled
+            if await is_enabled(
+                db, "tool_discovery_v2",
+                entity_id=entity_id, user_id=user_id, fallback=False,
+            ):
+                from packages.core.services import tool_path_memory as tpm
+                paths = await tpm.lookup_paths(
+                    entity_id=entity_id, user_id=user_id,
+                    user_message=active_user_message_text,
+                )
+                if paths:
+                    from packages.core.services.agent_permission_service import (
+                        resolve_usable_mcp_providers,
+                    )
+                    usable = await resolve_usable_mcp_providers(
+                        db, user_id=user_id, entity_id=entity_id,
+                        provider_keys=sorted({p.provider for p in paths if p.provider}),
+                    )
+                    paths = [p for p in paths if p.provider in usable]
+                if paths:
+                    path_hint = tpm.format_hint(paths)
+                    hinted_tool_names = {p.tool_name for p in paths}
+        except Exception:
+            logger.debug("tool_path_memory hint resolution failed", exc_info=True)
+            path_hint = None
+            hinted_tool_names = set()
+
+    extra_context = _append_extra_context(
+        _append_extra_context(
+            runtime.extra_context,
+            (
+                metadata.get("approval_resume_guidance")
+                if isinstance(metadata.get("approval_resume_guidance"), str)
+                else None
+            ),
+        ),
+        path_hint,
+    )
     runtime_request = runtime_request_for_chat_turn(
         surface=surface,
         entity_id=entity_id,
@@ -125,15 +183,15 @@ async def resolve_runtime_chat_context(
     assembled = await runtime_assemble_prompt_for_turn(
         db,
         request=runtime_request,
-        legacy_runtime_profile=legacy_tool_profile,
+        tool_profile=tool_profile,
         agent_id=agent_id,
         bound_tool_names=runtime.bound_tool_names,
         is_master=runtime.is_master,
         mcp_allowed_names=runtime.mcp_allowed_names,
         active_user_message=runtime_message_text_for_intent(message),
         manual_skill_selected=bool(manual_skill_refs),
-        legacy_extra_context=runtime.extra_context,
-        initial_extra_context=runtime.extra_context,
+        legacy_extra_context=extra_context,
+        initial_extra_context=extra_context,
         tool_schemas=[] if (disable_tools or not db) else None,
         allowed_tool_names=set() if (disable_tools or not db) else None,
         extra_tool_schemas=extra_tool_schemas,
@@ -145,20 +203,29 @@ async def resolve_runtime_chat_context(
     ctx = assembled.context
     tools = assembled.tool_schemas
     system_prompt = assembled.prompt
+    ctx.hinted_tool_names = hinted_tool_names
     if entity_id:
         try:
+            from packages.core.services.agent_runtime_config import (
+                agent_runtime_config_for,
+            )
             from packages.core.services.model_resolver import (
                 resolve_llm_metadata_for_user,
                 resolve_model_for_user,
             )
 
-            resolved_model = await resolve_model_for_user(
-                "primary",
-                user_id=user_id,
-                entity_id=entity_id,
-                db=db,
-            )
-            ctx.model = resolved_model
+            agent_config = agent_runtime_config_for(ctx.agent)
+            ctx.temperature = agent_config.temperature
+            ctx.max_tokens = agent_config.max_tokens
+            if agent_config.model:
+                ctx.model = agent_config.model
+            else:
+                ctx.model = await resolve_model_for_user(
+                    "primary",
+                    user_id=user_id,
+                    entity_id=entity_id,
+                    db=db,
+                )
             resolved_metadata = await resolve_llm_metadata_for_user(
                 "primary",
                 user_id=user_id,
@@ -168,7 +235,7 @@ async def resolve_runtime_chat_context(
             if resolved_metadata:
                 ctx.llm_metadata = {
                     **resolved_metadata,
-                    "_resolved_model": resolved_model,
+                    "_resolved_model": ctx.model,
                 }
         except Exception:
             logger.debug("Tenant LLM route resolution failed for chat context", exc_info=True)
@@ -191,10 +258,11 @@ async def resolve_runtime_chat_context(
         from packages.core.ai.agentic_loop import MAX_CONTEXT_TOKENS
 
         message_preview = runtime_message_text_for_intent(message)
-        overhead_chars = (
-            len(system_prompt) + len(json.dumps(tools)) + len(message_preview)
+        overhead_tokens = (
+            runtime_estimate_tokens_for_text(system_prompt)
+            + runtime_estimate_tokens_for_text(json.dumps(tools))
+            + runtime_estimate_tokens_for_text(message_preview)
         )
-        overhead_tokens = overhead_chars // CHARS_PER_TOKEN
         output_reserve = 4_000
         history_budget = max(
             MAX_CONTEXT_TOKENS - overhead_tokens - output_reserve,

@@ -121,7 +121,7 @@ def runtime_chat_insight_extractor_messages(payload: str) -> list[dict[str, str]
 async def runtime_execute_chat_insight_extraction_completion(
     *,
     entity_id: str,
-    workspace_id: str,
+    workspace_id: str | None,
     payload: str,
 ) -> RuntimeTextCompletionResult:
     """Execute chat insight extraction with Runtime-owned defaults."""
@@ -211,9 +211,22 @@ def runtime_conversation_summary_text(
     return "\n".join(parts)
 
 
-def runtime_conversation_summary_prompt(text_block: str) -> str:
+def runtime_conversation_summary_prompt(
+    text_block: str,
+    *,
+    prior_summary: str | None = None,
+) -> str:
     """Build the Runtime-owned prompt for rolling conversation summaries."""
 
+    if prior_summary and prior_summary.strip():
+        return (
+            "Update this rolling conversation summary. Merge the existing "
+            "summary with the new messages into 3-6 sentences. Keep still-"
+            "relevant facts from the existing summary; capture new topics, "
+            "decisions, and pending items. Be concise and factual.\n\n"
+            f"EXISTING SUMMARY:\n{prior_summary.strip()}\n\n"
+            f"NEW MESSAGES:\n{text_block}"
+        )
     return (
         "Summarize this conversation history in 3-5 sentences. "
         "Capture the key topics discussed, decisions made, and any pending items. "
@@ -222,10 +235,19 @@ def runtime_conversation_summary_prompt(text_block: str) -> str:
     )
 
 
-def runtime_conversation_summary_messages(text_block: str) -> list[dict[str, str]]:
+def runtime_conversation_summary_messages(
+    text_block: str,
+    *,
+    prior_summary: str | None = None,
+) -> list[dict[str, str]]:
     """Build Runtime one-shot messages for rolling conversation summaries."""
 
-    return [{"role": "user", "content": runtime_conversation_summary_prompt(text_block)}]
+    return [{
+        "role": "user",
+        "content": runtime_conversation_summary_prompt(
+            text_block, prior_summary=prior_summary
+        ),
+    }]
 
 
 async def runtime_execute_conversation_summary_completion(
@@ -233,11 +255,14 @@ async def runtime_execute_conversation_summary_completion(
     entity_id: str | None,
     workspace_id: str | None,
     text_block: str,
+    prior_summary: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute rolling conversation summary with Runtime-owned defaults."""
 
     return await runtime_execute_text_completion(
-        runtime_conversation_summary_messages(text_block),
+        runtime_conversation_summary_messages(
+            text_block, prior_summary=prior_summary
+        ),
         entity_id=entity_id,
         source=RUNTIME_CONVERSATION_SUMMARY_SOURCE,
         workspace_id=workspace_id,

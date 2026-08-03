@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams } from "react-router-dom";
 
 import ChatMarkdown from "../components/ChatMarkdown";
+import CollapsibleSentMessage from "../components/chat/CollapsibleSentMessage";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import { api, ApiError } from "../lib/api";
 import { tForLocale } from "../lib/i18n";
@@ -148,6 +149,7 @@ export default function PublicChat() {
   const [customerAuthLoading, setCustomerAuthLoading] = useState(false);
   const [customerGoogleLoading, setCustomerGoogleLoading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastServerMessageIdRef = useRef("");
@@ -360,6 +362,13 @@ export default function PublicChat() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, sending]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "38px";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [input]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -986,7 +995,13 @@ export default function PublicChat() {
                     null
                   ) : (
                     <>
-                      <ChatMarkdown content={visibleContent} isUser={isUser} streaming={isStreamingAssistant} />
+                      {isUser ? (
+                        <CollapsibleSentMessage text={visibleContent}>
+                          <ChatMarkdown content={visibleContent} isUser />
+                        </CollapsibleSentMessage>
+                      ) : (
+                        <ChatMarkdown content={visibleContent} isUser={false} streaming={isStreamingAssistant} />
+                      )}
                       {isStreamingAssistant && <span className="chat-streaming-cursor" />}
                     </>
                   )}
@@ -1050,14 +1065,20 @@ export default function PublicChat() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
             </svg>
           </button>
-          <input
-            type="text"
+          <textarea
+            ref={textareaRef}
             placeholder={customerText("page.public_chat.type_a_message")}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && send()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                send();
+              }
+            }}
             style={styles.chatInput}
             disabled={sending}
+            rows={1}
           />
           <button
             aria-label={customerText("page.public_chat.send_message")}
@@ -1284,12 +1305,21 @@ const styles: Record<string, React.CSSProperties> = {
   },
   chatInput: {
     flex: 1,
+    minHeight: 38,
+    maxHeight: 160,
     padding: "10px 14px",
     border: "1px solid rgba(28,25,23,0.06)",
     borderRadius: 12,
     fontSize: 13,
+    lineHeight: 1.4,
     outline: "none",
     background: "#fff",
+    resize: "none" as const,
+    overflowY: "auto" as const,
+    overscrollBehavior: "contain" as const,
+    whiteSpace: "pre-wrap" as const,
+    overflowWrap: "anywhere" as const,
+    wordBreak: "break-word" as const,
   },
   sendBtn: {
     width: 38,

@@ -17,6 +17,7 @@ from packages.core.ai.runtime.file_actions import (
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
 
 from . import common
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 
 _DEFAULT_BUNDLE_NAME = "code-project"
@@ -142,7 +143,7 @@ async def handle_code(
         entity_id=entity_id,
         workspace_id=kwargs.get("workspace_id"),
         name=_bundle_name(name or str(params.get("name") or ""), prompt),
-        default_subdir="code",
+        default_subdir=WorkspaceArtifactDir.CODE.value,
     )
     bundle = runtime_normalize_entity_file_path(bundle)
     if not bundle:

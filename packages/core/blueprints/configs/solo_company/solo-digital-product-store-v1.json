@@ -112,7 +112,7 @@
         "description": "Runs the Digital Product Store OS workspace operating loop.",
         "system_prompt": "You operate a product store. Keep listings conversion-ready, triage orders and support, draft lifecycle campaigns, and review margin. Never issue refunds, cancel orders, change prices, or publish campaigns without operator approval.",
         "config": {
-          "model": "default",
+          "model_mode": "inherit",
           "temperature": 0.3,
           "default_review_mode": "operator_review_before_external_action"
         },

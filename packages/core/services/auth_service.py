@@ -60,7 +60,19 @@ def create_access_token(user_id: str, entity_id: str, role: str, remember: bool 
 
 def decode_token(token: str) -> Optional[dict]:
     try:
-        return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        # Don't verify the `aud` claim: Manor's OAuth authorization-code exchange
+        # mints tokens carrying `aud=<client_id>` (for clients with a token TTL,
+        # which the seeder defaults on), yet Manor validates its own tokens here
+        # without passing an audience — python-jose then rejects them with
+        # "Invalid audience". Since every Manor JWT is signed with our own
+        # symmetric secret, `aud` is informational, not a trust boundary, so we
+        # accept tokens regardless of audience.
+        return jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+            options={"verify_aud": False},
+        )
     except JWTError:
         return None
 

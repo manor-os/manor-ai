@@ -6,8 +6,10 @@ Dispatches to service layer functions instead of tool pool.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import re
 from typing import Any
 
 from packages.core.ai.runtime.skills import (
@@ -84,6 +86,9 @@ from packages.core.ai.runtime.goal_actions import (
     runtime_get_goal_status_action,
     runtime_update_goal_value_action,
 )
+from packages.core.ai.runtime.notification_actions import (
+    runtime_notify_members_action,
+)
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     runtime_injected_tool_context_args,
@@ -119,15 +124,28 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("get_document", "Get document details by ID"),
         ("upload_document", "Upload a document to knowledge base"),
         ("delete_document", "Delete a document"),
-        ("search_documents", "Search user-visible Knowledge documents by keyword"),
+        (
+            "search_documents",
+            "Search user-visible document names and metadata by keyword; this does not "
+            "retrieve document-body evidence, so use the separate rag tool for facts, "
+            "values, summaries, comparisons, or calculations from document contents",
+        ),
         ("list_workspace_artifacts", "List AI-generated or saved files associated with a workspace"),
         ("list_document_folders", "List user-visible Knowledge folders"),
         ("create_document_folder", "Create a user-visible Knowledge folder"),
         ("rename_document_folder", "Rename a Knowledge folder"),
         ("move_document_folder", "Move a Knowledge folder under another folder or root"),
         ("delete_document_folder", "Delete a Knowledge folder and all nested contents"),
-        ("move_document_to_folder", "Move one Knowledge document into a folder or root"),
-        ("move_documents_to_folder", "Move multiple Knowledge documents into a folder or root"),
+        (
+            "move_document_to_folder",
+            "Move one Knowledge document (params: document_id, folder_id — a "
+            "folder id from list_document_folders, or 'root' for top level)",
+        ),
+        (
+            "move_documents_to_folder",
+            "Move multiple Knowledge documents (params: document_ids, folder_id "
+            "— a folder id from list_document_folders, or 'root' for top level)",
+        ),
         ("list_document_groups", "List document groups/collections used for workspace RAG context"),
     ],
     "Agents": [
@@ -138,9 +156,21 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("unbind_agent_tool", "Remove tool binding from an agent"),
     ],
     "Communications": [
-        ("send_email", "Send email via configured channel"),
+        (
+            "send_email",
+            "Send email via a configured account. Pass params.integration_account_id "
+            "from list_ready_integrations to choose the sender; omit it for the default.",
+        ),
         ("list_conversations", "List conversations by agent/user"),
         ("list_notifications", "List notifications with read/unread filter"),
+        (
+            "notify_members",
+            "Notify team members: reaches each member on their preferred "
+            "channels (in-app bell always, plus email/Telegram/etc. per their "
+            "notification preferences). Params: title (required), body?, "
+            "link?, member_ids? (user ids from list_staff/find_team_members; "
+            "omit to notify ALL active members of the entity).",
+        ),
         ("mark_notification_read", "Mark notification as read"),
         ("list_channel_bindings", "List every channel (Telegram/Slack/WhatsApp/…) and which agent it routes to"),
         ("bind_channel", "Route a channel's inbound messages to a specific agent (params: channel_config_id, agent_id)"),
@@ -247,6 +277,13 @@ def _search_actions(query: str, max_results: int = 8) -> list[dict]:
     query_lower = query.lower()
     scored: list[tuple[int, str, str, str]] = []
     for name, desc in _ALL_ACTIONS.items():
+        if name not in _IMPLEMENTED_ACTIONS:
+            # Never advertise catalog stubs whose dispatch branch doesn't
+            # exist — a match here sends the model straight into the
+            # "handler not yet implemented" dead end (staging dogfooding
+            # failure: search returned list_users / get_system_health /
+            # list_token_usage, none of which are dispatchable).
+            continue
         dept = _ACTION_DEPT[name]
         score = 0
         for word in query_lower.split():
@@ -357,6 +394,7 @@ async def _dispatch_action(
                 return await runtime_manor_list_documents(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -375,6 +413,7 @@ async def _dispatch_action(
                 return await runtime_manor_search_documents(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -382,6 +421,7 @@ async def _dispatch_action(
                 return await runtime_manor_list_workspace_artifacts(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                     workspace_id=workspace_id or "",
                     task_id=task_id or "",
@@ -391,6 +431,7 @@ async def _dispatch_action(
                 return await runtime_manor_get_document(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -789,6 +830,14 @@ async def _dispatch_action(
                     user_id=user_id,
                 )
 
+            if action == "notify_members":
+                return await runtime_notify_members_action(
+                    entity_id=entity_id,
+                    params=params,
+                    workspace_id=workspace_id or None,
+                    agent_id=getattr(runtime_envelope, "agent_id", None),
+                )
+
             # Conversations
             if action == "list_conversations":
                 return await runtime_manor_list_conversations(db, entity_id=entity_id)
@@ -904,14 +953,223 @@ async def _dispatch_action(
                     params=params,
                 )
 
-            # Fallback
-            return json.dumps({"error": f"Action '{action}' handler not yet implemented. Use search to find alternatives."})
+            # Fallback — a catalog entry with no dispatch branch. Bridge the
+            # action name into the deferred MCP pool so the model gets a
+            # concrete next step instead of a dead end.
+            return await _unimplemented_action_response(
+                action,
+                entity_id=entity_id,
+                user_id=user_id,
+            )
 
     except ImportError as ie:
         return json.dumps({"error": f"Service not available: {ie}"})
     except Exception as e:
         logger.exception("manor action=%s failed: %s", action, e)
         return json.dumps({"error": f"Action '{action}' failed: {e}"})
+
+
+# ── Implemented-action set ──────────────────────────────────────────────────
+#
+# The catalog above advertises some actions that have no dispatch branch in
+# _dispatch_action (they fall through to the "not implemented" fallback).
+# The dispatcher's own `if action == "..."` chain is the only source of
+# truth for what is actually callable, so derive the implemented set from
+# its source instead of maintaining a second hand-written list that would
+# drift the same way the catalog did.
+
+def _implemented_action_names() -> frozenset[str]:
+    try:
+        source = inspect.getsource(_dispatch_action)
+    except (OSError, TypeError):  # no source available — fail open
+        return frozenset(_ALL_ACTIONS)
+    names = set(re.findall(r'action == "([a-z_]+)"', source))
+    for group in re.findall(r"action in \{([^}]*)\}", source):
+        names.update(re.findall(r'"([a-z_]+)"', group))
+    return frozenset(names)
+
+
+_IMPLEMENTED_ACTIONS: frozenset[str] = _implemented_action_names()
+
+
+# ── Bridge to the deferred MCP tool pool ────────────────────────────────────
+#
+# The manor catalog and the deferred MCP pool (loadable via search_tools)
+# are disjoint surfaces. When the model asks manor for something the
+# catalog can't do, point it at the MCP tools that can — gated by the same
+# per-user availability check search_tools applies (the admin MCP must
+# surface for platform admins and never for regular users).
+
+_MCP_BRIDGE_MAX_MATCHES = 5
+_MCP_BRIDGE_HINT = (
+    "These MCP tools match this request but are not manor actions — load "
+    "and call one via search_tools query='select:<name>'."
+)
+
+
+def _registered_tool_schemas() -> tuple[tuple[str, dict], ...]:
+    """Snapshot of the full tool registry via the runtime registry adapter.
+
+    Imported lazily (registry initialization imports packages.core.ai.tools,
+    so a module-level import here would be circular). The adapter is the
+    only production surface allowed to touch the pool singleton (see
+    test_runtime_tool_registry_is_only_production_tool_pool_import).
+    """
+    from packages.core.ai.runtime.tool_registry import (
+        runtime_registered_tool_schemas,
+    )
+
+    return runtime_registered_tool_schemas()
+
+
+async def _bridge_search_enabled(
+    *,
+    entity_id: str,
+    user_id: str,
+) -> bool:
+    """Gate the bridge lookup on the ``tool_discovery_v2`` flag.
+
+    The availability resolution below (resolve_usable_mcp_providers) makes
+    one sequential can_use_integration call per provider (~40+ providers),
+    which search_tools only pays when tool_discovery_v2 is on — mirror that
+    here so flag-off tenants don't pay it on every manor search or
+    unimplemented-action call. Same is_enabled pattern as the search_tools
+    handler: fallback=False, any failure degrades to no bridge.
+    """
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.feature_flags import is_enabled
+
+        async with async_session() as db:
+            return await is_enabled(
+                db,
+                "tool_discovery_v2",
+                entity_id=entity_id,
+                user_id=user_id,
+                fallback=False,
+            )
+    except Exception:
+        return False
+
+
+async def _usable_mcp_providers(
+    *,
+    entity_id: str,
+    user_id: str,
+    provider_keys: list[str],
+) -> frozenset[str]:
+    """Which MCP providers can the acting user use right now?
+
+    Same source of truth as search_tools' pre-filter and MCP dispatch:
+    can_use_integration via resolve_usable_mcp_providers.
+    """
+    from packages.core.database import async_session
+    from packages.core.services.agent_permission_service import (
+        resolve_usable_mcp_providers,
+    )
+
+    async with async_session() as db:
+        return await resolve_usable_mcp_providers(
+            db,
+            user_id=user_id,
+            entity_id=entity_id,
+            provider_keys=provider_keys,
+        )
+
+
+async def _bridge_mcp_tool_matches(
+    query: str,
+    *,
+    entity_id: str | None,
+    user_id: str | None,
+    max_results: int = _MCP_BRIDGE_MAX_MATCHES,
+) -> list[dict[str, str]]:
+    """Search the deferred MCP tool pool for ``query``.
+
+    Returns name + description manifests only (the model loads full schemas
+    via search_tools). The availability gate always applies: without an
+    acting user there is no gate to evaluate, so nothing is returned. The
+    whole lookup is additionally gated on tool_discovery_v2 (see
+    _bridge_search_enabled) purely for cost; the stub hiding and improved
+    not-implemented wording stay unconditional.
+
+    Phase-2 (not done here): parallelize resolve_usable_mcp_providers'
+    per-provider checks. It cannot be a naive asyncio.gather on the shared
+    session — AsyncSession is not concurrency-safe — so it needs either
+    per-task sessions or a batched query in the permission service.
+    """
+    if not query or not entity_id or not user_id:
+        return []
+    if not await _bridge_search_enabled(entity_id=entity_id, user_id=user_id):
+        return []
+    try:
+        from packages.core.ai.runtime.tool_discovery import (
+            runtime_mcp_provider_from_tool_name,
+        )
+        from packages.core.ai.runtime.tool_search import (
+            runtime_search_tool_registry_candidates,
+        )
+
+        mcp_schemas = [
+            (name, schema)
+            for name, schema in _registered_tool_schemas()
+            if runtime_mcp_provider_from_tool_name(str(name))
+        ]
+        if not mcp_schemas:
+            return []
+        provider_keys = sorted({
+            provider
+            for name, _schema in mcp_schemas
+            if (provider := runtime_mcp_provider_from_tool_name(str(name)))
+        })
+        usable = await _usable_mcp_providers(
+            entity_id=entity_id,
+            user_id=user_id,
+            provider_keys=provider_keys,
+        )
+        if not usable:
+            return []
+        matches, _suppressed = runtime_search_tool_registry_candidates(
+            tool_schemas=mcp_schemas,
+            query=query,
+            max_results=max_results,
+            usable_providers=frozenset(usable),
+        )
+        return [
+            {
+                "name": str(match.get("name") or ""),
+                "description": str(match.get("description") or ""),
+            }
+            for match in matches
+            if str(match.get("name") or "").startswith("mcp__")
+        ][:max_results]
+    except Exception:
+        logger.exception("manor→MCP bridge search failed for query=%r", query)
+        return []
+
+
+async def _unimplemented_action_response(
+    action: str,
+    *,
+    entity_id: str | None,
+    user_id: str | None,
+) -> str:
+    """Error payload for catalog stubs, with bridge suggestions when found."""
+    mcp_matches = await _bridge_mcp_tool_matches(
+        action.replace("_", " "),
+        entity_id=entity_id,
+        user_id=user_id,
+    )
+    payload: dict[str, Any] = {"error": f"Action '{action}' is not implemented."}
+    if mcp_matches:
+        payload["mcp_tool_matches"] = mcp_matches
+        payload["hint"] = (
+            "These MCP tools may do what you need — load one via "
+            "search_tools query='select:<name>'."
+        )
+    else:
+        payload["hint"] = "Use action='search' to find an implemented alternative."
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ── Tool schema ──────────────────────────────────────────────────────────────
@@ -945,18 +1203,10 @@ MANOR_SCHEMA = {
     "function": {
         "name": "manor",
         "description": (
-            "Execute Manor platform actions. Use action='search' with a short "
-            "query first when unsure, then call the returned action with params. "
-            "Common direct actions: list_tasks, create_task, assign_task, "
-            "list_staff, list_documents, search_documents, list_document_folders, "
-            "create_document_folder, move_documents_to_folder, list_ready_integrations, list_agents, "
-            "list_workspaces, get_workspace_daily_summary, get_goal_status, update_goal_value, "
-            "get_dashboard_summary, create_scheduled_job. "
-            "For image/video/audio/document generation, use generate_file rather than Manor. "
-            "Use list_documents/search_documents for user-visible Knowledge; "
-            "raw filesystem tools are internal and should not be presented as "
-            "the user's file list. For delayed or recurring work, always use "
-            "create_scheduled_job rather than claiming completion."
+            "Execute Manor platform actions; use action='search' when unsure. "
+            "list_documents/search_documents identify visible files by metadata "
+            "only; use rag for document-body evidence. Use generate_file for "
+            "artifacts and create_scheduled_job for delayed or recurring work."
         ),
         "parameters": {
             "type": "object",
@@ -998,16 +1248,32 @@ async def _manor_handler(entity_id: str = "", **kwargs: Any) -> str:
     if not action:
         return json.dumps({"error": "action is required"})
 
-    # Search mode — no DB session needed
+    acting_user_id = kwargs.get("user_id") or runtime_context.user_id
+
+    # Search mode
     if action == "search":
         query = (kwargs.get("query") or "").strip()
         if not query:
-            summary = {dept: [a[0] for a in actions] for dept, actions in _ACTIONS.items()}
-            return json.dumps({"departments": summary, "total_actions": len(_ALL_ACTIONS)})
+            summary = {
+                dept: [name for name, _desc in actions if name in _IMPLEMENTED_ACTIONS]
+                for dept, actions in _ACTIONS.items()
+            }
+            summary = {dept: names for dept, names in summary.items() if names}
+            total = sum(len(names) for names in summary.values())
+            return json.dumps({"departments": summary, "total_actions": total})
         results = _search_actions(query)
+        payload: dict[str, Any] = {"matches": results, "query": query}
         if not results:
-            return json.dumps({"matches": [], "query": query, "hint": "Try broader keywords."})
-        return json.dumps({"matches": results, "query": query}, ensure_ascii=False)
+            payload["hint"] = "Try broader keywords."
+        mcp_matches = await _bridge_mcp_tool_matches(
+            query,
+            entity_id=entity_id,
+            user_id=acting_user_id,
+        )
+        if mcp_matches:
+            payload["mcp_tool_matches"] = mcp_matches
+            payload["mcp_hint"] = _MCP_BRIDGE_HINT
+        return json.dumps(payload, ensure_ascii=False)
 
     # Validate action exists before opening DB
     if action not in _ALL_ACTIONS:
@@ -1016,6 +1282,15 @@ async def _manor_handler(entity_id: str = "", **kwargs: Any) -> str:
             "error": f"Unknown action: '{action}'",
             "suggestions": [s["action"] for s in suggestions],
         })
+
+    # Catalog stubs with no dispatch branch: answer with the bridge instead
+    # of opening a DB session just to hit the not-implemented fallback.
+    if action not in _IMPLEMENTED_ACTIONS:
+        return await _unimplemented_action_response(
+            action,
+            entity_id=entity_id,
+            user_id=acting_user_id,
+        )
 
     params = _merge_action_params(kwargs)
     if legacy_create_workspace and not params.get("initial_brief"):

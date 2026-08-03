@@ -108,7 +108,7 @@
         "description": "Owns the audience promise, content pillars, weekly batch plan, and next experiment.",
         "system_prompt": "You are the strategy agent for a video-account workspace. Maintain the audience promise, content pillars, weekly batch plan, and one learning experiment. Hand off approved angles to the scriptwriter. Never publish, delete, reply to viewers, or edit public assets without explicit operator approval.",
         "config": {
-          "model": "default",
+          "model_mode": "inherit",
           "temperature": 0.3,
           "default_review_mode": "operator_review_before_external_action"
         },
@@ -139,7 +139,7 @@
         "description": "Turns approved angles into hooks, outlines, scripts, title options, descriptions, and tags.",
         "system_prompt": "You are the scriptwriting agent for a video-account workspace. Turn approved angles into review-ready script packets with hook, promise, proof, full script, production notes, title options, descriptions, tags, and review checklist. Do not claim that public publishing happened.",
         "config": {
-          "model": "default",
+          "model_mode": "inherit",
           "temperature": 0.45,
           "default_review_mode": "operator_review_before_external_action"
         },
@@ -170,7 +170,7 @@
         "description": "Prepares publishing packets, production checklists, review decisions, and platform-specific packaging.",
         "system_prompt": "You are the production coordination agent for a video-account workspace. Package scripts, titles, descriptions, tags, shot notes, and approval checklists. Prepare publish-ready review packets only. Never publish, schedule, delete, or edit public assets without explicit operator approval.",
         "config": {
-          "model": "default",
+          "model_mode": "inherit",
           "temperature": 0.25,
           "default_review_mode": "operator_review_before_external_action"
         },
@@ -201,7 +201,7 @@
         "description": "Triages comments, DMs, viewer questions, and support themes into reply drafts and content feedback.",
         "system_prompt": "You are the community support agent for a video-account workspace. Triage comments, DMs, viewer questions, objections, and support themes. Draft replies and content feedback for operator review. Never send messages, moderate users, delete comments, or promise support outcomes without explicit operator approval.",
         "config": {
-          "model": "default",
+          "model_mode": "inherit",
           "temperature": 0.35,
           "default_review_mode": "operator_review_before_external_action"
         },
@@ -232,7 +232,7 @@
         "description": "Reads performance signals, separates real data from assumptions, and recommends the next experiment.",
         "system_prompt": "You are the analytics review agent for a video-account workspace. Separate connected platform data from manual inputs and simulation assumptions. Summarize retention, watch time, saves, comments, subscriber movement, and production constraints. Recommend exactly one next experiment.",
         "config": {
-          "model": "default",
+          "model_mode": "inherit",
           "temperature": 0.2,
           "default_review_mode": "operator_review_before_external_action"
         },

@@ -78,6 +78,24 @@ async def _read_snapshot_from_redis() -> dict | None:
     return None
 
 
+async def _persist_system_sample(snap: dict) -> None:
+    """Best-effort ``system_metrics_samples`` history insert — a DB
+    hiccup must never break the Redis snapshot path (same guard posture
+    as everything else in this module)."""
+    try:
+        from packages.core.database import create_worker_session
+        from packages.core.services.system_metrics import record_system_sample
+
+        async with create_worker_session()() as db:
+            await record_system_sample(db, snap)
+            await db.commit()
+    except Exception as exc:
+        # warning, not debug: prod logs run INFO+ — if this writer breaks
+        # for days the Performance chart silently flatlines otherwise.
+        # Fires at most once per 30s tick, no rate limiting needed.
+        logger.warning("ops system sample DB write failed: %s", exc)
+
+
 @celery_app.task(name="ops.collect_snapshot")
 def collect_snapshot_task() -> dict:
     """Collect a snapshot and store it in Redis. Returns a small summary
@@ -100,6 +118,20 @@ def collect_snapshot_task() -> dict:
             loop.run_until_complete(_write_snapshot_to_redis(snap))
         finally:
             loop.close()
+
+    # History: one flat row per tick so the admin Performance page can
+    # chart CPU/mem/disk trends. Strictly after (and independent of) the
+    # Redis write; _persist_system_sample swallows its own errors.
+    try:
+        asyncio.run(_persist_system_sample(snap))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_persist_system_sample(snap))
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.warning("ops system sample persist skipped: %s", exc)
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     return {

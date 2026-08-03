@@ -23,7 +23,15 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from packages.core.constants.blueprints import BlueprintStatus
+
 logger = logging.getLogger(__name__)
+
+_INTERNAL_SKILL_MCP_PROVIDERS = {
+    "chrome_knowledge_local",
+    "knowledge_local",
+    "local_browser",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +80,7 @@ PROPOSE_SERVICE_SCHEMA = {
         "name": "ws_propose_service",
         "description": (
             "Add or replace one service the workspace will perform. Call "
-            "this 2-5 times to cover the workspace's primary_work. Re-calling "
+            "this 1-5 times to cover the workspace's primary_work. Re-calling "
             "with the same service_key replaces the prior entry."
         ),
         "parameters": {
@@ -104,9 +112,8 @@ PROPOSE_GOAL_SCHEMA = {
             "Add or replace one measurable goal. Re-calling with the same "
             "goal_key replaces the prior entry. ALL four of goal_key, "
             "description, target, and cadence are required — never omit "
-            "target or cadence even if the user did not mention numbers; "
-            "infer a reasonable default from the description and flag "
-            "rationale=\"inferred\"."
+            "target or cadence. Call only after the user supplied or confirmed "
+            "the measurable target; never infer or invent a KPI."
         ),
         "parameters": {
             "type": "object",
@@ -203,15 +210,25 @@ REQUEST_CUSTOM_AGENT_SCHEMA = {
                 "skill_bindings": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Skill ids OR slugs from ws_search_capabilities.skills the agent may invoke.",
+                    "description": (
+                        "Skill ids OR slugs from ws_search_capabilities.skills "
+                        "the agent may invoke. Bind the 'chrome' skill for "
+                        "browser-extension operation, even while its integration "
+                        "readiness says setup_required."
+                    ),
                 },
                 "mcp_bindings": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
                         "MCP server keys (e.g. 'twitter','gmail','manor_pms') "
-                        "to bind. Only include servers backed by an active "
-                        "integration -- check ws_search_capabilities.integrations."
+                        "to bind as the agent's capability intent. Include a "
+                        "supported server whenever the agent needs it even if "
+                        "active_integration is false. Connection readiness is "
+                        "tracked separately and setup requirements are added "
+                        "to the workspace automatically. Exception: Chrome "
+                        "browser-extension operation must use skill_bindings "
+                        "with the 'chrome' skill, not a direct MCP binding."
                     ),
                 },
                 "missing_skill_specs": {
@@ -381,7 +398,7 @@ SEARCH_CAPABILITIES_SCHEMA = {
     "function": {
         "name": "ws_search_capabilities",
         "description": (
-            "Single-shot inventory of everything the architect can bind "
+            "Complete inventory of everything the architect can bind "
             "to this workspace: runtime business capabilities, tools "
             "(from the platform tool pool), skills (entity + public "
             "templates), integrations + their MCP servers, the entity's "
@@ -391,15 +408,15 @@ SEARCH_CAPABILITIES_SCHEMA = {
             "use direct tool names only for narrow custom agent bindings. "
             "Always call this BEFORE proposing custom agents, staff "
             "assignments, or knowledge attachments so you reference real "
-            "ids. ``query`` narrows results across all categories."
+            "ids. This tool does not perform keyword filtering or matching; "
+            "the architect LLM must compare the user's service intent with "
+            "every returned candidate semantically."
         ),
         "parameters": {
             "type": "object",
             "required": ["draft_id"],
             "properties": {
                 "draft_id": {"type": "string"},
-                "query": {"type": "string"},
-                "limit_per_kind": {"type": "integer", "minimum": 5, "maximum": 100},
             },
         },
     },
@@ -588,18 +605,18 @@ SEARCH_ENTITY_AGENTS_SCHEMA = {
     "function": {
         "name": "ws_search_entity_agents",
         "description": (
-            "List the entity's available agents (and platform marketplace "
-            "templates) so you can pick a real agent_id for "
+            "List every materializable entity or global platform agent, including "
+            "each candidate's actual tool, skill, and MCP "
+            "bindings, so you can pick a real agent_id for "
             "ws_propose_agent_mapping. Always call this BEFORE proposing "
-            "any agent mapping. Returns id + name + description for each."
+            "any agent mapping. No keyword filtering is performed; the "
+            "architect LLM compares every candidate semantically."
         ),
         "parameters": {
             "type": "object",
             "required": ["draft_id"],
             "properties": {
                 "draft_id": {"type": "string"},
-                "query": {"type": "string", "description": "Optional substring filter on name/description."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             },
         },
     },
@@ -611,17 +628,39 @@ SEARCH_BLUEPRINTS_SCHEMA = {
     "function": {
         "name": "ws_search_blueprints",
         "description": (
-            "Search the workspace blueprint marketplace. Use early in the "
+            "List the workspace blueprint marketplace for semantic selection. Use early in the "
             "conversation: if a published blueprint clearly matches the "
-            "user's intent, suggest it instead of building from scratch."
+            "user's intent, suggest it instead of building from scratch. "
+            "The architect LLM evaluates the returned candidates; this tool "
+            "does not score keywords."
         ),
         "parameters": {
             "type": "object",
-            "required": ["draft_id", "query"],
+            "required": ["draft_id"],
             "properties": {
                 "draft_id": {"type": "string"},
-                "query": {"type": "string", "minLength": 2},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+        },
+    },
+}
+
+
+SUGGEST_BLUEPRINT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_suggest_blueprint",
+        "description": (
+            "Record the single published blueprint you selected after semantic "
+            "comparison of the complete ws_search_blueprints inventory. Use only "
+            "for a strong capability/workflow fit; never choose by keyword overlap."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["draft_id", "blueprint_id", "rationale"],
+            "properties": {
+                "draft_id": {"type": "string"},
+                "blueprint_id": {"type": "string"},
+                "rationale": {"type": "string", "minLength": 10},
             },
         },
     },
@@ -700,6 +739,7 @@ ALL_TOOL_SCHEMAS = [
     REMOVE_FIELD_SCHEMA,
     SEARCH_ENTITY_AGENTS_SCHEMA,
     SEARCH_BLUEPRINTS_SCHEMA,
+    SUGGEST_BLUEPRINT_SCHEMA,
     GET_DRAFT_SCHEMA,
     LINT_DRAFT_SCHEMA,
     MARK_READY_SCHEMA,
@@ -1177,6 +1217,15 @@ async def _merge_agent_missing_integration_flags(
             existing.setdefault("agent_name", create_draft.get("agent_name", ""))
             if resolved.covered_provider:
                 existing.setdefault("covered_provider", resolved.covered_provider)
+            for key in (
+                "setup_kind",
+                "setup_reason",
+                "connection_scope",
+                "binding_kind",
+                "binding_ref",
+            ):
+                if mi.get(key):
+                    existing.setdefault(key, mi[key])
             continue
         flag = {
             "provider": provider,
@@ -1188,8 +1237,134 @@ async def _merge_agent_missing_integration_flags(
         }
         if resolved.covered_provider:
             flag["covered_provider"] = resolved.covered_provider
+        for key in (
+            "setup_kind",
+            "setup_reason",
+            "connection_scope",
+            "binding_kind",
+            "binding_ref",
+        ):
+            if mi.get(key):
+                flag[key] = mi[key]
         flagged.append(flag)
     fields["flagged_integrations"] = flagged
+
+
+def _mcp_provider_keys_from_tool_names(tool_names: List[Any]) -> set[str]:
+    providers: set[str] = set()
+    for raw_name in tool_names or []:
+        parts = str(raw_name or "").split("__", 2)
+        if len(parts) == 3 and parts[0] == "mcp" and parts[1]:
+            provider = parts[1]
+            if provider in _INTERNAL_SKILL_MCP_PROVIDERS:
+                continue
+            providers.add(provider)
+    return providers
+
+
+async def _augment_missing_integrations_from_agent_bindings(
+    db,
+    *,
+    entity_id: str,
+    user_id: str,
+    service_key: str,
+    agent_name: str,
+    skill_bindings: List[str],
+    mcp_bindings: List[str],
+    missing_integrations: List[Any],
+) -> List[Dict[str, Any]]:
+    """Derive setup blockers from direct MCPs and skill-declared MCP dependencies."""
+    from sqlalchemy import or_, select
+
+    from packages.core.models.mcp import MCPServer
+    from packages.core.models.skill import Skill
+    from packages.core.services.integration_resolution import integration_provider_readiness
+    from packages.core.services.provider_keys import canonical_provider_key
+
+    refs = list(dict.fromkeys(
+        str(ref).strip() for ref in (mcp_bindings or []) if str(ref or "").strip()
+    ))
+    out = [dict(item) for item in (missing_integrations or []) if isinstance(item, dict)]
+    skill_refs = list(dict.fromkeys(
+        str(ref).strip() for ref in (skill_bindings or []) if str(ref or "").strip()
+    ))
+    if not refs and not skill_refs:
+        return out
+
+    skill_rows = []
+    if skill_refs:
+        skill_rows = list((await db.execute(
+            select(Skill).where(
+                Skill.status == "active",
+                or_(Skill.id.in_(skill_refs), Skill.slug.in_(skill_refs)),
+                or_(Skill.entity_id == entity_id, Skill.is_public.is_(True)),
+            )
+        )).scalars().all())
+    providers_from_skills: dict[str, str] = {}
+    for skill in skill_rows:
+        for provider in _mcp_provider_keys_from_tool_names(list(skill.tools or [])):
+            providers_from_skills.setdefault(
+                canonical_provider_key(provider),
+                skill.slug or skill.id,
+            )
+
+    servers = list((await db.execute(
+        select(MCPServer).where(
+            MCPServer.status == "active",
+            (MCPServer.id.in_(refs))
+            | (MCPServer.server_key.in_(refs))
+            | (MCPServer.server_key.in_(list(providers_from_skills))),
+        )
+    )).scalars().all())
+    readiness = await integration_provider_readiness(
+        db,
+        entity_id=entity_id,
+        user_id=user_id or None,
+        provider_keys=[server.server_key for server in servers],
+    )
+    existing_by_provider = {
+        canonical_provider_key(item.get("provider")): item
+        for item in out
+        if canonical_provider_key(item.get("provider"))
+    }
+    for server in servers:
+        provider = canonical_provider_key(server.server_key)
+        status = readiness.get(provider)
+        if status is None or status.ready:
+            continue
+        purpose = status.reason or (
+            f"Connect {server.name or server.server_key} before this agent can use it."
+        )
+        existing = existing_by_provider.get(provider)
+        if existing is None:
+            existing = {
+                "provider": provider,
+                "purpose": purpose,
+                "required": True,
+                "source": "mcp_binding_readiness",
+            }
+            out.append(existing)
+            existing_by_provider[provider] = existing
+        else:
+            existing.setdefault("purpose", purpose)
+            existing["required"] = True
+        skill_ref = providers_from_skills.get(provider)
+        if skill_ref:
+            existing["source"] = "skill_binding_readiness"
+            existing["binding_kind"] = "skill"
+            existing["binding_ref"] = skill_ref
+        else:
+            existing.setdefault("binding_kind", "mcp")
+            existing.setdefault("binding_ref", server.server_key)
+        existing["setup_reason"] = status.reason
+        existing["connection_scope"] = status.scope
+        if status.setup_kind:
+            existing["setup_kind"] = status.setup_kind
+        if service_key:
+            existing.setdefault("linked_service_keys", [service_key])
+        if agent_name:
+            existing.setdefault("agent_name", agent_name)
+    return out
 
 
 def _reconcile_agent_design_flags(fields: Dict[str, Any]) -> None:
@@ -1364,7 +1539,7 @@ async def _propose_goal(db, *, entity_id: str, user_id: str = "", **kwargs):
     target = kwargs.get("target", "")
     cadence = kwargs.get("cadence", "")
     if not target:
-        return _err("target is required (e.g. '10000', '5%') -- infer from description if user didn't specify")
+        return _err("target is required (e.g. '10000', '5%') -- ask the user instead of inferring a target")
     if cadence not in CADENCE_VALUES:
         return _err(f"cadence must be one of {CADENCE_VALUES}", got=cadence)
 
@@ -1475,6 +1650,16 @@ async def _request_custom_agent(db, *, entity_id: str, user_id: str = "", **kwar
         "missing_skill_specs": list(kwargs.get("missing_skill_specs") or []),
         "missing_integrations": list(kwargs.get("missing_integrations") or []),
     }
+    create_draft["missing_integrations"] = await _augment_missing_integrations_from_agent_bindings(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        service_key=service_key,
+        agent_name=create_draft["agent_name"],
+        skill_bindings=create_draft["skill_bindings"],
+        mcp_bindings=create_draft["mcp_bindings"],
+        missing_integrations=create_draft["missing_integrations"],
+    )
     mapping = {
         "service_key": service_key,
         "strategy": "create_custom",
@@ -1668,19 +1853,23 @@ async def _flag_missing_integration(db, *, entity_id: str, user_id: str = "", **
 async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwargs):
     """One-shot capability discovery for the architect.
 
-    Returns three parallel lists -- tools (from tool_pool), skills
-    (entity + public), and integrations (with their backing MCP servers
-    so the architect can bind ``mcp_bindings`` correctly).
+    Returns complete parallel inventories. The architect LLM performs the
+    semantic selection; this function only exposes structured facts.
     """
     from sqlalchemy import case, select, or_
     from packages.core.models.skill import Skill
-    from packages.core.models.document import Integration
     from packages.core.models.mcp import MCPServer
-    from packages.core.ai.runtime import legacy_tool_is_eager_for_profile
+    from packages.core.ai.runtime import runtime_tool_is_eager_for_profile
     from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
     from packages.core.ai.runtime.tool_registry import (
         runtime_registered_tool_schemas,
     )
+    from packages.core.services.integration_resolution import (
+        integration_provider_readiness,
+        supported_integration_provider_keys,
+    )
+    from packages.core.services.provider_keys import canonical_provider_key
+    from packages.core.services.builtin_skill_loader import seed_builtin_skills
 
     draft_id = kwargs.get("draft_id", "")
     if draft_id:
@@ -1688,16 +1877,10 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
         if draft is None:
             return _err("draft not found")
 
-    q = (kwargs.get("query") or "").strip().lower()
-    limit = int(kwargs.get("limit_per_kind", 30))
-
     # ── Business capabilities ── preferred runtime-level bindings.
     business_capabilities_out = []
     for capability in CORE_CAPABILITIES.values():
         if capability.id in {"workspace.architect", "file.patch"}:
-            continue
-        text = " ".join([capability.id, capability.name, capability.description]).lower()
-        if q and q not in text:
             continue
         business_capabilities_out.append({
             "id": capability.id,
@@ -1707,8 +1890,6 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
             "risk_level": capability.risk_level,
             "required_approval": capability.required_approval,
         })
-        if len(business_capabilities_out) >= limit:
-            break
 
     # ── Tools ── only safely-bindable ones the platform pre-approves.
     tools_out = []
@@ -1723,22 +1904,32 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
             continue  # workspace_architect's own tools are private to this skill.
         fn = (schema.get("function") or {})
         desc = (fn.get("description") or "")[:240]
-        if q and q not in name.lower() and q not in desc.lower():
-            continue
         tools_out.append({
             "name": name,
             "description": desc,
-            "always_loaded": legacy_tool_is_eager_for_profile(name, is_master=True),
+            "parameters": fn.get("parameters") or {},
+            "always_loaded": runtime_tool_is_eager_for_profile(name, is_master=True),
         })
-        if len(tools_out) >= limit:
-            break
+
+    mcp_tools_by_provider: Dict[str, List[Dict[str, Any]]] = {}
+    for name, schema in registered_tool_schemas:
+        parts = str(name or "").split("__", 2)
+        if len(parts) != 3 or parts[0] != "mcp" or not parts[1]:
+            continue
+        fn = schema.get("function") or {}
+        mcp_tools_by_provider.setdefault(canonical_provider_key(parts[1]), []).append({
+            "name": name,
+            "description": str(fn.get("description") or "")[:240],
+            "parameters": fn.get("parameters") or {},
+        })
 
     # ── Skills ── public templates + this entity's private skills.
+    await seed_builtin_skills(db)
     skill_priority = case((Skill.entity_id == entity_id, 0), else_=1)
     skill_stmt = select(Skill).where(
         Skill.status == "active",
         or_(Skill.entity_id == entity_id, Skill.is_public.is_(True)),
-    ).order_by(skill_priority.asc(), Skill.created_at.desc()).limit(max(limit, 80))
+    ).order_by(skill_priority.asc(), Skill.created_at.desc())
     skill_rows = (await db.execute(skill_stmt)).scalars().all()
     skills_out = []
     for s in skill_rows:
@@ -1747,45 +1938,79 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
             "slug": s.slug,
             "name": s.name,
             "description": (s.description or "")[:200],
+            "instructions_excerpt": (s.system_prompt or "")[:600],
             "tools": list(s.tools or []),
             "scope": "entity" if s.entity_id else "public",
+            "required_integration_keys": sorted(
+                _mcp_provider_keys_from_tool_names(list(s.tools or []))
+            ),
         })
-        if len(skills_out) >= max(limit, 80):
-            break
+
+    skills_by_provider: Dict[str, List[Dict[str, Any]]] = {}
+    for skill in skills_out:
+        for provider in skill["required_integration_keys"]:
+            skills_by_provider.setdefault(canonical_provider_key(provider), []).append({
+                "id": skill["id"],
+                "slug": skill["slug"],
+                "name": skill["name"],
+                "description": skill["description"],
+            })
 
     # ── Integrations + MCP servers ──
-    integ_stmt = select(Integration).where(
-        Integration.entity_id == entity_id,
-        Integration.status == "active",
-    )
-    integ_rows = (await db.execute(integ_stmt)).scalars().all()
-    integ_by_provider: dict[str, list] = {}
-    for i in integ_rows:
-        integ_by_provider.setdefault(i.provider, []).append(i)
-
     mcp_stmt = select(MCPServer).where(MCPServer.status == "active")
     mcp_rows = (await db.execute(mcp_stmt)).scalars().all()
+    supported_provider_keys = await supported_integration_provider_keys(db)
+    mcp_rows = [
+        m for m in mcp_rows
+        if canonical_provider_key(m.server_key) in supported_provider_keys
+    ]
+    readiness = await integration_provider_readiness(
+        db,
+        entity_id=entity_id,
+        user_id=user_id or None,
+        provider_keys=[m.server_key for m in mcp_rows],
+    )
 
     integrations_out = []
     for m in mcp_rows:
-        backing = integ_by_provider.get(m.server_key) or []
-        text = " ".join([m.name or "", m.server_key or "", m.description or ""]).lower()
-        if q and q not in text:
-            continue
+        provider = canonical_provider_key(m.server_key)
+        status = readiness.get(provider)
+        is_ready = bool(status and status.ready)
         integrations_out.append({
             "mcp_server_key": m.server_key,
             "name": m.name,
             "description": (m.description or "")[:200],
             "auth_type": m.auth_type,
-            "active_integration": bool(backing),
-            "integration_ids": [i.id for i in backing],
+            "active_integration": is_ready,
+            "connection_state": "ready" if is_ready else "setup_required",
+            "connection_scope": status.scope if status else "none",
+            "setup_required_reason": status.reason if status and not is_ready else "",
+            "setup_kind": status.setup_kind if status else None,
+            "tools": mcp_tools_by_provider.get(provider, []),
+            "related_skills": skills_by_provider.get(provider, []),
         })
+
+    for skill in skills_out:
+        dependencies = []
+        for provider in skill.pop("required_integration_keys", []):
+            status = readiness.get(canonical_provider_key(provider))
+            dependencies.append({
+                "provider": canonical_provider_key(provider),
+                "connection_state": (
+                    "ready" if status and status.ready else "setup_required"
+                ),
+                "setup_required_reason": (
+                    status.reason if status and not status.ready else ""
+                ),
+                "setup_kind": status.setup_kind if status else None,
+            })
+        skill["required_integrations"] = dependencies
 
     # ── Nango aggregator ── if the entity has a Nango Integration, list
     # the providers it has configured + the connections it already
     # holds. Lets the architect propose mcp_bindings for platforms that
     # don't have a dedicated MCP server (long-tail SaaS).
-    nango_block = await _list_nango_aggregator(db, entity_id, q)
+    nango_block = await _list_nango_aggregator(db, entity_id)
     if nango_block:
         integrations_out.append(nango_block)
 
@@ -1796,15 +2021,12 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
     staff_stmt = select(Staff).where(
         Staff.entity_id == entity_id,
         Staff.deleted_at.is_(None),
-    ).limit(limit)
+    )
     staff_rows = (await db.execute(staff_stmt)).scalars().all()
     staff_out = []
     for s in staff_rows:
         display_name = getattr(s, "display_name", None) or s.name
         role_label = getattr(s, "role", None) or getattr(s, "title", None)
-        text = " ".join([s.name or "", display_name or "", s.email or "", role_label or ""]).lower()
-        if q and q not in text:
-            continue
         staff_out.append({
             "id": s.id,
             "name": display_name,
@@ -1816,13 +2038,10 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
     # propose as templates to clone, plus any not-yet-assigned groups.
     kn_stmt = select(DocumentGroup).where(
         DocumentGroup.entity_id == entity_id,
-    ).limit(limit)
+    )
     kn_rows = (await db.execute(kn_stmt)).scalars().all()
     knowledge_out = []
     for k in kn_rows:
-        text = " ".join([k.name or ""]).lower()
-        if q and q not in text:
-            continue
         knowledge_out.append({
             "id": k.id,
             "name": k.name,
@@ -2108,8 +2327,13 @@ async def _remove(db, *, entity_id: str, user_id: str = "", **kwargs):
 # ── ws_search_entity_agents ────────────────────────────────────────────────
 
 async def _search_entity_agents(db, *, entity_id: str, user_id: str = "", **kwargs):
-    from sqlalchemy import select, or_
-    from packages.core.models.workspace import Agent
+    from collections import defaultdict
+
+    from sqlalchemy import or_, select
+
+    from packages.core.models.mcp import AgentMCPBinding, MCPServer
+    from packages.core.models.skill import AgentSkillBinding, Skill
+    from packages.core.models.workspace import Agent, AgentToolBinding, ToolDefinition
 
     draft_id = kwargs.get("draft_id", "")
     if draft_id:
@@ -2117,28 +2341,80 @@ async def _search_entity_agents(db, *, entity_id: str, user_id: str = "", **kwar
         if draft is None:
             return _err("draft not found")
 
-    limit = int(kwargs.get("limit", 30))
-    q = (kwargs.get("query") or "").strip().lower()
-
     stmt = select(Agent).where(
         Agent.deleted_at.is_(None),
         Agent.status == "active",
         or_(
             Agent.entity_id == entity_id,
-            Agent.is_template.is_(True),
+            Agent.entity_id.is_(None),
         ),
-    ).limit(limit)
+    )
     rows = (await db.execute(stmt)).scalars().all()
+    agent_ids = [agent.id for agent in rows]
+    tools_by_agent: dict[str, list[str]] = defaultdict(list)
+    skills_by_agent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    mcp_by_agent: dict[str, list[str]] = defaultdict(list)
+    if agent_ids:
+        tool_rows = (await db.execute(
+            select(AgentToolBinding.agent_id, ToolDefinition.name)
+            .join(ToolDefinition, ToolDefinition.id == AgentToolBinding.tool_id)
+            .where(
+                AgentToolBinding.agent_id.in_(agent_ids),
+                ToolDefinition.status == "active",
+            )
+        )).all()
+        for agent_id, tool_name in tool_rows:
+            tools_by_agent[str(agent_id)].append(str(tool_name))
+
+        skill_rows = (await db.execute(
+            select(AgentSkillBinding.agent_id, Skill.id, Skill.slug, Skill.name)
+            .join(Skill, Skill.id == AgentSkillBinding.skill_id)
+            .where(
+                AgentSkillBinding.agent_id.in_(agent_ids),
+                AgentSkillBinding.status == "active",
+                Skill.status == "active",
+            )
+        )).all()
+        for agent_id, skill_id, skill_slug, skill_name in skill_rows:
+            skills_by_agent[str(agent_id)].append({
+                "id": skill_id,
+                "slug": skill_slug,
+                "name": skill_name,
+            })
+
+        mcp_rows = (await db.execute(
+            select(AgentMCPBinding.agent_id, MCPServer.server_key)
+            .join(MCPServer, MCPServer.id == AgentMCPBinding.mcp_server_id)
+            .where(
+                AgentMCPBinding.agent_id.in_(agent_ids),
+                AgentMCPBinding.status == "active",
+                MCPServer.status == "active",
+            )
+        )).all()
+        for agent_id, server_key in mcp_rows:
+            mcp_by_agent[str(agent_id)].append(str(server_key))
+
     out = []
     for a in rows:
-        if q and q not in (a.name or "").lower() and q not in (a.description or "").lower():
-            continue
         out.append({
             "id": a.id,
             "name": a.name,
             "description": (a.description or "")[:200],
+            "instructions_excerpt": (a.system_prompt or "")[:600],
             "category": a.category,
-            "source": "template" if a.is_template else "entity",
+            "source": (
+                "entity"
+                if a.entity_id == entity_id
+                else "template"
+                if a.is_template
+                else "global"
+            ),
+            "tool_bindings": sorted(tools_by_agent[a.id]),
+            "skill_bindings": sorted(
+                skills_by_agent[a.id],
+                key=lambda skill: (str(skill.get("slug") or ""), str(skill.get("id") or "")),
+            ),
+            "mcp_bindings": sorted(mcp_by_agent[a.id]),
         })
     return _ok({"agents": out, "total": len(out)})
 
@@ -2155,27 +2431,12 @@ async def _search_blueprints(db, *, entity_id: str, user_id: str = "", **kwargs)
         if draft is None:
             return _err("draft not found")
 
-    query = (kwargs.get("query") or "").strip().lower()
-    limit = int(kwargs.get("limit", 8))
     stmt = (
         select(WorkspaceBlueprint)
-        .where(WorkspaceBlueprint.status == "published")
+        .where(WorkspaceBlueprint.status == BlueprintStatus.PUBLISHED)
         .order_by(WorkspaceBlueprint.install_count.desc())
-        .limit(40)
     )
     rows = (await db.execute(stmt)).scalars().all()
-    scored = []
-    tokens = set(re.findall(r"[a-z0-9]+", query))
-    for bp in rows:
-        hay = " ".join([
-            bp.title or "", bp.summary or "",
-            " ".join(str(t) for t in (bp.tags or [])),
-        ]).lower()
-        score = sum(1 for t in tokens if t in hay)
-        if score == 0 and tokens:
-            continue
-        scored.append((score, bp))
-    scored.sort(key=lambda x: -x[0])
     out = [
         {
             "id": bp.id,
@@ -2184,9 +2445,37 @@ async def _search_blueprints(db, *, entity_id: str, user_id: str = "", **kwargs)
             "tags": list(bp.tags or []),
             "install_count": int(bp.install_count or 0),
         }
-        for _, bp in scored[:limit]
+        for bp in rows
     ]
     return _ok({"blueprints": out, "total": len(out)})
+
+
+async def _suggest_blueprint(db, *, entity_id: str, user_id: str = "", **kwargs):
+    from sqlalchemy import select
+
+    from packages.core.models.blueprint import WorkspaceBlueprint
+
+    draft_id = kwargs.get("draft_id", "")
+    draft = await _load_draft(db, draft_id, entity_id)
+    if draft is None:
+        return _err("draft not found")
+    blueprint_id = str(kwargs.get("blueprint_id") or "").strip()
+    blueprint = (await db.execute(
+        select(WorkspaceBlueprint).where(
+            WorkspaceBlueprint.id == blueprint_id,
+            WorkspaceBlueprint.status == BlueprintStatus.PUBLISHED,
+        )
+    )).scalar_one_or_none()
+    if blueprint is None:
+        return _err("blueprint is not published or does not exist", blueprint_id=blueprint_id)
+
+    draft.suggested_blueprint_id = blueprint.id
+    await db.flush()
+    return _ok({
+        "blueprint_id": blueprint.id,
+        "title": blueprint.title,
+        "rationale": str(kwargs.get("rationale") or "").strip(),
+    })
 
 
 # ── ws_get_draft ────────────────────────────────────────────────────────────
@@ -2210,6 +2499,16 @@ async def _get_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
 # ── ws_lint_draft ───────────────────────────────────────────────────────────
 
 async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
+    from sqlalchemy import or_, select
+
+    from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
+    from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
+    from packages.core.models.mcp import MCPServer
+    from packages.core.models.skill import Skill
+    from packages.core.models.workspace import Agent, ToolDefinition
+    from packages.core.services.integration_resolution import supported_integration_provider_keys
+    from packages.core.services.provider_keys import canonical_provider_key
+
     draft_id = kwargs.get("draft_id", "")
     draft = await _load_draft(db, draft_id, entity_id)
     if draft is None:
@@ -2226,8 +2525,6 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
     services = fields.get("services") or []
     if not services:
         issues.append({"severity": "P0", "where": "services", "message": "No services defined -- call ws_propose_service at least once."})
-    elif len(services) < 2:
-        issues.append({"severity": "P1", "where": "services", "message": "Only 1 service -- consider whether the workspace needs at least 2."})
 
     service_keys = {(s or {}).get("service_key") for s in services}
 
@@ -2247,6 +2544,79 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
                 issues.append({"severity": "P1", "where": f"services.{sk}.{f}", "message": f"service field '{f}' is empty."})
 
     # Each mapping must point to a real service
+    referenced_agent_ids = {
+        str((mapping or {}).get("agent_id") or (mapping or {}).get("recommended_agent_id") or "").strip()
+        for mapping in mappings
+        if str((mapping or {}).get("agent_id") or (mapping or {}).get("recommended_agent_id") or "").strip()
+    }
+    available_agent_ids = set((await db.execute(
+        select(Agent.id).where(
+            Agent.id.in_(referenced_agent_ids),
+            Agent.deleted_at.is_(None),
+            Agent.status == "active",
+            or_(Agent.entity_id == entity_id, Agent.entity_id.is_(None)),
+        )
+    )).scalars().all()) if referenced_agent_ids else set()
+
+    custom_drafts = [
+        dict((mapping or {}).get("create_agent_draft") or {})
+        for mapping in mappings
+        if (mapping or {}).get("strategy") == "create_custom"
+    ]
+    tool_refs = {
+        str(ref).strip()
+        for custom in custom_drafts
+        for ref in (custom.get("tool_bindings") or [])
+        if str(ref or "").strip()
+    }
+    tool_rows = set((await db.execute(
+        select(ToolDefinition.name).where(
+            ToolDefinition.name.in_(tool_refs),
+            ToolDefinition.status == "active",
+        )
+    )).scalars().all()) if tool_refs else set()
+    available_tool_refs = tool_rows | set(runtime_registered_tool_names())
+
+    skill_refs = {
+        str(ref).strip()
+        for custom in custom_drafts
+        for ref in (custom.get("skill_bindings") or [])
+        if str(ref or "").strip()
+    }
+    skill_rows = list((await db.execute(
+        select(Skill).where(
+            Skill.status == "active",
+            or_(Skill.entity_id == entity_id, Skill.is_public.is_(True)),
+            (Skill.id.in_(skill_refs)) | (Skill.slug.in_(skill_refs)),
+        )
+    )).scalars().all()) if skill_refs else []
+    available_skill_refs = {
+        ref
+        for skill in skill_rows
+        for ref in (skill.id, skill.slug)
+        if ref
+    }
+    mcp_refs = {
+        str(ref).strip()
+        for custom in custom_drafts
+        for ref in (custom.get("mcp_bindings") or [])
+        if str(ref or "").strip()
+    }
+    mcp_rows = list((await db.execute(
+        select(MCPServer).where(
+            MCPServer.status == "active",
+            (MCPServer.id.in_(mcp_refs)) | (MCPServer.server_key.in_(mcp_refs)),
+        )
+    )).scalars().all()) if mcp_refs else []
+    supported_provider_keys = await supported_integration_provider_keys(db)
+    available_mcp_refs = {
+        ref
+        for server in mcp_rows
+        if canonical_provider_key(server.server_key) in supported_provider_keys
+        for ref in (server.id, server.server_key)
+        if ref
+    }
+
     for m in mappings:
         sk = (m or {}).get("service_key")
         if sk and sk not in service_keys:
@@ -2255,9 +2625,102 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
                 "where": f"agent_mappings.{sk}",
                 "message": f"mapping references unknown service '{sk}'.",
             })
+        strategy = str((m or {}).get("strategy") or "match")
+        if strategy == "create_custom":
+            custom = dict((m or {}).get("create_agent_draft") or {})
+            generated_skill_refs = {
+                str(missing_skill.get("slug") or "").strip()
+                for missing_skill in (custom.get("missing_skill_specs") or [])
+                if isinstance(missing_skill, dict)
+                and str(missing_skill.get("slug") or "").strip()
+            }
+            if not str(custom.get("agent_name") or "").strip():
+                issues.append({
+                    "severity": "P0",
+                    "where": f"agent_mappings.{sk}.agent_name",
+                    "message": "custom agent is missing agent_name.",
+                })
+            if not str(custom.get("system_prompt") or custom.get("system_prompt_seed") or "").strip():
+                issues.append({
+                    "severity": "P0",
+                    "where": f"agent_mappings.{sk}.system_prompt",
+                    "message": "custom agent is missing a reusable system_prompt.",
+                })
+            binding_count = sum(len(custom.get(key) or []) for key in (
+                "tool_bindings",
+                "business_capabilities",
+                "skill_bindings",
+                "mcp_bindings",
+                "missing_skill_specs",
+            ))
+            if binding_count == 0:
+                issues.append({
+                    "severity": "P0",
+                    "where": f"agent_mappings.{sk}.bindings",
+                    "message": "custom agent has no tool, capability, skill, or MCP binding.",
+                })
+            for ref in custom.get("tool_bindings") or []:
+                if ref not in available_tool_refs:
+                    issues.append({
+                        "severity": "P0",
+                        "where": f"agent_mappings.{sk}.tool_bindings",
+                        "message": f"tool binding {ref!r} is not available.",
+                    })
+            for ref in custom.get("business_capabilities") or []:
+                if ref not in CORE_CAPABILITIES:
+                    issues.append({
+                        "severity": "P0",
+                        "where": f"agent_mappings.{sk}.business_capabilities",
+                        "message": f"business capability {ref!r} is not available.",
+                    })
+            for ref in custom.get("skill_bindings") or []:
+                if ref not in available_skill_refs and ref not in generated_skill_refs:
+                    issues.append({
+                        "severity": "P0",
+                        "where": f"agent_mappings.{sk}.skill_bindings",
+                        "message": f"skill binding {ref!r} is not available to this entity.",
+                    })
+            for ref in custom.get("mcp_bindings") or []:
+                if ref not in available_mcp_refs:
+                    issues.append({
+                        "severity": "P0",
+                        "where": f"agent_mappings.{sk}.mcp_bindings",
+                        "message": f"MCP binding {ref!r} is not in the supported integration inventory.",
+                    })
+            for index, missing_skill in enumerate(custom.get("missing_skill_specs") or []):
+                if not isinstance(missing_skill, dict) or not str(missing_skill.get("name") or "").strip() or not str(missing_skill.get("system_prompt") or "").strip():
+                    issues.append({
+                        "severity": "P0",
+                        "where": f"agent_mappings.{sk}.missing_skill_specs.{index}",
+                        "message": "missing skill specs require name and system_prompt.",
+                    })
+                    continue
+                for ref in missing_skill.get("tools") or []:
+                    if ref not in available_tool_refs:
+                        issues.append({
+                            "severity": "P0",
+                            "where": f"agent_mappings.{sk}.missing_skill_specs.{index}.tools",
+                            "message": f"generated skill tool {ref!r} is not available.",
+                        })
+        else:
+            agent_id = str((m or {}).get("agent_id") or (m or {}).get("recommended_agent_id") or "").strip()
+            if not agent_id or agent_id not in available_agent_ids:
+                issues.append({
+                    "severity": "P0",
+                    "where": f"agent_mappings.{sk}.agent_id",
+                    "message": "mapped agent is missing, inactive, deleted, or outside this entity.",
+                })
 
-    # Goals: required fields
-    for g in fields.get("goals") or []:
+    # Strategist cannot rank or evaluate work without an explicit target. The
+    # Architect must ask the user for one; it must never invent a default goal.
+    goals = fields.get("goals") or []
+    if not goals:
+        issues.append({
+            "severity": "P0",
+            "where": "goals",
+            "message": "No confirmed goal defined -- ask the user for at least one measurable target before marking ready.",
+        })
+    for g in goals:
         gk = (g or {}).get("goal_key", "<unknown>")
         if not (g or {}).get("target"):
             issues.append({"severity": "P0", "where": f"goals.{gk}", "message": "goal missing target."})
@@ -2267,7 +2730,7 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
     # Channels
     cc = fields.get("channel_config") or {}
     pec = cc.get("primary_external_channel") or {}
-    if not pec.get("channel_type") or not pec.get("purpose"):
+    if pec and (not pec.get("channel_type") or not pec.get("purpose")):
         issues.append({"severity": "P1", "where": "channel_config.primary_external_channel", "message": "primary_external_channel needs channel_type and purpose -- call ws_propose_channel role=primary_external."})
 
     # Staff (informational P1) -- if no human is involved that's fine,
@@ -2356,6 +2819,7 @@ HANDLERS = {
     "ws_remove": _remove,
     "ws_search_entity_agents": _search_entity_agents,
     "ws_search_blueprints": _search_blueprints,
+    "ws_suggest_blueprint": _suggest_blueprint,
     "ws_get_draft": _get_draft,
     "ws_lint_draft": _lint_draft,
     "ws_mark_ready": _mark_ready,
@@ -2405,7 +2869,7 @@ def _ts() -> str:
 # unlocks without dedicated MCP servers.
 # ---------------------------------------------------------------------------
 
-async def _list_nango_aggregator(db, entity_id: str, query: str) -> Optional[Dict[str, Any]]:
+async def _list_nango_aggregator(db, entity_id: str) -> Optional[Dict[str, Any]]:
     """Return a single aggregator row describing the Nango platform +
     its providers/connections, or None if Nango is not configured.
     Failure to reach Nango is non-fatal — we just omit the block."""
@@ -2452,11 +2916,6 @@ async def _list_nango_aggregator(db, entity_id: str, query: str) -> Optional[Dic
             "active_integration": True,
             "error": f"Nango listing failed: {exc}",
         }
-
-    if query:
-        q = query.lower()
-        providers = [p for p in providers if q in (p.get("provider") or "").lower()]
-        connections = [c for c in connections if q in (c.get("provider_config_key") or "").lower()]
 
     return {
         "mcp_server_key": "nango",

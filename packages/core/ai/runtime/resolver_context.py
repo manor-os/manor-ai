@@ -14,9 +14,9 @@ from packages.core.ai.runtime.file_context import (
     file_context_mounts_for_request,
     file_context_mounts_to_trace,
 )
-from packages.core.ai.runtime.legacy_tool_surface import (
-    is_workspace_agent_legacy_profile,
-    legacy_tool_surface_spec,
+from packages.core.ai.runtime.tool_visibility import (
+    is_workspace_agent_tool_profile,
+    runtime_tool_surface_spec,
 )
 from packages.core.ai.runtime.memory import (
     MEMORY_MOUNTS_METADATA_KEY,
@@ -48,7 +48,7 @@ def skill_label(ref: dict[str, Any]) -> str | None:
 @dataclass
 class RuntimeResolverContext:
     request: AIRuntimeRequest
-    legacy_runtime_profile: str | None = None
+    tool_profile: str | None = None
     tool_schemas: tuple[dict[str, Any], ...] = ()
     incoming_allowed_tool_names: tuple[str, ...] = ()
     incoming_blocked_tool_names: tuple[str, ...] = ()
@@ -73,7 +73,7 @@ class RuntimeResolverContext:
         cls,
         request: AIRuntimeRequest,
         *,
-        legacy_runtime_profile: str | None = None,
+        tool_profile: str | None = None,
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
@@ -81,7 +81,7 @@ class RuntimeResolverContext:
     ) -> "RuntimeResolverContext":
         return cls(
             request=request,
-            legacy_runtime_profile=legacy_runtime_profile,
+            tool_profile=tool_profile,
             tool_schemas=tuple(tool_schemas or ()),
             incoming_allowed_tool_names=tuple(str(name) for name in (allowed_tool_names or ()) if name),
             incoming_blocked_tool_names=tuple(str(name) for name in (blocked_tool_names or ()) if name),
@@ -101,7 +101,7 @@ class RuntimeResolverContext:
             surface=self.request.surface,
             principal=self.principal,
             profile=profile,
-            legacy_runtime_profile=self.legacy_runtime_profile,
+            tool_profile=self.tool_profile,
             entity_id=self.request.entity_id,
             user_id=self.request.user_id,
             agent_id=self.request.agent_id,
@@ -208,22 +208,20 @@ class CapabilityResolverStage:
             for binding in tool_bindings_for_profile_tools(profile, tool_names)
         )
         context.unclassified_tool_names = unclassified_tool_names_for_profile(profile, tool_names)
-        if is_workspace_agent_legacy_profile(context.legacy_runtime_profile):
-            legacy_surface = legacy_tool_surface_spec(
+        if is_workspace_agent_tool_profile(context.tool_profile):
+            tool_surface = runtime_tool_surface_spec(
                 is_master=True,
-                legacy_tool_profile=context.legacy_runtime_profile,
+                tool_profile=context.tool_profile,
             )
-            context.metadata.setdefault(
-                "legacy_tool_surface",
-                {
-                    "name": legacy_surface.name,
-                    "source": legacy_surface.source,
-                    "capability_ids": legacy_surface.capability_ids,
-                    "contextual_capability_ids": legacy_surface.contextual_capability_ids,
-                    "eager_tool_names": tuple(sorted(legacy_surface.eager_tool_names)),
-                    "contextual_tool_names": tuple(sorted(legacy_surface.contextual_tool_names)),
-                },
-            )
+            metadata = {
+                "name": tool_surface.name,
+                "source": tool_surface.source,
+                "capability_ids": tool_surface.capability_ids,
+                "contextual_capability_ids": tool_surface.contextual_capability_ids,
+                "eager_tool_names": tuple(sorted(tool_surface.eager_tool_names)),
+                "contextual_tool_names": tuple(sorted(tool_surface.contextual_tool_names)),
+            }
+            context.metadata.setdefault("tool_surface_policy", metadata)
         return context
 
 

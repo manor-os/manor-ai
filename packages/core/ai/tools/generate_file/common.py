@@ -60,6 +60,7 @@ def _merge_params(kwargs: dict[str, Any]) -> dict[str, Any]:
         "purpose",
         "duration_seconds",
         "voice",
+        "voice_instructions",
         "response_format",
         "format",
         "model",
@@ -73,6 +74,7 @@ async def _scope_workspace_output_name(
     *,
     entity_id: str,
     workspace_id: str | None,
+    task_id: str | None = None,
     name: str,
     default_subdir: str,
 ) -> str:
@@ -84,6 +86,7 @@ async def _scope_workspace_output_name(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     return scope_workspace_artifact_path(
         name,

@@ -108,6 +108,11 @@ async def generate_skill_streaming(
         except ValueError:
             refined = None
         if refined and refined.get("system_prompt"):
+            # A reviewer that trims the bundle objects must not silently
+            # degrade a sandbox bundle into a prompt-only skill.
+            for key in ("scripts", "references"):
+                if key not in refined and spec.get(key):
+                    refined[key] = spec[key]
             logger.info("Skill '%s' refined on attempt %d", spec.get("name"), attempt + 1)
             spec = refined
         else:

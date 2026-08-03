@@ -141,7 +141,7 @@ class TaskRunner:
             assembled = await runtime_assemble_prompt_for_turn(
                 prompt_db,
                 request=runtime_request,
-                legacy_runtime_profile=runtime.legacy_tool_profile,
+                tool_profile=runtime.tool_profile,
                 agent_id=agent_id,
                 bound_tool_names=runtime.bound_tool_names,
                 is_master=runtime.is_master,
@@ -202,14 +202,6 @@ class TaskRunner:
                 db=db,
             )
 
-            logger.info(
-                "Task %s model=%s (role=%s), supervisor=%s",
-                task_id,
-                runtime_task_engine_model(self._engine),
-                _model_role,
-                self._worker_model,
-            )
-
             if task.status in _TERMINAL_STATUSES:
                 return {"task_id": task_id, "status": task.status, "error": "already terminal"}
 
@@ -218,6 +210,8 @@ class TaskRunner:
             agent_name = "AI Agent"
             system_prompt = ""
             runtime_prompt_result = None
+            self._agent_temperature = None
+            self._agent_max_tokens = None
             from packages.core.constants.agents import is_master_agent, MANOR_AGENT_NAME
             is_master = is_master_agent(effective_agent_id, task.agent_type)
             from packages.core.services.workspace_runtime import resolve_workspace_runtime
@@ -255,6 +249,17 @@ class TaskRunner:
             elif effective_agent_id:
                 agent = await get_agent(db, effective_agent_id)
                 if agent:
+                    from packages.core.services.agent_runtime_config import (
+                        agent_runtime_config_for,
+                    )
+                    agent_config = agent_runtime_config_for(agent)
+                    if agent_config.model:
+                        self._engine = runtime_configure_task_engine_model(
+                            self._engine,
+                            agent_config.model,
+                        )
+                    self._agent_temperature = agent_config.temperature
+                    self._agent_max_tokens = agent_config.max_tokens
                     agent_name = agent.name or "AI Agent"
                     active_task_text = "\n".join(
                         part for part in (task.title, task.description) if part
@@ -292,7 +297,7 @@ class TaskRunner:
                                 fallback_appendix = await runtime_prepare_context_appendix_for_turn(
                                     db,
                                     request=fallback_request,
-                                    legacy_runtime_profile=runtime.legacy_tool_profile,
+                                    tool_profile=runtime.tool_profile,
                                     legacy_extra_context=runtime.extra_context,
                                 )
                                 system_prompt = runtime_merge_prompt_appendix(
@@ -301,6 +306,14 @@ class TaskRunner:
                                 )
                             except Exception:
                                 logger.debug("Failed to render runtime fallback context", exc_info=True)
+
+            logger.info(
+                "Task %s model=%s (role=%s), supervisor=%s",
+                task_id,
+                runtime_task_engine_model(self._engine),
+                _model_role,
+                self._worker_model,
+            )
 
             task_dict = {
                 "id": task.id, "title": task.title, "description": task.description,
@@ -317,7 +330,7 @@ class TaskRunner:
             # Get done_when criteria from task details
             done_when = str((task.details or {}).get("done_when", "")).strip()
 
-            apply_task_status_transition(task, "in_progress")
+            await apply_task_status_transition(task, "in_progress", db=db)
             await db.commit()
 
         # Stash for ``_log`` so subsequent log entries carry agent context
@@ -348,7 +361,7 @@ class TaskRunner:
                 runtime_prompt_result = await runtime_prepare_prompt_appendix_for_turn(
                     prompt_db,
                     request=runtime_request,
-                    legacy_runtime_profile=runtime.legacy_tool_profile,
+                    tool_profile=runtime.tool_profile,
                     agent_id=effective_agent_id,
                     bound_tool_names=runtime.bound_tool_names,
                     is_master=runtime.is_master,
@@ -428,9 +441,11 @@ class TaskRunner:
                     conversation_id=task_dict.get("conversation_id"),
                     task_id=task_id,
                     active_user_message=user_prompt,
-                    legacy_tool_profile=runtime.legacy_tool_profile,
+                    tool_profile=runtime.tool_profile,
                     allowed_tool_names=allowed_tool_names,
                     metadata=getattr(self, "_agent_llm_metadata", None),
+                    temperature=getattr(self, "_agent_temperature", None),
+                    max_tokens=getattr(self, "_agent_max_tokens", None),
                 )
                 messages = turn_result.messages
                 tools = turn_result.tools
@@ -511,6 +526,8 @@ class TaskRunner:
                     messages=messages,
                     system_prompt=full_system_prompt,
                     metadata=getattr(self, "_agent_llm_metadata", None),
+                    temperature=getattr(self, "_agent_temperature", None),
+                    max_tokens=getattr(self, "_agent_max_tokens", None),
                 )
                 messages = final_response.messages
                 if final_response.usage:
@@ -755,13 +772,20 @@ class TaskRunner:
                 meta["agent_name"] = agent_name
             if runtime_metadata:
                 meta.update(runtime_metadata)
-        # Use the resolved agent's name as the displayed author when
-        # we have one; falls back to the generic "AI Agent" label so
-        # older clients (no meta-aware UI) still get something readable.
-        display = agent_name or "AI Agent"
+        # Use the resolved agent's name as the displayed author when we have
+        # one. With no name we are the master agent running as the workspace
+        # agent, so say so instead of the old generic "AI Agent" label.
+        from packages.core.constants.agents import MANOR_AGENT_NAME
+        from packages.core.constants.task_actors import TaskActor
+
+        display = agent_name or MANOR_AGENT_NAME
+        actor = TaskActor.AGENT if agent_name and agent_name != MANOR_AGENT_NAME else TaskActor.MANOR
         try:
             async with self._get_session() as db:
-                await add_task_log(db, task_id, log_type, content, created_by=display, metadata=meta)
+                await add_task_log(
+                    db, task_id, log_type, content,
+                    actor=actor, created_by=display, metadata=meta,
+                )
                 await db.commit()
         except Exception as exc:
             logger.debug("TaskRunner: log failed for task %s: %s", task_id, exc)

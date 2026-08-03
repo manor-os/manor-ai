@@ -25,7 +25,13 @@ from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.deps import get_current_user
+from apps.api.deps import get_current_user, require_workspace_readable
+from packages.core.constants.task import TaskLogType, TaskStatus
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
+from packages.core.constants.task_actors import TaskActor
 from packages.core.database import get_db
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Task
@@ -265,7 +271,7 @@ def _reset_step_for_retry(
     note: str | None = None,
     preserve_result: bool = False,
 ) -> None:
-    step.step_status = "pending"
+    step.step_status = ExecutionStepStatus.PENDING.value
     step.current_lease_id = None
     step.error = None
     step.finished_at = None
@@ -302,7 +308,7 @@ def _reset_skipped_downstream_steps_for_retry(
     done_or_retried = {
         step.step_key
         for step in steps
-        if step.step_status == "done" or step.step_key in retried_step_keys
+        if step.step_status == ExecutionStepStatus.DONE or step.step_key in retried_step_keys
     }
     revived_keys = set(retried_step_keys)
     reset: list[ExecutionStep] = []
@@ -311,7 +317,7 @@ def _reset_skipped_downstream_steps_for_retry(
     while changed:
         changed = False
         for step in steps:
-            if step.step_key in done_or_retried or step.step_status != "skipped":
+            if step.step_key in done_or_retried or step.step_status != ExecutionStepStatus.SKIPPED:
                 continue
             deps = [str(dep) for dep in (step.depends_on or []) if dep]
             if not deps:
@@ -331,7 +337,7 @@ def _reset_skipped_downstream_steps_for_retry(
 
 def _revive_plan_for_retry(plan: ExecutionPlan) -> None:
     if plan.status in _RESETTABLE_PLAN_STATUSES:
-        plan.status = "draft"
+        plan.status = ExecutionPlanStatus.DRAFT.value
     plan.completed_at = None
     plan.last_error = None
 
@@ -381,7 +387,9 @@ async def _record_retry_on_task(
     }
 
     from packages.core.services.task_state_machine import apply_task_status_transition
-    apply_task_status_transition(task, "in_progress", now=now)
+    await apply_task_status_transition(
+        task, "in_progress", now=now, db=db, actor_kind="user", actor_id=user.id,
+    )
     task.started_at = now
     task.completed_at = None
     task.actual_output = None
@@ -390,8 +398,9 @@ async def _record_retry_on_task(
     await add_task_log(
         db,
         task.id,
-        "manual_retry",
+        TaskLogType.MANUAL_RETRY,
         f"Manual {mode} retry requested" + (f": {note}" if note else ""),
+        actor=TaskActor.USER,
         created_by=user.display_name or user.email,
         metadata={
             "mode": mode,
@@ -430,9 +439,20 @@ async def list_plans(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_readable(db, user, workspace_id)
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
+    readable_ws = await readable_workspace_ids_for_user(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
     stmt = select(ExecutionPlan).where(ExecutionPlan.entity_id == user.entity_id)
     if workspace_id:
         stmt = stmt.where(ExecutionPlan.workspace_id == workspace_id)
+    if readable_ws is not None:
+        from sqlalchemy import or_ as _or
+        stmt = stmt.where(_or(
+            ExecutionPlan.workspace_id.is_(None),
+            ExecutionPlan.workspace_id.in_(readable_ws),
+        ))
     if task_id:
         stmt = stmt.where(ExecutionPlan.task_id == task_id)
     if status:
@@ -553,23 +573,27 @@ async def approve(
     p = await get_plan(db, plan_id, entity_id=user.entity_id)
     if not p:
         raise HTTPException(404, "plan not found")
-    if p.status != "pending_approval":
+    if p.status != ExecutionPlanStatus.PENDING_APPROVAL:
         raise HTTPException(409, f"plan status is {p.status}, not pending_approval")
-    p.status = "draft"  # executor flips draft → running on first cycle
+    p.status = ExecutionPlanStatus.DRAFT.value  # executor flips draft → running on first cycle
     p.approval_required = False
     if p.task_id:
         task = (await db.execute(
             select(Task).where(Task.id == p.task_id, Task.entity_id == p.entity_id)
         )).scalar_one_or_none()
-        if task and task.status == "waiting_on_customer":
+        if task and task.status == TaskStatus.WAITING_ON_CUSTOMER:
             from packages.core.services.task_state_machine import apply_task_status_transition
 
-            apply_task_status_transition(task, "in_progress")
+            await apply_task_status_transition(
+                task, "in_progress", db=db, actor_kind="user", actor_id=user.id,
+            )
             await add_task_log(
                 db,
                 task.id,
-                "ai_hitl_resumed",
+                TaskLogType.AI_HITL_RESUMED,
                 "Plan approval received. Execution will resume.",
+                actor=TaskActor.USER,
+                created_by=user.display_name or user.email,
                 metadata={"plan_id": p.id, "approval_required": False},
             )
     await db.commit()
@@ -610,6 +634,17 @@ async def retry_failed_steps(
     reset_step_ids: list[str] = []
     for step in steps:
         if step.step_status in _RETRYABLE_STEP_STATUSES:
+            if step.step_status == ExecutionStepStatus.WAITING_HUMAN:
+                # Retrying an approval-paused step IS the approval — grant its
+                # open unified request so the dispatcher gate lets the reparked
+                # step through instead of re-pausing it (#317 loop).
+                from packages.core.governance.approvals import (
+                    grant_open_request_for_step,
+                )
+                await grant_open_request_for_step(
+                    db, entity_id=user.entity_id, step_id=step.id,
+                    by_user_id=user.id, via="plan_retry",
+                )
             _reset_step_for_retry(step, user=user, note=note)
             reset_steps += 1
             reset_step_ids.append(step.id)
@@ -653,6 +688,13 @@ async def retry_step(
 
     note = (req.note if req else None) or None
     steps = await list_plan_steps(db, p.id)
+    if step.step_status == ExecutionStepStatus.WAITING_HUMAN:
+        # Retrying an approval-paused step IS the approval (see retry_failed_steps).
+        from packages.core.governance.approvals import grant_open_request_for_step
+        await grant_open_request_for_step(
+            db, entity_id=user.entity_id, step_id=step.id,
+            by_user_id=user.id, via="plan_retry",
+        )
     _reset_step_for_retry(step, user=user, note=note)
     downstream_steps = _reset_skipped_downstream_steps_for_retry(
         steps,
@@ -699,7 +741,7 @@ async def _maybe_dispatch(plan_row: ExecutionPlan, *, force: bool = False) -> No
 
     Best-effort: failures are logged but don't block the API response —
     the plan row exists; the operator can re-trigger from the UI."""
-    if plan_row.status == "pending_approval" and not force:
+    if plan_row.status == ExecutionPlanStatus.PENDING_APPROVAL and not force:
         return
     try:
         from packages.core.tasks.ai_tasks import run_plan

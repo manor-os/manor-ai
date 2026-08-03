@@ -1,67 +1,86 @@
-"""Guard the skill generator's quality bar.
-
-Generated skills must be *detailed* — a 200-300 line system_prompt with the
-full section structure — and carry a discovery-ready description (what it does
-AND when to use it). A regression toward the old terse "4-12 steps / one-line
-description" prompt would silently degrade every skill created afterwards.
-
-These assert on the generator's prompt *source* so they run without importing
-the heavy runtime (cryptography/db) or calling a model.
-"""
+"""Guard the packaged Skill Creator contract used by Manor generation."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-_SKILLS_PY = Path(__file__).resolve().parents[1] / "packages" / "core" / "ai" / "runtime" / "skills.py"
-_SRC = _SKILLS_PY.read_text()
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SKILLS_PY = _REPO_ROOT / "packages" / "core" / "ai" / "runtime" / "skills.py"
+_CONTRACT_PATH = (
+    _REPO_ROOT
+    / "packages"
+    / "core"
+    / "ai"
+    / "skills"
+    / "skill-creator"
+    / "references"
+    / "generation-contract.md"
+)
+_SRC = _SKILLS_PY.read_text(encoding="utf-8")
+_CONTRACT = _CONTRACT_PATH.read_text(encoding="utf-8")
 
 
 def _generation_prompt() -> str:
-    m = re.search(r'RUNTIME_SKILL_GENERATION_SYSTEM_PROMPT = """\\\n(.*?)"""', _SRC, re.S)
-    assert m, "generation system prompt constant not found"
-    return m.group(1)
+    match = re.search(
+        r'RUNTIME_SKILL_GENERATION_SYSTEM_PROMPT = """\\\n(.*?)"""',
+        _SRC,
+        re.S,
+    )
+    assert match, "generation system prompt constant not found"
+    return match.group(1)
 
 
-def test_generation_prompt_demands_a_detailed_skill():
-    g = _generation_prompt()
-    assert "200-300 lines" in g, "no explicit length target — skills stay short"
-    required_sections = [
-        "## Overview",
-        "## When to use",
-        "## Inputs",
-        "## Workflow",
-        "## Tools",
-        "## Worked example",
-        "Edge cases",
-        "## Quality bar",
-        "## Output format",
-    ]
-    for section in required_sections:
-        assert section in g, f"generation prompt no longer requires section: {section}"
+def test_generation_prompt_loads_the_packaged_skill_creator_contract() -> None:
+    prompt = _generation_prompt()
+
+    assert "fully defines" in prompt
+    assert "reusable skill at production quality" in prompt
+    assert "packaged Skill Creator contract" in prompt
+    assert "runtime_skill_generation_contract()" in _SRC
+    assert "_system_prompt_with_skill_creation_contract(" in _SRC
 
 
-def test_description_rule_requires_a_trigger():
-    g = _generation_prompt()
-    # The description must say WHEN to use the skill, not just what it does.
-    assert "Use this skill when" in g
-    assert "WHEN to use it" in g
+def test_generation_contract_defines_the_complete_spec_envelope() -> None:
+    for field in (
+        '"name"',
+        '"slug"',
+        '"display_name"',
+        '"description"',
+        '"system_prompt"',
+        '"tools"',
+        '"input_schema"',
+        '"output_format"',
+        '"category"',
+        '"tags"',
+        '"complexity"',
+        '"scripts"',
+        '"references"',
+    ):
+        assert field in _CONTRACT, f"generation contract is missing {field}"
 
 
-def test_review_holds_the_same_bar():
-    # The refine loop must push toward detail + a trigger-bearing description,
-    # otherwise it would happily pass a thin skill.
-    assert "detailed enough" in _SRC
-    assert (
-        "200-300 lines" in _SRC.split("RUNTIME_SKILL_GENERATION_SYSTEM_PROMPT", 1)[0]
-        or _SRC.count("200-300 lines") >= 2
-    ), "review prompt should reassert the length bar"
+def test_contract_prefers_semantic_discovery_and_progressive_disclosure() -> None:
+    assert "semantic situations" in _CONTRACT
+    assert "near-misses" in _CONTRACT
+    assert "literal keyword list" in _CONTRACT
+    assert "progressive disclosure" in _CONTRACT
+    assert "Do not target an arbitrary size such as 200-300 lines" in _CONTRACT
+    assert "move detailed static material into references" in _CONTRACT
 
 
-def test_token_caps_allow_long_skills():
-    # A 200-300 line system_prompt + JSON fields cannot fit in the old 2000-2500
-    # cap; the generation/review calls need real headroom.
+def test_review_and_patch_share_the_same_contract() -> None:
+    review_block = _SRC.split("RUNTIME_SKILL_REVIEW_SYSTEM_PROMPT", 1)[1]
+    patch_block = _SRC.split("RUNTIME_SKILL_PATCH_SYSTEM_PROMPT", 1)[1]
+
+    assert "Do not treat 200-300 lines as a quality target" in _SRC
+    assert "_system_prompt_with_skill_creation_contract(" in review_block
+    assert "_system_prompt_with_skill_creation_contract(" in patch_block
+    assert "side effects, approvals, authorization" in _SRC
+
+
+def test_token_caps_allow_bundled_resources() -> None:
     relevant_source = "\n".join(
         block
         for block in re.findall(
@@ -70,7 +89,8 @@ def test_token_caps_allow_long_skills():
             re.S,
         )
     )
-    caps = sorted(int(x) for x in re.findall(r"max_tokens=(\d+)", relevant_source))
-    assert caps, "no max_tokens settings found"
-    assert caps[0] >= 6000, f"smallest cap {caps[0]} too low for a full skill spec"
-    assert caps[-1] >= 8000, f"largest cap {caps[-1]} too low for generation/review"
+    caps = sorted(int(value) for value in re.findall(r"max_tokens=(\d+)", relevant_source))
+
+    assert caps
+    assert caps[0] >= 6000
+    assert caps[-1] >= 8000

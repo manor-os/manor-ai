@@ -1,11 +1,45 @@
 import json
+from types import SimpleNamespace
 
+import pytest
+
+from packages.core.workers import internal
 from packages.core.workers.internal import (
+    EmptyModelOutput,
     _coerce_llm_text_result,
     _infer_prompt_backed_fields,
     _merge_tool_backed_fields_for_schema,
 )
 from packages.core.ai.runtime import runtime_prompt_with_output_schema
+
+
+# ── an empty completion is a step failure, not a `{"text": ""}` success ──
+
+
+@pytest.mark.parametrize("content", ["", "   \n\t ", None])
+async def test_exec_llm_empty_completion_raises_empty_model_output(monkeypatch, content):
+    """Staging: the model returned "" and the step was recorded as done.
+
+    Empty completions are frequently transient, so this must surface as a step
+    failure the dispatcher's retry policy can act on — not a silent success.
+    """
+    async def _fake_llm(**_kwargs):
+        return SimpleNamespace(content=content, usage={})
+
+    monkeypatch.setattr(internal, "runtime_execute_internal_worker_llm_step", _fake_llm)
+
+    with pytest.raises(EmptyModelOutput):
+        await internal._exec_llm({"params": {"prompt": "draft the report"}})
+
+
+async def test_exec_llm_non_empty_completion_still_returns_result(monkeypatch):
+    async def _fake_llm(**_kwargs):
+        return SimpleNamespace(content="a real answer", usage={})
+
+    monkeypatch.setattr(internal, "runtime_execute_internal_worker_llm_step", _fake_llm)
+
+    out = await internal._exec_llm({"params": {"prompt": "draft the report"}})
+    assert out["result"] == {"text": "a real answer"}
 
 
 def test_coerce_fenced_json_array_for_array_schema():
@@ -126,6 +160,67 @@ def test_tool_backed_tweet_publish_fields_are_merged_from_tool_result():
     assert result["tweet_url"] == "https://x.com/i/web/status/1999000000000000002"
 
 
+def test_tool_backed_linkedin_publish_fields_are_merged_from_tool_result():
+    schema = {
+        "type": "object",
+        "required": ["post_url", "post_text", "published_at", "status"],
+        "properties": {
+            "post_url": {"type": "string"},
+            "post_text": {"type": "string"},
+            "published_at": {"type": "string"},
+            "status": {"type": "string"},
+        },
+    }
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_publish",
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__linkedin__create_post",
+                        "arguments": json.dumps({"text": "Every founder hits a wall."}),
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_publish",
+            "content": json.dumps(
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "created": True,
+                                    "urn": "urn:li:share:1999000000000000003",
+                                    "created_at": "2026-05-21T14:00:00.000Z",
+                                }
+                            ),
+                        }
+                    ],
+                    "isError": False,
+                }
+            ),
+        },
+    ]
+
+    result = _merge_tool_backed_fields_for_schema(
+        {"post_text": "Every founder hits a wall."},
+        messages,
+        schema=schema,
+    )
+
+    assert result["post_url"] == "https://www.linkedin.com/feed/update/urn:li:share:1999000000000000003/"
+    assert result["published_at"] == "2026-05-21T14:00:00.000Z"
+    assert result["status"] == "published"
+    assert result["post_text"] == "Every founder hits a wall."
+
+
 def test_prompt_with_output_schema_instructs_machine_readable_output():
     prompt = runtime_prompt_with_output_schema("Research trends.", {"type": "array"})
 
@@ -150,3 +245,69 @@ def test_llm_text_result_prefers_schema_matching_json_candidate():
     content = f"Input echo: {json.dumps(first_script)}\n\nFinal output:\n{json.dumps({'scripts': scripts})}"
 
     assert _coerce_llm_text_result(content, schema) == {"scripts": scripts}
+
+
+def test_tool_backed_linkedin_publish_fields_are_merged_from_tool_result():
+    # Regression: LinkedIn publish payloads were invisible to the tool-backed
+    # merge (only tweets were recognized), so publish_linkedin_post steps failed
+    # output validation (X Growth tasks …X5W1 / …QB8C, 2026-05).
+    schema = {
+        "type": "object",
+        "required": ["post_text", "platform", "published_at"],
+        "properties": {
+            "post_text": {"type": "string"},
+            "platform": {"enum": ["LinkedIn"], "type": "string"},
+            "published_at": {"type": "string"},
+            "post_url": {"type": "string"},
+        },
+    }
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_li",
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__linkedin__create_post",
+                        "arguments": json.dumps({"text": "Founder story: ship weekly."}),
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_li",
+            "content": json.dumps(
+                {
+                    "urn": "urn:li:share:7350000000000000000",
+                    "text": "Founder story: ship weekly.",
+                    "created_at": "2026-05-15T21:00:00Z",
+                }
+            ),
+        },
+    ]
+
+    result = _merge_tool_backed_fields_for_schema(
+        {"text": "Posted to LinkedIn."},
+        messages,
+        schema=schema,
+    )
+
+    assert result["post_text"] == "Founder story: ship weekly."
+    assert result["platform"] == "LinkedIn"
+    assert result["published_at"] == "2026-05-15T21:00:00Z"
+    assert result["post_url"] == "https://www.linkedin.com/feed/update/urn:li:share:7350000000000000000/"
+
+
+def test_linkedin_payload_detection_by_name_and_shape():
+    from packages.core.workers.internal import _looks_like_publish_tool_payload
+
+    assert _looks_like_publish_tool_payload("mcp__linkedin__create_post", {"ok": True})
+    assert _looks_like_publish_tool_payload("", {"post_url": "https://www.linkedin.com/posts/x"})
+    assert _looks_like_publish_tool_payload("", {"share_url": "https://www.linkedin.com/posts/x"})
+    assert _looks_like_publish_tool_payload("", {"urn": "urn:li:share:7350000000000000000"})
+    assert _looks_like_publish_tool_payload("", {"id": "urn:li:ugcPost:7351111111111111111"})
+    assert not _looks_like_publish_tool_payload("mcp__linkedin__get_profile", {"id": "member-123"})
+    assert not _looks_like_publish_tool_payload("", {"text": "no publish evidence here"})

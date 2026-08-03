@@ -8,7 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import RuntimeEnvelope
-from packages.core.ai.runtime.persistence import runtime_envelope_meta, runtime_events
+from packages.core.ai.runtime.persistence import (
+    runtime_envelope_meta,
+    runtime_events,
+    runtime_mark_events_persisted,
+    runtime_persisted_event_count,
+)
 from packages.core.models.runtime_learning import RuntimeEventLog
 
 logger = logging.getLogger(__name__)
@@ -20,13 +25,21 @@ def runtime_event_records_from_envelope(
     source: str = "runtime",
     message_id: str | None = None,
     trace_id: str | None = None,
+    start_index: int = 0,
 ) -> list[dict[str, Any]]:
-    """Convert an envelope's runtime events into durable row payloads."""
+    """Convert an envelope's runtime events into durable row payloads.
+
+    ``start_index`` skips events already written for this envelope (see
+    ``runtime_persisted_event_count``); ``sequence`` stays the absolute
+    position in the run so the rows still order correctly.
+    """
     if not envelope.entity_id:
         return []
     runtime_meta = runtime_envelope_meta(envelope) or {}
     rows: list[dict[str, Any]] = []
     for idx, event in enumerate(runtime_events(envelope)):
+        if idx < start_index:
+            continue
         event_type = str(event.get("type") or "").strip()
         if not event_type:
             continue
@@ -59,6 +72,7 @@ async def persist_runtime_events(
     source: str = "runtime",
     message_id: str | None = None,
     trace_id: str | None = None,
+    start_index: int = 0,
 ) -> list[RuntimeEventLog]:
     """Persist runtime events for later audit/query.
 
@@ -70,6 +84,7 @@ async def persist_runtime_events(
         source=source,
         message_id=message_id,
         trace_id=trace_id,
+        start_index=start_index,
     )
     logs = [RuntimeEventLog(**record) for record in records]
     if logs:
@@ -88,8 +103,16 @@ async def persist_runtime_events_best_effort(
 
     Runtime event rows are audit/learning side data. They must never roll back
     the user-visible message, channel reply, or task completion they describe.
+
+    Idempotent per event: handlers now persist from a ``finally`` so the call
+    happens on every exit path, and ``runtime_event_logs`` has no unique
+    constraint to catch a repeat. Only events past the envelope's persisted
+    watermark are written.
     """
-    if envelope is None or not runtime_events(envelope):
+    if envelope is None:
+        return 0
+    already_persisted = runtime_persisted_event_count(envelope)
+    if len(runtime_events(envelope)) <= already_persisted:
         return 0
     try:
         from packages.core.database import async_session
@@ -101,8 +124,10 @@ async def persist_runtime_events_best_effort(
                 source=source,
                 message_id=message_id,
                 trace_id=trace_id,
+                start_index=already_persisted,
             )
             await db.commit()
+            runtime_mark_events_persisted(envelope, already_persisted + len(logs))
             return len(logs)
     except Exception:
         logger.warning(

@@ -13,14 +13,24 @@ import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import Button from "../components/ui/Button";
+import PageHeader from "../components/ui/PageHeader";
 import Input from "../components/ui/Input";
+import Select from "../components/ui/Select";
 import Textarea from "../components/ui/Textarea";
 import Toggle from "../components/ui/Toggle";
+import AgentLearningPanel from "../components/AgentLearningPanel";
 import { IconWarning, IconChevronLeft, IconPlus, IconDownload } from "../components/icons";
 
 import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 import { getSkillDescription } from "./skills/skillTypes";
+import {
+  AGENT_MODEL_INHERIT_VALUE,
+  AgentModelMode,
+  agentModelMode,
+  agentModelSelectOptions,
+  fixedAgentModel,
+} from "../lib/agentRuntimeConfig";
 /* -- helpers ------------------------------------------------ */
 
 const FALLBACK_COLORS = [
@@ -52,7 +62,7 @@ const CATEGORIES = [
   { value: "HR", label: t("page.agent_detail.category_hr") },
 ];
 
-type Tab = "overview" | "tools" | "skills" | "executions" | "settings";
+type Tab = "overview" | "tools" | "skills" | "executions" | "learning" | "settings";
 
 function objectConfig(value: unknown): Record<string, any> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -96,7 +106,7 @@ function agentConnectionInfo(agent: Pick<Agent, "config" | "source" | "is_templa
   }
   return {
     label: "Manor Hosted",
-    detail: "Runs on Manor Hosted by default. CLI or HTTPS connections are chosen when adding it to a workspace.",
+    detail: "Runs on Manor Hosted by default. HTTPS connections are chosen when adding it to a workspace.",
     type: "success",
   };
 }
@@ -116,6 +126,7 @@ export default function AgentDetail() {
   const [promptDraft, setPromptDraft] = useState("");
   const [editingConfig, setEditingConfig] = useState(false);
   const [configDraft, setConfigDraft] = useState<Record<string, any> & {
+    model_mode?: AgentModelMode;
     model?: string;
     temperature?: number;
     max_tokens?: number;
@@ -174,7 +185,34 @@ export default function AgentDetail() {
   const { data: deployments } = useQuery({
     queryKey: ["agent-deployments", agentId],
     queryFn: () => api.agents.deployments(agentId!),
-    enabled: !!agentId && tab === "overview",
+    enabled: !!agentId && (tab === "overview" || tab === "learning"),
+  });
+
+  const {
+    data: learningCandidates,
+    isLoading: learningCandidatesLoading,
+    error: learningCandidatesError,
+  } = useQuery({
+    queryKey: ["agent-learning-candidates", agentId],
+    queryFn: () => api.agents.learningCandidates(agentId!, { limit: 50, status: null }),
+    enabled: !!agentId && tab === "learning",
+  });
+
+  const {
+    data: runtimeEvidence,
+    isLoading: runtimeEvidenceLoading,
+    error: runtimeEvidenceError,
+  } = useQuery({
+    queryKey: ["agent-runtime-evidence", agentId],
+    queryFn: () => api.agents.runtimeEvidence(agentId!, { limit: 50 }),
+    enabled: !!agentId && tab === "learning",
+  });
+
+  const { data: modelCatalog } = useQuery({
+    queryKey: ["model-catalog"],
+    queryFn: () => api.auth.getModelCatalog(),
+    enabled: editingConfig,
+    staleTime: 60_000,
   });
 
   /* -- mutations ------------------------------------------ */
@@ -263,7 +301,17 @@ export default function AgentDetail() {
   };
 
   const saveConfig = () => {
-    updateMutation.mutate({ config: configDraft } as Partial<Agent>);
+    const nextConfig = { ...configDraft };
+    const model = fixedAgentModel(nextConfig);
+    if (model) {
+      nextConfig.model_mode = AgentModelMode.Fixed;
+      nextConfig.model = model;
+    } else {
+      nextConfig.model_mode = AgentModelMode.Inherit;
+      delete nextConfig.model;
+    }
+    updateMutation.mutate({ config: nextConfig } as Partial<Agent>);
+    setConfigDraft(nextConfig);
     setEditingConfig(false);
   };
 
@@ -334,6 +382,11 @@ export default function AgentDetail() {
   const toolCount = tools?.length ?? agent.tool_count ?? 0;
   const skillCount = boundSkills?.length ?? agent.skill_count ?? 0;
   const deploymentItems = (deployments || []) as AgentDeploymentResponse[];
+  const deploymentNames = Object.fromEntries(
+    deploymentItems
+      .filter((deployment) => deployment.workspace_id)
+      .map((deployment) => [deployment.workspace_id!, deployment.workspace_name || t("page.agent_detail.learning_workspace_scope")]),
+  );
   const connectionInfo = agentConnectionInfo(agent);
   const agentLearningEnabled = runtimeLearningEnabled(agent.config);
   const toggleAgentLearning = () => {
@@ -347,6 +400,7 @@ export default function AgentDetail() {
     { key: "tools", label: t("page.workspace_detail.tools"), count: toolCount },
     { key: "skills", label: t("page.agent_detail.skills"), count: skillCount },
     { key: "executions", label: t("page.agent_detail.executions"), count: execItems.length },
+    { key: "learning", label: t("page.agent_detail.learning"), count: learningCandidates?.length },
     { key: "settings", label: t("page.agent_detail.actions") },
   ];
 
@@ -368,6 +422,11 @@ export default function AgentDetail() {
       description.toLowerCase().includes(skillSearch.toLowerCase());
     return !bound.includes(skill.id) && matchesSearch;
   });
+  const modelOptions = agentModelSelectOptions(
+    modelCatalog?.catalog,
+    fixedAgentModel(configDraft),
+    t("page.api_keys.default"),
+  );
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
@@ -393,46 +452,42 @@ export default function AgentDetail() {
           {t("page.agent_detail.back_to_agents")}
         </button>
 
-        <div
-          style={{
-            display: "flex",
-            alignItems: "flex-start",
-            gap: 14,
-            flexWrap: "wrap",
-            padding: "4px 0 2px",
-          }}
-        >
-          <AgentAvatar
-            name={agent.name}
-            avatarUrl={agent.avatar_url}
-            seed={agent.id}
-            size={48}
-            shape="rounded"
-          />
-
-          <div style={{ flex: 1, minWidth: 220 }}>
-            {editingName ? (
-              <input
-                value={nameDraft}
-                onChange={(e) => setNameDraft(e.target.value)}
-                onBlur={saveName}
-                onKeyDown={(e) => e.key === "Enter" && saveName()}
-                autoFocus
-                className="manor-input"
-                style={{ fontSize: 20, fontWeight: 800, height: "auto", padding: "4px 8px" }}
-              />
-            ) : (
-              <h1
-                onClick={() => setEditingName(true)}
-                style={{ fontSize: 22, fontWeight: 800, color: "#292524", margin: 0, cursor: "pointer", lineHeight: 1.2 }}
-              >
-                {agent.name}
-              </h1>
-            )}
-            {agentDescription && (
-              <p style={{ fontSize: 13, color: "#78716c", margin: "4px 0 0", maxWidth: 720, lineHeight: 1.45 }}>{agentDescription}</p>
-            )}
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+        <PageHeader
+          title={(
+            <span className="inline-flex min-w-0 items-center gap-3">
+              <span aria-hidden="true">
+                <AgentAvatar
+                  name={agent.name}
+                  avatarUrl={agent.avatar_url}
+                  seed={agent.id}
+                  size={40}
+                  shape="rounded"
+                />
+              </span>
+              {editingName ? (
+                <input
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  onBlur={saveName}
+                  onKeyDown={(e) => e.key === "Enter" && saveName()}
+                  autoFocus
+                  className="manor-input min-w-0 text-[inherit] font-[inherit]"
+                  style={{ height: "auto", padding: "4px 8px" }}
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setEditingName(true)}
+                  className="min-w-0 cursor-pointer border-0 bg-transparent p-0 text-left font-[inherit] leading-[inherit] tracking-[inherit] text-[inherit]"
+                >
+                  {agent.name}
+                </button>
+              )}
+            </span>
+          )}
+          subtitle={agentDescription}
+          meta={(
+            <>
               <StatusBadge type={agent.status === "active" ? "success" : "inactive"} dot>
                 {agent.status === "active" ? t("page.workspaces.filter_active") : agent.status || t("page.workspaces.draft")}
               </StatusBadge>
@@ -451,12 +506,14 @@ export default function AgentDetail() {
               >
                 {agent.source === "custom" ? t("page.agent_detail.custom") : t("page.agent_detail.template")}
               </span>
-            </div>
-          </div>
-          <Button variant="outline" size="sm" onClick={() => navigate(`/agents?edit=${agent.id}`)}>
-            {t("page.agents.edit_agent")}
-          </Button>
-        </div>
+            </>
+          )}
+          actions={(
+            <Button variant="outline" size="sm" onClick={() => navigate(`/agents?edit=${agent.id}`)}>
+              {t("page.agents.edit_agent")}
+            </Button>
+          )}
+        />
       </div>
 
       {/* Tabs */}
@@ -512,7 +569,7 @@ export default function AgentDetail() {
                 <div style={{ border: "1px dashed rgba(28,25,23,0.06)", borderRadius: 12, padding: 14, background: "rgba(250,250,249,0.65)" }}>
                   <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "#44403c" }}>Not used in a workspace yet</p>
                   <p style={{ margin: "4px 0 0", fontSize: 12, color: "#78716c" }}>
-                    Add it from a workspace to choose Manor Hosted, CLI, HTTPS, or a custom profile for that workspace.
+                    Add it from a workspace to choose Manor Hosted, HTTPS, or a custom profile for that workspace.
                   </p>
                 </div>
               ) : (
@@ -532,11 +589,17 @@ export default function AgentDetail() {
                       }}
                     >
                       <div style={{ minWidth: 0 }}>
-                        <p style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "#44403c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <p style={{ margin: 0, fontSize: 13, fontWeight: 800, color: deployment.workspace_status && deployment.workspace_status !== "active" ? "#a8a29e" : "#44403c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {deployment.workspace_name || "Workspace"}
+                          {deployment.workspace_status && deployment.workspace_status !== "active" ? (
+                            <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.03em", color: "#a8a29e" }}>
+                              {deployment.workspace_status}
+                            </span>
+                          ) : null}
                         </p>
                         <p style={{ margin: "3px 0 0", fontSize: 11, color: "#a8a29e" }}>
                           service <span style={{ fontFamily: "monospace" }}>{deployment.service_key || "unscoped"}</span>
+                          {deployment.created_at ? <> · added {relativeTime(deployment.created_at)}</> : null}
                         </p>
                       </div>
                       <StatusBadge type={(deployment.workers || []).length > 0 ? "success" : "warning"}>
@@ -599,9 +662,29 @@ export default function AgentDetail() {
                 <div>
                   <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>{t("page.agent_detail.model_override")}</label>
                   {editingConfig ? (
-                    <Input value={configDraft.model || ""} onChange={(e) => setConfigDraft({ ...configDraft, model: e.target.value })} placeholder={t("page.agent_detail.e_g_gpt_4o")} />
+                    <Select
+                      value={
+                        agentModelMode(configDraft) === AgentModelMode.Fixed
+                          ? fixedAgentModel(configDraft)
+                          : AGENT_MODEL_INHERIT_VALUE
+                      }
+                      onChange={(selection) => {
+                        const nextConfig = { ...configDraft };
+                        if (selection === AGENT_MODEL_INHERIT_VALUE) {
+                          nextConfig.model_mode = AgentModelMode.Inherit;
+                          delete nextConfig.model;
+                        } else {
+                          nextConfig.model_mode = AgentModelMode.Fixed;
+                          nextConfig.model = selection;
+                        }
+                        setConfigDraft(nextConfig);
+                      }}
+                      options={modelOptions}
+                      placeholder={t("page.api_keys.default")}
+                      filterable
+                    />
                   ) : (
-                    <p style={{ fontSize: 13, color: "#44403c", margin: 0 }}>{agent.config?.model || t("page.api_keys.default")}</p>
+                    <p style={{ fontSize: 13, color: "#44403c", margin: 0 }}>{fixedAgentModel(agent.config) || t("page.api_keys.default")}</p>
                   )}
                 </div>
                 <div>
@@ -1021,6 +1104,21 @@ export default function AgentDetail() {
               </div>
             )}
           </div>
+        )}
+
+        {/* ====== LEARNING ====== */}
+        {tab === "learning" && (
+          <AgentLearningPanel
+            candidates={learningCandidates || []}
+            evidence={runtimeEvidence || []}
+            enabled={agentLearningEnabled}
+            isUpdating={updateMutation.isPending}
+            isLoading={learningCandidatesLoading || runtimeEvidenceLoading}
+            error={learningCandidatesError || runtimeEvidenceError}
+            workspaceNames={deploymentNames}
+            onToggleEnabled={toggleAgentLearning}
+            onAdjustAgent={() => navigate(`/agents?edit=${agent.id}`)}
+          />
         )}
 
         {/* ====== SETTINGS ====== */}

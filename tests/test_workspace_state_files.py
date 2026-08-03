@@ -26,7 +26,7 @@ def test_render_files_md_exposes_document_id_and_origin() -> None:
         files=files,
     )
 
-    assert "| Name | Document ID | What | Location | Origin | Updated |" in rendered
+    assert "| Name | Document ID | What | Display Path | Storage Location | Origin | Updated |" in rendered
     assert "doc_1" in rendered
     assert "assets/campaign-hero.png" in rendered
     assert "task=Generate campaign visuals" in rendered

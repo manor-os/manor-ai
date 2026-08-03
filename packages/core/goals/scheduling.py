@@ -179,15 +179,24 @@ async def install_measurement_schedule(db: AsyncSession, goal: Goal) -> Schedule
     )).scalar_one_or_none()
 
     if existing:
+        updates = {
+            "schedule_kind": schedule_kind,
+            "cron_expr": schedule_fields.get("cron_expr"),
+            "every_seconds": schedule_fields.get("every_seconds"),
+            "execution_type": "goal_measurement",
+            "execution_target": {"goal_id": goal.id},
+            "enabled": True,
+        }
+        changed = {k: v for k, v in updates.items() if getattr(existing, k) != v}
         existing.entity_id = goal.entity_id
         existing.workspace_id = goal.workspace_id
-        existing.schedule_kind = schedule_kind
-        existing.cron_expr = schedule_fields.get("cron_expr")
-        existing.every_seconds = schedule_fields.get("every_seconds")
-        existing.execution_type = "goal_measurement"
-        existing.execution_target = {"goal_id": goal.id}
-        existing.enabled = True
         existing.consecutive_errors = 0
+        for key, value in changed.items():
+            setattr(existing, key, value)
+        if changed:
+            # M11: config actually changed — bump the revision + audit.
+            from packages.core.revisions import bump_revision
+            await bump_revision(db, existing, patch=changed)
         await db.flush()
         return existing
 

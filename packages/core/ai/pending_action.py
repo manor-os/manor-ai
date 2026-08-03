@@ -60,16 +60,63 @@ from __future__ import annotations
 import secrets
 from typing import Any, ClassVar, Dict, List, Literal, Optional
 
+from packages.core.constants.pending_actions import PendingActionKind
 
-# Kind constants. Strings (not Enum) for trivial JSONB round-trip.
-KIND_NEEDS_LOGIN = "needs_login"
-KIND_NEEDS_INPUT = "needs_input"
-KIND_NEEDS_CONFIRMATION = "needs_confirmation"
 
-# Existing kinds elsewhere in the codebase (do NOT duplicate; listed
-# here only so consumers can route on a single union).
-KIND_APPROVE_PROPOSALS = "approve_proposals"
-KIND_RETRY_STRATEGIST_REVIEW = "retry_strategist_review"
+# The kind vocabulary is ``PendingActionKind`` (packages/core/constants/
+# pending_actions.py) — one enum for every card kind in the repo, not just the
+# three this module produces.
+#
+# These module-level ``KIND_*`` names are kept as aliases onto its members.
+# They are what the dispatcher, the resolve endpoint and the producer tests
+# already import, and because the enum is ``str``-based an alias is the member
+# itself: ``KIND_NEEDS_LOGIN == "needs_login"`` and ``KIND_NEEDS_LOGIN.value``
+# both hold, so no caller had to change. Prefer ``PendingActionKind`` in new
+# code; the aliases exist so this refactor stayed a type change and not a
+# rewrite of the four consumers.
+KIND_NEEDS_LOGIN = PendingActionKind.NEEDS_LOGIN
+KIND_NEEDS_INPUT = PendingActionKind.NEEDS_INPUT
+KIND_NEEDS_CONFIRMATION = PendingActionKind.NEEDS_CONFIRMATION
+
+# The free-form text-input card the chat notifier builds when a lease pauses
+# without a structured payload. Not tool-produced, but it lands in the same
+# ``pending_action`` column and is answered through the same endpoint.
+KIND_HUMAN_INPUT = PendingActionKind.HUMAN_INPUT
+
+# Kinds produced elsewhere in the codebase, re-exported here so consumers that
+# route on the whole union have one import.
+KIND_APPROVE_PROPOSALS = PendingActionKind.APPROVE_PROPOSALS
+KIND_RETRY_STRATEGIST_REVIEW = PendingActionKind.RETRY_STRATEGIST_REVIEW
+KIND_GOVERNANCE_APPROVAL = PendingActionKind.GOVERNANCE_APPROVAL
+
+
+#: Mid-execution ("path C") HITL pauses whose unified HitlRequest the chat
+#: resolve endpoint knows how to close.
+#:
+#: ⚠ This is the ONE definition shared by both ends of that lifecycle:
+#:   * mint  — ``dispatcher.service.lease_needs_human`` mints only for kinds
+#:             in this set;
+#:   * close — ``apps.api.routers.workspace_chat.resolve_chat_action`` decides
+#:             requests only for cards of these kinds.
+#: They must stay equal. Minting a kind the endpoint cannot close strands the
+#: row PENDING forever, and it is a closed loop rather than a leak that some
+#: sweep later collects: the step stays waiting_human, so the plan never
+#: reaches a terminal state, so ``resolve_origin_requests`` — whose only
+#: production caller is the plan's terminal path — never runs.
+#:
+#: Adding a kind here means first giving its resolve branch a grant/deny
+#: verdict (see ``_lease_decision``); otherwise you reopen the same hole from
+#: the other side.
+#:
+#: Members are ``.value`` (plain ``str``), not enum members: the thing tested
+#: against this set is a raw word off a JSONB blob, and a set of plain strings
+#: is the one spelling that cannot depend on how a mixin enum hashes.
+LEASE_HITL_CLOSEABLE_KINDS: frozenset[str] = frozenset({
+    KIND_HUMAN_INPUT.value,
+    KIND_NEEDS_INPUT.value,
+    KIND_NEEDS_CONFIRMATION.value,
+    KIND_NEEDS_LOGIN.value,
+})
 
 
 # Envelope key. Underscore prefix → Manor-internal, ignored by MCP
@@ -94,9 +141,9 @@ class PendingAction:
     # Maps kind → required keys (other than 'kind' / 'options'). Used by
     # the from_dict roundtrip to validate before consumers act on it.
     _REQUIRED_BY_KIND: ClassVar[Dict[str, List[str]]] = {
-        KIND_NEEDS_LOGIN: ["login_url"],
-        KIND_NEEDS_INPUT: ["questions"],
-        KIND_NEEDS_CONFIRMATION: ["action_summary"],
+        KIND_NEEDS_LOGIN.value: ["login_url"],
+        KIND_NEEDS_INPUT.value: ["questions"],
+        KIND_NEEDS_CONFIRMATION.value: ["action_summary"],
     }
 
     def __init__(self, payload: Dict[str, Any]) -> None:
@@ -151,7 +198,7 @@ class PendingAction:
             raise ValueError("login_url required")
         host = _host_of(login_url)
         return cls({
-            "kind": KIND_NEEDS_LOGIN,
+            "kind": KIND_NEEDS_LOGIN.value,
             "title": title or (
                 f"Sign in to {integration_hint or host}"
                 if (integration_hint or host)
@@ -191,7 +238,7 @@ class PendingAction:
         if not questions:
             raise ValueError("questions required and non-empty")
         return cls({
-            "kind": KIND_NEEDS_INPUT,
+            "kind": KIND_NEEDS_INPUT.value,
             "title": title or "I need a few answers",
             "context_summary": context_summary,
             "questions": questions,
@@ -225,7 +272,7 @@ class PendingAction:
         if not action_summary:
             raise ValueError("action_summary required")
         return cls({
-            "kind": KIND_NEEDS_CONFIRMATION,
+            "kind": KIND_NEEDS_CONFIRMATION.value,
             "title": title or "Please confirm",
             "action_summary": action_summary,
             "impact": impact,
@@ -275,9 +322,9 @@ class PendingAction:
     @staticmethod
     def _default_options(kind: str) -> List[str]:
         return {
-            KIND_NEEDS_LOGIN: ["sign_in", "skip"],
-            KIND_NEEDS_INPUT: ["provide_answers", "skip"],
-            KIND_NEEDS_CONFIRMATION: ["confirm", "cancel"],
+            KIND_NEEDS_LOGIN.value: ["sign_in", "skip"],
+            KIND_NEEDS_INPUT.value: ["provide_answers", "skip"],
+            KIND_NEEDS_CONFIRMATION.value: ["confirm", "cancel"],
         }.get(kind, [])
 
 

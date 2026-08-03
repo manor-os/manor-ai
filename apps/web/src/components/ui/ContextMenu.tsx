@@ -40,6 +40,15 @@ export default function ContextMenu({ items, x, y, onClose }: ContextMenuProps) 
     requestAnimationFrame(() => setVisible(true));
   }, [x, y]);
 
+  // Context menus opened from a keyboard-accessible overflow button should
+  // move focus into the menu instead of leaving keyboard users behind it.
+  useEffect(() => {
+    if (!visible) return;
+    menuRef.current
+      ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+      ?.focus();
+  }, [visible]);
+
   // Close on outside click
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -63,6 +72,8 @@ export default function ContextMenu({ items, x, y, onClose }: ContextMenuProps) 
   return createPortal(
     <div
       ref={menuRef}
+      role="menu"
+      aria-label="Actions"
       style={{
         position: "fixed",
         left: pos.x,
@@ -85,6 +96,7 @@ export default function ContextMenu({ items, x, y, onClose }: ContextMenuProps) 
         return (
           <button
             key={i}
+            role="menuitem"
             disabled={item.disabled}
             onClick={() => {
               if (!item.disabled && item.onClick) {
@@ -130,7 +142,11 @@ export function useContextMenu() {
     setMenu({ x: e.clientX, y: e.clientY, items });
   }, []);
 
+  const showAt = useCallback((x: number, y: number, items: MenuItem[]) => {
+    setMenu({ x, y, items });
+  }, []);
+
   const close = useCallback(() => setMenu(null), []);
 
-  return { menu, show, close };
+  return { menu, show, showAt, close };
 }

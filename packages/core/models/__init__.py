@@ -24,8 +24,23 @@ from packages.core.models.audit import AuditLog
 from packages.core.models.event import EventLog
 from packages.core.models.people import Client
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
+from packages.core.models.metrics import MetricsDailyUsage, MetricsDailyToolCalls
+from packages.core.models.system_metrics import SystemMetricsSample
+from packages.core.models.http_stats import HttpRequestHourly
 from packages.core.models.user_session import UserPageViewLog, UserSessionLog
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
+from packages.core.models.hitl_request import HitlRequest
+from packages.core.models.workspace_event import WorkspaceEvent
+from packages.core.models.review_run import ReviewRun
+from packages.core.models.consolidation_report import ConsolidationReport
+from packages.core.models.proposal import ProposalRecord, ProposalItemRecord
+from packages.core.models.participant import (
+    ParticipantProfile,
+    HumanCommitment,
+    HumanContribution,
+)
+from packages.core.models.automation_revision import AutomationRevision
+from packages.core.models.experiment import Experiment
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun, AgentExecution
 from packages.core.models.webhook import WebhookEndpoint, WebhookDelivery
@@ -40,7 +55,13 @@ from packages.core.models.comment import Comment
 from packages.core.models.quota import EntityQuota
 from packages.core.models.favorite import Favorite
 from packages.core.models.tag import Tag, ResourceTag
-from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
+from packages.core.models.workflow import (
+    WorkflowActionGrant,
+    WorkflowBinding,
+    WorkflowDefinition,
+    WorkflowProject,
+    WorkflowRun,
+)
 from packages.core.models.billing import SubscriptionPlan, CreditReservation, CreditUsageAllocation, CreditUsageLog, PaymentLog, Order
 from packages.core.models.order import BusinessOrder, BusinessOrderItem
 from packages.core.models.channel import ChannelConfig, MessageLog, PhoneNumber, Announcement, AnnouncementRecipient
@@ -54,7 +75,10 @@ from packages.core.models.worker import (
 from packages.core.models.integration_session import IntegrationSession
 from packages.core.models.governance import GovernancePolicy, GovernanceRevision
 from packages.core.models.channel_pairing import ChannelPairingCode
-from packages.core.models.blueprint import WorkspaceBlueprint
+from packages.core.models.blueprint import (
+    BlueprintFavorite,
+    WorkspaceBlueprint,
+)
 from packages.core.models.merchant import MerchantAccount
 from packages.core.models.blueprint_purchase import BlueprintPurchase
 from packages.core.models.workspace_draft import WorkspaceDraft
@@ -63,6 +87,7 @@ from packages.core.models.ai_tool_spec import CLIToolSpec, BrowserToolSpec
 from packages.core.models.feature_flag import FeatureFlag, FeatureFlagOverride
 from packages.core.models.platform_announcement import (
     PlatformAnnouncement,
+    PlatformAnnouncementBannerDismissal,
     PlatformAnnouncementDismissal,
 )
 from packages.core.models.support_ticket import SupportMessage, SupportTicket
@@ -75,7 +100,6 @@ from packages.core.models.permission import (
     ResourceGrant,
     ResourceGrantPending,
     Share,
-    PermissionAudit,
     DocumentAccessLog,
     ResourceType,
     SubjectType,
@@ -87,6 +111,7 @@ from packages.core.models.permission import (
 )
 from packages.core.models.oauth_provider import OAuthClientApp, OAuthAuthorizationCode
 from packages.core.models.client_error import ClientErrorEvent
+from packages.core.models.tool_path_memory import ToolIntentPath
 
 __all__ = [
     "Base", "generate_ulid", "TimestampMixin", "SoftDeleteMixin",
@@ -101,7 +126,18 @@ __all__ = [
     "EventLog",
     "Client",
     "TokenUsageLog", "ToolCallLog", "UserSessionLog", "UserPageViewLog",
+    "MetricsDailyUsage", "MetricsDailyToolCalls",
+    "SystemMetricsSample",
+    "HttpRequestHourly",
     "ExecutionPlan", "ExecutionStep",
+    "HitlRequest",
+    "WorkspaceEvent",
+    "ReviewRun",
+    "ConsolidationReport",
+    "ProposalRecord", "ProposalItemRecord",
+    "AutomationRevision",
+    "Experiment",
+    "ParticipantProfile", "HumanCommitment", "HumanContribution",
     "Goal", "GoalMeasurement", "GoalTaskLink",
     "ScheduledJob", "ScheduledJobRun", "AgentExecution",
     "WebhookEndpoint", "WebhookDelivery",
@@ -115,7 +151,7 @@ __all__ = [
     "EntityQuota",
     "Favorite",
     "Tag", "ResourceTag",
-    "WorkflowDefinition", "WorkflowRun",
+    "WorkflowActionGrant", "WorkflowBinding", "WorkflowDefinition", "WorkflowProject", "WorkflowRun",
     "SubscriptionPlan", "CreditReservation", "CreditUsageAllocation", "CreditUsageLog", "PaymentLog", "Order",
     "ChannelConfig", "MessageLog", "PhoneNumber", "Announcement", "AnnouncementRecipient",
     "Feature", "FeaturePackage", "EntityFeature",
@@ -128,7 +164,7 @@ __all__ = [
     "IntegrationSession",
     "GovernancePolicy", "GovernanceRevision",
     "ChannelPairingCode",
-    "WorkspaceBlueprint",
+    "WorkspaceBlueprint", "BlueprintFavorite",
     "MerchantAccount",
     "BlueprintPurchase",
     "WorkspaceDraft",
@@ -136,6 +172,7 @@ __all__ = [
     "CLIToolSpec", "BrowserToolSpec",
     "FeatureFlag", "FeatureFlagOverride",
     "PlatformAnnouncement",
+    "PlatformAnnouncementBannerDismissal",
     "PlatformAnnouncementDismissal",
     "SupportMessage",
     "SupportTicket",
@@ -145,10 +182,11 @@ __all__ = [
     "PlatformModelProviderKey",
     "PlatformSetting",
     "ResourceGrant", "ResourceGrantPending", "Share",
-    "PermissionAudit", "DocumentAccessLog",
+    "DocumentAccessLog",
     "ResourceType", "SubjectType", "Capability",
     "Visibility", "Classification",
     "GrantStatus", "PendingStatus",
     "OAuthClientApp", "OAuthAuthorizationCode",
     "ClientErrorEvent",
+    "ToolIntentPath",
 ]

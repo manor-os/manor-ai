@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -17,11 +18,11 @@ from packages.core.ai.runtime import (
     runtime_conversation_summary_text,
 )
 from packages.core.ai.runtime.streams import runtime_persisted_tool_calls_history_summary
+from packages.core.ai.runtime.token_estimate import runtime_estimate_tokens_for_text
 
 logger = logging.getLogger(__name__)
 
 HISTORY_TOKEN_BUDGET = 80_000
-CHARS_PER_TOKEN = 4
 SUMMARY_TRIGGER = 10
 MAX_HISTORY_ROWS = 200
 CHAT_MODE_MARKER_RE = re.compile(r"^\[Mode:\s*.+?\]\s*$", re.IGNORECASE)
@@ -60,22 +61,32 @@ def strip_chat_mode_history_markers(content: str) -> str:
     return "\n".join(lines).strip()
 
 
+COMPLETED_TOOL_ACTIVITY_FRAME = (
+    "[Completed tool activity from the previous turn — already done, "
+    "do not re-run these actions; reuse their results as context]"
+)
+
+
 def should_include_previous_tool_activity_for_turn(
     latest_user_message: str | None,
     tool_summary: str | None,
+    *,
+    is_last_assistant_message: bool = False,
 ) -> bool:
     """Decide whether prior tool activity is safe to replay into this turn.
 
     Persisted tool summaries are operational traces, not user-visible memory.
-    When a new user turn is being built, keep prior prose history but do not
-    replay earlier tool traces into the model as fresh context. This prevents
-    stale queued/search actions from being interpreted as active work without
-    relying on keyword or topic matching.
+    When a new user turn is being built, older tool traces are dropped so
+    stale queued/search actions are not interpreted as active work. The most
+    recent assistant turn's trace IS kept (framed as completed): dropping it
+    forces the model to redo every lookup the previous turn just finished.
     """
 
     if not tool_summary:
         return False
-    return not str(latest_user_message or "").strip()
+    if not str(latest_user_message or "").strip():
+        return True
+    return is_last_assistant_message
 
 
 def should_include_tool_history_summary(message: Any) -> bool:
@@ -111,22 +122,22 @@ async def load_conversation_history(
     if not msgs:
         return []
 
-    char_budget = token_budget * CHARS_PER_TOKEN
-    used_chars = 0
+    used_tokens = 0
     selected: list[Any] = []
 
     for m in reversed(msgs):
         meta = m.meta or {}
-        reasoning_chars = len(str(meta.get(PROVIDER_REASONING_META_KEY) or ""))
         tool_summary = runtime_persisted_tool_calls_history_summary(m.tool_calls)
-        msg_chars = (
-            len(m.content or "")
-            + len(tool_summary or "")
-            + reasoning_chars
+        msg_tokens = (
+            runtime_estimate_tokens_for_text(m.content or "")
+            + runtime_estimate_tokens_for_text(tool_summary or "")
+            + runtime_estimate_tokens_for_text(
+                str(meta.get(PROVIDER_REASONING_META_KEY) or "")
+            )
         )
-        if used_chars + msg_chars > char_budget and selected:
+        if used_tokens + msg_tokens > token_budget and selected:
             break
-        used_chars += msg_chars
+        used_tokens += msg_tokens
         selected.append(m)
 
     selected.reverse()
@@ -143,13 +154,29 @@ async def load_conversation_history(
         dropped = len(msgs) - len(selected)
         if dropped >= SUMMARY_TRIGGER:
             try:
+                # Snapshot before scheduling: the task outlives this request,
+                # so it must not touch the request-scoped session or its ORM rows.
+                snapshots = [
+                    SimpleNamespace(role=m.role, content=m.content or "")
+                    for m in msgs[:dropped]
+                ]
                 asyncio.create_task(
-                    update_conversation_summary(db, conversation_id, msgs[:dropped])
+                    update_conversation_summary(conversation_id, snapshots)
                 )
             except Exception:
                 pass
 
-    for m in selected:
+    last_assistant_idx = next(
+        (
+            idx
+            for idx in range(len(selected) - 1, -1, -1)
+            if selected[idx].role == "assistant"
+        ),
+        None,
+    )
+    has_new_user_message = bool(str(latest_user_message or "").strip())
+
+    for idx, m in enumerate(selected):
         content = strip_chat_mode_history_markers(
             strip_leaked_tool_activity(m.content or "")
         )
@@ -161,9 +188,12 @@ async def load_conversation_history(
         if tool_summary and not should_include_previous_tool_activity_for_turn(
             latest_user_message,
             tool_summary,
+            is_last_assistant_message=idx == last_assistant_idx,
         ):
             tool_summary = None
         if tool_summary:
+            if has_new_user_message:
+                tool_summary = f"{COMPLETED_TOOL_ACTIVITY_FRAME}\n{tool_summary}"
             content = f"{content}\n\n{tool_summary}" if content else tool_summary
         entry: dict = {
             "role": m.role,
@@ -182,35 +212,47 @@ async def load_conversation_history(
 
 
 async def update_conversation_summary(
-    db: AsyncSession,
     conversation_id: str,
     dropped_messages: list[Any],
 ) -> None:
-    """Generate a rolling summary of dropped messages and store it."""
+    """Roll dropped messages into the stored conversation summary.
+
+    Runs fire-and-forget after the originating request, so it opens its own
+    session. The prior summary is merged into the new one — regenerating from
+    only the latest dropped window used to silently discard everything the
+    previous summary covered.
+    """
 
     try:
-        conv_row = await _get_conversation_for_history(db, conversation_id)
+        from packages.core.database import async_session
 
         text_block = runtime_conversation_summary_text(dropped_messages)
         if not text_block:
             return
 
-        completion = await runtime_execute_conversation_summary_completion(
-            entity_id=conv_row.entity_id if conv_row else None,
-            workspace_id=conv_row.workspace_id if conv_row else None,
-            text_block=text_block,
-        )
-        summary = completion.content
-        if summary and summary.strip():
-            conv = await _get_conversation_for_history(db, conversation_id)
-            if conv:
-                conv.summary = summary.strip()
-                await db.flush()
-                logger.info(
-                    "Updated conversation summary for %s (%d chars)",
-                    conversation_id,
-                    len(conv.summary),
-                )
+        async with async_session() as db:
+            conv_row = await _get_conversation_for_history(db, conversation_id)
+            if conv_row is None:
+                return
+            prior_summary = (conv_row.summary or "").strip() or None
+
+            completion = await runtime_execute_conversation_summary_completion(
+                entity_id=conv_row.entity_id,
+                workspace_id=conv_row.workspace_id,
+                text_block=text_block,
+                prior_summary=prior_summary,
+            )
+            summary = completion.content
+            if summary and summary.strip():
+                conv = await _get_conversation_for_history(db, conversation_id)
+                if conv:
+                    conv.summary = summary.strip()
+                    await db.commit()
+                    logger.info(
+                        "Updated conversation summary for %s (%d chars)",
+                        conversation_id,
+                        len(conv.summary),
+                    )
     except Exception:
         logger.warning("Failed to update conversation summary", exc_info=True)
 

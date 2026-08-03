@@ -1104,6 +1104,8 @@ dependencies = [
     { name = "httpx" },
     { name = "hvac" },
     { name = "jsonschema" },
+    { name = "lxml" },
+    { name = "markdown" },
     { name = "minio" },
     { name = "openai" },
     { name = "openpyxl" },
@@ -1112,6 +1114,7 @@ dependencies = [
     { name = "psycopg2-binary" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pyjwt" },
     { name = "pypdf" },
     { name = "python-docx" },
     { name = "python-jose", extra = ["cryptography"] },
@@ -1120,9 +1123,9 @@ dependencies = [
     { name = "python-ulid" },
     { name = "pyyaml" },
     { name = "redis" },
+    { name = "signxml" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "stripe" },
-    { name = "temporalio" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1159,6 +1162,8 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "hvac", specifier = ">=2.0" },
     { name = "jsonschema", specifier = ">=4.20" },
+    { name = "lxml", specifier = ">=5.0" },
+    { name = "markdown", specifier = ">=3.5" },
     { name = "minio", specifier = ">=7.0" },
     { name = "openai", specifier = ">=1.0" },
     { name = "openpyxl", specifier = ">=3.1" },
@@ -1171,6 +1176,7 @@ requires-dist = [
     { name = "psycopg2-binary", specifier = ">=2.9" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.0" },
+    { name = "pyjwt", specifier = ">=2.10" },
     { name = "pypdf", specifier = ">=4.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
@@ -1182,12 +1188,21 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
+    { name = "signxml", specifier = ">=4.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "stripe", specifier = ">=8.0" },
-    { name = "temporalio", specifier = ">=1.7" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
 ]
 provides-extras = ["dev", "pdf", "otel", "browser"]
+
+[[package]]
+name = "markdown"
+version = "3.10.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2b/f4/69fa6ed85ae003c2378ffa8f6d2e3234662abd02c10d216c0ba96081a238/markdown-3.10.2.tar.gz", hash = "sha256:994d51325d25ad8aa7ce4ebaec003febcce822c3f8c911e3b17c52f7f589f950", size = 368805, upload-time = "2026-02-09T14:57:26.942Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/de/1f/77fa3081e4f66ca3576c896ae5d31c3002ac6607f9747d2e3aa49227e464/markdown-3.10.2-py3-none-any.whl", hash = "sha256:e91464b71ae3ee7afd3017d9f358ef0baf158fd9a298db92f1d4761133824c36", size = 108180, upload-time = "2026-02-09T14:57:25.787Z" },
+]
 
 [[package]]
 name = "markupsafe"
@@ -1277,18 +1292,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/40/df/6dfc6540f96a74125a11653cce717603fd5b7d0001a8e847b3e54e72d238/minio-7.2.20.tar.gz", hash = "sha256:95898b7a023fbbfde375985aa77e2cd6a0762268db79cf886f002a9ea8e68598", size = 136113, upload-time = "2025-11-27T00:37:15.569Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3e/9a/b697530a882588a84db616580f2ba5d1d515c815e11c30d219145afeec87/minio-7.2.20-py3-none-any.whl", hash = "sha256:eb33dd2fb80e04c3726a76b13241c6be3c4c46f8d81e1d58e757786f6501897e", size = 93751, upload-time = "2025-11-27T00:37:13.993Z" },
-]
-
-[[package]]
-name = "nexus-rpc"
-version = "1.4.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/35/d5/cd1ffb202b76ebc1b33c1332a3416e55a39929006982adc2b1eb069aaa9b/nexus_rpc-1.4.0.tar.gz", hash = "sha256:3b8b373d4865671789cc43623e3dc0bcbf192562e40e13727e17f1c149050fba", size = 82367, upload-time = "2026-02-25T22:01:34.053Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/52/6327a5f4fda01207205038a106a99848a41c83e933cd23ea2cab3d2ebc6c/nexus_rpc-1.4.0-py3-none-any.whl", hash = "sha256:14c953d3519113f8ccec533a9efdb6b10c28afef75d11cdd6d422640c40b3a49", size = 29645, upload-time = "2026-02-25T22:01:33.122Z" },
 ]
 
 [[package]]
@@ -1915,6 +1918,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyjwt"
+version = "2.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/81/58d0ac84e1ef3a3843791d6954d94c0b33d526c75eeb1efbce9d0a4c4077/pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423", size = 107515, upload-time = "2026-05-21T19:54:36.618Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/5e/ecf12fdb62546d64385c158514e9b2b671f7832108ef2ecd2020ce0af2d1/pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728", size = 31274, upload-time = "2026-05-21T19:54:35.362Z" },
+]
+
+[[package]]
 name = "pypdf"
 version = "6.10.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2328,6 +2340,20 @@ wheels = [
 ]
 
 [[package]]
+name = "signxml"
+version = "5.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "cryptography" },
+    { name = "lxml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/48/82fb75feed6fd29af5cc26ff6b8d05845c7e4620a13c18e4c9c0f7940d09/signxml-5.1.0.tar.gz", hash = "sha256:9b5fb208b59e843a87f36fd9fc3c8ccbb46e11b1ffab037d4b177ece33b5fd18", size = 1623299, upload-time = "2026-07-05T02:03:03.41Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/50/20/16b2e170786aa6140344d3aac887fbd266717421ab4a79c0020df0e19726/signxml-5.1.0-py3-none-any.whl", hash = "sha256:f9d815164e35c8451295fc532d5292d2b10202a85a845c17c802fb15da8783c6", size = 62628, upload-time = "2026-07-05T02:03:01.556Z" },
+]
+
+[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2430,25 +2456,6 @@ wheels = [
 ]
 
 [[package]]
-name = "temporalio"
-version = "1.26.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "nexus-rpc" },
-    { name = "protobuf" },
-    { name = "types-protobuf" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ae/d4/fa21150a225393f87732ed6fef3cc9735d9e751edc6be415fe6e375105c6/temporalio-1.26.0.tar.gz", hash = "sha256:f4bfb35125e6f5e8c7f7ed1277c7354d812c6fac7ed5f8dbd50536cf289aaaa7", size = 2388994, upload-time = "2026-04-15T23:43:00.911Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/27/8c421c622d18cc8e034247d5d72b89e6456937344b5bec1de40abef3c085/temporalio-1.26.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:5489040c0cf621edeb36984199dd9e4fbd2b3a07d61a4f2a8da1f2cb9820ef26", size = 14221070, upload-time = "2026-04-15T23:42:26.21Z" },
-    { url = "https://files.pythonhosted.org/packages/49/7c/d2b691d16ec5db87198c2e08dbfba58e286c096faee15753613a581abdce/temporalio-1.26.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:b18dd85771509c19ef059a31908bcd4e6130d1f67037c4db519702f3f2ad6d4a", size = 13583991, upload-time = "2026-04-15T23:42:34.357Z" },
-    { url = "https://files.pythonhosted.org/packages/05/ca/b8728451320ca9d8bb6e1680b9bd23767118f86d5b8644edf2304d533f1b/temporalio-1.26.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:46187d5f82ca2ae81f35ea5916a76db0e2f067210dc6b1852c3749475721946e", size = 13808036, upload-time = "2026-04-15T23:42:42.757Z" },
-    { url = "https://files.pythonhosted.org/packages/cb/54/3113f5e0ac58655790abac64656373e06191b351d74bfb94692e81bd6784/temporalio-1.26.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:03300c3e5237443367ac61bb20bd726c656b3daa50310bdd436599d5bdc7cf97", size = 14336604, upload-time = "2026-04-15T23:42:49.851Z" },
-    { url = "https://files.pythonhosted.org/packages/fd/9b/c50840a26af3587c0c8d9af04d9976743e22496996dc1a377efc75dcd316/temporalio-1.26.0-cp310-abi3-win_amd64.whl", hash = "sha256:1c4a0d82f0a3796cbf78864c799f8dca0b94cdaec68e7b8b224c859005686ec4", size = 14525849, upload-time = "2026-04-15T23:42:57.589Z" },
-]
-
-[[package]]
 name = "tqdm"
 version = "4.67.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2458,15 +2465,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/16/e1/3079a9ff9b8e11b846c6ac5c8b5bfb7ff225eee721825310c91b3b50304f/tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf", size = 78374, upload-time = "2026-02-03T17:35:50.982Z" },
-]
-
-[[package]]
-name = "types-protobuf"
-version = "6.32.1.20260221"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5f/e2/9aa4a3b2469508bd7b4e2ae11cbedaf419222a09a1b94daffcd5efca4023/types_protobuf-6.32.1.20260221.tar.gz", hash = "sha256:6d5fb060a616bfb076cbb61b4b3c3969f5fc8bec5810f9a2f7e648ee5cbcbf6e", size = 64408, upload-time = "2026-02-21T03:55:13.916Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/e8/1fd38926f9cf031188fbc5a96694203ea6f24b0e34bd64a225ec6f6291ba/types_protobuf-6.32.1.20260221-py3-none-any.whl", hash = "sha256:da7cdd947975964a93c30bfbcc2c6841ee646b318d3816b033adc2c4eb6448e4", size = 77956, upload-time = "2026-02-21T03:55:12.894Z" },
 ]
 
 [[package]]

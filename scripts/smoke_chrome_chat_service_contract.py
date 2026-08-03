@@ -102,7 +102,7 @@ async def resolve_runtime_chat_context(
         runtime_envelope=SimpleNamespace(profile=SimpleNamespace(value="owner_copilot")),
         workspace_id=kwargs.get("workspace_id") or "ws-chat-service-smoke",
         task_id="task-chat-service-smoke",
-        legacy_runtime_profile="owner_copilot",
+        tool_profile="owner_copilot",
         allowed_tool_names={
             "search_tools",
             "mcp__chrome__read_page",
@@ -239,6 +239,7 @@ def _install_stubs() -> None:
     )
     _module(
         "packages.core.ai.runtime.output_policy",
+        runtime_assistant_stream_error_content=lambda message: message,
         runtime_assistant_result_meta=lambda result: {"stop_reason": getattr(result, "stop_reason", None)},
         runtime_coerce_visible_text_language=lambda text, message: text,
         runtime_fallback_stream_final_summary=lambda *args, **kwargs: "",
@@ -256,6 +257,18 @@ def _install_stubs() -> None:
         runtime_tool_status_for_chat=lambda result: "complete",
         runtime_tool_stream_sink_var=runtime_tool_stream_sink_var,
     )
+    _module(
+        "packages.core.ai.runtime.provider_approvals",
+        ProviderApprovalCollector=type(
+            "ProviderApprovalCollector",
+            (),
+            {
+                "capture": lambda self, *args, **kwargs: None,
+                "capture_recorded_tool_call": lambda self, *args, **kwargs: None,
+                "pending_request": lambda self: None,
+            },
+        ),
+    )
 
     _module(
         "packages.core.services.conversation_messages",
@@ -269,6 +282,10 @@ def _install_stubs() -> None:
         "packages.core.services.hitl_requests",
         hitl_requests_from_data=lambda data: None,
         workspace_operation_pending_action_from_data=lambda data: None,
+    )
+    _module(
+        "packages.core.services.chat_approvals",
+        register_chat_provider_approval=lambda *args, **kwargs: _async_noop(*args, **kwargs),
     )
     _module(
         "packages.core.services.model_resolver",
@@ -359,7 +376,7 @@ async def main() -> int:
         "conversation_id": "conv-chat-service-smoke",
         "task_id": "task-chat-service-smoke",
         "active_user_message": message,
-        "legacy_tool_profile": "owner_copilot",
+        "tool_profile": "owner_copilot",
         "model": "smoke-primary-model",
         "metadata": {"model_context": "smoke"},
         "forced_tool_calls": [{"name": "mcp__chrome__read_page", "arguments": {"tabId": 321}}],

@@ -333,6 +333,213 @@ async def test_missing_artifact_supervisor_requests_replan_not_human(db_session,
     )
     await db_session.commit()
 
-    verdict = await PlanExecutor._supervise_outcome(db_session, plan, "completed")
+    decision = await PlanExecutor._supervise_outcome(db_session, plan, "completed")
 
-    assert verdict == "needs_replan"
+    from packages.core.constants.supervisor import (
+        SupervisorDecisionSource,
+        SupervisorVerdict,
+    )
+    assert decision.verdict is SupervisorVerdict.NEEDS_REPLAN
+    # The gate states its own finding — a verdict without evidence is the
+    # bug this type exists to prevent.
+    assert decision.evidence
+    assert decision.source is SupervisorDecisionSource.GATE
+
+
+# ── replan context: completed steps carry reusable handles ────────────
+
+
+def _done_step(result, *, key: str = "draft", kind: str = "subagent", status: str = "done"):
+    return SimpleNamespace(step_status=status, result=result, step_key=key, kind=kind)
+
+
+def test_succeeded_step_context_surfaces_generated_files() -> None:
+    steps = [
+        _done_step(
+            {
+                "text": "Script written and saved.",
+                "artifact_materialized": True,
+                "files": [
+                    {"name": "script.md", "fs_path": "workspace/artifacts/script.md"},
+                ],
+            },
+            key="write_script",
+        )
+    ]
+
+    contexts = executor._succeeded_step_contexts(steps)
+
+    assert len(contexts) == 1
+    entry = contexts[0]
+    assert entry["step_key"] == "write_script"
+    assert entry["kind"] == "subagent"
+    # The point of the change: a usable handle, not only a text blurb.
+    assert entry["artifacts"] == [
+        {
+            "type": "file",
+            "step": "write_script",
+            "source": "fs_path",
+            "name": "script.md",
+            "fs_path": "workspace/artifacts/script.md",
+        }
+    ]
+
+
+def test_succeeded_step_context_marks_done_step_with_no_output() -> None:
+    steps = [_done_step(None, key="notify_team", kind="action")]
+
+    contexts = executor._succeeded_step_contexts(steps)
+
+    assert contexts == [
+        {"step_key": "notify_team", "kind": "action", "no_output": True}
+    ]
+
+
+def test_succeeded_step_context_surfaces_top_level_document_and_path() -> None:
+    steps = [
+        _done_step(
+            {
+                "text": "Deck exported.",
+                "document_id": "doc_42",
+                "fs_path": "workspace/artifacts/deck.pptx",
+            },
+            key="export_deck",
+        )
+    ]
+
+    entry = executor._succeeded_step_contexts(steps)[0]
+
+    assert entry["document_id"] == "doc_42"
+    assert entry["fs_path"] == "workspace/artifacts/deck.pptx"
+
+
+def test_succeeded_step_context_keeps_usable_text_not_a_label() -> None:
+    long_text = "x" * 5000
+    entry = executor._succeeded_step_contexts([_done_step({"text": long_text})])[0]
+
+    assert len(entry["result_summary"]) == executor._REPLAN_STEP_SUMMARY_CHARS
+    assert len(entry["result_summary"]) > 200
+
+
+def test_succeeded_step_context_skips_non_done_steps() -> None:
+    steps = [
+        _done_step({"text": "ok"}, key="a"),
+        _done_step({"text": "boom"}, key="b", status="failed"),
+        _done_step({"text": "later"}, key="c", status="pending"),
+    ]
+
+    assert [e["step_key"] for e in executor._succeeded_step_contexts(steps)] == ["a"]
+
+
+def test_succeeded_step_context_stays_within_prompt_budget() -> None:
+    import json
+
+    steps = [
+        _done_step(
+            {
+                "text": "y" * 4000,
+                "artifact_materialized": True,
+                "files": [
+                    {"name": f"asset-{i}-{n}.png", "fs_path": f"workspace/artifacts/asset-{i}-{n}.png"}
+                    for n in range(25)
+                ],
+            },
+            key=f"step_{i}",
+        )
+        for i in range(40)
+    ]
+
+    contexts = executor._succeeded_step_contexts(steps)
+
+    assert len(contexts) == executor._REPLAN_MAX_SUCCEEDED_STEPS
+    # Tail is kept — downstream steps are what a follow-up plan consumes.
+    assert contexts[-1]["step_key"] == "step_39"
+    for entry in contexts:
+        assert len(entry.get("artifacts", [])) <= executor._REPLAN_MAX_ARTIFACTS_PER_STEP
+        assert len(entry.get("result_summary", "")) <= executor._REPLAN_STEP_SUMMARY_CHARS
+    summary_chars = sum(len(e.get("result_summary", "")) for e in contexts)
+    assert summary_chars <= executor._REPLAN_SUMMARY_TOTAL_CHARS
+    # Stated budget for the whole blob that gets dumped into the prompt.
+    assert len(json.dumps(contexts, ensure_ascii=False)) < 30000
+
+
+@pytest.mark.asyncio
+async def test_replan_context_carries_artifacts_of_completed_steps(db_session, monkeypatch) -> None:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.plans.executor import PlanExecutor
+
+    monkeypatch.setattr(
+        "packages.core.tasks.ai_tasks.plan_and_run_task.delay",
+        lambda task_id: None,
+    )
+
+    entity_id = generate_ulid()
+    task_id = generate_ulid()
+    plan_id = generate_ulid()
+    db_session.add(
+        Task(
+            id=task_id,
+            entity_id=entity_id,
+            title="做一条产品短视频",
+            status="in_progress",
+            priority=3,
+            task_type="general",
+            details={},
+        )
+    )
+    plan = ExecutionPlan(
+        id=plan_id,
+        entity_id=entity_id,
+        task_id=task_id,
+        status="running",
+        plan_dag={},
+    )
+    produced = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan_id,
+        entity_id=entity_id,
+        step_key="write_script",
+        kind="subagent",
+        step_status="done",
+        result={
+            "text": "脚本全文……",
+            "artifact_materialized": True,
+            "files": [{"name": "script.md", "fs_path": "workspace/artifacts/script.md"}],
+        },
+    )
+    side_effect = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan_id,
+        entity_id=entity_id,
+        step_key="notify_team",
+        kind="action",
+        step_status="done",
+        result=None,
+    )
+    failed = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan_id,
+        entity_id=entity_id,
+        step_key="render_video",
+        kind="action",
+        step_status="failed",
+        error={"type": "ToolError", "message": "renderer timed out"},
+    )
+    db_session.add_all([plan, produced, side_effect, failed])
+    await db_session.commit()
+
+    replanned = await PlanExecutor._maybe_replan(
+        db_session, plan, [produced, side_effect, failed], reason="step_failed",
+    )
+    await db_session.flush()
+
+    assert replanned is True
+    task = await db_session.get(Task, task_id)
+    assert task is not None
+    succeeded = task.details["_replan_context"]["succeeded_steps"]
+    by_key = {e["step_key"]: e for e in succeeded}
+    assert set(by_key) == {"write_script", "notify_team"}
+    assert by_key["write_script"]["artifacts"][0]["fs_path"] == "workspace/artifacts/script.md"
+    assert by_key["notify_team"]["no_output"] is True

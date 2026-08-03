@@ -19,7 +19,9 @@ from packages.core.blueprints.payload import validate_payload
 FROZEN_AT = "2026-06-03"
 CONFIG_DIR = Path(__file__).with_name("configs") / "solo_company"
 CONFIG_ORDER = (
+    "product-video-studio-v1.json",
     "solo-video-account-studio-v1.json",
+    "solo-faceless-stickman-studio-v1.json",
     "solo-productized-service-os-v1.json",
     "solo-digital-product-store-v1.json",
 )

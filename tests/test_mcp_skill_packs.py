@@ -50,8 +50,7 @@ def _real_tool_names(server_key: str) -> set[str] | None:
     remote MCPs, or a server neither source knows):
 
     - the in-process module's ``list_tools()`` (when a module exists), and
-    - the ``_SERVER_TOOL_SCHEMAS`` deferred-tool registry in mcp_builtin
-      (covers no-module builtins like discord).
+    - the ``_SERVER_TOOL_SCHEMAS`` deferred-tool registry in mcp_builtin.
     """
     if server_key in _REMOTE_VENDOR_SERVERS:
         return None

@@ -150,6 +150,65 @@ async def test_delete_conversation(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_conversation_messages_page_loads_older_messages(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "conv_page")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conv_id = generate_ulid()
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            title="Paged chat",
+            channel="web",
+            scope="channel",
+        )
+    )
+    for index in range(6):
+        db_session.add(
+            Message(
+                id=generate_ulid(),
+                conversation_id=conv_id,
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"message-{index}",
+                created_at=base + timedelta(minutes=index),
+            )
+        )
+    await db_session.commit()
+
+    first = await client.get(
+        f"/api/v1/chat/conversations/{conv_id}/messages/page?limit=2",
+        headers=headers,
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    assert [row["content"] for row in first_body["items"]] == [
+        "message-4",
+        "message-5",
+    ]
+    assert first_body["has_more"] is True
+    assert first_body["next_cursor"]
+
+    second = await client.get(
+        f"/api/v1/chat/conversations/{conv_id}/messages/page",
+        headers=headers,
+        params={"limit": 2, "before": first_body["next_cursor"]},
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert [row["content"] for row in second_body["items"]] == [
+        "message-2",
+        "message-3",
+    ]
+    assert second_body["has_more"] is True
+    assert second_body["next_cursor"]
+
+
+@pytest.mark.asyncio
 async def test_delete_conversation_purges_cli_worker_execution_rows(db_session: AsyncSession):
     entity_id = generate_ulid()
     user_id = generate_ulid()

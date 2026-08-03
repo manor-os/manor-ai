@@ -12,6 +12,7 @@ import { adjustDiagramDraftFromPrompt } from "../lib/diagram/aiDraft";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import AiEditButton from "../components/ui/AiEditButton";
+import PageHeader from "../components/ui/PageHeader";
 import { openEditorLiveChat } from "../lib/editorLiveChat";
 
 function summarizeDiagramAiEdit(before: EditableDiagramDocument, after: EditableDiagramDocument) {
@@ -146,41 +147,37 @@ export default function DiagramStudio() {
 
   return (
     <div className="manor-editor-shell">
-      <div className="manor-editor-header">
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <h1 className="manor-editor-title">
-            Diagram Canvas
-          </h1>
-          <p className="manor-editor-subtitle">
-            {diagram.elements.length} editable objects
-          </p>
-        </div>
-        <div className="manor-editor-actions">
-          <AiEditButton
-            onClick={() => void openLiveEdit()}
-            disabled={isSavingKnowledge}
-          />
-          <button onClick={resetCanvas} className="btn-manor-ghost" style={{ fontSize: 12, padding: "6px 12px" }}>
-            New file
-          </button>
-          <button
-            onClick={saveToKnowledge}
-            disabled={isSavingKnowledge}
-            className="btn-manor-ghost"
-            style={{ fontSize: 12, padding: "6px 12px", opacity: isSavingKnowledge ? 0.6 : 1 }}
-          >
-            {knowledgeDocId ? "Save changes" : "Save to Knowledge"}
-          </button>
-          {knowledgeDocId && (
-            <button onClick={() => navigate(`/editor/${knowledgeDocId}`, { state: { knowledgeReturnTo: "/knowledge" } })} className="btn-manor-ghost" style={{ fontSize: 12, padding: "6px 12px" }}>
-              Open saved
+      <PageHeader
+        title="Diagram Canvas"
+        subtitle={`${diagram.elements.length} editable objects`}
+        actions={(
+          <div className="manor-editor-actions">
+            <AiEditButton
+              onClick={() => void openLiveEdit()}
+              disabled={isSavingKnowledge}
+            />
+            <button onClick={resetCanvas} className="btn-manor-ghost" style={{ fontSize: 12, padding: "6px 12px" }}>
+              New file
             </button>
-          )}
-          <button onClick={downloadJson} className="btn-manor" style={{ fontSize: 12, padding: "6px 14px" }}>
-            JSON
-          </button>
-        </div>
-      </div>
+            <button
+              onClick={saveToKnowledge}
+              disabled={isSavingKnowledge}
+              className="btn-manor-ghost"
+              style={{ fontSize: 12, padding: "6px 12px", opacity: isSavingKnowledge ? 0.6 : 1 }}
+            >
+              {knowledgeDocId ? "Save changes" : "Save to Knowledge"}
+            </button>
+            {knowledgeDocId && (
+              <button onClick={() => navigate(`/editor/${knowledgeDocId}`, { state: { knowledgeReturnTo: "/knowledge" } })} className="btn-manor-ghost" style={{ fontSize: 12, padding: "6px 12px" }}>
+                Open saved
+              </button>
+            )}
+            <button onClick={downloadJson} className="btn-manor" style={{ fontSize: 12, padding: "6px 14px" }}>
+              JSON
+            </button>
+          </div>
+        )}
+      />
       {saveLabel && (
         <div className="manor-editor-substatus">
           {saveLabel}

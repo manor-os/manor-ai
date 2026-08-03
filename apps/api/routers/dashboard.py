@@ -1,6 +1,7 @@
 """Dashboard analytics endpoints — stats, trends, goals, activity feed."""
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import re
@@ -17,6 +18,7 @@ from packages.core.ai.runtime.dashboard_module_validation import (
     DASHBOARD_BLOCKED_HTML,
     DASHBOARD_BLOCKED_JAVASCRIPT,
 )
+from packages.core import database as core_database
 from packages.core.cache import cache
 from packages.core.database import get_db
 from packages.core.models.user import User
@@ -49,11 +51,18 @@ from packages.core.services.conversation_lifecycle import (
     get_or_create_conversation,
 )
 from packages.core.services.conversation_records import list_messages
+from packages.core.services.dashboard_generation import (
+    DashboardGenerationConflict,
+    DashboardGenerationError,
+    cancel_dashboard_generation_job,
+    get_dashboard_generation_job,
+    start_dashboard_generation_job,
+)
 from packages.core.services.settings_service import (
     get_user_preferences,
     update_user_preferences,
 )
-from apps.api.deps import get_current_user
+from apps.api.deps import get_current_user, require_workspace_readable
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 
@@ -521,6 +530,19 @@ class DashboardLayoutResponse(BaseModel):
     modules: list[DashboardGeneratedModule] = Field(default_factory=list)
 
 
+class DashboardAppliedModuleChange(BaseModel):
+    """Normalized delta between the job's snapshot and its merged layout.
+
+    Concurrent generations each start from their own snapshot, so clients
+    must apply these deltas to the live draft instead of replacing the whole
+    layout — a full replace would drop modules finished by other jobs.
+    """
+
+    action: Literal["create", "update", "remove"]
+    module: DashboardGeneratedModule | None = None
+    module_id: str | None = None
+
+
 class DashboardLayoutSuggestionResponse(DashboardLayoutResponse):
     assistant_message: str | None = None
     changed_module_id: str | None = None
@@ -528,6 +550,10 @@ class DashboardLayoutSuggestionResponse(DashboardLayoutResponse):
     tool_calls: list[str] = Field(default_factory=list)
     hitl_requests: list[dict] = Field(default_factory=list)
     preview_created: bool = False
+    applied_module_changes: list[DashboardAppliedModuleChange] = Field(
+        default_factory=list
+    )
+    widgets_changed: bool = False
 
 
 class DashboardLayoutUpdate(BaseModel):
@@ -727,19 +753,13 @@ async def update_dashboard_layout(
     return DashboardLayoutResponse(**layout)
 
 
-@router.post(
-    "/layout/suggest",
-    response_model=DashboardLayoutSuggestionResponse,
-    response_model_exclude_none=True,
-)
-async def suggest_dashboard_layout(
+async def _run_dashboard_layout_suggestion(
+    db: AsyncSession,
+    *,
+    user: User,
     req: DashboardLayoutSuggestionRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    if not req.prompt.strip():
-        raise HTTPException(422, "Dashboard request must not be empty")
-
+) -> DashboardLayoutSuggestionResponse:
+    """Run one dashboard generation turn and merge the suggested layout."""
     current = _normalize_dashboard_layout(
         {
             "widgets": [widget.model_dump() for widget in req.widgets],
@@ -852,7 +872,159 @@ async def suggest_dashboard_layout(
         tool_calls=turn.tool_calls,
         hitl_requests=turn.hitl_requests,
         preview_created=layout != current,
+        applied_module_changes=_diff_dashboard_modules(current, layout),
+        widgets_changed=layout["widgets"] != current["widgets"],
     )
+
+
+def _diff_dashboard_modules(
+    current: dict, layout: dict
+) -> list[DashboardAppliedModuleChange]:
+    before = {module["id"]: module for module in current.get("modules", [])}
+    after = {module["id"]: module for module in layout.get("modules", [])}
+    changes: list[DashboardAppliedModuleChange] = []
+    for module_id, module in after.items():
+        if module_id not in before:
+            changes.append(
+                DashboardAppliedModuleChange(action="create", module=module)
+            )
+        elif before[module_id] != module:
+            changes.append(
+                DashboardAppliedModuleChange(action="update", module=module)
+            )
+    for module_id in before:
+        if module_id not in after:
+            changes.append(
+                DashboardAppliedModuleChange(action="remove", module_id=module_id)
+            )
+    return changes
+
+
+@router.post(
+    "/layout/suggest",
+    response_model=DashboardLayoutSuggestionResponse,
+    response_model_exclude_none=True,
+)
+async def suggest_dashboard_layout(
+    req: DashboardLayoutSuggestionRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not req.prompt.strip():
+        raise HTTPException(422, "Dashboard request must not be empty")
+    return await _run_dashboard_layout_suggestion(db, user=user, req=req)
+
+
+class DashboardGenerationJobResponse(BaseModel):
+    job_id: str
+    status: Literal["running", "succeeded", "failed", "cancelled"]
+    error: str | None = None
+    error_code: str | None = None
+    result: DashboardLayoutSuggestionResponse | None = None
+
+
+def _dashboard_job_response(job) -> DashboardGenerationJobResponse:
+    return DashboardGenerationJobResponse(
+        job_id=job.id,
+        status=job.status,
+        error=job.error,
+        error_code=job.error_code,
+        result=(
+            DashboardLayoutSuggestionResponse.model_validate(job.result)
+            if job.status == "succeeded" and job.result is not None
+            else None
+        ),
+    )
+
+
+@router.post(
+    "/layout/suggest/jobs",
+    response_model=DashboardGenerationJobResponse,
+    response_model_exclude_none=True,
+)
+async def start_dashboard_layout_suggestion_job(
+    req: DashboardLayoutSuggestionRequest,
+    user: User = Depends(get_current_user),
+):
+    if not req.prompt.strip():
+        raise HTTPException(422, "Dashboard request must not be empty")
+
+    user_id = user.id
+
+    async def _runner() -> dict:
+        # The request-scoped session is gone by the time this runs; use a
+        # dedicated session and re-load the user inside it. Resolved via the
+        # module attribute because tests rebind database.async_session.
+        async with core_database.async_session() as job_db:
+            job_user = await job_db.get(User, user_id)
+            if job_user is None:
+                raise DashboardGenerationError("User is no longer available")
+            try:
+                response = await _run_dashboard_layout_suggestion(
+                    job_db, user=job_user, req=req
+                )
+            except HTTPException as exc:
+                raise DashboardGenerationError(
+                    str(exc.detail), code="agent_error"
+                ) from exc
+            return response.model_dump()
+
+    try:
+        job = start_dashboard_generation_job(
+            user_id,
+            _runner,
+            target_key=req.target_module_id,
+        )
+    except DashboardGenerationConflict as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "message": str(exc),
+                "code": (
+                    "page.dashboard.ai_target_busy"
+                    if exc.code == "target_busy"
+                    else "page.dashboard.ai_concurrency_limit"
+                ),
+                "conflict": exc.code,
+            },
+        ) from exc
+    return _dashboard_job_response(job)
+
+
+@router.get(
+    "/layout/suggest/jobs/{job_id}",
+    response_model=DashboardGenerationJobResponse,
+    response_model_exclude_none=True,
+)
+async def dashboard_layout_suggestion_job_status(
+    job_id: str,
+    user: User = Depends(get_current_user),
+):
+    job = get_dashboard_generation_job(job_id, user.id)
+    if job is None:
+        raise HTTPException(404, "Dashboard generation job not found")
+    return _dashboard_job_response(job)
+
+
+@router.post(
+    "/layout/suggest/jobs/{job_id}/cancel",
+    response_model=DashboardGenerationJobResponse,
+    response_model_exclude_none=True,
+)
+async def cancel_dashboard_layout_suggestion_job(
+    job_id: str,
+    user: User = Depends(get_current_user),
+):
+    job = cancel_dashboard_generation_job(job_id, user.id)
+    if job is None:
+        raise HTTPException(404, "Dashboard generation job not found")
+    # Cancellation is asynchronous; give the task one scheduler pass so the
+    # common case returns a terminal status immediately.
+    for _ in range(10):
+        if job.status != "running":
+            break
+        await asyncio.sleep(0)
+    return _dashboard_job_response(job)
 
 
 @router.get(
@@ -1049,6 +1221,7 @@ async def dashboard_stats(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_readable(db, user, workspace_id)
     data = await get_dashboard_stats(
         db,
         user.entity_id,
@@ -1065,6 +1238,7 @@ async def task_trends(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_readable(db, user, workspace_id)
     return await get_task_trends(
         db,
         user.entity_id,
@@ -1090,6 +1264,7 @@ async def active_goals(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_readable(db, user, workspace_id)
     return await get_active_goals(db, user.entity_id, limit=limit, workspace_id=workspace_id)
 
 
@@ -1101,6 +1276,7 @@ async def recent_activity(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_readable(db, user, workspace_id)
     try:
         return await get_recent_activity(
             db,

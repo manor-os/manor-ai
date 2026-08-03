@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.cache import cache
 from packages.core.models.base import generate_ulid
+from packages.core.models.permission import Visibility
 from packages.core.models.workspace import Agent, AgentSubscription, ToolDefinition, AgentToolBinding
+from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 
 
 # ── Agents ──
@@ -72,10 +74,16 @@ async def create_agent(
     avatar_url: str = "", category: str = "", tags: list[str] | None = None,
     is_template: bool = False, is_public: bool = False,
     config: dict | None = None, source: str = "custom",
+    owner_user_id: str | None = None,
+    workspace_id: str | None = None,
+    visibility: str | None = None,
 ) -> Agent:
     agent = Agent(
         id=generate_ulid(),
         entity_id=entity_id,
+        owner_user_id=owner_user_id,
+        workspace_id=workspace_id,
+        visibility=visibility or Visibility.ENTITY,
         name=name,
         description=description or None,
         system_prompt=system_prompt or None,
@@ -84,7 +92,7 @@ async def create_agent(
         tags=tags or [],
         is_template=is_template,
         is_public=is_public,
-        config=config or {},
+        config=normalize_agent_runtime_config(config),
         source=source,
     )
     db.add(agent)
@@ -96,9 +104,22 @@ async def update_agent(db: AsyncSession, agent_id: str, entity_id: str, **fields
     agent = await get_agent(db, agent_id)
     if not agent or (agent.entity_id and agent.entity_id != entity_id):
         return None
+    # M11: diff BEFORE applying — only real changes to behavior-affecting
+    # fields bump the config revision; cosmetic edits (name/description/
+    # tags/avatar) and same-value writes leave it alone.
+    from packages.core.revisions import (
+        AGENT_CONTENT_REVISION_FIELDS,
+        bump_revision,
+        content_patch_for,
+    )
+    content_patch = content_patch_for(agent, fields, AGENT_CONTENT_REVISION_FIELDS)
     for k, v in fields.items():
         if hasattr(agent, k) and v is not None:
+            if k == "config":
+                v = normalize_agent_runtime_config(v)
             setattr(agent, k, v)
+    if content_patch:
+        await bump_revision(db, agent, patch=content_patch)
     await db.flush()
     # Invalidate cache
     await cache.delete(f"agent:{agent_id}")

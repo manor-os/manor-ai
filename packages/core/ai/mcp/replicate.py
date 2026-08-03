@@ -24,6 +24,8 @@ from typing import Any, Dict, List
 
 import httpx
 
+from packages.core.contracts.artifacts import build_knowledge_artifacts, build_mcp_text_result
+
 logger = logging.getLogger(__name__)
 
 _API = "https://api.replicate.com/v1"
@@ -137,7 +139,7 @@ async def call_tool(
 
     try:
         result = await handler(arguments, bearer_token)
-        return _content(result)
+        return result if isinstance(result, dict) else _content(result)
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
         return _error(f"Replicate HTTP {exc.response.status_code}: {body}")
@@ -148,7 +150,7 @@ async def call_tool(
 
 # ── Handlers ────────────────────────────────────────────────────────────────
 
-async def _generate_image(args: Dict[str, Any], token: str) -> str:
+async def _generate_image(args: Dict[str, Any], token: str) -> Dict[str, Any]:
     model = (args.get("model") or _DEFAULT_IMAGE_MODEL).strip()
     inp: Dict[str, Any] = {
         "prompt": args.get("prompt") or "",
@@ -161,7 +163,7 @@ async def _generate_image(args: Dict[str, Any], token: str) -> str:
     return await _run_and_format(token, model, inp, intent="image")
 
 
-async def _generate_video(args: Dict[str, Any], token: str) -> str:
+async def _generate_video(args: Dict[str, Any], token: str) -> Dict[str, Any]:
     model = (args.get("model") or _DEFAULT_VIDEO_MODEL).strip()
     inp: Dict[str, Any] = {"prompt": args.get("prompt") or ""}
     if args.get("aspect_ratio"):
@@ -171,7 +173,7 @@ async def _generate_video(args: Dict[str, Any], token: str) -> str:
     return await _run_and_format(token, model, inp, intent="video")
 
 
-async def _run_model(args: Dict[str, Any], token: str) -> str:
+async def _run_model(args: Dict[str, Any], token: str) -> Dict[str, Any]:
     model = (args.get("model") or "").strip()
     inp = args.get("input") or {}
     if not model:
@@ -185,7 +187,7 @@ async def _run_model(args: Dict[str, Any], token: str) -> str:
 
 async def _run_and_format(
     token: str, model: str, input_payload: Dict[str, Any], *, intent: str,
-) -> str:
+) -> Dict[str, Any]:
     """Submit a prediction, poll until done, return a JSON-ish summary."""
     headers = {
         "Authorization": f"Bearer {token}",
@@ -228,14 +230,15 @@ async def _run_and_format(
     raise RuntimeError(f"Replicate prediction did not complete within {_TIMEOUT}s")
 
 
-def _format_output(body: Dict[str, Any], intent: str) -> str:
+def _format_output(body: Dict[str, Any], intent: str) -> Dict[str, Any]:
     output = body.get("output")
     urls: List[str] = []
     if isinstance(output, list):
         urls = [str(x) for x in output if isinstance(x, str)]
     elif isinstance(output, str):
         urls = [output]
-    return _truncate(json.dumps({
+    artifact_kind = intent if intent in {"audio", "document", "image", "video"} else "file"
+    visible_text = _truncate(json.dumps({
         "intent": intent,
         "model": body.get("model"),
         "id": body.get("id"),
@@ -245,6 +248,10 @@ def _format_output(body: Dict[str, Any], intent: str) -> str:
         "primary": urls[0] if urls else None,
         "metrics": body.get("metrics") or {},
     }, ensure_ascii=False, indent=2))
+    return build_mcp_text_result(
+        visible_text,
+        knowledge_artifacts=build_knowledge_artifacts(urls, kind=artifact_kind),
+    )
 
 
 def _format_failure(body: Dict[str, Any]) -> str:

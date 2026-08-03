@@ -7,31 +7,74 @@
  */
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
-import { api } from "../lib/api";
+import { Link, useNavigate } from "react-router-dom";
+import { api, type WorkspaceChatEntrypoint } from "../lib/api";
 import { MANOR_AGENT_NAME } from "../lib/constants";
-import type { Workspace } from "../lib/types";
+import type { Workspace, Agent } from "../lib/types";
 import { useWebSocket } from "../lib/websocket";
 import { useAuthStore } from "../stores/auth";
 import { t } from "../lib/i18n";
+import { openDetail, closeDetail, useDetailStore } from "../stores/detail";
+import { openAgentEditModal } from "../stores/agentEditModal";
 import ChatMarkdown from "./ChatMarkdown";
 import AssistantMessageBlocks from "./AssistantMessageBlocks";
+import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
+import ChatScrollRail, {
+  type ChatScrollRailMarker,
+} from "./chat/ChatScrollRail";
 import ManorAvatar from "./ui/ManorAvatar";
 import UserAvatar from "./ui/UserAvatar";
 import WorkspaceIconTile from "./ui/WorkspaceIcon";
 import ChatActionCard from "./ui/ChatActionCard";
+import { isErrorHitlCard } from "../lib/approvalCopy";
+import { PendingActionKind } from "../lib/pendingActionKinds";
 import InlineTips from "./ui/InlineTips";
 import ToolCallList from "./ui/ToolCallList";
+import LoadingSpinner from "./ui/LoadingSpinner";
+import Select from "./ui/Select";
+import { ChatMessagesSkeleton, SkeletonLine } from "./ui/Skeleton";
 import ChatInputFooter, {
   manualSkillLabel,
   stripManualSkillTokens,
   type AttachedItem,
   type ManualSkillItem,
 } from "./ChatInputFooter";
-import { IconChatBubble, IconThumbDown, IconThumbUp } from "./icons";
-import { parseToolCalls, type ChatMessage, type ToolCall } from "../lib/chatStream";
+import WorkspaceWorkflowRunHost, {
+  buildWorkspaceWorkflowRunGroups,
+  workflowRunIdForMessage,
+  workflowHostOwnedMessageIds,
+} from "./workflows/WorkspaceWorkflowRunHost";
+import {
+  IconChatBubble,
+  IconEdit,
+  IconFlow,
+  IconThumbDown,
+  IconThumbUp,
+} from "./icons";
+import {
+  parseToolCalls,
+  type ChatMessage,
+  type SubAgentEvent,
+  type ToolCall,
+} from "../lib/chatStream";
 import { useChatStreamStore } from "../stores/chatStream";
-import { formatUserFacingStructuredText, formatUserFacingText } from "../lib/taskDisplay";
+import {
+  formatUserFacingStructuredText,
+  formatUserFacingText,
+} from "../lib/taskDisplay";
+import { relativeTime } from "../lib/format";
+import Chip from "./ui/Chip";
+import StatusBadge from "./ui/StatusBadge";
+import {
+  proposalImpactExplainer,
+  proposalImpactLabel,
+  proposalPriorityLabel,
+  proposalTaskEntries,
+} from "../lib/proposalDisplay";
+import {
+  INSERT_CHAT_COMPOSER_EVENT,
+  type InsertChatComposerDetail,
+} from "../lib/selectionActions";
 
 /* ── Types ── */
 
@@ -43,6 +86,7 @@ interface WsMessage {
   id: string;
   conversation_id: string;
   created_at: string;
+  updated_at?: string | null;
   body: string | null;
   tool_calls?: any;
   assistant_blocks?: any[] | null;
@@ -58,7 +102,11 @@ interface WsMessage {
   meta: Record<string, any> | null;
   pending_action: { kind: string; [k: string]: any } | null;
   resolved_at: string | null;
-  resolution: { choice: string; note?: string } | null;
+  resolution: {
+    choice: string;
+    note?: string;
+    payload?: Record<string, any>;
+  } | null;
   resolved_by_user_id?: string | null;
   resolved_by_user_name?: string | null;
   resolved_by_user_email?: string | null;
@@ -100,7 +148,13 @@ function agentColor(name: string) {
 }
 
 function isGovernanceApprovalMessage(msg: WsMessage) {
-  return msg.pending_action?.kind === "governance_approval";
+  // An `error` card rides the same pending_action kind but is not a policy
+  // pause — nothing about it came from the workspace rules, so it must not be
+  // attributed to them.
+  return (
+    msg.pending_action?.kind === PendingActionKind.GOVERNANCE_APPROVAL
+    && !isErrorHitlCard(msg.pending_action?.hitl_type)
+  );
 }
 
 function systemSenderName(msg: WsMessage) {
@@ -121,6 +175,7 @@ function formatTime(iso: string) {
 }
 
 const WORKSPACE_CHAT_DRAFT_PREFIX = "manor_workspace_chat_draft:";
+const WORKSPACE_CHAT_PAGE_SIZE = 75;
 
 function workspaceChatDraftKey(workspaceId: string) {
   return `${WORKSPACE_CHAT_DRAFT_PREFIX}${workspaceId}`;
@@ -146,12 +201,43 @@ function saveWorkspaceChatDraft(workspaceId: string, value: string) {
   }
 }
 
+function mergeWorkspaceMessages(existing: WsMessage[], incoming: WsMessage[]) {
+  const byId = new Map<string, WsMessage>();
+  [...existing, ...incoming].forEach((message) => {
+    if (message.id) byId.set(message.id, message);
+  });
+  return Array.from(byId.values());
+}
+
+/** Mark locally-remembered open action cards closed when an authoritative
+ *  page omits them. `mergeWorkspaceMessages` is a union — it can update a
+ *  card only if the server hands it back, and an answered card leaves the
+ *  pinned set instead of returning marked resolved. Callers must only pass a
+ *  page the server flagged as carrying the complete open set. */
+function closeActionsMissingFrom(existing: WsMessage[], authoritative: WsMessage[]) {
+  const present = new Set(authoritative.map((m) => m.id));
+  let changed = false;
+  const next = existing.map((msg) => {
+    if (!isOpenPendingAction(msg) || present.has(msg.id)) return msg;
+    changed = true;
+    return { ...msg, resolved_at: new Date().toISOString() };
+  });
+  return changed ? next : existing;
+}
+
 /* ── Local streaming message ── */
 type WorkspaceLocalMsg = ChatMessage & {
   id?: string;
   agentName?: string;
   agentColor?: string;
 };
+
+function delegatedAgentRunsFromMeta(meta: Record<string, any> | null) {
+  const runs = meta?.sub_agent_events;
+  return Array.isArray(runs)
+    ? runs.filter((run): run is SubAgentEvent => Boolean(run && typeof run === "object"))
+    : [];
+}
 
 const LOCAL_MESSAGE_DEDUPE_WINDOW_MS = 2 * 60 * 1000;
 const COLLAPSIBLE_MESSAGE_MAX_CHARS = 900;
@@ -160,6 +246,39 @@ const COLLAPSED_MESSAGE_MAX_HEIGHT = 260;
 
 function normalizeMessageText(value: string | null | undefined) {
   return (value || "").replace(/\s+/g, " ").trim();
+}
+
+function compactWorkspaceRailText(value: unknown) {
+  const raw =
+    typeof value === "string"
+      ? value
+      : value == null
+        ? ""
+        : JSON.stringify(value);
+  return raw
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[#>*_~]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function workspaceRailPreviewFromText(value: unknown, fallbackTitle: string) {
+  const compact = compactWorkspaceRailText(value);
+  if (!compact) return { title: fallbackTitle, excerpt: "" };
+  const titleLength = compact.length > 58 ? 58 : compact.length;
+  const title =
+    compact.length > titleLength
+      ? `${compact.slice(0, titleLength).trim()}...`
+      : compact;
+  const excerptSource =
+    compact.length > titleLength ? compact.slice(titleLength).trim() : compact;
+  const excerpt =
+    excerptSource.length > 150
+      ? `${excerptSource.slice(0, 150).trim()}...`
+      : excerptSource;
+  return { title, excerpt };
 }
 
 function messageTimestampMs(value: string | null | undefined) {
@@ -232,13 +351,9 @@ function isLongWorkspaceMessage(content: string) {
 }
 
 function shouldCollapseWorkspaceMessage(msg: WsMessage, isUser: boolean) {
-  if (isUser || !msg.body || !isLongWorkspaceMessage(msg.body)) return false;
-  if (msg.message_kind === "step_event") return true;
-  return (
-    msg.message_kind === "agent_update" &&
-    Array.isArray(msg.refs) &&
-    msg.refs.some((ref) => ref.type === "plan")
-  );
+  if (!msg.body || !isLongWorkspaceMessage(msg.body)) return false;
+  if (isUser) return true;
+  return msg.message_kind !== "proposal" && !msg.pending_action;
 }
 
 function messageRefId(msg: WsMessage, refType: string) {
@@ -467,6 +582,20 @@ function pendingActionLabel(action: WsMessage["pending_action"]) {
     : translated;
 }
 
+function workflowStarterAction(msg: WsMessage): WsMessage["pending_action"] {
+  const action = msg.pending_action;
+  if (!action || action.kind !== PendingActionKind.WORKFLOW_STARTER_INPUT || action.title) {
+    return action;
+  }
+  const workflowRef = (msg.refs || []).find((ref) => ref.type === "workflow");
+  const metadataTitle = String(msg.meta?.workflow_title || "").trim();
+  if (!workflowRef?.title && !metadataTitle) return action;
+  return {
+    ...action,
+    title: workflowRef?.title || metadataTitle,
+  };
+}
+
 function pendingActionsLabel(count: number) {
   if (count === 1) return t("component.workspace_chat.pending_action_one");
   return t("component.workspace_chat.pending_action_many").replace("{count}", String(count));
@@ -499,6 +628,8 @@ export default function WorkspaceChat({
   entityAgents,
 }: WorkspaceChatProps) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const [agentsExpanded, setAgentsExpanded] = useState(false);
   const currentUser = useAuthStore((s) => s.user);
   const currentUserName =
     currentUser?.display_name ||
@@ -509,6 +640,7 @@ export default function WorkspaceChat({
     t("component.workspace_chat.you");
   const currentUserAvatar = currentUser?.avatar_url;
   const bottomRef = useRef<HTMLDivElement>(null);
+  const chatBodyRef = useRef<HTMLDivElement>(null);
   const didInitialScrollRef = useRef(false);
   const streamScrollFrameRef = useRef<number | null>(null);
   const lastStreamScrollAtRef = useRef(0);
@@ -518,6 +650,7 @@ export default function WorkspaceChat({
     : workspaceId;
   const streamSessionKey = `workspace-chat:${draftScope}`;
   const [input, setInput] = useState(() => loadWorkspaceChatDraft(draftScope));
+  const [selectedEntrypointId, setSelectedEntrypointId] = useState("");
   const currentSession = useChatStreamStore(
     (s) => s.sessions[streamSessionKey],
   );
@@ -554,6 +687,7 @@ export default function WorkspaceChat({
   // in-flight messages alive across route changes just like normal chat.
   useEffect(() => {
     setInput(loadWorkspaceChatDraft(draftScope));
+    setSelectedEntrypointId("");
     setMentionAgent(null);
     setMentionDropdownOpen(false);
   }, [draftScope]);
@@ -566,16 +700,24 @@ export default function WorkspaceChat({
   const mentionRef = useRef<HTMLDivElement>(null);
 
   // Fetch agent mappings + entity agents for this workspace (self-contained)
-  const { data: fetchedMappings } = useQuery({
+  const { data: fetchedMappings, isLoading: fetchedMappingsLoading } = useQuery({
     queryKey: ["workspace-agents", workspaceId],
     queryFn: () => api.workspaces.agents.list(workspaceId),
     enabled: !!workspaceId,
   });
-  const { data: fetchedAgents } = useQuery({
+  const { data: fetchedAgents, isLoading: fetchedAgentsLoading } = useQuery({
     queryKey: ["entity-agents"],
     queryFn: () => api.agents.list(),
     enabled: !!workspaceId,
   });
+  const { data: workflowEntrypoints = [] } = useQuery({
+    queryKey: ["workspace-chat-entrypoints", workspaceId],
+    queryFn: () => api.workspaces.chat.listEntrypoints(workspaceId),
+    enabled: Boolean(workspaceId && !threadRef),
+  });
+  const selectedEntrypoint = workflowEntrypoints.find(
+    (entrypoint: WorkspaceChatEntrypoint) => entrypoint.binding_id === selectedEntrypointId,
+  );
 
   // Merge props with fetched data (props override if provided)
   const mappings = (agentMappings || fetchedMappings || []) as any[];
@@ -599,6 +741,108 @@ export default function WorkspaceChat({
     return Array.from(seen.values());
   }, [subToAgent]);
 
+  const latestAgentQuickViewRequestRef = useRef(0);
+
+  const openAgentQuickView = async (agent: AgentInfo) => {
+    const requestId = ++latestAgentQuickViewRequestRef.current;
+    openDetail({
+      icon: (
+        <UserAvatar
+          name={agent.name}
+          avatarUrl={agent.avatar_url}
+          type="agent"
+          seed={agent.id}
+          size={48}
+        />
+      ),
+      title: agent.name,
+      subtitle: t("component.workspace_chat.loading"),
+      body: <LoadingSpinner size={20} />,
+    });
+    // Discard the late result if a newer chip click superseded this one, or
+    // if the user already closed the drawer while the fetch was in flight
+    // (re-calling openDetail would pop it back open).
+    const isStale = () =>
+      latestAgentQuickViewRequestRef.current !== requestId ||
+      useDetailStore.getState().payload === null;
+    try {
+      const full: Agent = await api.agents.get(agent.id);
+      if (isStale()) return;
+      const tags = Array.isArray(full.tags) ? full.tags : [];
+      openDetail({
+        icon: (
+          <UserAvatar
+            name={full.name}
+            avatarUrl={full.avatar_url}
+            type="agent"
+            seed={full.id}
+            size={48}
+          />
+        ),
+        title: full.name,
+        subtitle: full.category || undefined,
+        badges: (
+          <>
+            <StatusBadge
+              type={full.status === "active" ? "active" : "inactive"}
+              dot
+              pulse={full.status === "active"}
+            >
+              {full.status === "active" ? t("page.agents.live") : t("page.agents.off")}
+            </StatusBadge>
+            {tags.slice(0, 4).map((tag, i) => (
+              <Chip key={`${full.id}-chip-${tag}-${i}`} variant="slate" size="sm">
+                {tag}
+              </Chip>
+            ))}
+          </>
+        ),
+        body: <p style={{ margin: 0, color: "#44403c" }}>{full.description}</p>,
+        primaryAction: {
+          label: t("page.agents.manage"),
+          onClick: () => {
+            closeDetail();
+            navigate(`/agents/${full.id}`);
+          },
+        },
+        secondaryActions: [
+          {
+            label: t("action.edit"),
+            icon: <IconEdit size={16} />,
+            onClick: () => {
+              closeDetail();
+              openAgentEditModal(full.id);
+            },
+          },
+        ],
+      });
+    } catch {
+      if (isStale()) return;
+      openDetail({
+        icon: (
+          <UserAvatar
+            name={agent.name}
+            avatarUrl={agent.avatar_url}
+            type="agent"
+            seed={agent.id}
+            size={48}
+          />
+        ),
+        title: agent.name,
+        body: (
+          <p style={{ margin: 0, color: "#a8a29e" }}>
+            {t("component.workspace_chat.failed_to_load_agent_details")}
+          </p>
+        ),
+      });
+    }
+  };
+
+  const workspaceAgentsLoading =
+    !agentMappings &&
+    !entityAgents &&
+    (fetchedMappingsLoading || fetchedAgentsLoading);
+
   // Filtered agents for @mention dropdown
   const mentionFiltered = useMemo(() => {
     if (!mentionQuery) return agentList;
@@ -606,8 +850,22 @@ export default function WorkspaceChat({
     return agentList.filter((a) => (a.name || "").toLowerCase().includes(q));
   }, [agentList, mentionQuery]);
 
-  // Fetch workspace chat messages
-  const { data: wsMessages = [] } = useQuery({
+  const [wsMessages, setWsMessages] = useState<WsMessage[]>([]);
+  const [workspaceHistoryState, setWorkspaceHistoryState] = useState({
+    hasMore: false,
+    nextCursor: null as string | null,
+  });
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const suppressNextAutoScrollRef = useRef(false);
+
+  useEffect(() => {
+    setWsMessages([]);
+    setWorkspaceHistoryState({ hasMore: false, nextCursor: null });
+    setLoadingOlderMessages(false);
+  }, [workspaceId, threadRef?.kind, threadRef?.id]);
+
+  // Fetch the latest workspace chat page; older pages are loaded on demand.
+  const { data: workspaceMessagesPage, isLoading: workspaceMessagesLoading } = useQuery({
     queryKey: [
       "workspace-chat",
       workspaceId,
@@ -615,12 +873,83 @@ export default function WorkspaceChat({
       threadRef?.id || "",
     ],
     queryFn: () =>
-      api.workspaces.chat.listMessages(workspaceId, {
-        limit: 100,
+      api.workspaces.chat.listMessagesPage(workspaceId, {
+        limit: WORKSPACE_CHAT_PAGE_SIZE,
         thread_ref_kind: threadRef?.kind,
         thread_ref_id: threadRef?.id,
       }),
   });
+
+  useEffect(() => {
+    if (!workspaceMessagesPage) return;
+    const items = workspaceMessagesPage.items || [];
+    setWsMessages((prev) =>
+      mergeWorkspaceMessages(
+        // When the server says this page carries every open action card, any
+        // open card we still remember but it did not send has been answered
+        // (from another tab, another device, or by the system). Merge-by-id
+        // can only overwrite what it is handed, so mark those closed here or
+        // they stay "waiting" until a reload.
+        workspaceMessagesPage.open_actions_complete
+          ? closeActionsMissingFrom(prev, items)
+          : prev,
+        items,
+      ),
+    );
+    setWorkspaceHistoryState({
+      hasMore: Boolean(workspaceMessagesPage.has_more),
+      nextCursor: workspaceMessagesPage.next_cursor || null,
+    });
+  }, [workspaceMessagesPage]);
+
+  const handleLoadOlderMessages = useCallback(async () => {
+    if (
+      !workspaceHistoryState.hasMore ||
+      !workspaceHistoryState.nextCursor ||
+      loadingOlderMessages
+    ) {
+      return;
+    }
+    const container = chatBodyRef.current;
+    const previousHeight = container?.scrollHeight || 0;
+    const previousTop = container?.scrollTop || 0;
+    setLoadingOlderMessages(true);
+    try {
+      const page = await api.workspaces.chat.listMessagesPage(workspaceId, {
+        limit: WORKSPACE_CHAT_PAGE_SIZE,
+        thread_ref_kind: threadRef?.kind,
+        thread_ref_id: threadRef?.id,
+        before: workspaceHistoryState.nextCursor,
+      });
+      suppressNextAutoScrollRef.current = true;
+      setWsMessages((prev) =>
+        mergeWorkspaceMessages(page.items || [], prev),
+      );
+      setWorkspaceHistoryState({
+        hasMore: Boolean(page.has_more),
+        nextCursor: page.next_cursor || null,
+      });
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          const nextContainer = chatBodyRef.current;
+          if (!nextContainer) return;
+          const heightDelta = nextContainer.scrollHeight - previousHeight;
+          nextContainer.scrollTop = previousTop + heightDelta;
+        });
+      });
+    } catch {
+      // request() already reports API failures; keep the timeline stable.
+    } finally {
+      setLoadingOlderMessages(false);
+    }
+  }, [
+    loadingOlderMessages,
+    threadRef?.id,
+    threadRef?.kind,
+    workspaceHistoryState.hasMore,
+    workspaceHistoryState.nextCursor,
+    workspaceId,
+  ]);
 
   // The conversation other members type into is the one their messages live
   // in; fall back to our own stream conversation before any message exists.
@@ -686,12 +1015,68 @@ export default function WorkspaceChat({
           queryClient.invalidateQueries({
             queryKey: ["workspace-chat", workspaceId],
           });
+          const changedRunId = workflowRunIdForMessage(
+            (wsMessages as WsMessage[]).find((message) => message.id === data.message_id)
+              || {
+                id: String(data.message_id || ""),
+                meta: { workflow_run_id: data.workflow_run_id },
+              },
+          );
+          if (changedRunId) {
+            queryClient.invalidateQueries({
+              queryKey: ["workflow-run", changedRunId],
+            });
+          }
         }
       },
-      [workspaceId, queryClient],
+      [workspaceId, queryClient, wsMessages],
     ),
     onTyping: handleTyping,
   });
+
+  const sorted = useMemo(
+    () =>
+      [...(wsMessages as WsMessage[])].sort((a, b) => {
+        const aTime = messageTimestampMs(a.created_at);
+        const bTime = messageTimestampMs(b.created_at);
+        const timeDelta =
+          (Number.isFinite(aTime) ? aTime : 0) -
+          (Number.isFinite(bTime) ? bTime : 0);
+        if (timeDelta !== 0) return timeDelta;
+
+        const rankDelta = persistedMessageSortRank(a) - persistedMessageSortRank(b);
+        if (rankDelta !== 0) return rankDelta;
+
+        return a.id.localeCompare(b.id);
+      }),
+    [wsMessages],
+  );
+
+  const workflowRunGroups = useMemo(
+    () => buildWorkspaceWorkflowRunGroups(sorted),
+    [sorted],
+  );
+  const hostOwnedWorkflowMessageIds = useMemo(
+    () => workflowHostOwnedMessageIds(workflowRunGroups),
+    [workflowRunGroups],
+  );
+  const visibleSortedMessages = useMemo(
+    () => sorted.filter((msg) => !hostOwnedWorkflowMessageIds.has(msg.id)),
+    [hostOwnedWorkflowMessageIds, sorted],
+  );
+
+  const pendingActions = useMemo(
+    () => sorted.filter((msg) =>
+      isOpenPendingAction(msg) && !hostOwnedWorkflowMessageIds.has(msg.id)
+    ),
+    [hostOwnedWorkflowMessageIds, sorted],
+  );
+  const latestPendingAction = pendingActions[pendingActions.length - 1];
+  const latestPendingActionId = latestPendingAction?.id;
+  const latestPendingActionIsLatest = Boolean(
+    latestPendingActionId
+    && visibleSortedMessages[visibleSortedMessages.length - 1]?.id === latestPendingActionId,
+  );
 
   // Auto-scroll: initial load jumps to the latest message; streaming follows at a calmer pace.
   useLayoutEffect(() => {
@@ -700,6 +1085,11 @@ export default function WorkspaceChat({
       bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
     };
 
+    if (suppressNextAutoScrollRef.current) {
+      suppressNextAutoScrollRef.current = false;
+      return;
+    }
+
     if (!didInitialScrollRef.current) {
       didInitialScrollRef.current = true;
       scrollToBottom();
@@ -707,7 +1097,7 @@ export default function WorkspaceChat({
     }
 
     if (!streaming) {
-      scrollToBottom();
+      if (!latestPendingActionIsLatest) scrollToBottom();
       return;
     }
 
@@ -723,38 +1113,87 @@ export default function WorkspaceChat({
       streamScrollFrameRef.current = null;
       scrollToBottom();
     });
-  }, [wsMessages.length, localMsgs.length, streaming]);
+  }, [wsMessages.length, localMsgs.length, streaming, latestPendingActionIsLatest]);
 
   // Resolve pending action
   const resolveMutation = useMutation({
-    mutationFn: ({
+    mutationFn: async ({
       msgId,
       choice,
       note,
       payload,
+      files,
     }: {
       msgId: string;
       choice: string;
       note?: string;
       payload?: Record<string, any>;
-    }) =>
-      api.workspaces.chat.resolveAction(
+      files?: File[];
+    }) => {
+      const uploadedAttachments = files?.length
+        ? await Promise.all(files.map(async (file) => {
+            const document = await api.documents.upload(file);
+            if (!document?.id) {
+              throw new Error(`Failed to upload ${file.name}`);
+            }
+            return { name: file.name, id: document.id, type: "knowledge" };
+          }))
+        : [];
+      const existingAttachments = Array.isArray(payload?.attachments)
+        ? payload.attachments
+        : [];
+      const resolvedPayload = uploadedAttachments.length > 0
+        ? {
+            ...(payload || {}),
+            attachments: [...existingAttachments, ...uploadedAttachments],
+          }
+        : payload;
+      return api.workspaces.chat.resolveAction(
         workspaceId,
         msgId,
         choice,
         note,
-        payload,
-      ),
-    onSuccess: () => {
+        resolvedPayload,
+      );
+    },
+    onSuccess: (resolved, { msgId }) => {
+      // Close the card locally on the server's own response. The refetch below
+      // cannot be relied on for this: a card pinned from outside the page
+      // window drops out of the pinned set the instant it is answered, so the
+      // next page simply omits it and merge-by-id has nothing to overwrite.
+      setWsMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === msgId
+            ? {
+                ...msg,
+                resolved_at:
+                  (resolved as WsMessage | undefined)?.resolved_at ||
+                  new Date().toISOString(),
+                resolution:
+                  (resolved as WsMessage | undefined)?.resolution ?? msg.resolution,
+              }
+            : msg,
+        ),
+      );
       queryClient.invalidateQueries({
         queryKey: ["workspace-chat", workspaceId],
       });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      // Task updates are broadcast before the approval transaction commits,
+      // so a realtime refetch can still see the old `proposed` status.  The
+      // resolve response is returned after commit; refresh once more here.
+      queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["workflow-run"] });
+      queryClient.invalidateQueries({
+        queryKey: ["workspace-workflow-runs", workspaceId],
+      });
       window.dispatchEvent(
         new CustomEvent("manor:workspace-actions-refresh", {
           detail: { workspaceId },
         }),
       );
+      resolveMutation.reset();
     },
   });
   const feedbackMutation = useMutation({
@@ -780,8 +1219,9 @@ export default function WorkspaceChat({
       choice: string,
       note?: string,
       payload?: Record<string, any>,
+      files?: File[],
     ) => {
-      resolveMutation.mutate({ msgId, choice, note, payload });
+      resolveMutation.mutate({ msgId, choice, note, payload, files });
     },
     [resolveMutation],
   );
@@ -808,7 +1248,7 @@ export default function WorkspaceChat({
       return;
     }
     const atIdx = val.lastIndexOf("@");
-    if (atIdx >= 0 && (atIdx === 0 || val[atIdx - 1] === " ")) {
+    if (atIdx >= 0 && (atIdx === 0 || /\s/.test(val[atIdx - 1]))) {
       setMentionQuery(val.substring(atIdx + 1));
       setMentionDropdownOpen(true);
       setMentionActiveIdx(0);
@@ -817,11 +1257,35 @@ export default function WorkspaceChat({
     }
   }
 
+  useEffect(() => {
+    const handleInsertChatPrompt = (event: Event) => {
+      const detail =
+        (event as CustomEvent<InsertChatComposerDetail>).detail || {};
+      const prompt = (detail.prompt || "").trim();
+      if (!prompt) return;
+      const current = input.trim();
+      setInputDraft(current ? `${input.trimEnd()}\n\n${prompt}` : prompt);
+      setMentionDropdownOpen(false);
+      window.setTimeout(() => textareaRef.current?.focus(), 0);
+    };
+
+    window.addEventListener(
+      INSERT_CHAT_COMPOSER_EVENT,
+      handleInsertChatPrompt as EventListener,
+    );
+    return () =>
+      window.removeEventListener(
+        INSERT_CHAT_COMPOSER_EVENT,
+        handleInsertChatPrompt as EventListener,
+      );
+  }, [input, setInputDraft]);
+
   /* ── Select agent from @mention dropdown ── */
   function selectMention(agent: AgentInfo) {
     const atIdx = input.lastIndexOf("@");
     const cleaned = atIdx >= 0 ? input.substring(0, atIdx).trimEnd() : input;
     setInputDraft(cleaned);
+    setSelectedEntrypointId("");
     setMentionAgent(agent);
     setMentionDropdownOpen(false);
     textareaRef.current?.focus();
@@ -834,11 +1298,11 @@ export default function WorkspaceChat({
   }
 
   /* ── Resolve inline @mention on send ── */
-  function resolveInlineMention(): AgentInfo | null {
+  function resolveInlineMention(value: string): AgentInfo | null {
     if (mentionAgent) return mentionAgent;
-    const val = input;
+    const val = value;
     const atIdx = val.lastIndexOf("@");
-    if (atIdx < 0 || (atIdx > 0 && val[atIdx - 1] !== " ")) return null;
+    if (atIdx < 0 || (atIdx > 0 && !/\s/.test(val[atIdx - 1]))) return null;
     const q = val
       .substring(atIdx + 1)
       .trim()
@@ -861,7 +1325,7 @@ export default function WorkspaceChat({
       if (streamingRef.current) return;
 
       // Resolve @mention if typed inline
-      const resolvedAgent = resolveInlineMention();
+      const resolvedAgent = resolveInlineMention(rawText);
       let text = stripManualSkillTokens(rawText, manualSkills).trim();
       if (!text && attachments.length === 0 && manualSkills.length === 0)
         return;
@@ -874,6 +1338,8 @@ export default function WorkspaceChat({
 
       const now = new Date().toISOString();
       const targetAgent = resolvedAgent;
+      const starterBindingId =
+        !targetAgent && manualSkills.length === 0 ? selectedEntrypointId : "";
       const targetName = targetAgent?.name || MANOR_AGENT_NAME;
       const targetColor = targetAgent
         ? agentColor(targetAgent.name)
@@ -925,7 +1391,18 @@ export default function WorkspaceChat({
       try {
         await startStream(
           () =>
-            api.chat.stream(
+            starterBindingId
+              ? api.workspaces.chat.streamEntrypoint(
+                  workspaceId,
+                  starterBindingId,
+                  text || "Use the attached context to run this workflow.",
+                  conversationId,
+                  {
+                    files: localFiles.length > 0 ? localFiles : undefined,
+                    documentIds: documentIds.length > 0 ? documentIds : undefined,
+                  },
+                )
+              : api.chat.stream(
               text ||
                 "Use the manually selected skill with the current conversation context.",
               conversationId,
@@ -947,6 +1424,7 @@ export default function WorkspaceChat({
           () => {},
           streamSessionKey,
         );
+        setSelectedEntrypointId("");
       } catch {
         // startStream owns user-visible error state in the shared session.
       }
@@ -972,6 +1450,7 @@ export default function WorkspaceChat({
       setInputDraft,
       startStream,
       streamSessionKey,
+      selectedEntrypointId,
     ],
   );
 
@@ -1002,36 +1481,44 @@ export default function WorkspaceChat({
     }
   }
 
-  const sorted = useMemo(
-    () =>
-      [...(wsMessages as WsMessage[])].sort((a, b) => {
-        const aTime = messageTimestampMs(a.created_at);
-        const bTime = messageTimestampMs(b.created_at);
-        const timeDelta =
-          (Number.isFinite(aTime) ? aTime : 0) -
-          (Number.isFinite(bTime) ? bTime : 0);
-        if (timeDelta !== 0) return timeDelta;
+  useEffect(() => {
+    if (!latestPendingActionId) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(
+        `workspace-chat-message-${latestPendingActionId}`,
+      )?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [latestPendingActionId]);
 
-        const rankDelta = persistedMessageSortRank(a) - persistedMessageSortRank(b);
-        if (rankDelta !== 0) return rankDelta;
-
-        return a.id.localeCompare(b.id);
-      }),
-    [wsMessages],
+  // The COUNT comes from the server, never from `pendingActions.length`. This
+  // list is whatever the client has accumulated, and it drifts above the truth
+  // the moment a card is answered: the answered card leaves the pinned set, so
+  // no later page hands it back for merge-by-id to overwrite. The sidebar badge
+  // re-counts in the DB and drops — which is how one answer produced two
+  // numbers. Fall back to the local length only before the first page lands.
+  const openActionCount =
+    workspaceMessagesPage?.open_action_count ?? pendingActions.length;
+  // Jump to the OLDEST open action, not the newest. `sorted` is ascending, so
+  // the newest sits nearest the bottom where the reader already is, while the
+  // one that has waited longest is buried far above — the only one that
+  // genuinely needs a shortcut. (Background plans file their cards in their
+  // own thread; those get merged into this view by created_at, so a card that
+  // has been blocked for days lands above days of newer chat.)
+  const oldestPendingAction = pendingActions[0];
+  // How long the longest-blocked item has waited. Silence is the failure mode
+  // here — work sat blocked for days behind a badge that only said "13".
+  const oldestPendingWaitLabel = useMemo(
+    () => (oldestPendingAction ? relativeTime(oldestPendingAction.created_at, "") : ""),
+    [oldestPendingAction],
   );
-
-  const pendingActions = useMemo(
-    () => sorted.filter(isOpenPendingAction),
-    [sorted],
-  );
-  const latestPendingAction = pendingActions[pendingActions.length - 1];
-  const jumpToLatestPendingAction = useCallback(() => {
-    if (!latestPendingAction) return;
+  const jumpToOldestPendingAction = useCallback(() => {
+    if (!oldestPendingAction) return;
     const el = document.getElementById(
-      `workspace-chat-message-${latestPendingAction.id}`,
+      `workspace-chat-message-${oldestPendingAction.id}`,
     );
     el?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [latestPendingAction]);
+  }, [oldestPendingAction]);
 
   const visibleLocalMsgs = useMemo(
     () =>
@@ -1052,9 +1539,9 @@ export default function WorkspaceChat({
   const timelinePersistedMessages = useMemo(
     () =>
       hasVisibleLocalAssistant
-        ? sorted.filter((msg) => !isRunningStreamPlaceholder(msg))
-        : sorted,
-    [hasVisibleLocalAssistant, sorted],
+        ? visibleSortedMessages.filter((msg) => !isRunningStreamPlaceholder(msg))
+        : visibleSortedMessages,
+    [hasVisibleLocalAssistant, visibleSortedMessages],
   );
 
   const timelineItems = useMemo(() => {
@@ -1087,7 +1574,7 @@ export default function WorkspaceChat({
         localIndex: index,
         time: Math.max(localTime, minLocalTime),
         rank: localMessageSortRank(msg),
-        order: sorted.length + index,
+        order: visibleSortedMessages.length + index,
       };
     });
     return [...persistedItems, ...localItems].sort((a, b) => {
@@ -1097,7 +1584,7 @@ export default function WorkspaceChat({
       if (rankDelta !== 0) return rankDelta;
       return a.order - b.order;
     });
-  }, [sorted.length, timelinePersistedMessages, visibleLocalMsgs]);
+  }, [timelinePersistedMessages, visibleLocalMsgs, visibleSortedMessages.length]);
 
   // Fold every step/plan status message of the same plan into ONE collapsible
   // activity-run line, regardless of interleaving with other plans or chat.
@@ -1131,6 +1618,113 @@ export default function WorkspaceChat({
     }
     return out;
   }, [timelineItems]);
+
+  const workspaceThreadLoading = workspaceMessagesLoading && timelineItems.length === 0;
+
+  const chatScrollRailMarkers = useMemo<ChatScrollRailMarker[]>(
+    () =>
+      renderTimeline.map((item, index) => {
+        if (item.kind === "activity-run") {
+          const first = item.msgs[0];
+          const preview = workspaceRailPreviewFromText(
+            first ? formatUserFacingStructuredText(first.body) : "",
+            "Action update",
+          );
+          return {
+            id: item.key,
+            tone: "action",
+            title: preview.title,
+            excerpt: preview.excerpt,
+          };
+        }
+        if (item.kind === "local") {
+          const fallbackTitle =
+            item.msg.role === "user"
+              ? currentUserName || "You"
+              : item.msg.agentName || MANOR_AGENT_NAME;
+          const body =
+            item.msg.role === "user"
+              ? item.msg.content
+              : formatUserFacingStructuredText(item.msg.content);
+          const preview = workspaceRailPreviewFromText(body, fallbackTitle);
+          const attachment =
+            Array.isArray(item.msg.attachments) && item.msg.attachments.length > 0
+              ? item.msg.attachments[0]
+              : null;
+          const attachmentRecord = attachment as Record<string, unknown> | null;
+          const fileLabel =
+            String(
+              attachmentRecord?.name ||
+                attachmentRecord?.filename ||
+                attachmentRecord?.title ||
+                "",
+            ) || "";
+          const fileKindSource =
+            fileLabel.includes(".") ? fileLabel.split(".").pop() : "file";
+          return {
+            id: item.key || item.msg.id || `workspace-chat-local-${index}`,
+            tone: item.msg.role === "user" ? "user" : "assistant",
+            title: preview.title,
+            excerpt: preview.excerpt,
+            fileKind: String(fileKindSource).slice(0, 4).toUpperCase(),
+            fileLabel,
+          };
+        }
+        const msg = item.msg;
+        const hasArtifacts =
+          Array.isArray(msg.attachments) && msg.attachments.length > 0;
+        const agent = msg.author_subscription_id
+          ? subToAgent.get(msg.author_subscription_id)
+          : null;
+        const fallbackTitle =
+          msg.author_kind === "user"
+            ? msg.author_user_name || currentUserName || "You"
+            : msg.author_kind === "system"
+              ? systemSenderName(msg)
+              : agent?.name || MANOR_AGENT_NAME;
+        const body =
+          msg.author_kind === "user"
+            ? msg.body
+            : formatUserFacingStructuredText(msg.body);
+        const preview = workspaceRailPreviewFromText(body, fallbackTitle);
+        const attachment =
+          Array.isArray(msg.attachments) && msg.attachments.length > 0
+            ? msg.attachments[0]
+            : null;
+        const ref =
+          Array.isArray(msg.refs) && msg.refs.length > 0 ? msg.refs[0] : null;
+        const fileLabel =
+          attachment?.name ||
+          attachment?.filename ||
+          attachment?.title ||
+          ref?.title ||
+          ref?.name ||
+          "";
+        const fileKindSource =
+          attachment?.type ||
+          ref?.type ||
+          (fileLabel.includes(".") ? fileLabel.split(".").pop() : "") ||
+          "file";
+        return {
+          id: item.key || msg.id || `workspace-chat-${index}`,
+          tone:
+            msg.author_kind === "user"
+              ? "user"
+              : msg.pending_action
+                ? "action"
+                : hasArtifacts
+                  ? "artifact"
+                  : isActivityMessage(msg)
+                    ? "system"
+                    : "assistant",
+          title: preview.title,
+          excerpt: preview.excerpt,
+          fileKind: String(fileKindSource).slice(0, 4).toUpperCase(),
+          fileLabel,
+        };
+      }),
+    [currentUserName, renderTimeline, subToAgent],
+  );
 
   useEffect(() => {
     if (
@@ -1271,14 +1865,25 @@ export default function WorkspaceChat({
       </div>
 
       {/* ── Agent chips (display only — DM via @mention) ── */}
-      {agentList.length > 0 && (
+      {workspaceAgentsLoading ? (
+        <div className="embedded-agents-row" aria-hidden="true">
+          <SkeletonLine width={112} height={24} radius={999} />
+          <SkeletonLine width={92} height={24} radius={999} />
+          <SkeletonLine width={84} height={24} radius={999} />
+        </div>
+      ) : agentList.length > 0 && (
         <div className="embedded-agents-row">
           <span className="agent-chip agent-chip--selected">
             <ManorAvatar size={14} />
             {MANOR_AGENT_NAME}
           </span>
-          {agentList.slice(0, 5).map((agent) => (
-            <span key={agent.id} className="agent-chip">
+          {(agentsExpanded ? agentList : agentList.slice(0, 5)).map((agent) => (
+            <button
+              key={agent.id}
+              type="button"
+              className="agent-chip"
+              onClick={() => openAgentQuickView(agent)}
+            >
               <UserAvatar
                 name={agent.name}
                 avatarUrl={agent.avatar_url}
@@ -1287,45 +1892,59 @@ export default function WorkspaceChat({
                 size={14}
               />
               {agent.name}
-            </span>
+            </button>
           ))}
           {agentList.length > 5 && (
-            <span className="agent-chip agent-chip--more">
-              +{agentList.length - 5}
-            </span>
+            <button
+              type="button"
+              className="agent-chip agent-chip--more"
+              onClick={() => setAgentsExpanded((v) => !v)}
+            >
+              {agentsExpanded
+                ? t("component.workspace_chat.show_less")
+                : `+${agentList.length - 5}`}
+            </button>
           )}
         </div>
       )}
 
       {/* ── Messages ── */}
-      <div
-        className={`embedded-chat-body ${
-          timelineItems.length === 0 ? "embedded-chat-body--empty workspace-chat-body--empty" : ""
-        }`}
-      >
-        {pendingActions.length > 0 && (
+      <div className="embedded-chat-body-wrap workspace-chat-body-wrap chat-scroll-rail-host">
+        <div
+          ref={chatBodyRef}
+          className={`embedded-chat-body ${
+            timelineItems.length === 0 ? "embedded-chat-body--empty workspace-chat-body--empty" : ""
+          }`}
+        >
+        {openActionCount > 0 && pendingActions.length > 0 && (
           <div className="workspace-pending-actions-banner">
             <div>
               <div className="workspace-pending-actions-title">
-                {pendingActionsLabel(pendingActions.length)}
+                {pendingActionsLabel(openActionCount)}
               </div>
               <div className="workspace-pending-actions-copy">
+                {/* Lead with what has waited longest — the oldest is what the
+                    jump targets, and how long it has been stuck is the part
+                    worth reacting to. */}
                 {pendingActions
-                  .slice(-3)
+                  .slice(0, 3)
                   .map((msg) => pendingActionLabel(msg.pending_action))
                   .join(" · ")}
+                {oldestPendingWaitLabel ? ` · ${oldestPendingWaitLabel}` : ""}
               </div>
             </div>
             <button
               type="button"
               className="workspace-pending-actions-jump"
-              onClick={jumpToLatestPendingAction}
+              onClick={jumpToOldestPendingAction}
             >
-              {t("component.workspace_chat.jump_to_latest_action")}
+              {t("component.workspace_chat.jump_to_oldest_action")}
             </button>
           </div>
         )}
-        {timelineItems.length === 0 && (
+        {workspaceThreadLoading ? (
+          <ChatMessagesSkeleton rows={5} />
+        ) : timelineItems.length === 0 && (
           <div
             style={{
               display: "flex",
@@ -1357,11 +1976,26 @@ export default function WorkspaceChat({
           </div>
         )}
 
+        {timelineItems.length > 0 && workspaceHistoryState.hasMore && (
+          <div className="chat-history-load-more">
+            <button
+              type="button"
+              className="chat-history-load-more-button"
+              disabled={loadingOlderMessages}
+              onClick={handleLoadOlderMessages}
+            >
+              {loadingOlderMessages && <LoadingSpinner size={13} />}
+              {t("page.chat_history.load_earlier_messages")}
+            </button>
+          </div>
+        )}
+
         {renderTimeline.map((item) => {
           if (item.kind === "activity-run") {
             return (
               <WsActivityRun
                 key={item.key}
+                markerId={item.key}
                 msgs={item.msgs}
                 subToAgent={subToAgent}
               />
@@ -1369,24 +2003,37 @@ export default function WorkspaceChat({
           }
           if (item.kind === "persisted") {
             if (isActivityMessage(item.msg)) {
-              return <WsActivityLine key={item.key} msg={item.msg} />;
+              return (
+                <WsActivityLine
+                  key={item.key}
+                  markerId={item.key}
+                  msg={item.msg}
+                />
+              );
             }
             return (
               <WsMessageRow
                 key={item.key}
+                markerId={item.key}
                 msg={item.msg}
                 subToAgent={subToAgent}
                 currentUserName={currentUserName}
                 currentUserAvatar={currentUserAvatar}
                 currentUserId={currentUser?.id || null}
                 onResolve={handleResolve}
+                actionResetToken={resolveMutation.failureCount}
                 onFeedback={handleTaskCompletionFeedback}
               />
             );
           }
 
           const msg = item.msg;
-          const localTools = msg.role === "assistant" ? ((msg.tool_calls || []) as ToolCall[]) : [];
+          const delegatedRuns =
+            msg.role === "assistant" ? msg.sub_agent_events || [] : [];
+          const localTools =
+            msg.role === "assistant"
+              ? ((msg.tool_calls || []) as ToolCall[])
+              : [];
           const localCodingNotice =
             msg.role === "assistant" ? maybeLocalCodingRunNoticeForTools(localTools) : null;
           const bubbleContent = localCodingNotice || msg.content;
@@ -1397,6 +2044,7 @@ export default function WorkspaceChat({
           return (
             <div
               key={item.key}
+              data-chat-scroll-marker-id={item.key}
               className={`chat-message-row ${msg.role === "user" ? "chat-message-row--user" : ""}`}
             >
               {msg.role === "user" ? (
@@ -1430,7 +2078,11 @@ export default function WorkspaceChat({
                   className={`chat-bubble ${msg.role === "user" ? "chat-bubble--user" : "chat-bubble--bot"}`}
                 >
                   {localTools.length > 0 && (
-                    <ToolCallList tools={localTools} keyPrefix={item.key} minimal />
+                    <ToolCallList
+                      tools={localTools}
+                      keyPrefix={item.key}
+                      subAgentRuns={delegatedRuns}
+                    />
                   )}
                   {bubbleContent ? (
                     <ChatMarkdown
@@ -1448,6 +2100,11 @@ export default function WorkspaceChat({
         })}
 
         <div ref={bottomRef} />
+        </div>
+        <ChatScrollRail
+          containerRef={chatBodyRef}
+          markers={chatScrollRailMarkers}
+        />
       </div>
 
       {/* Live typing indicator for other members. */}
@@ -1472,6 +2129,16 @@ export default function WorkspaceChat({
         />
       </div>
 
+      <WorkspaceWorkflowRunHost
+        workspaceId={workspaceId}
+        groups={workflowRunGroups}
+        onResolveMessage={handleResolve}
+        resolveLoading={resolveMutation.isPending}
+        resolveError={resolveMutation.error}
+        resolveMessageId={resolveMutation.variables?.msgId || null}
+        onRunChange={resolveMutation.reset}
+      />
+
       {/* ── Footer / Input (shared composer with attach + voice + #) ── */}
       <ChatInputFooter
         value={input}
@@ -1481,9 +2148,51 @@ export default function WorkspaceChat({
         streaming={streaming}
         onSend={handleSend}
         onStop={() => stopStream(streamSessionKey)}
+        modeSlot={
+          !threadRef && workflowEntrypoints.length > 0 ? (
+            <div
+              className="workspace-workflow-starter"
+              title={selectedEntrypoint?.description || t("component.workspace_chat.workflow_starter_help")}
+            >
+              <IconFlow size={14} aria-hidden="true" />
+              <span className="sr-only">{t("component.workspace_chat.workflow_starter")}</span>
+              <Select
+                value={selectedEntrypointId}
+                onChange={(value) => {
+                  setSelectedEntrypointId(value);
+                  if (value) {
+                    setMentionAgent(null);
+                    setMentionDropdownOpen(false);
+                  }
+                }}
+                disabled={streaming}
+                ariaLabel={t("component.workspace_chat.workflow_starter")}
+                options={[
+                  {
+                    value: "",
+                    label: t("component.workspace_chat.workflow_starter_auto"),
+                  },
+                  ...workflowEntrypoints.map((entrypoint: WorkspaceChatEntrypoint) => ({
+                    value: entrypoint.binding_id,
+                    label: entrypoint.title,
+                  })),
+                ]}
+                dropdownMinWidth={260}
+                style={{ flex: "1 1 auto", minWidth: 0 }}
+                openButtonStyle={{
+                  borderColor: "transparent",
+                  background: "transparent",
+                  boxShadow: "none",
+                }}
+              />
+            </div>
+          ) : undefined
+        }
         placeholder={
           mentionAgent
             ? `Message ${mentionAgent.name}... / skill`
+            : selectedEntrypoint?.placeholder
+              ? selectedEntrypoint.placeholder
             : `Message ${MANOR_AGENT_NAME}... @ mention, # attach, / skill`
         }
         textareaRef={textareaRef}
@@ -1491,21 +2200,7 @@ export default function WorkspaceChat({
           mentionDropdownOpen && mentionFiltered.length > 0 ? (
             <div
               ref={mentionRef}
-              style={{
-                position: "absolute",
-                bottom: "100%",
-                left: 12,
-                right: 12,
-                marginBottom: 4,
-                background: "#fff",
-                border: "1px solid rgba(28,25,23,0.06)",
-                borderRadius: 12,
-                boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
-                zIndex: 100,
-                padding: 4,
-                maxHeight: 220,
-                overflowY: "auto",
-              }}
+              className="workspace-chat-agent-menu"
             >
               {mentionFiltered.map((agent, idx) => (
                 <div
@@ -1514,18 +2209,8 @@ export default function WorkspaceChat({
                     e.preventDefault();
                     selectMention(agent);
                   }}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    padding: "8px 12px",
-                    cursor: "pointer",
-                    borderRadius: 8,
-                    fontSize: 13,
-                    transition: "background 0.15s",
-                    background:
-                      idx === mentionActiveIdx ? "#f5f5f4" : "transparent",
-                  }}
+                  className="workspace-chat-agent-menu-item"
+                  data-active={idx === mentionActiveIdx}
                   onMouseEnter={() => setMentionActiveIdx(idx)}
                 >
                   <UserAvatar
@@ -1535,7 +2220,7 @@ export default function WorkspaceChat({
                     seed={agent.id}
                     size={24}
                   />
-                  <span style={{ fontWeight: 600, color: "#44403c" }}>
+                  <span>
                     {agent.name}
                   </span>
                 </div>
@@ -1598,14 +2283,17 @@ export default function WorkspaceChat({
 /* ── Workspace event message row ── */
 
 function WsMessageRow({
+  markerId,
   msg,
   subToAgent,
   currentUserName,
   currentUserAvatar,
   currentUserId,
   onResolve,
+  actionResetToken,
   onFeedback,
 }: {
+  markerId?: string;
   msg: WsMessage;
   subToAgent: Map<string, AgentInfo>;
   currentUserName: string;
@@ -1616,7 +2304,9 @@ function WsMessageRow({
     choice: string,
     note?: string,
     payload?: Record<string, any>,
+    files?: File[],
   ) => void;
+  actionResetToken?: number;
   onFeedback: (msgId: string, rating: "up" | "down") => void;
 }) {
   const isExternalCustomer = isExternalCustomerMessage(msg);
@@ -1641,18 +2331,31 @@ function WsMessageRow({
   const collapseBody = shouldCollapseWorkspaceMessage(msg, isUser);
   const taskId = messageRefId(msg, "task");
   const linkedTaskRefs = taskRefs(msg);
+  const delegatedRuns = delegatedAgentRunsFromMeta(msg.meta);
   const visibleTools = parseToolCalls(msg.tool_calls) || [];
   const hasAssistantBlocks =
-    !isUser && Array.isArray(msg.assistant_blocks) && msg.assistant_blocks.length > 0;
+    !isUser &&
+    Array.isArray(msg.assistant_blocks) &&
+    msg.assistant_blocks.length > 0;
   const localCodingNotice = !isUser ? maybeLocalCodingRunNoticeForTools(visibleTools) : null;
   const bodyContent = localCodingNotice || msg.body;
   const showTaskCompletionActions =
     !isUser && isTaskCompletionMessage(msg) && Boolean(taskId);
   const feedback = taskCompletionFeedback(msg, currentUserId);
+  const canRetryFailedProposalApproval = Boolean(
+    msg.resolved_at &&
+      msg.pending_action?.kind === PendingActionKind.APPROVE_PROPOSALS &&
+      ["approve", "approve_all"].includes(
+        String(msg.resolution?.choice || "").toLowerCase(),
+      ) &&
+      linkedTaskRefs.some((ref) => ref.status === "proposed"),
+  );
+  const displayPendingAction = workflowStarterAction(msg);
 
   return (
     <div
       id={`workspace-chat-message-${msg.id}`}
+      data-chat-scroll-marker-id={markerId || msg.id}
       className={`chat-message-row ${isCurrentUser ? "chat-message-row--user" : ""}`}
     >
       {isUser ? (
@@ -1737,19 +2440,30 @@ function WsMessageRow({
           }
         >
           {!hasAssistantBlocks && visibleTools.length > 0 && (
-            <ToolCallList tools={visibleTools} keyPrefix={`ws-${msg.id}`} minimal />
+            <ToolCallList
+              tools={visibleTools}
+              keyPrefix={`ws-${msg.id}`}
+              subAgentRuns={delegatedRuns}
+            />
           )}
 
           {hasAssistantBlocks && (
             <AssistantMessageBlocks
-              blocks={msg.assistant_blocks as any}
+              blocks={msg.assistant_blocks}
               content={bodyContent}
               keyPrefix={`ws-${msg.id}`}
               minimal
+              collapseLongFinal={collapseBody}
+              subAgentRuns={delegatedRuns}
             />
           )}
 
+          {!hasAssistantBlocks && msg.message_kind === "workflow_activity" && (
+            <WorkflowActivityContent msg={msg} subToAgent={subToAgent} />
+          )}
+
           {!hasAssistantBlocks &&
+            msg.message_kind !== "workflow_activity" &&
             bodyContent &&
             // An open approval renders a clean action card below; suppress the
             // raw governance body so internal keys/payloads never leak. Keep the
@@ -1757,12 +2471,13 @@ function WsMessageRow({
             // the card is only an input box.
             !(
               msg.pending_action?.kind &&
-              msg.pending_action.kind !== "human_input" &&
+              msg.pending_action.kind !== PendingActionKind.HUMAN_INPUT &&
               !msg.resolved_at
             ) && (
             msg.message_kind === "proposal" && !isUser ? (
               <ProposalMessageContent
                 content={formatUserFacingStructuredText(bodyContent)}
+                structured={structuredProposal(msg)}
               />
             ) : (
               <ExpandableWorkspaceMarkdown
@@ -1776,9 +2491,11 @@ function WsMessageRow({
           {((msg.pending_action && msg.pending_action.kind) ||
             (msg.resolved_at && msg.resolution)) && (
             <ChatActionCard
-              action={msg.pending_action || { kind: "unknown" }}
-              resolved={!!msg.resolved_at}
-              resolution={msg.resolution}
+              action={displayPendingAction || { kind: "unknown" }}
+              resolved={!!msg.resolved_at && !canRetryFailedProposalApproval}
+              resolution={
+                canRetryFailedProposalApproval ? null : msg.resolution
+              }
               resolvedByName={
                 msg.resolved_by_user_id
                   ? msg.resolved_by_user_id === currentUserId
@@ -1789,8 +2506,9 @@ function WsMessageRow({
                   : undefined
               }
               currentUserName={currentUserName}
-              onResolve={(choice, note, payload) =>
-                onResolve(msg.id, choice, note, payload)
+              resetToken={actionResetToken}
+              onResolve={(choice, note, payload, files) =>
+                onResolve(msg.id, choice, note, payload, files)
               }
             />
           )}
@@ -1859,6 +2577,100 @@ function WsMessageRow({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function WorkflowActivityContent({
+  msg,
+  subToAgent,
+}: {
+  msg: WsMessage;
+  subToAgent: Map<string, AgentInfo>;
+}) {
+  const meta = msg.meta || {};
+  const steps = Array.isArray(meta.workflow_steps)
+    ? meta.workflow_steps.filter((step: unknown) => step && typeof step === "object")
+    : [];
+  const status = String(meta.workflow_status || "queued").toLowerCase();
+  const businessOutcome = String(meta.workflow_business_outcome || "in_progress").toLowerCase();
+  const attemptNumber = Math.max(1, Number(meta.workflow_attempt_number || 1));
+  const currentStepId = String(meta.workflow_current_step_id || "");
+  const currentStep = steps.find(
+    (step: Record<string, unknown>) => String(step.id || "") === currentStepId,
+  ) as Record<string, unknown> | undefined;
+  const currentSubscriptionId = String(meta.workflow_current_subscription_id || "");
+  const currentAgent = currentSubscriptionId
+    ? subToAgent.get(currentSubscriptionId) || null
+    : null;
+  const completedCount = steps.filter(
+    (step: Record<string, unknown>) => String(step.status || "") === "completed",
+  ).length;
+
+  return (
+    <div className="workspace-workflow-activity" data-status={status}>
+      <div className="workspace-workflow-activity-header">
+        <span className="workspace-workflow-activity-icon" aria-hidden="true">
+          <IconFlow size={15} />
+        </span>
+        <strong>{String(meta.workflow_title || t("component.workspace_chat.workflow"))}</strong>
+        <span className="workspace-workflow-activity-status">
+          <span aria-hidden="true" />
+          {formatUserFacingText(status)}
+        </span>
+      </div>
+
+      <div className="workspace-workflow-activity-outcome">
+        <span>
+          {t("component.workspace_chat.workflow_outcome", {
+            outcome: formatUserFacingText(businessOutcome),
+          })}
+        </span>
+        <span className="mono">
+          {t("component.workspace_chat.workflow_attempt", { count: attemptNumber })}
+        </span>
+      </div>
+
+      {(currentStep || currentAgent) && (
+        <div className="workspace-workflow-activity-current">
+          <AgentMiniAvatar agent={currentAgent} size={18} />
+          <span>
+            {currentAgent?.name || MANOR_AGENT_NAME}
+            {currentStep?.name ? ` · ${formatUserFacingText(String(currentStep.name))}` : ""}
+          </span>
+        </div>
+      )}
+
+      {steps.length > 0 && (
+        <div
+          className="workspace-workflow-activity-steps"
+          aria-label={t("component.workspace_chat.activity_steps", { count: steps.length })}
+        >
+          {steps.map((step: Record<string, unknown>) => {
+            const stepStatus = String(step.status || "queued").toLowerCase();
+            return (
+              <span
+                key={String(step.id || step.name)}
+                className="workspace-workflow-activity-step"
+                data-status={stepStatus}
+                title={`${formatUserFacingText(String(step.name || step.id))}: ${formatUserFacingText(stepStatus)}`}
+              >
+                <span aria-hidden="true" />
+                {formatUserFacingText(String(step.name || step.id))}
+              </span>
+            );
+          })}
+          <span className="workspace-workflow-activity-count mono">
+            {completedCount}/{steps.length}
+          </span>
+        </div>
+      )}
+
+      {meta.workflow_error && (
+        <div className="workspace-workflow-activity-error">
+          {formatUserFacingText(String(meta.workflow_error))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1937,9 +2749,11 @@ function AgentMiniAvatar({
 // the task — so a burst of step receipts and retries reads as one background
 // activity rather than a wall of bubbles.
 function WsActivityRun({
+  markerId,
   msgs,
   subToAgent,
 }: {
+  markerId?: string;
   msgs: WsMessage[];
   subToAgent: Map<string, AgentInfo>;
 }) {
@@ -1978,7 +2792,10 @@ function WsActivityRun({
     </>
   );
   return (
-    <div className="ws-activity-line-row">
+    <div
+      className="ws-activity-line-row"
+      data-chat-scroll-marker-id={markerId || last?.id || title}
+    >
       <div className="ws-activity-run">
         <div className="ws-activity-line ws-activity-run-bar">
           <button
@@ -2055,11 +2872,20 @@ function WsActivityRun({
   );
 }
 
-function WsActivityLine({ msg }: { msg: WsMessage }) {
+function WsActivityLine({
+  markerId,
+  msg,
+}: {
+  markerId?: string;
+  msg: WsMessage;
+}) {
   const text = activityLineText(msg);
   const failed = /failed|✗/i.test(msg.body || "");
   return (
-    <div className="ws-activity-line-row">
+    <div
+      className="ws-activity-line-row"
+      data-chat-scroll-marker-id={markerId || msg.id}
+    >
       <span className="ws-activity-line">
         <span className="ws-activity-line-glyph" aria-hidden>
           {failed ? "✗" : "▸"}
@@ -2073,9 +2899,68 @@ function WsActivityLine({ msg }: { msg: WsMessage }) {
   );
 }
 
-function ProposalMessageContent({ content }: { content: string }) {
-  const proposal = parseWorkspaceProposal(content);
-  if (!proposal) {
+/** The typed payload the backend attaches to every proposal card. */
+type StructuredProposal = {
+  summary?: string | null;
+  notes?: string | null;
+  tasks?: unknown;
+  /** Non-task cohort members (changes / experiments). */
+  items?: unknown;
+  /** Informational footers: auto-approval reason, governance block notice. */
+  footnotes?: unknown;
+};
+
+function structuredProposalItems(source: unknown): { kind: string; summary: string }[] {
+  if (!Array.isArray(source)) return [];
+  return source
+    .filter((item): item is Record<string, any> => Boolean(item && typeof item === "object"))
+    .map((item) => ({
+      kind: formatUserFacingText(String(item.kind || "item").replace(/_/g, " ")),
+      summary: formatUserFacingText(String(item.summary || "")),
+    }))
+    .filter((item) => item.summary || item.kind);
+}
+
+/** `meta.proposal` is written for every card; `pending_action.tasks` is the
+ *  same list, kept for cards whose meta was pruned by an older writer. */
+function structuredProposal(msg: WsMessage): StructuredProposal | null {
+  const fromMeta = msg.meta?.proposal;
+  if (fromMeta && typeof fromMeta === "object") return fromMeta as StructuredProposal;
+  const fromAction = msg.pending_action?.tasks;
+  if (Array.isArray(fromAction)) return { tasks: fromAction };
+  return null;
+}
+
+function ProposalMessageContent({
+  content,
+  structured,
+}: {
+  content: string;
+  structured?: StructuredProposal | null;
+}) {
+  const structuredTasks = proposalTaskEntries(structured?.tasks);
+  const proposal: ParsedProposal | null = structured
+    ? {
+        summary: cleanProposalLine(structured.summary || ""),
+        tasks: [],
+        notes: splitProposalNotes(structured.notes || "").filter(Boolean),
+      }
+    : // `parseWorkspaceProposal` survives for ONE reason: proposal cards
+      // posted before the structured payload shipped still have to render.
+      // Cards written today never reach it — do not extend it.
+      parseWorkspaceProposal(content);
+  const legacyTasks = structured ? [] : proposal?.tasks || [];
+  const structuredItems = structuredProposalItems(structured?.items);
+  const footnotes = Array.isArray(structured?.footnotes)
+    ? structured!.footnotes.map((line) => formatUserFacingText(String(line))).filter(Boolean)
+    : [];
+  const structuredEmpty =
+    Boolean(structured) &&
+    !proposal?.summary &&
+    !structuredTasks.length &&
+    !structuredItems.length &&
+    !(proposal?.notes.length || 0);
+  if (!proposal || structuredEmpty) {
     return (
       <ExpandableWorkspaceMarkdown
         content={content.replace(/~~/g, "")}
@@ -2096,13 +2981,52 @@ function ProposalMessageContent({ content }: { content: string }) {
         </div>
       )}
 
-      {proposal.tasks.length > 0 && (
+      {(structuredTasks.length > 0 || legacyTasks.length > 0) && (
         <div className="workspace-proposal-section">
           <div className="workspace-proposal-section-title">
             {t("component.workspace_chat.proposed_work")}
           </div>
           <div className="workspace-proposal-task-list">
-            {proposal.tasks.map((task, index) => (
+            {/* Typed payload: the ordinal stays an ordinal, the priority
+                becomes a word, and the predicted delta says what it moves. */}
+            {structuredTasks.map((task, index) => {
+              const priorityLabel = proposalPriorityLabel(task.priority);
+              const impact = proposalImpactLabel(task);
+              return (
+                <div
+                  className="workspace-proposal-task"
+                  key={task.task_id || `${task.title}-${index}`}
+                >
+                  <div className="workspace-proposal-task-rank">{index + 1}</div>
+                  <div className="workspace-proposal-task-body">
+                    <div className="workspace-proposal-task-title-row">
+                      <span className="workspace-proposal-task-title">
+                        {formatUserFacingText(task.title)}
+                      </span>
+                      {priorityLabel && (
+                        <Chip size="sm" variant={task.priority === 5 ? "red" : "slate"}>
+                          {priorityLabel}
+                        </Chip>
+                      )}
+                      {impact && (
+                        <span
+                          className="workspace-proposal-impact"
+                          title={proposalImpactExplainer()}
+                        >
+                          {impact}
+                        </span>
+                      )}
+                    </div>
+                    {task.rationale && (
+                      <p className="workspace-proposal-task-detail">
+                        {formatUserFacingText(task.rationale)}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {legacyTasks.map((task, index) => (
               <div className="workspace-proposal-task" key={`${task.title}-${index}`}>
                 <div className="workspace-proposal-task-rank">
                   {task.rank || index + 1}
@@ -2124,11 +3048,32 @@ function ProposalMessageContent({ content }: { content: string }) {
         </div>
       )}
 
+      {/* Changes / experiments that ride the same cohort. */}
+      {structuredItems.length > 0 && (
+        <div className="workspace-proposal-section">
+          <div className="workspace-proposal-section-title">
+            {t("component.workspace_chat.proposed_changes")}
+          </div>
+          <div className="workspace-proposal-task-list">
+            {structuredItems.map((item, index) => (
+              <div className="workspace-proposal-task" key={`${item.summary}-${index}`}>
+                <div className="workspace-proposal-task-body">
+                  <div className="workspace-proposal-task-title-row">
+                    <Chip size="sm" variant="slate">{item.kind}</Chip>
+                    <span className="workspace-proposal-task-title">{item.summary}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {proposal.notes.length > 0 && (
         <div className="workspace-proposal-section workspace-proposal-notes">
           <div className="workspace-proposal-section-title">
             {t(
-              proposal.tasks.length > 0
+              structuredTasks.length + legacyTasks.length > 0
                 ? "component.workspace_chat.proposal_context"
                 : "component.workspace_chat.blocking_reasons",
             )}
@@ -2140,6 +3085,10 @@ function ProposalMessageContent({ content }: { content: string }) {
           </ol>
         </div>
       )}
+
+      {footnotes.map((line, index) => (
+        <p className="workspace-proposal-footnote" key={`${line}-${index}`}>{line}</p>
+      ))}
     </div>
   );
 }
@@ -2160,58 +3109,38 @@ function ExpandableWorkspaceMarkdown({
     return <ChatMarkdown content={content} isUser={isUser} />;
   }
 
+  if (isUser) {
+    return (
+      <CollapsibleSentMessage text={content}>
+        <ChatMarkdown content={content} isUser />
+      </CollapsibleSentMessage>
+    );
+  }
+
   return (
-    <div>
+    <div className="workspace-markdown-expandable">
       <div
-        style={{
-          position: "relative",
-          maxHeight: expanded ? "none" : COLLAPSED_MESSAGE_MAX_HEIGHT,
-          overflow: expanded ? "visible" : "hidden",
-        }}
+        className={`workspace-markdown-clamp${expanded ? "" : " workspace-markdown-clamp--collapsed"}`}
+        style={
+          expanded
+            ? undefined
+            : ({
+                "--workspace-markdown-clamp-height": `${COLLAPSED_MESSAGE_MAX_HEIGHT}px`,
+              } as CSSProperties)
+        }
       >
         <ChatMarkdown content={content} isUser={isUser} />
         {!expanded && (
-          <div
-            style={{
-              position: "absolute",
-              left: 0,
-              right: 0,
-              bottom: 0,
-              height: 54,
-              pointerEvents: "none",
-              borderRadius: "0 0 12px 12px",
-              background:
-                "linear-gradient(to bottom, rgba(250,250,249,0), rgba(250,250,249,0.98) 72%)",
-              display: "flex",
-              alignItems: "flex-end",
-              justifyContent: "center",
-              color: "#78716c",
-              fontWeight: 800,
-              letterSpacing: "0.18em",
-              paddingBottom: 4,
-            }}
+          <button
+            type="button"
+            className="workspace-markdown-expand-button"
+            onClick={() => setExpanded(true)}
+            aria-label={t("chat.show_more")}
           >
-            ...
-          </div>
+            <span aria-hidden="true">...</span>
+          </button>
         )}
       </div>
-      <button
-        type="button"
-        onClick={() => setExpanded((value) => !value)}
-        style={{
-          marginTop: 8,
-          border: "1px solid rgba(79,125,117,0.18)",
-          background: "rgba(242,246,245,0.85)",
-          color: "#436b65",
-          borderRadius: 999,
-          padding: "4px 10px",
-          fontSize: 11,
-          fontWeight: 800,
-          cursor: "pointer",
-        }}
-      >
-        {expanded ? t("chat.show_less") : t("chat.show_more")}
-      </button>
     </div>
   );
 }
@@ -2225,6 +3154,11 @@ function KindBadge({ kind }: { kind: string }) {
     },
     step_event: {
       label: t("component.workspace_chat.step"),
+      color: "#5f574f",
+      bg: "rgba(120,113,108,0.11)",
+    },
+    workflow_activity: {
+      label: t("component.workspace_chat.workflow"),
       color: "#5f574f",
       bg: "rgba(120,113,108,0.11)",
     },

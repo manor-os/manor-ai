@@ -17,9 +17,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import desc, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation, Message
 
@@ -201,6 +202,68 @@ async def post_message(
 
 # ── Reads ─────────────────────────────────────────────────────────────
 
+def open_pending_action_filters(entity_id: str, workspace_id: str) -> tuple:
+    """The single definition of "an action card still waiting on a human".
+
+    Every surface that shows the user a number must count through this, or the
+    numbers drift apart and the user has to guess which one is lying.
+    """
+    return (
+        Conversation.entity_id == entity_id,
+        Conversation.workspace_id == workspace_id,
+        Message.pending_action.isnot(None),
+        Message.pending_action["kind"].as_string().isnot(None),
+        Message.resolved_at.is_(None),
+    )
+
+
+async def unresolved_pending_messages(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    limit: int = 50,
+) -> list[Message]:
+    """Every unresolved action card in the workspace, any conversation.
+
+    Background plans post their approval/input cards into their own thread
+    conversation, so the main chat's own message window can miss them entirely
+    while the sidebar badge still counts them. Callers merge these in so the
+    badge can never point at work the chat refuses to show.
+    """
+    return list((await db.execute(
+        select(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(*open_pending_action_filters(entity_id, workspace_id))
+        .order_by(desc(Message.created_at))
+        .limit(limit)
+    )).scalars().all())
+
+
+async def count_open_pending_actions(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+) -> int:
+    """How many action cards are still waiting — authoritative, from the DB.
+
+    The chat banner used to count the cards it happened to be holding in
+    memory, which only ever drifts upward: ``unresolved_pending_messages``
+    pins cards from far outside the page window, and the moment the user
+    answers one it leaves the pinned set instead of coming back marked
+    resolved. The client merges pages by id and never removes, so the stale
+    "still waiting" copy sits there until a reload. Meanwhile the sidebar
+    badge re-counted from the DB and dropped — one answer, two numbers.
+    """
+    return int((await db.execute(
+        select(func.count())
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(*open_pending_action_filters(entity_id, workspace_id))
+    )).scalar() or 0)
+
+
 async def list_messages(
     db: AsyncSession,
     *,
@@ -210,8 +273,17 @@ async def list_messages(
     thread_ref_id: Optional[str] = None,
     limit: int = 100,
     before: Optional[datetime] = None,
+    before_id: Optional[str] = None,
+    pin_pending: bool = True,
 ) -> list[Message]:
-    """List messages newest-first. ``before`` cursor for pagination."""
+    """List messages newest-first. ``before`` cursor for pagination.
+
+    ``pin_pending`` merges unresolved action cards from other conversations
+    into the first page of the main view. Paginating callers pass False and
+    merge them AFTER their own windowing — otherwise the merged rows sit past
+    the page limit and get truncated away (which silently hid days of blocked
+    work behind a non-zero badge).
+    """
     main_workspace_view = not (thread_ref_kind and thread_ref_id)
     if thread_ref_kind and thread_ref_id:
         conv = (await db.execute(
@@ -237,31 +309,34 @@ async def list_messages(
 
     stmt = select(Message).where(Message.conversation_id == conv.id)
     if before is not None:
-        stmt = stmt.where(Message.created_at < before)
-    stmt = stmt.order_by(desc(Message.created_at)).limit(limit)
+        if before_id:
+            stmt = stmt.where(
+                or_(
+                    Message.created_at < before,
+                    and_(Message.created_at == before, Message.id < before_id),
+                )
+            )
+        else:
+            stmt = stmt.where(Message.created_at < before)
+    stmt = stmt.order_by(desc(Message.created_at), desc(Message.id)).limit(limit)
     rows = list((await db.execute(stmt)).scalars().all())
 
     # The chat sidebar badge counts unresolved proposal/HITL cards. If those
     # cards are older than the normal message window, pin them into the initial
     # workspace chat payload so the badge never points at invisible work.
-    if main_workspace_view and before is None:
-        pending_rows = list((await db.execute(
-            select(Message)
-            .join(Conversation, Message.conversation_id == Conversation.id)
-            .where(
-                Conversation.entity_id == entity_id,
-                Conversation.workspace_id == workspace_id,
-                Message.pending_action.isnot(None),
-                Message.pending_action["kind"].as_string().isnot(None),
-                Message.resolved_at.is_(None),
-            )
-            .order_by(desc(Message.created_at))
-            .limit(50)
-        )).scalars().all())
+    if pin_pending and main_workspace_view and before is None:
+        pending_rows = await unresolved_pending_messages(
+            db, entity_id=entity_id, workspace_id=workspace_id,
+        )
         by_id = {m.id: m for m in rows}
         for msg in pending_rows:
             by_id.setdefault(msg.id, msg)
-        rows = list(by_id.values())
+        # Keep the newest-first contract the callers slice and reverse on.
+        rows = sorted(
+            by_id.values(),
+            key=lambda m: (m.created_at, m.id),
+            reverse=True,
+        )
 
     return rows
 
@@ -300,6 +375,10 @@ async def resolve_pending_action(
     is_retry = choice in ("retry", "retry_now")
     is_feedback = choice == "feedback"
     is_response = choice in ("respond", "provide_answers", "submit", "ok")
+    is_workflow_start = (
+        msg.pending_action.get("kind") == PendingActionKind.WORKFLOW_STARTER_INPUT
+        and choice in ("run", "start", "confirm")
+    )
     is_cancelled = "cancel" in choice or choice in ("skip", "stopped")
     is_approve = (
         "approve" in choice
@@ -311,6 +390,8 @@ async def resolve_pending_action(
         content = "✓ Feedback sent"
     elif is_response:
         content = "✓ Response submitted"
+    elif is_workflow_start:
+        content = "✓ Workflow started"
     elif is_cancelled:
         content = "✗ Cancelled"
     else:

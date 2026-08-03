@@ -2,18 +2,22 @@
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import CONVERSATION_LOG_TYPES
 from packages.core.constants.execution import DEFAULT_AGENT_MAX_TURNS
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services.scheduler_service import (
     create_scheduled_job, list_scheduled_jobs, get_scheduled_job,
     update_scheduled_job, delete_scheduled_job, toggle_scheduled_job,
-    create_job_run, list_job_runs,
+    summarize_scheduled_jobs,
+    list_job_runs,
     create_agent_execution, list_agent_executions, update_agent_execution,
 )
 from apps.api.deps import get_current_user
@@ -53,6 +57,7 @@ class ScheduledJobResponse(BaseModel):
     delete_after_run: bool | None = False
     last_run_at: str | None = None
     last_status: str | None = None
+    last_error: str | None = None
     consecutive_errors: int = 0
     created_at: str | None = None
     updated_at: str | None = None
@@ -95,6 +100,9 @@ class ScheduledJobUpdateRequest(BaseModel):
 class ScheduledJobListResponse(BaseModel):
     items: list[ScheduledJobResponse]
     total: int
+    summary_total: int
+    enabled_total: int
+    attention_total: int
 
 
 class ToggleRequest(BaseModel):
@@ -168,7 +176,7 @@ class AgentExecutionListResponse(BaseModel):
 
 # ── Helpers ──
 
-def _job_response(j) -> ScheduledJobResponse:
+def _job_response(j, *, last_error: str | None = None) -> ScheduledJobResponse:
     return ScheduledJobResponse(
         id=j.id, job_id=j.job_id, entity_id=j.entity_id,
         workspace_id=j.workspace_id, name=j.name, job_type=j.job_type,
@@ -185,6 +193,7 @@ def _job_response(j) -> ScheduledJobResponse:
         enabled=j.enabled, delete_after_run=j.delete_after_run,
         last_run_at=j.last_run_at.isoformat() if j.last_run_at else None,
         last_status=j.last_status,
+        last_error=last_error,
         consecutive_errors=j.consecutive_errors or 0,
         created_at=j.created_at.isoformat() if j.created_at else None,
         updated_at=j.updated_at.isoformat() if j.updated_at else None,
@@ -219,12 +228,51 @@ def _exec_response(e) -> AgentExecutionResponse:
     )
 
 
+async def _latest_job_errors(
+    db: AsyncSession,
+    job_ids: list[str],
+) -> dict[str, str]:
+    if not job_ids:
+        return {}
+
+    from packages.core.models.scheduler import ScheduledJobRun
+
+    ranked = (
+        select(
+            ScheduledJobRun.job_id.label("job_id"),
+            ScheduledJobRun.error.label("error"),
+            func.row_number().over(
+                partition_by=ScheduledJobRun.job_id,
+                order_by=ScheduledJobRun.created_at.desc(),
+            ).label("position"),
+        )
+        .where(ScheduledJobRun.job_id.in_(job_ids))
+        .subquery()
+    )
+    rows = (
+        await db.execute(
+            select(ranked.c.job_id, ranked.c.error).where(
+                ranked.c.position == 1,
+            )
+        )
+    ).all()
+    return {
+        str(job_id): str(error)
+        for job_id, error in rows
+        if error
+    }
+
+
 # ── Scheduled Jobs Endpoints ──
 
 @jobs_router.get("", response_model=ScheduledJobListResponse)
 async def list_jobs(
     enabled_only: bool = Query(False),
     workspace_id: str | None = Query(None),
+    search: str | None = Query(None, max_length=200),
+    status: Literal["all", "enabled", "paused", "attention"] = Query("all"),
+    agent_id: str | None = Query(None),
+    include_workflows: bool = Query(True),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     user: User = Depends(get_current_user),
@@ -233,9 +281,32 @@ async def list_jobs(
     jobs, total = await list_scheduled_jobs(
         db, user.entity_id, enabled_only=enabled_only,
         workspace_id=workspace_id,
+        search=search, status=status, agent_id=agent_id,
+        include_workflows=include_workflows,
         limit=limit, offset=offset,
     )
-    return ScheduledJobListResponse(items=[_job_response(j) for j in jobs], total=total)
+    summary = await summarize_scheduled_jobs(
+        db,
+        user.entity_id,
+        workspace_id=workspace_id,
+        search=search,
+        agent_id=agent_id,
+        include_workflows=include_workflows,
+    )
+    latest_errors = await _latest_job_errors(
+        db,
+        [job.job_id for job in jobs if (job.consecutive_errors or 0) > 0],
+    )
+    return ScheduledJobListResponse(
+        items=[
+            _job_response(job, last_error=latest_errors.get(job.job_id))
+            for job in jobs
+        ],
+        total=total,
+        summary_total=summary["total"],
+        enabled_total=summary["enabled"],
+        attention_total=summary["attention"],
+    )
 
 
 @jobs_router.post("", response_model=ScheduledJobResponse, status_code=201)
@@ -432,14 +503,12 @@ async def get_job_run_detail(
         logs = await get_task_logs(db, task_row.id)
         timeline = [
             {
-                "type": l.log_type,
-                "content": (l.content or "")[:1000],
-                "ts": l.created_at.isoformat() if l.created_at else None,
+                "type": log_entry.log_type,
+                "content": (log_entry.content or "")[:1000],
+                "ts": log_entry.created_at.isoformat() if log_entry.created_at else None,
             }
-            for l in reversed(logs)  # logs come desc; reverse to chronological
-            if l.log_type and (
-                l.log_type.startswith("ai_") or l.log_type == "comment"
-            )
+            for log_entry in reversed(logs)  # logs come desc; reverse to chronological
+            if log_entry.log_type in CONVERSATION_LOG_TYPES
         ]
         task_dict = {
             "id": task_row.id,

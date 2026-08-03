@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .office_common import handle_office_skill
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 
 async def handle_pdf(
@@ -18,7 +19,7 @@ async def handle_pdf(
 ) -> str:
     return await handle_office_skill(
         skill="pdf",
-        default_subdir="documents",
+        default_subdir=WorkspaceArtifactDir.DOCUMENTS.value,
         kind="pdf",
         entity_id=entity_id,
         user_id=user_id,

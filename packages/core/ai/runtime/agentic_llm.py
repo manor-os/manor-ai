@@ -54,6 +54,7 @@ async def runtime_execute_agentic_round_tool_completion(
     tools: list[dict[str, Any]],
     *,
     temperature: float,
+    max_tokens: int | None = None,
     model: str | None = None,
     stream_handler: Any = None,
     metadata: dict[str, Any] | None = None,
@@ -67,7 +68,11 @@ async def runtime_execute_agentic_round_tool_completion(
         model=model,
         stream_handler=_agentic_tool_stream_handler(stream_handler),
         metadata=metadata,
-        max_tokens=RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS,
+        max_tokens=(
+            RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS
+            if max_tokens is None
+            else max_tokens
+        ),
     )
 
 
@@ -75,6 +80,7 @@ async def runtime_execute_agentic_round_text_completion(
     messages: list[dict[str, Any]],
     *,
     temperature: float,
+    max_tokens: int | None = None,
     model: str | None = None,
     stream_handler: Any = None,
     metadata: dict[str, Any] | None = None,
@@ -85,7 +91,11 @@ async def runtime_execute_agentic_round_text_completion(
         list(messages),
         temperature=temperature,
         model=model,
-        max_tokens=RUNTIME_AGENTIC_TEXT_MAX_TOKENS,
+        max_tokens=(
+            RUNTIME_AGENTIC_TEXT_MAX_TOKENS
+            if max_tokens is None
+            else max_tokens
+        ),
         stream_handler=stream_handler,
         metadata=metadata,
     )
@@ -95,6 +105,7 @@ async def runtime_execute_agentic_final_completion(
     messages: list[dict[str, Any]],
     *,
     temperature: float,
+    max_tokens: int | None = None,
     model: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -104,6 +115,10 @@ async def runtime_execute_agentic_final_completion(
         list(messages),
         temperature=temperature,
         model=model,
-        max_tokens=RUNTIME_AGENTIC_TEXT_MAX_TOKENS,
+        max_tokens=(
+            RUNTIME_AGENTIC_TEXT_MAX_TOKENS
+            if max_tokens is None
+            else max_tokens
+        ),
         metadata=metadata,
     )

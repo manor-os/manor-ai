@@ -22,6 +22,9 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    ExecutionStepStatus,
+)
 from packages.core.budget import get_budget_status
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
@@ -577,7 +580,7 @@ def _build_time_efficiency(
         for s in steps
         if s.started_at and s.finished_at
     ]
-    waiting_human = sum(1 for s in steps if s.step_status == "waiting_human")
+    waiting_human = sum(1 for s in steps if s.step_status == ExecutionStepStatus.WAITING_HUMAN)
     blocked = sum(1 for t in tasks if t.status in {"waiting_on_customer", "blocked"})
     avg_task = _avg(task_hours)
     avg_step = _avg(step_minutes)
@@ -700,7 +703,7 @@ def _build_governance_health(
     steps: list[ExecutionStep], evidence: list[RuntimeEvidence]
 ) -> dict[str, Any]:
     approval_required = sum(1 for s in steps if s.requires_approval)
-    waiting_human = sum(1 for s in steps if s.step_status == "waiting_human")
+    waiting_human = sum(1 for s in steps if s.step_status == ExecutionStepStatus.WAITING_HUMAN)
     blocked = 0
     violations = 0
     for s in steps:

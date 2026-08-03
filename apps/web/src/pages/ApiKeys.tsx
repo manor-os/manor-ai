@@ -149,7 +149,7 @@ export default function ApiKeys({ embedded = false }: { embedded?: boolean } = {
   }
 
   return (
-    <div style={embedded ? undefined : { maxWidth: 1060, margin: "0 auto" }}>
+    <div style={embedded ? undefined : { maxWidth: 1060 }}>
       {!embedded && (
       <PageHeader
         title={t("page.api_keys.title")}

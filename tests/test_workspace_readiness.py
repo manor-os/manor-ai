@@ -111,6 +111,55 @@ def test_readiness_report_documents_part_roles_and_checks() -> None:
     text = report.to_prompt_text()
     assert "Agents and services: missing" in text
     assert "Role: Execution capacity" in text
-    assert "Check: At least one active AgentSubscription" in text
+    assert "Check: Every declared service has an active AgentSubscription" in text
     assert "External integrations: missing" in text
     assert report.missing_setup_keys == ["no_agents", "no_goals", "no_integrations"]
+
+
+def test_readiness_requires_every_declared_service_and_worker_binding() -> None:
+    report = build_workspace_readiness_report(
+        operating_model={
+            "services": [
+                {"service_key": "research"},
+                {"service_key": "publishing"},
+            ]
+        },
+        subscriptions=[
+            SimpleNamespace(id="sub_research", service_key="research"),
+        ],
+        goals=[SimpleNamespace(id="goal_1")],
+        declared_provider_keys=set(),
+        active_provider_keys=set(),
+        configured_integrations=[],
+        configured_channels=[],
+        knowledge_nets=[],
+        governance_policy=None,
+        operating_memory="",
+        runtime_bound_subscription_ids=set(),
+    )
+
+    agents = next(part for part in report.parts if part.key == "agents")
+    assert agents.status == "partial"
+    assert agents.missing_setup_key == "no_agents"
+    assert agents.details["missing_service_keys"] == ["publishing"]
+    assert agents.details["unbound_subscription_ids"] == ["sub_research"]
+
+
+def test_readiness_blocks_when_only_some_declared_integrations_are_connected() -> None:
+    report = build_workspace_readiness_report(
+        operating_model={},
+        subscriptions=[SimpleNamespace(id="sub_1", service_key="research")],
+        goals=[SimpleNamespace(id="goal_1")],
+        declared_provider_keys={"gmail", "twitter_x"},
+        active_provider_keys={"gmail"},
+        configured_integrations=["gmail"],
+        configured_channels=[],
+        knowledge_nets=[],
+        governance_policy=None,
+        operating_memory="",
+    )
+
+    integrations = next(part for part in report.parts if part.key == "integrations")
+    assert integrations.status == "partial"
+    assert integrations.missing_setup_key == "no_integrations"
+    assert integrations.details["missing"] == ["twitter_x"]

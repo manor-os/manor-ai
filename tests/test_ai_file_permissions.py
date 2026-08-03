@@ -161,11 +161,15 @@ def test_document_file_state_missing_and_available_markers():
     )
 
     assert mark_document_file_missing(doc, source="move") is True
-    assert doc.is_trashed is True
-    assert doc.trashed_at is not None
+    assert doc.is_trashed is False
+    assert doc.trashed_at is None
     assert doc.vector_status == "failed"
     assert doc.metadata_["file_integrity"]["status"] == "missing"
     assert doc.metadata_["file_integrity"]["recoverable"] is False
+
+    assert mark_document_file_missing(doc, source="delete", trash=True) is True
+    assert doc.is_trashed is True
+    assert doc.trashed_at is not None
 
     assert mark_document_file_available(doc, source="filesystem") is True
     assert doc.vector_status == "pending"

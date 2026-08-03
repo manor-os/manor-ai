@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Boolean, Index, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,10 +23,20 @@ class Skill(Base, TimestampMixin):
         Index("ix_skills_slug", "slug"),
         Index("ix_skills_category", "category"),
         Index("ix_skills_tags", "tags", postgresql_using="gin"),
+        Index("ix_skills_workspace", "entity_id", "workspace_id"),
+        Index("ix_skills_owner", "entity_id", "owner_user_id"),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[Optional[str]] = mapped_column(String(26))  # None = platform skill
+    # Ownership triple read by packages/core/services/resource_access.py.
+    # NULL owner = pre-migration row (only an entity admin may modify it);
+    # NULL workspace = shared entity-wide rather than scoped to one workspace.
+    owner_user_id: Mapped[Optional[str]] = mapped_column(String(26))
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
+    visibility: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="entity"
+    )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     slug: Mapped[Optional[str]] = mapped_column(String(100))
     display_name: Mapped[Optional[str]] = mapped_column(String(255))
@@ -38,9 +48,21 @@ class Skill(Base, TimestampMixin):
     category: Mapped[Optional[str]] = mapped_column(String(50))
     tags: Mapped[list] = mapped_column(ARRAY(String), server_default="{}")
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Author-managed release label ("1.0.0"); used by the marketplace to
+    # decide whether an installed bundle is out of date, and by blueprints
+    # for ``min_version`` matching. Bumped by humans / bundle authors only.
     version: Mapped[str] = mapped_column(String(20), default="1.0.0")
     config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     status: Mapped[str] = mapped_column(String(20), default="active")
+    # M11 config revision — the machine-owned counterpart of ``version``:
+    # a monotone integer that ``packages.core.revisions.bump_revision``
+    # increments on every behavior-affecting content change (system_prompt
+    # / tools / input_schema / output_format / config / status), appending
+    # an ``automation_revisions`` audit row. Cosmetic edits (name,
+    # description, tags, category) never move it.
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", default=1,
+    )
 
 
 class AgentSkillBinding(Base, TimestampMixin):

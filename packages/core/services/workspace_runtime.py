@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskLogType
 from packages.core.ai.runtime import (
     ChatSurface,
     RuntimeProfile,
@@ -49,21 +50,15 @@ class WorkspaceRuntimeEnvelope:
     task_id: str | None = None
     thread_ref_kind: str | None = None
     thread_ref_id: str | None = None
-    # Manor-level RuntimeProfile for this resolved workspace turn. Legacy tool
-    # visibility is carried separately in legacy_tool_profile.
+    # Manor-level RuntimeProfile and the separate tool-visibility profile.
     runtime_profile: str | None = None
-    legacy_tool_profile: str | None = None
+    tool_profile: str | None = None
     extra_context: str | None = None
     is_master: bool = False
     bound_tool_names: set[str] | None = None
     mcp_allowed_names: set[str] | None = None
     capability_ids: set[str] = field(default_factory=set)
     service_agent_ids: list[str] = field(default_factory=list)
-
-    @property
-    def legacy_runtime_profile(self) -> str | None:
-        return self.legacy_tool_profile
-
 
 def compact_runtime_json(value, *, max_chars: int = 1400) -> str:
     if not value:
@@ -405,6 +400,7 @@ async def _resolve_workspace_operation_tool_scope(
             binding,
             agent_id=agent_id,
             is_master=is_master,
+            task_id=task.id if task else None,
             current_service_keys=current_service_keys,
             task_service_keys=task_service_keys,
             subscription_agent_ids_by_id=subscription_agent_ids_by_id,
@@ -540,7 +536,7 @@ async def resolve_workspace_runtime(
     )
     turn_profiles = runtime_workspace_turn_profile_names(workspace_id)
     runtime_profile = turn_profiles.runtime_profile
-    legacy_tool_profile = turn_profiles.legacy_tool_profile
+    tool_profile = turn_profiles.tool_profile
     bound_tool_names, mcp_allowed_names = await _resolve_agent_tool_scope(
         db,
         agent_id=agent_id,
@@ -630,7 +626,7 @@ async def resolve_workspace_runtime(
         thread_ref_kind=thread_ref_kind,
         thread_ref_id=thread_ref_id,
         runtime_profile=runtime_profile,
-        legacy_tool_profile=legacy_tool_profile,
+        tool_profile=tool_profile,
         extra_context=extra_context,
         is_master=resolved_is_master,
         bound_tool_names=bound_tool_names,
@@ -707,7 +703,14 @@ async def process_workspace_task_comment(
 
             workspace_id = task.workspace_id
             if responding_agent_id is None:
-                responding_agent_id = task.agent_id
+                # Not just task.agent_id: plan-driven work resolves an agent
+                # per step and never copies it up, so a reply would land on
+                # the master agent instead of the one that produced the work.
+                from packages.core.services.task_service import (
+                    task_executing_agent_id,
+                )
+
+                responding_agent_id = await task_executing_agent_id(db, task)
             conv = await ensure_workspace_task_conversation(
                 db,
                 entity_id=entity_id,
@@ -746,14 +749,15 @@ async def process_workspace_task_comment(
             )
             content = str((result or {}).get("content") or "").strip()
             if content:
-                created_by, author_meta = await agent_log_authorship(
-                    db, responding_agent_id, fallback="workspace-agent",
+                created_by, author_meta, author_actor = await agent_log_authorship(
+                    db, responding_agent_id,
                 )
                 await add_task_log(
                     db,
                     task_id,
-                    "workspace_agent_response",
+                    TaskLogType.WORKSPACE_AGENT_RESPONSE,
                     content,
+                    actor=author_actor,
                     created_by=created_by,
                     metadata={
                         **(author_meta or {}),
@@ -773,14 +777,15 @@ async def process_workspace_task_comment(
         )
         try:
             async with async_session() as db:
-                created_by, author_meta = await agent_log_authorship(
-                    db, responding_agent_id, fallback="workspace-agent",
+                created_by, author_meta, author_actor = await agent_log_authorship(
+                    db, responding_agent_id,
                 )
                 await add_task_log(
                     db,
                     task_id,
-                    "workspace_agent_error",
+                    TaskLogType.WORKSPACE_AGENT_ERROR,
                     f"Workspace Agent could not process comment: {exc}",
+                    actor=author_actor,
                     created_by=created_by,
                     metadata={**(author_meta or {}), "source": "task_comment", "task_log_id": log_id},
                 )

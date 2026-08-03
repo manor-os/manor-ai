@@ -22,6 +22,10 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import (
+    TaskLogType,
+    TaskStatus,
+)
 from packages.core.database import get_db
 from packages.core.models.task import Task, TaskLog
 from packages.core.models.base import generate_ulid
@@ -150,7 +154,7 @@ async def public_update_status(
 
         if req.status not in VALID_STATUSES:
             raise HTTPException(400, f"Invalid status: {req.status}")
-        apply_task_status_transition(task, req.status)
+        await apply_task_status_transition(task, req.status, db=db)
         if req.status in TERMINAL_STATUSES:
             from packages.core.services.workspace_operation_service import check_work_batch_completion
 
@@ -164,7 +168,7 @@ async def public_update_status(
         log = TaskLog(
             id=generate_ulid(),
             task_id=task.id,
-            log_type="comment",
+            log_type=TaskLogType.COMMENT,
             content=req.comment,
             created_by="staff (public)",
         )
@@ -185,13 +189,13 @@ async def public_complete_task(
     from packages.core.services.task_state_machine import apply_task_status_transition
     from packages.core.services.workspace_operation_service import check_work_batch_completion
 
-    apply_task_status_transition(task, "completed")
+    await apply_task_status_transition(task, "completed", db=db)
 
     if req.notes:
         log = TaskLog(
             id=generate_ulid(),
             task_id=task.id,
-            log_type="status_change",
+            log_type=TaskLogType.STATUS_CHANGE,
             content=f"Completed: {req.notes}",
             created_by="staff (public)",
         )
@@ -214,7 +218,7 @@ async def public_evaluate_task(
     """Submit customer evaluation/rating for a completed task."""
     task = await _get_task_by_code(req.code, db)
 
-    if task.status != "completed":
+    if task.status != TaskStatus.COMPLETED:
         raise HTTPException(400, "Can only evaluate completed tasks")
 
     if req.score < 1 or req.score > 5:
@@ -232,7 +236,7 @@ async def public_evaluate_task(
     log = TaskLog(
         id=generate_ulid(),
         task_id=task.id,
-        log_type="evaluation",
+        log_type=TaskLogType.EVALUATION,
         content=f"Rating: {req.score}/5" + (f" — {req.review}" if req.review else ""),
         created_by="customer (public)",
     )

@@ -26,6 +26,7 @@ RUN for attempt in 1 2 3; do \
 
 # Copy source
 COPY alembic.ini .
+COPY .agents/ .agents/
 COPY packages/ packages/
 COPY apps/ apps/
 COPY scripts/ scripts/

@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 from packages.core.ai.runtime import (
     RUNTIME_GENERATE_AUDIO_TOOL_SOURCE,
     RUNTIME_GENERATE_IMAGE_TOOL_SOURCE,
@@ -477,8 +478,43 @@ async def _resolve_user_media_credentials(
     return api_key, base_url, is_byok
 
 
+async def _resolve_primary_byok_media_credentials(
+    user_id: str,
+    entity_id: str,
+    *,
+    provider: str,
+) -> tuple[str, str, bool]:
+    """Reuse Primary BYOK only when its key matches the selected media provider."""
+    if not entity_id or not provider:
+        return "", "", False
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.model_resolver import resolve_llm_metadata_for_user
+
+        async with async_session() as db:
+            metadata = await resolve_llm_metadata_for_user(
+                "primary",
+                user_id=user_id or None,
+                entity_id=entity_id,
+                db=db,
+            )
+        key = str((metadata or {}).get("llm_api_key") or "").strip()
+        if not key or not _is_native_key_for_provider(key, provider):
+            return "", "", False
+        base_url = str((metadata or {}).get("llm_base_url") or "").strip().rstrip("/")
+        return key, base_url, True
+    except Exception:
+        logger.debug("Compatible Primary BYOK media lookup failed", exc_info=True)
+        return "", "", False
+
+
 def _catalog_provider(model: str) -> str:
     return (model or "").split("/", 1)[0].strip().lower() if "/" in (model or "") else ""
+
+
+def _is_openrouter_base_url(base_url: str) -> bool:
+    hostname = (urlsplit(str(base_url or "").strip()).hostname or "").lower()
+    return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
 
 
 def _native_media_model(model: str, *, kind: str, provider: str) -> str:
@@ -511,10 +547,12 @@ def _media_key_provider_mismatch(api_key: str, provider: str) -> str:
     key = (api_key or "").strip()
     selected = (provider or "").lower()
     if key.startswith("ark-") and selected and selected != "bytedance":
+        target = {"kwaivgi": "Kling", "atlascloud": "Atlas Cloud"}.get(selected, selected)
         return (
             "The saved video API key looks like a Volcengine/Seedance key, "
-            "but the selected video model is Kling. Select a Seedance model, "
-            "clear the video provider key to use Manor credits, or save a Kling API key."
+            f"but the selected video model is {target}. Select a Seedance model, "
+            "clear the video provider key to use Manor credits, or save a "
+            f"{target} API key."
         )
     return ""
 
@@ -574,6 +612,8 @@ def _openrouter_audio_formats(model: str, role: str, requested_format: str = "")
     requested = _normalize_audio_format(requested_format)
     if role == "voice" and model_id.startswith("google/") and "tts" in model_id:
         return "pcm", "wav"
+    if role == "voice" and model_id.startswith("zyphra/"):
+        return "mp3", "mp3"
     if role in {"audio", "sfx"} and model_id.startswith("openai/"):
         return "pcm16", "wav"
     if requested:
@@ -633,8 +673,14 @@ def _image_result_payload(
     payload = {"image_url": image_url, "prompt": prompt, "size": size, "model": model}
     if saved_to_knowledge is not None:
         payload["saved_to_knowledge"] = saved_to_knowledge
-    if include_fs_path:
-        payload["fs_path"] = _fs_path_from_result_url(image_url, entity_id)
+    # Always report where the file landed. The system — not the model —
+    # chooses the path now, so withholding it leaves the next step unable to
+    # find what this one produced. ``include_fs_path`` used to depend on the
+    # caller having passed workspace_id in kwargs, which the runtime-context
+    # path does not, so the model often never saw the location at all.
+    fs_path = _fs_path_from_result_url(image_url, entity_id)
+    if fs_path or include_fs_path:
+        payload["fs_path"] = fs_path
     return payload
 
 
@@ -737,6 +783,7 @@ async def _save_generated_image_bytes(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     target = build_generated_media_target(
         prompt=prompt,
@@ -747,7 +794,7 @@ async def _save_generated_image_bytes(
         ),
         ext=ext,
         fallback="generated-image",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, "images"),
+        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.IMAGES.value),
         entity_root=entity_root,
     )
     filename = target.filename
@@ -800,11 +847,15 @@ async def _save_generated_image_bytes(
         from packages.core.database import create_worker_session
         from packages.core.services.document_service import upsert_document_by_fs_path
         from packages.core.services.document_metadata import merge_document_metadata
-        from packages.core.services.knowledge_sync import ensure_folder_path
 
         factory = create_worker_session()
         async with factory() as db:
-            folder_id = await ensure_folder_path(entity_id, target.rel_dir)
+            folder_id = await _ensure_generated_media_document_folder(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                rel_path=target.rel_path,
+                rel_dir=target.rel_dir,
+            )
             doc = await upsert_document_by_fs_path(
                 db,
                 entity_id,
@@ -851,6 +902,29 @@ async def _save_generated_image_bytes(
         logger.warning("Failed to register generated image as document", exc_info=True)
 
     return image_url
+
+
+async def _ensure_generated_media_document_folder(
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    rel_path: str,
+    rel_dir: str,
+) -> str | None:
+    if workspace_id:
+        from packages.core.services.workspace_artifacts import (
+            ensure_workspace_document_folder,
+        )
+
+        return await ensure_workspace_document_folder(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            rel_path=rel_path,
+        )
+
+    from packages.core.services.knowledge_sync import ensure_folder_path
+
+    return await ensure_folder_path(entity_id, rel_dir)
 
 
 async def _resolve_user_audio_model(
@@ -942,6 +1016,7 @@ async def _save_generated_audio_bytes(
     audio_bytes: bytes,
     audio_format: str,
     is_byok: bool,
+    voice_instructions: str = "",
     output_name: str = "",
     workspace_id: str | None = None,
     task_id: str | None = None,
@@ -969,6 +1044,7 @@ async def _save_generated_audio_bytes(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     target = build_generated_media_target(
         prompt=prompt,
@@ -979,7 +1055,7 @@ async def _save_generated_audio_bytes(
         ),
         ext=ext,
         fallback="generated-audio",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, "audio"),
+        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.AUDIO.value),
         entity_root=entity_root,
     )
     filename = target.filename
@@ -1008,11 +1084,15 @@ async def _save_generated_audio_bytes(
         from packages.core.database import create_worker_session
         from packages.core.services.document_service import upsert_document_by_fs_path
         from packages.core.services.document_metadata import merge_document_metadata
-        from packages.core.services.knowledge_sync import ensure_folder_path
 
         factory = create_worker_session()
         async with factory() as db:
-            folder_id = await ensure_folder_path(entity_id, target.rel_dir)
+            folder_id = await _ensure_generated_media_document_folder(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                rel_path=target.rel_path,
+                rel_dir=target.rel_dir,
+            )
             doc = await upsert_document_by_fs_path(
                 db,
                 entity_id,
@@ -1044,6 +1124,7 @@ async def _save_generated_audio_bytes(
                     "model": model,
                     "purpose": purpose,
                     "format": audio_format,
+                    "voice_instructions": voice_instructions or None,
                 },
             )
             await db.commit()
@@ -1066,6 +1147,17 @@ async def _save_generated_audio_bytes(
     return audio_url
 
 
+def _directed_speech_prompt(prompt: str, voice_instructions: str) -> str:
+    if not voice_instructions:
+        return prompt
+    return (
+        f"{voice_instructions}\n\n"
+        "Read aloud exactly the script below. Do not speak these directions, "
+        "and do not add, remove, or paraphrase words.\n\n"
+        f"SCRIPT:\n{prompt}"
+    )
+
+
 async def _openrouter_speech_bytes(
     *,
     api_key: str,
@@ -1073,6 +1165,7 @@ async def _openrouter_speech_bytes(
     prompt: str,
     voice: str,
     audio_format: str,
+    voice_instructions: str = "",
 ) -> bytes:
     import httpx
 
@@ -1083,6 +1176,10 @@ async def _openrouter_speech_bytes(
     }
     if voice:
         payload["voice"] = voice
+    if voice_instructions and model.lower().startswith("google/"):
+        payload["input"] = _directed_speech_prompt(prompt, voice_instructions)
+    elif voice_instructions and model.lower().startswith("openai/"):
+        payload["instructions"] = voice_instructions
     async with httpx.AsyncClient(timeout=180.0) as client:
         resp = await client.post(
             "https://openrouter.ai/api/v1/audio/speech",
@@ -1099,6 +1196,452 @@ async def _openrouter_speech_bytes(
         return resp.content
 
 
+class _OpenAICompatibleSpeechEndpointUnavailable(RuntimeError):
+    """Signal that an OpenAI-compatible relay does not expose Audio Speech."""
+
+
+class _OpenAICompatibleAudioProviderBlocker(RuntimeError):
+    """Signal that an OpenAI-compatible provider returned unusable audio."""
+
+
+_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES = 50 * 1024 * 1024
+_OPENAI_COMPATIBLE_CHAT_AUDIO_JSON_OVERHEAD_BYTES = 1024 * 1024
+_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_RESPONSE_BYTES = (
+    4 * ((_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES + 2) // 3)
+    + _OPENAI_COMPATIBLE_CHAT_AUDIO_JSON_OVERHEAD_BYTES
+)
+
+
+def _speech_404_means_endpoint_unavailable(response_text: str, *, model: str = "") -> bool:
+    """Distinguish a missing speech route from a provider/model-level 404."""
+    raw_text = str(response_text or "").strip()
+    lowered_text = raw_text.lower()
+
+    try:
+        parsed = json.loads(raw_text)
+    except (TypeError, ValueError):
+        parsed = None
+
+    def _json_strings(value: Any) -> list[str]:
+        if isinstance(value, dict):
+            strings: list[str] = []
+            for key, child in value.items():
+                strings.append(str(key))
+                strings.extend(_json_strings(child))
+            return strings
+        if isinstance(value, list):
+            strings = []
+            for child in value:
+                strings.extend(_json_strings(child))
+            return strings
+        if isinstance(value, str):
+            return [value]
+        return []
+
+    searchable = " ".join(_json_strings(parsed)).lower() if parsed is not None else lowered_text
+    model_markers = (
+        "model_not_found",
+        "model not found",
+        "model does not exist",
+        "model is not available",
+        "model unavailable",
+        "unknown model",
+        "unsupported model",
+        "invalid model",
+    )
+    if any(marker in searchable for marker in model_markers):
+        return False
+    if "model" in searchable and any(
+        marker in searchable
+        for marker in ("does not exist", "not found", "not available", "unavailable", "unsupported", "invalid")
+    ):
+        return False
+    native_model = str(model or "").strip().lower()
+    if native_model and native_model in searchable and any(
+        marker in searchable for marker in ("does not exist", "not found", "not available", "unavailable")
+    ):
+        return False
+
+    route_markers = (
+        "route_not_found",
+        "route not found",
+        "no route",
+        "endpoint_not_found",
+        "endpoint not found",
+        "unknown endpoint",
+        "unsupported endpoint",
+        "path not found",
+        "cannot post",
+        "method not allowed for",
+        "/audio/speech not found",
+    )
+    if any(marker in searchable for marker in route_markers):
+        return True
+
+    plain_page_markers = ("not found", "404 not found", "404 page not found", "page not found")
+    if parsed is not None:
+        json_values = [value.strip().lower() for value in _json_strings(parsed)]
+        return any(value in plain_page_markers for value in json_values)
+    return lowered_text in plain_page_markers or (
+        "404" in lowered_text and "not found" in lowered_text
+    )
+
+
+async def _openai_compatible_speech_bytes(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    voice: str,
+    audio_format: str,
+    voice_instructions: str = "",
+) -> bytes:
+    import httpx
+
+    native_model = _native_media_model(model, kind="audio", provider="openai")
+    payload: dict[str, Any] = {
+        "model": native_model,
+        "input": prompt,
+        "response_format": audio_format,
+    }
+    if voice:
+        payload["voice"] = voice
+    if voice_instructions:
+        payload["instructions"] = voice_instructions
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        resp = await client.post(
+            f"{(base_url or 'https://api.openai.com/v1').rstrip('/')}/audio/speech",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        endpoint_unavailable = resp.status_code in {405, 501} or (
+            resp.status_code == 404
+            and _speech_404_means_endpoint_unavailable(resp.text, model=native_model)
+        )
+        if endpoint_unavailable:
+            raise _OpenAICompatibleSpeechEndpointUnavailable(
+                f"OpenAI-compatible speech generation failed ({resp.status_code}): "
+                f"{resp.text[:500]}"
+            )
+        if resp.status_code >= 300:
+            raise RuntimeError(
+                f"OpenAI-compatible speech generation failed ({resp.status_code}): "
+                f"{resp.text[:500]}"
+            )
+        return resp.content
+
+
+def _is_openai_chat_audio_model(model: str) -> bool:
+    normalized = str(model or "").strip().lower()
+    return normalized.startswith("gpt-4o-audio") or normalized.startswith("gpt-audio")
+
+
+def _openai_compatible_json_object(response: Any, *, operation: str) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            f"OpenAI-compatible {operation} returned invalid JSON; expected a JSON object."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _OpenAICompatibleAudioProviderBlocker(
+            f"OpenAI-compatible {operation} returned invalid JSON; expected a JSON object."
+        )
+    return payload
+
+
+def _openai_compatible_json_bytes_object(
+    response_bytes: bytes,
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(response_bytes)
+    except Exception as exc:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            f"OpenAI-compatible {operation} returned invalid JSON; expected a JSON object."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _OpenAICompatibleAudioProviderBlocker(
+            f"OpenAI-compatible {operation} returned invalid JSON; expected a JSON object."
+        )
+    return payload
+
+
+async def _read_bounded_openai_compatible_chat_audio_response(response: Any) -> bytes:
+    headers = getattr(response, "headers", None) or {}
+    content_length = headers.get("content-length") or headers.get("Content-Length")
+    if content_length:
+        try:
+            declared_length = int(str(content_length).strip())
+        except (TypeError, ValueError) as exc:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat audio response included an invalid Content-Length header."
+            ) from exc
+        if declared_length < 0:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat audio response included an invalid Content-Length header."
+            )
+        if declared_length > _MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_RESPONSE_BYTES:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat audio response Content-Length exceeded the "
+                f"{_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_RESPONSE_BYTES}-byte limit."
+            )
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if not chunk:
+            continue
+        next_size = len(body) + len(chunk)
+        if next_size > _MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_RESPONSE_BYTES:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat audio response exceeded the "
+                f"{_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_RESPONSE_BYTES}-byte limit while streaming."
+            )
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _discover_openai_compatible_chat_audio_model(
+    *,
+    client: Any,
+    api_key: str,
+    base_url: str,
+    requested_model: str,
+) -> str:
+    endpoint = (base_url or "https://api.openai.com/v1").rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = await client.get(f"{endpoint}/models", headers=headers)
+    if resp.status_code >= 300:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            f"OpenAI-compatible audio model discovery failed ({resp.status_code}): "
+            f"{resp.text[:500]}"
+        )
+
+    payload = _openai_compatible_json_object(resp, operation="model discovery")
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible model discovery field 'data' must be a list of model objects."
+        )
+    if any(not isinstance(entry, dict) for entry in entries):
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible model discovery field 'data' must contain only objects."
+        )
+    advertised_models = [
+        str(entry.get("id") or "").strip()
+        for entry in entries
+        if str(entry.get("id") or "").strip()
+    ]
+    advertised_by_name = {model_id.lower(): model_id for model_id in advertised_models}
+
+    native_requested = _native_media_model(
+        requested_model,
+        kind="audio",
+        provider="openai",
+    )
+    preferred_models = []
+    if _is_openai_chat_audio_model(native_requested):
+        preferred_models.append(native_requested)
+    preferred_models.append("gpt-4o-audio-preview")
+    for preferred_model in preferred_models:
+        advertised_model = advertised_by_name.get(preferred_model.lower())
+        if advertised_model:
+            return advertised_model
+
+    for advertised_model in advertised_models:
+        if _is_openai_chat_audio_model(advertised_model):
+            return advertised_model
+    raise _OpenAICompatibleAudioProviderBlocker(
+        "OpenAI-compatible provider did not advertise a GPT audio model."
+    )
+
+
+def _validate_openai_compatible_chat_audio_wav(audio_bytes: bytes) -> None:
+    import io
+    import wave
+
+    byte_count = len(audio_bytes)
+    if byte_count > _MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible chat audio exceeded the "
+            f"{_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES}-byte limit."
+        )
+    if byte_count < 12:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible chat audio is too short to be a WAV file."
+        )
+    if audio_bytes[:4] != b"RIFF" or audio_bytes[8:12] != b"WAVE":
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible chat audio is missing a RIFF/WAVE header."
+        )
+
+    declared_size = int.from_bytes(audio_bytes[4:8], "little") + 8
+    if declared_size > byte_count:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible chat audio contains a truncated RIFF/WAVE structure."
+        )
+
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            if wav_file.getcomptype() != "NONE":
+                raise _OpenAICompatibleAudioProviderBlocker(
+                    "OpenAI-compatible chat audio must contain uncompressed PCM."
+                )
+            frame_count = wav_file.getnframes()
+            channel_count = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            if frame_count <= 0:
+                raise _OpenAICompatibleAudioProviderBlocker(
+                    "OpenAI-compatible chat audio contains zero audio frames."
+                )
+            pcm_bytes = wav_file.readframes(frame_count)
+    except _OpenAICompatibleAudioProviderBlocker:
+        raise
+    except Exception as exc:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            f"OpenAI-compatible chat audio has an invalid RIFF/WAVE PCM structure: {exc}"
+        ) from exc
+
+    expected_pcm_bytes = frame_count * channel_count * sample_width
+    if len(pcm_bytes) != expected_pcm_bytes:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible chat audio contains truncated PCM frame data."
+        )
+    if sample_width == 1:
+        has_signal = any(sample != 128 for sample in pcm_bytes)
+    else:
+        has_signal = any(
+            int.from_bytes(pcm_bytes[offset : offset + sample_width], "little", signed=True) != 0
+            for offset in range(0, len(pcm_bytes), sample_width)
+        )
+    if not has_signal:
+        raise _OpenAICompatibleAudioProviderBlocker(
+            "OpenAI-compatible chat audio contains only digital silence."
+        )
+
+
+async def _openai_compatible_chat_audio_bytes(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    voice: str,
+    audio_format: str,
+    voice_instructions: str = "",
+) -> bytes:
+    import base64
+    import binascii
+    import httpx
+
+    endpoint = (base_url or "https://api.openai.com/v1").rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        chat_audio_model = await _discover_openai_compatible_chat_audio_model(
+            client=client,
+            api_key=api_key,
+            base_url=endpoint,
+            requested_model=model,
+        )
+        async with client.stream(
+            "POST",
+            f"{endpoint}/chat/completions",
+            headers=headers,
+            json={
+                "model": chat_audio_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Speak the user's script exactly as written. Do not introduce, "
+                            "remove, paraphrase, explain, or comment on it. "
+                            + (voice_instructions or "Use a natural, conversational delivery.")
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "modalities": ["text", "audio"],
+                "audio": {"voice": voice or "alloy", "format": audio_format},
+                "stream": False,
+            },
+        ) as resp:
+            response_bytes = await _read_bounded_openai_compatible_chat_audio_response(resp)
+            if resp.status_code >= 300:
+                response_excerpt = response_bytes.decode("utf-8", errors="replace")[:500]
+                raise _OpenAICompatibleAudioProviderBlocker(
+                    f"OpenAI-compatible chat audio generation failed ({resp.status_code}): "
+                    f"{response_excerpt}"
+                )
+
+        payload = _openai_compatible_json_bytes_object(
+            response_bytes,
+            operation="chat audio generation",
+        )
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response field 'choices' must be a non-empty list."
+            )
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response choice must be an object."
+            )
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response message must be an object."
+            )
+        if "audio" not in message:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response did not include audio data."
+            )
+        audio = message.get("audio")
+        if not isinstance(audio, dict):
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response audio must be an object."
+            )
+        if "data" not in audio:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response did not include audio data."
+            )
+        audio_data = audio.get("data")
+        if not isinstance(audio_data, str):
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response audio.data must be a string."
+            )
+        if not audio_data.strip():
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response did not include audio data."
+            )
+        max_base64_chars = 4 * ((_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES + 2) // 3)
+        if len(audio_data) > max_base64_chars:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response base64 audio data exceeded the encoded limit "
+                f"for {_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES} decoded bytes."
+            )
+        try:
+            decoded = base64.b64decode(audio_data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response included invalid base64 audio data."
+            ) from exc
+        if not decoded:
+            raise _OpenAICompatibleAudioProviderBlocker(
+                "OpenAI-compatible chat response did not include audio data."
+            )
+        _validate_openai_compatible_chat_audio_wav(decoded)
+        return decoded
+
+
 async def _google_speech_bytes(
     *,
     api_key: str,
@@ -1106,6 +1649,7 @@ async def _google_speech_bytes(
     prompt: str,
     voice: str,
     base_url: str = "",
+    voice_instructions: str = "",
 ) -> bytes:
     """Generate speech with Gemini's native generateContent AUDIO API.
 
@@ -1118,8 +1662,9 @@ async def _google_speech_bytes(
     native_model = _native_media_model(model, kind="audio", provider="google")
     endpoint = (base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
     voice_name = (voice or "Zephyr").strip() or "Zephyr"
+    directed_prompt = _directed_speech_prompt(prompt, voice_instructions)
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
+        "contents": [{"parts": [{"text": directed_prompt}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
@@ -1333,6 +1878,9 @@ async def _generate_audio_handler(
     if not prompt:
         return json.dumps({"error": "prompt is required"})
     purpose = str(kwargs.get("purpose") or "speech").strip().lower()
+    voice_instructions = str(
+        kwargs.get("voice_instructions") or kwargs.get("instructions") or ""
+    ).strip()
     duration_seconds = _audio_duration_seconds(kwargs.get("duration_seconds") or kwargs.get("duration"))
     output_name = str(kwargs.get("name") or kwargs.get("output_name") or kwargs.get("filename") or "").strip()
     model, role = await _resolve_user_audio_model(user_id, entity_id, purpose=purpose)
@@ -1357,7 +1905,32 @@ async def _generate_audio_handler(
         entity_id,
         role=role,
     )
+    if role == "voice" and provider and not is_byok:
+        primary_key, primary_base_url, primary_is_byok = (
+            await _resolve_primary_byok_media_credentials(
+                user_id,
+                entity_id,
+                provider=provider,
+            )
+        )
+        if primary_is_byok:
+            api_key = primary_key
+            base_url_override = primary_base_url
+            is_byok = True
     native_voice_provider = ""
+    native_openai_voice = bool(
+        role == "voice"
+        and provider == "openai"
+        and api_key
+        and not _is_openrouter_base_url(base_url_override)
+        and (
+            not api_key.startswith("sk-or-")
+            or (
+                is_byok
+                and bool(base_url_override)
+            )
+        )
+    )
     if role == "voice" and provider in {"google", "zyphra"}:
         if is_byok:
             if not _is_native_key_for_provider(api_key, provider):
@@ -1379,7 +1952,12 @@ async def _generate_audio_handler(
                 base_url_override = native_base_url or base_url_override
                 native_voice_provider = provider
 
-    if not native_voice_provider:
+    if not native_voice_provider and not native_openai_voice:
+        if not api_key or not api_key.startswith("sk-or-"):
+            env_openrouter_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+            if env_openrouter_key:
+                api_key = env_openrouter_key
+                is_byok = False
         if not api_key or not api_key.startswith("sk-or-"):
             return json.dumps({"error": "Self-hosted audio generation requires a matching provider API key."})
     if entity_id and not is_byok:
@@ -1397,6 +1975,7 @@ async def _generate_audio_handler(
                 model=model,
                 prompt=prompt,
                 voice=voice,
+                voice_instructions=voice_instructions,
                 base_url=base_url_override,
             )
             audio_bytes = _wav_from_pcm16(audio_bytes)
@@ -1412,12 +1991,36 @@ async def _generate_audio_handler(
                 audio_format=request_format,
                 base_url=base_url_override,
             )
+        elif native_openai_voice:
+            openai_audio_kwargs = {
+                "api_key": api_key,
+                "base_url": base_url_override,
+                "model": model,
+                "prompt": prompt,
+                "voice": voice,
+                "voice_instructions": voice_instructions,
+                "audio_format": request_format,
+            }
+            try:
+                audio_bytes = await _openai_compatible_speech_bytes(**openai_audio_kwargs)
+            except _OpenAICompatibleSpeechEndpointUnavailable:
+                chat_audio_kwargs = {**openai_audio_kwargs, "audio_format": "wav"}
+                audio_bytes = await _openai_compatible_chat_audio_bytes(**chat_audio_kwargs)
+                _validate_openai_compatible_chat_audio_wav(audio_bytes)
+                request_format = "wav"
+                storage_format = "wav"
+            if request_format == "pcm" and storage_format == "wav":
+                audio_bytes = _wav_from_pcm16(audio_bytes)
         elif role == "voice":
+            if request_format not in {"mp3", "pcm"}:
+                request_format = "pcm"
+                storage_format = "wav"
             audio_bytes = await _openrouter_speech_bytes(
                 api_key=api_key,
                 model=model,
                 prompt=prompt,
                 voice=voice,
+                voice_instructions=voice_instructions,
                 audio_format=request_format,
             )
             if request_format == "pcm" and storage_format == "wav":
@@ -1444,6 +2047,7 @@ async def _generate_audio_handler(
             audio_bytes=audio_bytes,
             audio_format=storage_format,
             is_byok=is_byok,
+            voice_instructions=voice_instructions,
             output_name=output_name,
             workspace_id=kwargs.get("workspace_id"),
             task_id=kwargs.get("task_id"),
@@ -1460,15 +2064,243 @@ async def _generate_audio_handler(
             "purpose": purpose,
             "model": model,
             "voice": voice or None,
+            "voice_instructions": voice_instructions or None,
             "format": storage_format,
             "provider_response_format": request_format,
             "duration_seconds": duration_seconds,
             "file_size": len(audio_bytes),
         }
         return json.dumps(payload, ensure_ascii=False)
+    except _OpenAICompatibleAudioProviderBlocker as exc:
+        logger.warning("OpenAI-compatible audio provider blocker: %s", exc)
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "provider_blocker",
+                "error": str(exc),
+                "model": model,
+                "purpose": purpose,
+            }
+        )
     except Exception as exc:  # noqa: BLE001 - tool should return structured errors
         logger.exception("OpenRouter audio generation failed")
         return json.dumps({"status": "error", "error": str(exc), "model": model, "purpose": purpose})
+
+
+# ── transcribe_audio ──────────────────────────────────────────────────────────
+
+def _srt_timecode(seconds: float) -> str:
+    """Format ``seconds`` as an SRT timecode: HH:MM:SS,mmm."""
+    total_ms = int(round(max(0.0, seconds) * 1000))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, millis = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _srt_from_segments(segments: list[dict]) -> str:
+    """Build a standard SRT document from timed transcription segments."""
+    blocks: list[str] = []
+    index = 1
+    for seg in segments:
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = _srt_timecode(float(seg.get("start") or 0.0))
+        end = _srt_timecode(float(seg.get("end") or 0.0))
+        blocks.append(f"{index}\n{start} --> {end}\n{text}")
+        index += 1
+    return ("\n\n".join(blocks) + "\n") if blocks else ""
+
+
+async def _rel_path_from_document_id(document_id: str, entity_id: str) -> str | None:
+    """Best-effort: resolve a Knowledge document id to its filesystem path."""
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.document_service import get_document
+
+        async with async_session() as db:
+            doc = await get_document(db, str(document_id), entity_id)
+        if doc is not None:
+            return getattr(doc, "fs_path", None) or None
+    except Exception:
+        logger.debug("audio document id resolution failed", exc_info=True)
+    return None
+
+
+async def _load_audio_reference_bytes(ref: str, entity_id: str) -> tuple[str, bytes, str]:
+    """Load a Knowledge audio reference as ``(filename, bytes, mime)``.
+
+    Accepts a Knowledge-relative path, a ``/api/v1/fs`` URL, a public URL, or a
+    Knowledge document id — mirrors ``_load_image_reference_bytes`` but for audio.
+    """
+    import mimetypes
+
+    text = str(ref or "").strip()
+    if not text:
+        raise ValueError("Empty audio reference")
+
+    if text.startswith(("http://", "https://")):
+        import httpx
+
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(text)
+            resp.raise_for_status()
+        mime = (resp.headers.get("content-type") or "audio/mpeg").split(";", 1)[0]
+        name = os.path.basename(urlsplit(text).path) or "audio"
+        return name, resp.content, mime
+
+    if not entity_id:
+        raise ValueError(f"Audio reference requires an entity filesystem: {text}")
+
+    from packages.core.services.entity_fs import get_entity_root
+    from packages.core.tasks.media_tasks import _entity_rel_path_from_reference
+
+    entity_root = get_entity_root(entity_id)
+    rel_path = _entity_rel_path_from_reference(text, entity_id, entity_root)
+
+    # If the reference doesn't resolve to a file, try treating it as a document id.
+    if not rel_path or not os.path.isfile(os.path.join(entity_root, rel_path)):
+        doc_rel = await _rel_path_from_document_id(text, entity_id)
+        if doc_rel:
+            rel_path = doc_rel
+
+    if not rel_path:
+        raise ValueError(f"Unsupported audio reference: {text}")
+    full_path = os.path.join(entity_root, rel_path)
+    if not os.path.isfile(full_path):
+        raise FileNotFoundError(f"Audio reference file not found: {rel_path}")
+    mime = mimetypes.guess_type(full_path)[0] or "audio/mpeg"
+    with open(full_path, "rb") as fh:
+        return os.path.basename(rel_path), fh.read(), mime
+
+
+async def _transcribe_audio_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    **kwargs: Any,
+) -> str:
+    """Transcribe a Knowledge audio file into timestamped segments + SRT."""
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    user_id = _media_context_user_id(user_id, runtime_context.user_id)
+    audio_path = str(
+        kwargs.get("audio_path")
+        or kwargs.get("path")
+        or kwargs.get("audio_url")
+        or ""
+    ).strip()
+    if not audio_path:
+        return json.dumps({"error": "audio_path is required"})
+
+    try:
+        filename, audio_bytes, mime = await _load_audio_reference_bytes(audio_path, entity_id)
+    except Exception as exc:  # noqa: BLE001 - tool returns structured errors
+        return json.dumps({"error": f"Could not load audio: {exc}"})
+
+    # Resolve the STT model + optional BYOK key the same way chat audio
+    # attachments do (file_context.py), so BYOK / self-hosted keys are honoured.
+    stt_model = None
+    user_key = None
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.model_resolver import (
+            resolve_llm_metadata_for_user,
+            resolve_model_for_user,
+        )
+
+        async with async_session() as db:
+            stt_model = await resolve_model_for_user(
+                "stt", user_id=user_id or None, entity_id=entity_id or None, db=db,
+            )
+            metadata = await resolve_llm_metadata_for_user(
+                "stt", user_id=user_id or None, entity_id=entity_id or None, db=db,
+            )
+            user_key = (metadata or {}).get("llm_api_key")
+    except Exception:
+        logger.debug("STT model/key resolution failed", exc_info=True)
+    if kwargs.get("model"):
+        stt_model = str(kwargs["model"]).strip()
+    language = str(kwargs.get("language") or "").strip() or None
+
+    from packages.core.services.voice.whisper import WhisperError, transcribe_blob
+
+    try:
+        result = await transcribe_blob(
+            audio_bytes,
+            mime=mime or "audio/mpeg",
+            filename=filename or "audio.mp3",
+            language=language,
+            user_api_key=user_key,
+            resolved_model=stt_model,
+        )
+    except WhisperError as exc:
+        return json.dumps({"error": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - tool returns structured errors
+        logger.exception("transcribe_audio failed")
+        return json.dumps({"error": str(exc)})
+
+    segments = result.segments
+    if segments:
+        payload = {
+            "text": result.text,
+            "duration_seconds": result.duration_seconds,
+            "model": result.model,
+            "segments": segments,
+            "srt": _srt_from_segments(segments),
+            "timestamps_available": True,
+        }
+    else:
+        payload = {
+            "text": result.text,
+            "duration_seconds": result.duration_seconds,
+            "model": result.model,
+            "segments": [],
+            "srt": "",
+            "timestamps_available": False,
+            "note": (
+                "Timestamped segments require a native Whisper/OpenAI (or Groq) "
+                "speech-to-text key. This transcription used the OpenRouter "
+                "chat-audio fallback, which returns text only."
+            ),
+        }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+TRANSCRIBE_AUDIO_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "transcribe_audio",
+        "description": (
+            "Transcribe a Knowledge audio file (e.g. a generated narration track) into "
+            "timestamped segments plus a ready-to-use SRT subtitle string. Use it to build "
+            "accurate subtitles or to time video scene-cuts against spoken narration. Returns "
+            "the transcript text, duration, per-segment start/end/text timings, and an SRT "
+            "document. Timestamps require a native Whisper/OpenAI (or Groq) STT key; the "
+            "OpenRouter chat-audio fallback returns text only (timestamps_available=false)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "audio_path": {
+                    "type": "string",
+                    "description": (
+                        "Audio file to transcribe: a Knowledge-relative path "
+                        "(e.g. project/audio/narration.mp3), a /api/v1/fs URL, or a Knowledge document id."
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional STT model override (e.g. whisper-1, whisper-large-v3).",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional ISO language hint (e.g. en, zh) to improve accuracy.",
+                },
+            },
+            "required": ["audio_path"],
+        },
+    },
+}
 
 
 async def _download_image_bytes(url: str) -> tuple[bytes, str]:
@@ -1681,20 +2513,86 @@ def _image_size_for_aspect_ratio(aspect_ratio: str = "", explicit_size: Any = No
     }.get(str(aspect_ratio or "").strip(), "1024x1024")
 
 
+_IMAGE_ASPECT_RATIOS: dict[str, tuple[int, int]] = {
+    "16:9": (16, 9),
+    "9:16": (9, 16),
+    "1:1": (1, 1),
+}
+
+
+def _aspect_ratio_prompt_hint(aspect_ratio: str = "") -> str:
+    """Say the aspect ratio in the prompt, because most routes cannot say it
+    any other way.
+
+    The OpenRouter image route is a chat completion — there is no size or
+    aspect parameter, only the prompt. Without this the model composes to its
+    own default (usually square) and the caller's requested ratio is a
+    fiction. Asking up front is the only way to get a correctly *composed*
+    image; reshaping afterwards can only move or destroy pixels.
+    """
+    target = _IMAGE_ASPECT_RATIOS.get(str(aspect_ratio or "").strip())
+    if not target:
+        return ""
+    ratio = f"{target[0]}:{target[1]}"
+    if target[0] > target[1]:
+        orientation = "landscape (wider than tall)"
+    elif target[0] < target[1]:
+        orientation = "portrait (taller than wide)"
+    else:
+        orientation = "square"
+    return (
+        f"\n\nIMPORTANT — compose this image as {ratio} {orientation}. "
+        f"Fit the entire composition, including every piece of text, inside "
+        f"the {ratio} frame with margins; nothing may run past the edges."
+    )
+
+
+def _dominant_border_color(image: "Image.Image") -> tuple[int, int, int]:
+    """The colour the image already ends in, so padding continues it.
+
+    Black bars on a white-background line drawing read as damage. Sampling
+    what the edge actually is makes the added area a continuation of the
+    canvas rather than a frame around it.
+    """
+    from collections import Counter
+
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    step = max(1, min(width, height) // 64)
+    edge = Counter()
+    for x in range(0, width, step):
+        edge[rgb.getpixel((x, 0))] += 1
+        edge[rgb.getpixel((x, height - 1))] += 1
+    for y in range(0, height, step):
+        edge[rgb.getpixel((0, y))] += 1
+        edge[rgb.getpixel((width - 1, y))] += 1
+    return edge.most_common(1)[0][0] if edge else (255, 255, 255)
+
+
 def _normalize_image_bytes_for_aspect_ratio(
     image_bytes: bytes,
     mime: str,
     aspect_ratio: str = "",
 ) -> tuple[bytes, str, str]:
-    ratios = {
-        "16:9": (16, 9),
-        "9:16": (9, 16),
-        "1:1": (1, 1),
-    }
-    target = ratios.get(str(aspect_ratio or "").strip())
-    if not target:
-        return image_bytes, mime, ""
+    """Deliver the requested aspect ratio by padding. Never crop.
 
+    This once center-cropped to force the ratio, which silently destroyed
+    content: a 1024x1024 poster requested as 9:16 came back 576x1024 — 43% of
+    the width gone, headline and side labels sliced off both edges, nothing in
+    the result saying so. That was removed, and for a while an off-ratio image
+    was delivered as generated on the reasoning that bars are also a silent
+    edit.
+
+    Delivering off-ratio has its own cost, and downstream it is the larger
+    one. The video pipeline animates each still with generate_video, and a
+    still whose ratio differs from the clip's gets cropped by the provider —
+    outside our ffmpeg, where nothing can pad it back. Fixing the ratio here,
+    where the whole composition is still present, is what keeps every later
+    stage from having to.
+
+    So: pad to the requested ratio, extending the colour the image already
+    ends in. Every pixel the model produced survives; the frame simply grows.
+    """
     try:
         import io
         from PIL import Image
@@ -1703,29 +2601,46 @@ def _normalize_image_bytes_for_aspect_ratio(
         width, height = image.size
         if width <= 0 or height <= 0:
             return image_bytes, mime, ""
+        # convert() drops .format, and re-encoding line art as JPEG is its
+        # own quiet damage — read it while it is still there.
+        source_format = (image.format or "").upper()
 
-        target_ratio = target[0] / target[1]
-        current_ratio = width / height
-        if abs(current_ratio - target_ratio) < 0.01:
+        target = _IMAGE_ASPECT_RATIOS.get(str(aspect_ratio or "").strip())
+        if not target:
             return image_bytes, mime, f"{width}x{height}"
 
-        if current_ratio > target_ratio:
-            new_width = max(1, round(height * target_ratio))
-            left = max(0, (width - new_width) // 2)
-            box = (left, 0, left + new_width, height)
-        else:
-            new_height = max(1, round(width / target_ratio))
-            top = max(0, (height - new_height) // 2)
-            box = (0, top, width, top + new_height)
+        target_ratio = target[0] / target[1]
+        if abs((width / height) - target_ratio) < 0.01:
+            return image_bytes, mime, f"{width}x{height}"
 
-        cropped = image.crop(box)
-        output = io.BytesIO()
-        if cropped.mode not in {"RGB", "RGBA"}:
-            cropped = cropped.convert("RGBA")
-        cropped.save(output, format="PNG")
-        return output.getvalue(), "image/png", f"{cropped.size[0]}x{cropped.size[1]}"
+        # Grow the short side; never reduce either one, or we would be
+        # cropping by another name.
+        if (width / height) > target_ratio:
+            canvas_w, canvas_h = width, max(height, round(width / target_ratio))
+        else:
+            canvas_w, canvas_h = max(width, round(height * target_ratio)), height
+
+        has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
+        if has_alpha:
+            image = image.convert("RGBA")
+            canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+            out_format, out_mime = "PNG", "image/png"
+        else:
+            image = image.convert("RGB")
+            canvas = Image.new("RGB", (canvas_w, canvas_h), _dominant_border_color(image))
+            out_format = "JPEG" if source_format in ("JPEG", "JPG") else "PNG"
+            out_mime = "image/png" if out_format == "PNG" else "image/jpeg"
+
+        canvas.paste(image, ((canvas_w - width) // 2, (canvas_h - height) // 2))
+        buffer = io.BytesIO()
+        canvas.save(buffer, format=out_format, **({"quality": 95} if out_format == "JPEG" else {}))
+        logger.info(
+            "generated image was %dx%d, not the requested %s — padded to %dx%d (no crop)",
+            width, height, aspect_ratio, canvas_w, canvas_h,
+        )
+        return buffer.getvalue(), out_mime, f"{canvas_w}x{canvas_h}"
     except Exception:
-        logger.debug("image aspect-ratio normalization failed", exc_info=True)
+        logger.debug("image aspect normalisation failed", exc_info=True)
         return image_bytes, mime, ""
 
 
@@ -1753,6 +2668,12 @@ async def _generate_image_handler(
     output_name = str(kwargs.get("name") or kwargs.get("output_name") or kwargs.get("filename") or "").strip()
     aspect_ratio = str(kwargs.get("aspect_ratio") or "").strip()
     size = _image_size_for_aspect_ratio(aspect_ratio, kwargs.get("size"))
+    # State the ratio in the prompt as well as the API field. The OpenRouter
+    # route is a chat completion with no size parameter at all, so without
+    # this the model never learns the requested shape — it composed square
+    # posters that were then cropped to fit.
+    if isinstance(prompt, str) and prompt.strip():
+        prompt = f"{prompt}{_aspect_ratio_prompt_hint(aspect_ratio)}"
     quality = kwargs.get("quality", "medium")
     save_to_knowledge = _coerce_bool(kwargs.get("save_to_knowledge"), True)
     # Optional: deliver the generated image straight into the active sandbox
@@ -1773,6 +2694,8 @@ async def _generate_image_handler(
 
     api_key, base_url_override, is_byok = await _resolve_user_media_credentials(user_id, entity_id, role="image")
     model = await _resolve_user_image_model(user_id, entity_id, api_key.startswith("sk-or-"))
+    if kwargs.get("model"):
+        model = str(kwargs["model"]).strip()
     provider = _catalog_provider(model)
     if not is_byok and provider in {"openai", "google"}:
         native_key, native_base_url = await _platform_native_media_credential_async(provider)
@@ -3075,6 +3998,8 @@ async def _generate_video_handler(
         return _video_error_result("prompt is required")
 
     model = await _resolve_user_video_model(user_id, entity_id)
+    if kwargs.get("model"):
+        model = str(kwargs["model"]).strip()
     provider = _catalog_provider(model)
     from packages.core.tasks.media_tasks import (
         VIDEO_DURATION_MAX_SECONDS,
@@ -3134,6 +4059,17 @@ async def _generate_video_handler(
         is_byok = False
     if not api_key:
         return _video_error_result("No video generation API key configured", prompt=raw_prompt, model=model)
+    # Atlas Cloud models are BYOK-only: Manor holds no platform key and does
+    # not proxy or bill these calls. Without a user-supplied Atlas key the
+    # resolved credential would be Manor's OpenRouter default, which cannot
+    # serve Atlas-hosted models.
+    if provider == "atlascloud" and not is_byok:
+        return _video_error_result(
+            "This model requires your own Atlas Cloud API key. Save it as your "
+            "video provider key in Settings → AI Models, or pick another video model.",
+            prompt=raw_prompt,
+            model=model,
+        )
     mismatch = _media_key_provider_mismatch(api_key, provider)
     if mismatch:
         return _video_error_result(mismatch, prompt=raw_prompt, model=model)
@@ -3218,7 +4154,11 @@ async def _generate_video_handler(
         try:
             from packages.core.services.billing_service import video_to_credits
 
-            credits_estimate = video_to_credits(model, duration, resolution)
+            credits_estimate = video_to_credits(
+                model, duration, resolution,
+                with_audio=bool(generate_audio),
+                has_video_input=bool(reference_video_urls),
+            )
         except Exception:
             pass
 
@@ -3445,6 +4385,7 @@ def get_tools():
         (EXTRACT_DATA_SCHEMA, _extract_data_handler),
         (GENERATE_IMAGE_SCHEMA, _generate_image_handler),
         (GENERATE_VIDEO_SCHEMA, _generate_video_handler),
+        (TRANSCRIBE_AUDIO_SCHEMA, _transcribe_audio_handler),
     ]
 
 

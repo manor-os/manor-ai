@@ -1138,13 +1138,13 @@ export function AIModelSection({
     setSavingCustomRole(role);
     setApiKeyErrors((prev) => ({ ...prev, [role]: "" }));
     try {
-      if (draft.apiKey.trim()) {
-        await api.auth.saveLlmApiKey(draft.apiKey.trim(), role);
-      }
-      await api.auth.saveLlmBaseUrl(draft.baseUrl.trim(), role);
-      await (api.auth.updateMyModels?.({
-        models: { [role]: draft.model.trim() },
-      }) || api.auth.updateProfile({ llm_model: draft.model.trim() }));
+      await api.auth.saveCatalogModel({
+        role,
+        model: draft.model.trim(),
+        api_key: draft.apiKey.trim() || undefined,
+        use_saved_api_key: draft.useSavedApiKey && !draft.apiKey.trim(),
+        base_url: draft.baseUrl.trim(),
+      });
       queryClient.setQueryData(["my-models"], (prev: any) => {
         if (!prev) return prev;
         return {
@@ -1251,12 +1251,17 @@ export function AIModelSection({
     "anthropic/claude-opus-4.7": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-opus-4.6": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-haiku-4.5": { in: 1.0, out: 5.0, unit: "token" },
+    "openai/gpt-5.6-sol": { in: 5.0, out: 30.0, unit: "token" },
+    "openai/gpt-5.6-terra": { in: 2.5, out: 15.0, unit: "token" },
+    "openai/gpt-5.6-luna": { in: 1.0, out: 6.0, unit: "token" },
     "openai/gpt-5.5": { in: 5.0, out: 30.0, unit: "token" },
     "openai/gpt-5.5-pro": { in: 30.0, out: 180.0, unit: "token" },
+    "moonshotai/kimi-k3": { in: 3.0, out: 15.0, unit: "token" },
     "moonshotai/kimi-k2.6": { in: 0.74, out: 3.49, unit: "token" },
     "qwen/qwen3.6-plus": { in: 0.325, out: 1.95, unit: "token" },
     "deepseek/deepseek-v4-pro": { in: 0.435, out: 0.87, unit: "token" },
     "deepseek/deepseek-v4-flash": { in: 0.14, out: 0.28, unit: "token" },
+    "openai/gpt-4": { in: 30.0, out: 60.0, unit: "token" },
     "openai/gpt-4.1": { in: 2.0, out: 8.0, unit: "token" },
     "openai/gpt-4.1-mini": { in: 0.4, out: 1.6, unit: "token" },
     "openai/gpt-4o": { in: 2.5, out: 10.0, unit: "token" },
@@ -1318,7 +1323,7 @@ export function AIModelSection({
         return "Self-hosted video generation needs a matching Seedance or Kling API key from your provider account.";
       }
       if (roleKey === "stt") {
-        return "Self-hosted speech-to-text needs a matching OpenAI speech API key from your provider account.";
+        return "Self-hosted speech-to-text needs a matching OpenAI or Groq speech API key from your provider account.";
       }
       return "Self-hosted model calls use the API key from your provider account for the selected model.";
   };
@@ -1339,8 +1344,8 @@ export function AIModelSection({
     perplexity: "https://api.perplexity.ai",
     fireworks: "https://api.fireworks.ai/inference/v1",
     xai: "https://api.x.ai/v1",
-    moonshot: "https://api.moonshot.cn/v1",
-    moonshotai: "https://api.moonshot.cn/v1",
+    moonshot: "https://api.moonshot.ai/v1",
+    moonshotai: "https://api.moonshot.ai/v1",
     qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   };
 
@@ -1387,7 +1392,7 @@ export function AIModelSection({
           const canUseCustomModel = ["primary", "worker", "embedding"].includes(
             role.key,
           );
-          const canUseCatalogByok = ["image", "video", "stt"].includes(
+          const canUseCatalogByok = ["image", "video", "voice", "stt"].includes(
             role.key,
           );
           const canUseOwnProvider = canUseCustomModel || canUseCatalogByok;
@@ -2004,9 +2009,14 @@ export function AIModelSection({
                             onChange={(e) => {
                               const newModel = e.target.value;
                               const autoUrl = inferBaseUrl(newModel);
+                              const previousAutoUrl = inferBaseUrl(draft.model);
+                              const shouldReplaceBaseUrl =
+                                !draft.baseUrl ||
+                                draft.baseUrl.replace(/\/+$/, "") ===
+                                  previousAutoUrl;
                               updateDraft(role.key, {
                                 model: newModel,
-                                ...(autoUrl && !draft.baseUrl
+                                ...(autoUrl && shouldReplaceBaseUrl
                                   ? { baseUrl: autoUrl }
                                   : {}),
                               });
@@ -3126,7 +3136,7 @@ export default function Account() {
       style={{
         height: "100%",
         overflowY: "auto",
-        padding: "1.5rem 2rem",
+        padding: 0,
         animation: "fade-in 0.3s ease-out",
       }}
     >

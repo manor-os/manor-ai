@@ -2,12 +2,12 @@
 import pytest
 from httpx import AsyncClient
 
+from tests.marketplace_helpers import _force_fallback_verification, _register
+
+
 pytestmark = pytest.mark.asyncio
 
 CLOUD = [{"DEPLOYMENT_MODE": "cloud", "STRIPE_SECRET_KEY": "sk_test_x"}]
-
-
-from tests.marketplace_helpers import _force_fallback_verification, _register
 
 
 async def _make_blueprint(db_session, entity_id, **kw):
@@ -16,6 +16,7 @@ async def _make_blueprint(db_session, entity_id, **kw):
         entity_id=entity_id, slug=kw.get("slug", "bp-price-1"), title="BP",
         payload={"manifest": {}}, payload_version="1.1",
         status=kw.get("status", "draft"), price_cents=kw.get("price_cents"),
+        list_price_cents=kw.get("list_price_cents"),
     )
     db_session.add(bp)
     await db_session.commit()
@@ -123,3 +124,73 @@ async def test_price_boundary_and_paid_to_free(client: AsyncClient, db_session, 
                          headers=headers, json={"price_cents": 0})
     assert r.status_code == 200
     assert r.json()["price_cents"] == 0
+
+
+@pytest.mark.parametrize("client", CLOUD, indirect=True)
+async def test_free_sale_preserves_original_price_without_payout_account(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    _force_fallback_verification(monkeypatch)
+    headers, entity_id = await _register(client, "pricing_free_sale")
+    bp_id = await _make_blueprint(db_session, entity_id, slug="bp-free-sale")
+
+    r = await client.put(
+        f"/api/v1/blueprints/{bp_id}/pricing",
+        headers=headers,
+        json={"price_cents": 0, "list_price_cents": 1000},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["price_cents"] == 0
+    assert r.json()["list_price_cents"] == 1000
+
+
+@pytest.mark.parametrize("client", CLOUD, indirect=True)
+async def test_sale_price_must_be_lower_than_list_price(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    _force_fallback_verification(monkeypatch)
+    headers, entity_id = await _register(client, "pricing_sale_bounds")
+    bp_id = await _make_blueprint(db_session, entity_id, slug="bp-sale-bounds")
+
+    for current_price, list_price in ((1000, 1000), (1000, 500), (0, 0)):
+        r = await client.put(
+            f"/api/v1/blueprints/{bp_id}/pricing",
+            headers=headers,
+            json={
+                "price_cents": current_price,
+                "list_price_cents": list_price,
+            },
+        )
+        assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("client", CLOUD, indirect=True)
+async def test_sale_can_be_cleared_without_changing_current_price(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    _force_fallback_verification(monkeypatch)
+    headers, entity_id = await _register(client, "pricing_clear_sale")
+    bp_id = await _make_blueprint(
+        db_session,
+        entity_id,
+        slug="bp-clear-sale",
+        price_cents=0,
+        list_price_cents=1000,
+    )
+
+    r = await client.put(
+        f"/api/v1/blueprints/{bp_id}/pricing",
+        headers=headers,
+        json={"price_cents": 0, "list_price_cents": None},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["price_cents"] == 0
+    assert r.json()["list_price_cents"] is None

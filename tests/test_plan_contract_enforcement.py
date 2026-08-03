@@ -210,3 +210,21 @@ def test_planner_system_prompt_has_minimal_replan_guidance():
     )
     assert "_replan_context" in out
     assert "minimal" in out.lower()
+
+
+def test_planner_system_prompt_tells_planner_to_reuse_completed_artifacts():
+    from packages.core.ai.runtime.planning import runtime_planner_system_prompt
+
+    out = runtime_planner_system_prompt(
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys=[],
+    )
+    assert "HAS ALREADY RUN" in out
+    assert "no_output" in out
+    # The reuse handles the executor now emits.
+    assert "artifacts[].fs_path" in out
+    assert "document_id" in out
+    # Cross-plan refs do not resolve — the planner must inline literals.
+    assert "CANNOT reach a previous plan" in out
+    assert "inline the literal value" in out

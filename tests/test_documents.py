@@ -288,6 +288,78 @@ async def test_browse_documents_returns_more_than_default_document_page(client: 
 
 
 @pytest.mark.asyncio
+async def test_browse_storage_used_matches_visible_active_knowledge(client: AsyncClient, monkeypatch):
+    import packages.core.database as db_module
+    from packages.core.constants import plans as plan_constants
+    from packages.core.services import plan_enforcement
+    from packages.core.services import plan_gate
+    from packages.core.services.document_service import create_document
+
+    visible_size = 10 * 1024 * 1024
+    hidden_size = 150 * 1024 * 1024
+    trashed_size = 40 * 1024 * 1024
+
+    headers = await _auth(client, "docbrowsestoragevisible")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    entity_id = me["entity_id"]
+
+    async with db_module.async_session() as db:
+        await create_document(
+            db,
+            entity_id,
+            name="visible.md",
+            fs_path="visible.md",
+            file_size=visible_size,
+            file_type="md",
+            mime_type="text/markdown",
+            source="manual",
+            created_by="docbrowsestoragevisible",
+            skip_storage_check=True,
+        )
+        await create_document(
+            db,
+            entity_id,
+            name="hidden.bin",
+            fs_path="tmp/hidden.bin",
+            file_size=hidden_size,
+            file_type="bin",
+            mime_type="application/octet-stream",
+            source="manual",
+            created_by="docbrowsestoragevisible",
+            skip_storage_check=True,
+        )
+        trashed = await create_document(
+            db,
+            entity_id,
+            name="trashed.mov",
+            fs_path="trashed.mov",
+            file_size=trashed_size,
+            file_type="mov",
+            mime_type="video/quicktime",
+            source="manual",
+            created_by="docbrowsestoragevisible",
+            skip_storage_check=True,
+        )
+        trashed.is_trashed = True
+        await db.commit()
+
+    monkeypatch.setattr(plan_gate, "is_cloud", lambda: True)
+    monkeypatch.setattr(plan_enforcement, "is_cloud", lambda: True)
+    monkeypatch.setattr(plan_constants, "is_cloud", lambda: True)
+    plan_gate.invalidate_gate_cache(entity_id)
+
+    browse = await client.get("/api/v1/documents/browse?folder_id=root", headers=headers)
+
+    assert browse.status_code == 200, browse.text
+    payload = browse.json()
+    assert [item["name"] for item in payload["documents"]] == ["visible.md"]
+    assert payload["total_files"] == 1
+    assert payload["total_size"] == visible_size
+    assert payload["storage_used_mb"] == pytest.approx(10.0)
+    assert payload["storage_limit_mb"] == 100
+
+
+@pytest.mark.asyncio
 async def test_move_document_to_folder_moves_filesystem_payload(client: AsyncClient, tmp_path):
     import packages.core.database as db_module
     from packages.core.config import get_settings
@@ -387,7 +459,7 @@ async def test_upload_rejects_when_cloud_filesystem_unavailable(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_list_documents_hides_missing_filesystem_payload(db_session, tmp_path):
+async def test_list_documents_keeps_missing_filesystem_payload_visible(db_session, tmp_path):
     from packages.core.config import get_settings
     from packages.core.models.document import Document
     from packages.core.services.document_access import list_visible_documents
@@ -425,14 +497,14 @@ async def test_list_documents_hides_missing_filesystem_payload(db_session, tmp_p
             role="member",
         )
 
-        assert total == 0
-        assert all(item.id != doc_id for item in docs)
+        assert total == 1
+        assert [item.id for item in docs] == [doc_id]
 
         stored = await db_session.get(Document, doc_id)
         assert stored is not None
-        assert stored.is_trashed is True
+        assert stored.is_trashed is False
         assert stored.metadata_["file_integrity"]["status"] == "missing"
-        assert stored.vector_status == "failed"
+        assert stored.vector_status == "ready"
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
@@ -440,7 +512,7 @@ async def test_list_documents_hides_missing_filesystem_payload(db_session, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_missing_filesystem_payload_filter_marks_stale_doc(tmp_path, monkeypatch):
+async def test_missing_filesystem_payload_filter_keeps_stale_doc_visible_without_trashing_it(tmp_path, monkeypatch):
     from packages.core.models.document import VectorStatus
     from packages.core.services import document_access
 
@@ -468,14 +540,14 @@ async def test_missing_filesystem_payload_filter_marks_stale_doc(tmp_path, monke
 
     visible = await document_access._filter_readable_local_documents(FakeDb(), [doc])
 
-    assert visible == []
-    assert doc.is_trashed is True
-    assert doc.vector_status == VectorStatus.FAILED
+    assert visible == [doc]
+    assert doc.is_trashed is False
+    assert doc.vector_status == VectorStatus.READY
     assert doc.metadata_["file_integrity"]["status"] == "missing"
 
 
 @pytest.mark.asyncio
-async def test_pending_filesystem_payload_is_hidden_when_file_is_missing(tmp_path, monkeypatch):
+async def test_pending_filesystem_payload_stays_visible_when_file_is_missing(tmp_path, monkeypatch):
     from packages.core.models.document import VectorStatus
     from packages.core.services import document_access
 
@@ -501,9 +573,11 @@ async def test_pending_filesystem_payload_is_hidden_when_file_is_missing(tmp_pat
 
     visible = await document_access._filter_readable_local_documents(FakeDb(), [doc])
 
-    assert visible == []
-    assert doc.vector_status == VectorStatus.FAILED
-    assert doc.is_trashed is True
+    assert visible == [doc]
+    assert doc.vector_status == VectorStatus.PENDING
+    assert doc.is_trashed is False
+    assert doc.metadata_["file_integrity"]["status"] == "missing"
+    assert doc.metadata_["file_integrity"]["recoverable"] is True
 
 
 @pytest.mark.asyncio
@@ -512,8 +586,10 @@ async def test_unavailable_entity_root_does_not_trash_all_documents(tmp_path, mo
     from packages.core.services import document_access
 
     class FakeDb:
+        flushed = False
+
         async def flush(self):
-            raise AssertionError("unavailable filesystem should not mutate rows")
+            self.flushed = True
 
     doc = SimpleNamespace(
         id="doc_1",
@@ -530,10 +606,14 @@ async def test_unavailable_entity_root_does_not_trash_all_documents(tmp_path, mo
         lambda: SimpleNamespace(MANOR_FS_ENABLED=True, MANOR_FS_ROOT=str(tmp_path / "missing-root")),
     )
 
-    visible = await document_access._filter_readable_local_documents(FakeDb(), [doc])
+    db = FakeDb()
+    visible = await document_access._filter_readable_local_documents(db, [doc])
 
     assert visible == [doc]
     assert doc.is_trashed is False
+    assert doc.metadata_["file_integrity"]["status"] == "unavailable"
+    assert doc.metadata_["file_integrity"]["recoverable"] is True
+    assert db.flushed is True
 
 
 @pytest.mark.asyncio
@@ -563,8 +643,9 @@ async def test_failed_placeholder_without_payload_is_hidden_from_knowledge(tmp_p
     visible = await document_access._filter_readable_local_documents(FakeDb(), [doc])
 
     assert visible == []
-    assert doc.is_trashed is True
+    assert doc.is_trashed is False
     assert doc.metadata_["file_integrity"]["status"] == "unavailable"
+    assert doc.metadata_["file_integrity"]["recoverable"] is True
 
 
 @pytest.mark.asyncio

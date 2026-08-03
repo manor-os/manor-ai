@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .office_common import handle_office_skill
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 
 async def handle_spreadsheet(
@@ -18,7 +19,7 @@ async def handle_spreadsheet(
 ) -> str:
     return await handle_office_skill(
         skill="xlsx",
-        default_subdir="spreadsheets",
+        default_subdir=WorkspaceArtifactDir.SPREADSHEETS.value,
         kind="spreadsheet",
         entity_id=entity_id,
         user_id=user_id,

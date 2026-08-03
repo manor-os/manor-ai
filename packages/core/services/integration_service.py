@@ -59,12 +59,24 @@ async def get_integration(
 async def create_integration(
     db: AsyncSession, entity_id: str, provider: str, *,
     config: dict | None = None, credentials: dict | None = None,
+    created_by_user_id: str | None = None,
 ) -> Integration:
+    resolved_config = dict(config or {})
+    if "is_default" not in resolved_config:
+        sibling_exists = (await db.execute(
+            select(Integration.id).where(
+                Integration.entity_id == entity_id,
+                Integration.provider == provider,
+                Integration.status == "active",
+            ).limit(1)
+        )).scalar_one_or_none()
+        resolved_config["is_default"] = sibling_exists is None
     integration = Integration(
         id=generate_ulid(),
         entity_id=entity_id,
+        created_by_user_id=created_by_user_id,
         provider=provider,
-        config=config or {},
+        config=resolved_config,
         credentials={},
     )
     if credentials:
@@ -87,6 +99,12 @@ async def update_integration(
     new_creds = kwargs.pop("credentials", None)
     for key, value in kwargs.items():
         if value is not None and hasattr(integration, key):
+            if key == "config" and isinstance(value, dict):
+                value = dict(value)
+                value.setdefault(
+                    "is_default",
+                    bool((integration.config or {}).get("is_default")),
+                )
             setattr(integration, key, value)
     if new_creds is not None:
         get_credential_service().store_integration(integration, new_creds)
@@ -458,6 +476,11 @@ _COMING_SOON_SERVERS_BASE = {
     # correct UX surface for that state.
     # PayPal — sandbox-only until Live App approval issued by PayPal
     "paypal",
+    # Discord — catalog row exists but there is no in-process MCP module
+    # yet (packages/core/ai/mcp/discord.py). Keep the UI card visible as
+    # coming-soon without exposing un-executable tools to agents (see
+    # tests/test_tool_surface_executable.py).
+    "discord",
     # Image/video generation — gateway not shipped yet
     "jimeng",
     # QuickBooks — Intuit App Assessment required before Production

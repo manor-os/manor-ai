@@ -21,6 +21,12 @@ from . import (
     manor_mcp_calendar,
     github,
     linkedin,
+    outlook,
+    onedrive,
+    ms_calendar,
+    ms_teams,
+    ms_excel,
+    nango,
     quickbooks,
     stripe,
     twitter_x,
@@ -59,6 +65,20 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     "google_drive": google_drive,
     "github": github,
     "linkedin": linkedin,
+    # Microsoft 365 (Graph API, shared Azure AD app registration). The
+    # provider set is coming_soon-gated in the UI until the deploy has
+    # MS_CLIENT_ID/SECRET, but the modules are real implementations —
+    # registered so every advertised schema dispatches (see
+    # tests/test_tool_surface_executable.py).
+    "outlook": outlook,
+    "onedrive": onedrive,
+    "ms_calendar": ms_calendar,
+    "ms_teams": ms_teams,
+    "ms_excel": ms_excel,
+    # Nango — self-hosted OAuth multiplexer; bearer_token is the entity's
+    # Nango secret_key and the module degrades with a clear "not
+    # connected" error when absent.
+    "nango": nango,
     "quickbooks": quickbooks,
     "stripe": stripe,
     "twitter_x": twitter_x,

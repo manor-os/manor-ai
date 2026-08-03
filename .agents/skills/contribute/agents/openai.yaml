@@ -1,0 +1,4 @@
+interface:
+  display_name: "Contribute to Manor"
+  short_description: "Follow Manor UI contribution standards."
+  default_prompt: "Use $contribute to implement or review this Manor UI change against the project design constraints."

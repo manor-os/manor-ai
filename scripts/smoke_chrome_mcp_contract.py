@@ -103,7 +103,15 @@ async def main() -> int:
 
     chrome._local_worker_runner.dispatch_local_action = fake_dispatch_local_action
 
+    if chrome._ACTION_BY_TOOL.get("open_new_tab") != "open_new_tab":
+        raise AssertionError("open_new_tab action alias must not collapse back to legacy open")
+
     scenarios = [
+        (
+            "reload_extension",
+            {},
+            expected_dispatch("reload_extension", {}),
+        ),
         (
             "read_page",
             {"tabId": 321},
@@ -136,8 +144,8 @@ async def main() -> int:
         ),
         (
             "type_text",
-            {"text": "hello"},
-            expected_dispatch("type_text", {"text": "hello"}),
+            {"text": "hello", "fallbackReason": "contract dispatch focused typing fallback"},
+            expected_dispatch("type_text", {"text": "hello", "fallbackReason": "contract dispatch focused typing fallback"}),
         ),
         (
             "scroll",
@@ -148,6 +156,15 @@ async def main() -> int:
             "navigate",
             {"url": "https://example.com/", "tabId": 321},
             expected_dispatch("navigate", {"url": "https://example.com/", "tabId": 321}),
+        ),
+        (
+            "open_new_tab",
+            {"url": "https://example.com/extra", "active": True},
+            expected_dispatch(
+                "open_new_tab",
+                {"url": "https://example.com/extra", "active": True},
+                mcp_tool_name="mcp__chrome__open_new_tab",
+            ),
         ),
         (
             "get_interactive_elements",
@@ -174,8 +191,8 @@ async def main() -> int:
         ),
         (
             "keyboard",
-            {"key": "Enter"},
-            expected_dispatch("keyboard", {"key": "Enter"}),
+            {"key": "Enter", "fallbackReason": "contract dispatch focused key fallback"},
+            expected_dispatch("keyboard", {"key": "Enter", "fallbackReason": "contract dispatch focused key fallback"}),
         ),
         (
             "upload",

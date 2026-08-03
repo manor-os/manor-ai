@@ -1,4 +1,4 @@
-"""Platform-wide announcements (broadcast banners + email).
+"""Platform-wide announcements (What's New, optional banners, and email).
 
 Distinct from the existing tenant-side ``Announcement`` model (in
 ``packages/core/models/channel.py``) which is for org-internal comms.
@@ -39,7 +39,7 @@ class PlatformAnnouncement(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     body_md: Mapped[str] = mapped_column(Text, nullable=False)
-    """Markdown — rendered in the user app banner."""
+    """Markdown rendered in the selected user-facing delivery channels."""
 
     severity: Mapped[str] = mapped_column(
         String(20), nullable=False, default="info", server_default="info",
@@ -54,6 +54,10 @@ class PlatformAnnouncement(Base, TimestampMixin):
     show_in_app: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true",
     )
+    """Legacy storage name for the What's New delivery channel."""
+    show_as_banner: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
     send_email: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false",
     )
@@ -66,7 +70,7 @@ class PlatformAnnouncement(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active", server_default="active",
     )
-    # 'active' | 'archived'
+    # 'draft' | 'active' | 'archived'
 
     email_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     """Set once the send_email fanout task has finished. NULL means the
@@ -75,12 +79,7 @@ class PlatformAnnouncement(Base, TimestampMixin):
 
 
 class PlatformAnnouncementDismissal(Base):
-    """Per-user dismissal record for a platform announcement.
-
-    Replaces (and supplements) the client-only localStorage flag so a
-    user who dismissed a banner doesn't see it again from another
-    device or after clearing browser storage.
-    """
+    """Per-user read state for an item in the What's New feed."""
     __tablename__ = "platform_announcement_dismissals"
     __table_args__ = (
         PrimaryKeyConstraint(
@@ -88,6 +87,25 @@ class PlatformAnnouncementDismissal(Base):
             name="pk_platform_announcement_dismissals",
         ),
         Index("ix_platform_announcement_dismissals_user", "user_id"),
+    )
+
+    announcement_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    dismissed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False, server_default=func.now(),
+    )
+
+
+class PlatformAnnouncementBannerDismissal(Base):
+    """Per-user dismissal state for the interruptive banner channel."""
+    __tablename__ = "platform_announcement_banner_dismissals"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "announcement_id", "user_id",
+            name="pk_platform_announcement_banner_dismissals",
+        ),
+        Index("ix_platform_announcement_banner_dismissals_user", "user_id"),
     )
 
     announcement_id: Mapped[str] = mapped_column(String(26), nullable=False)

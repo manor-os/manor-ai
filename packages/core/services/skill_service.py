@@ -7,6 +7,7 @@ import json
 import hashlib
 import posixpath
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,6 +22,7 @@ from packages.core.ai.runtime import (
     runtime_skill_binding_ref,
 )
 from packages.core.models.base import generate_ulid
+from packages.core.models.permission import Visibility
 from packages.core.models.skill import Skill, AgentSkillBinding
 
 logger = logging.getLogger(__name__)
@@ -392,7 +394,7 @@ def _try_list_skill_bundle_files(extra_files: dict[str, str], args: dict) -> str
 
 
 def _load_prompt_skill_extra_files(skill: Skill, config: dict) -> dict[str, str]:
-    """Load prompt skill bundled files, preferring MinIO with config fallback."""
+    """Load prompt skill bundled files from config, disk, or MinIO."""
     extra_files: dict[str, str] = {}
     raw_extra = config.get("extra_files") or {}
     if isinstance(raw_extra, dict):
@@ -401,6 +403,42 @@ def _load_prompt_skill_extra_files(skill: Skill, config: dict) -> dict[str, str]
             for path, content in raw_extra.items()
             if str(path).strip()
         })
+
+    if not skill.entity_id:
+        skill_dir_value = str(config.get("skill_dir") or "").strip()
+        raw_roots = config.get("bundle_roots") or []
+        bundle_roots = (
+            list(raw_roots)
+            if isinstance(raw_roots, (list, tuple, set))
+            else [raw_roots]
+        )
+        if skill_dir_value and bundle_roots:
+            skill_dir = Path(skill_dir_value).resolve()
+            for raw_root in bundle_roots:
+                rel_root = _normalize_skill_bundle_path(raw_root)
+                if not rel_root:
+                    continue
+                source_root = (skill_dir / rel_root).resolve()
+                if skill_dir not in source_root.parents or not source_root.exists():
+                    continue
+                candidates = (
+                    [source_root]
+                    if source_root.is_file()
+                    else sorted(path for path in source_root.rglob("*") if path.is_file())
+                )
+                for path in candidates:
+                    resolved = path.resolve()
+                    if skill_dir not in resolved.parents:
+                        continue
+                    rel_path = resolved.relative_to(skill_dir).as_posix()
+                    try:
+                        extra_files[rel_path] = resolved.read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        logger.debug(
+                            "[skill_service] Skipped unreadable built-in bundle file skill=%s path=%s",
+                            skill.id,
+                            rel_path,
+                        )
 
     if skill.entity_id:
         try:
@@ -686,6 +724,11 @@ async def create_skill(
     skill = Skill(
         id=skill_id,
         entity_id=entity_id,
+        # Ownership triple for resource_access.py. Platform skills (no entity)
+        # never carry an owner or workspace.
+        owner_user_id=kwargs.get("owner_user_id") if entity_id else None,
+        workspace_id=kwargs.get("workspace_id") if entity_id else None,
+        visibility=kwargs.get("visibility") or Visibility.ENTITY,
         name=effective_name,
         slug=slug,
         display_name=display_name,
@@ -751,9 +794,23 @@ async def update_skill(
                 explicit_slug=True,
             )
 
+    # M11: diff BEFORE applying — only real changes to behavior-affecting
+    # fields bump the config revision. Cosmetic edits (name/display_name/
+    # description/slug/tags/category/version label) and same-value writes
+    # (idempotent marketplace re-imports) must not move it.
+    from packages.core.revisions import (
+        SKILL_CONTENT_REVISION_FIELDS,
+        bump_revision,
+        content_patch_for,
+    )
+    content_patch = content_patch_for(skill, kwargs, SKILL_CONTENT_REVISION_FIELDS)
+
     for key, value in kwargs.items():
         if value is not None and hasattr(skill, key):
             setattr(skill, key, value)
+
+    if content_patch:
+        await bump_revision(db, skill, patch=content_patch)
 
     # Auto-update slug if name changed
     if "name" in kwargs and kwargs["name"] is not None and "slug" not in kwargs:
@@ -1213,11 +1270,15 @@ async def invoke_skill(
     conversation_id: Optional[str] = None,
     task_id: Optional[str] = None,
     manual_skill_selected: bool = False,
-    legacy_tool_profile: Optional[str] = None,
+    tool_profile: Optional[str] = None,
     allowed_tool_names: Optional[set[str]] = None,
     runtime_envelope: Any | None = None,
     metadata: Optional[dict] = None,
     model: Optional[str] = None,
+    active_user_message: Optional[str] = None,
+    runtime_tool_context: Optional[Mapping[str, Any]] = None,
+    output_schema: Optional[dict[str, Any]] = None,
+    forced_tool_calls: Optional[list[dict[str, Any]]] = None,
 ) -> dict:
     """Invoke a skill — prompt or sandbox depending on skill type.
 
@@ -1375,6 +1436,9 @@ async def invoke_skill(
     skill_extra_files = _load_prompt_skill_extra_files(skill, config)
     effective_prompt = minio_prompt if minio_prompt else skill.system_prompt
     effective_prompt = _append_skill_bundle_manifest(effective_prompt, skill_extra_files)
+    authorization_user_message = (
+        input_text if active_user_message is None else active_user_message
+    )
     from packages.core.ai.runtime import (
         runtime_execute_skill_agent_loop,
         runtime_prepare_prompt_skill_tool_surface,
@@ -1421,12 +1485,13 @@ async def invoke_skill(
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
-            active_user_message=input_text,
+            active_user_message=authorization_user_message,
             manual_skill_selected=manual_skill_selected,
-            legacy_tool_profile=legacy_tool_profile,
+            tool_profile=tool_profile,
             allowed_tool_names=skill_allowed_tool_names,
             runtime_envelope=skill_runtime_envelope,
             skill_slug=(skill.slug or skill.name or ""),
+            runtime_tool_context=runtime_tool_context,
         ),
         read_bundle_file=lambda tool_args: _try_read_skill_bundle_file(
             skill_extra_files,
@@ -1455,8 +1520,8 @@ async def invoke_skill(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         task_id=task_id,
-        active_user_message=input_text,
-        legacy_tool_profile=legacy_tool_profile,
+        active_user_message=authorization_user_message,
+        tool_profile=tool_profile,
         allowed_tool_names=skill_allowed_tool_names,
         tool_executor=skill_tool_executor,
         max_rounds=max_rounds,
@@ -1467,6 +1532,8 @@ async def invoke_skill(
         on_tool_end=on_sub_tool_end,
         tool_schema_resolver=skill_tool_schema_resolver,
         terminal_tool_result_policy=runtime_policy,
+        output_schema=output_schema,
+        forced_tool_calls=forced_tool_calls,
     )
     control = getattr(result, "control", None) or {}
 

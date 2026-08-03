@@ -9,12 +9,12 @@ Indexing is NOT an agent concern — it happens automatically when documents
 are uploaded or when files written via ``write_file`` are picked up by the
 ingest watcher. There is no ``index_document`` tool.
 
-Other legacy RAG tools (``search_knowledge``, ``search_documents``,
-``list_documents``) have been retired. Agents who
-need document metadata use ``manor({action: "list_documents"})``; agents
-who need to produce final deliverable files can use ``generate_document_file``;
-agents doing low-level file I/O should use ``write_file`` and let the watcher
-index it.
+``search_documents`` and ``list_documents`` remain metadata-only document
+inventory tools; they are not RAG aliases and their filename matches are not
+evidence of document contents. Agents who need document metadata use
+``manor({action: "list_documents"})``; agents who need to produce final
+deliverable files can use ``generate_document_file``; agents doing low-level
+file I/O should use ``write_file`` and let the watcher index it.
 """
 from __future__ import annotations
 
@@ -33,41 +33,26 @@ RAG_SCHEMA = {
     "function": {
         "name": "rag",
         "description": (
-            "Semantically search the entity's indexed documents for a "
-            "natural-language question. Returns ranked document excerpts.\n\n"
-            "Use RAG when the answer lives inside uploaded files or "
-            "knowledge-base documents. For literal file I/O on the "
-            "filesystem, use read_file / glob_files / grep_files instead.\n\n"
-            "Scope:\n"
-            "  • No workspace_id → searches all documents in the entity.\n"
-            "  • workspace_id=<id> → searches only documents bound to that "
-            "workspace (via DocumentGroup.workspace_id).\n"
-            "  • net_ids/group_ids → searches only those Knowledge Nets."
+            "Search indexed Knowledge document contents for facts, values, "
+            "passages, summaries, comparisons, or calculations. Prefer RAG "
+            "when intent mixes filename and content."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "The natural-language question to answer.",
+                    "description": "Question requiring document-body evidence.",
                 },
                 "workspace_id": {
                     "type": "string",
-                    "description": "Optional — limit search to this workspace's documents.",
                 },
                 "net_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional — Knowledge Net ids to search. Alias: group_ids.",
-                },
-                "group_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional alias for net_ids.",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max hits to return (default 5, max 20).",
                 },
             },
             "required": ["question"],

@@ -13,7 +13,6 @@ from __future__ import annotations
 import copy
 import logging
 from collections.abc import Iterable
-from importlib import import_module
 from typing import Any, Optional
 
 from packages.core.ai.runtime.tool_search import (
@@ -24,43 +23,15 @@ from packages.core.ai.runtime.tool_search import (
 from packages.core.ai.runtime.tool_execution import (
     runtime_execute_registered_tool,
 )
-from packages.core.ai.runtime.legacy_tool_surface import (
-    legacy_tool_is_deferred,
+from packages.core.ai.runtime.tool_visibility import (
+    runtime_tool_is_deferred,
 )
 
 logger = logging.getLogger(__name__)
 
-_LEGACY_RUNTIME_EXPORTS = {
-    "ALWAYS_LOADED": ("packages.core.ai.runtime.legacy_tool_surface", "ALWAYS_LOADED"),
-    "MASTER_ALWAYS_LOADED": ("packages.core.ai.runtime.legacy_tool_surface", "MASTER_ALWAYS_LOADED"),
-    "TOOL_PROFILE_WORKSPACE_AGENT": (
-        "packages.core.ai.runtime.legacy_tool_surface",
-        "TOOL_PROFILE_WORKSPACE_AGENT",
-    ),
-    "WORKSPACE_AGENT_ALWAYS_LOADED": (
-        "packages.core.ai.runtime.legacy_tool_surface",
-        "WORKSPACE_AGENT_ALWAYS_LOADED",
-    ),
-    "WORKSPACE_AGENT_CONTEXTUAL_TOOLS": (
-        "packages.core.ai.runtime.legacy_tool_surface",
-        "WORKSPACE_AGENT_CONTEXTUAL_TOOLS",
-    ),
-}
-
-
-def __getattr__(name: str) -> Any:
-    exported = _LEGACY_RUNTIME_EXPORTS.get(name)
-    if not exported:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attr_name = exported
-    value = getattr(import_module(module_name), attr_name)
-    globals()[name] = value
-    return value
-
-
 def is_deferred(name: str, auto_pass: set | None = None) -> bool:
     """Check if a tool should be deferred (schema withheld)."""
-    return legacy_tool_is_deferred(name, auto_pass_tool_names=auto_pass)
+    return runtime_tool_is_deferred(name, auto_pass_tool_names=auto_pass)
 
 
 class ToolPool:
@@ -134,7 +105,7 @@ class ToolPool:
         active_user_message: str | None = None,
         manual_skill_selected: bool = False,
         manual_skill_slugs: list[str] | None = None,
-        legacy_tool_profile: str | None = None,
+        tool_profile: str | None = None,
         allowed_tool_names: set[str] | None = None,
         llm_metadata: dict[str, Any] | None = None,
         llm_model: str | None = None,
@@ -156,7 +127,7 @@ class ToolPool:
             active_user_message=active_user_message,
             manual_skill_selected=manual_skill_selected,
             manual_skill_slugs=manual_skill_slugs,
-            legacy_tool_profile=legacy_tool_profile,
+            tool_profile=tool_profile,
             allowed_tool_names=allowed_tool_names,
             llm_metadata=llm_metadata,
             llm_model=llm_model,

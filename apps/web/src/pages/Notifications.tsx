@@ -137,10 +137,10 @@ export default function Notifications() {
   ];
 
   return (
-    <div style={{ height: "100%", overflowY: "auto", padding: "1.5rem 2rem" }}>
+    <div style={{ height: "100%", overflowY: "auto", padding: 0 }}>
       <PageHeader
         title={t("nav.notifications")}
-        subtitle={unreadCount > 0 ? `${unreadCount} unread` : t("page.notifications.you_re_all_caught_up")}
+        meta={unreadCount > 0 ? `${unreadCount} unread` : t("page.notifications.you_re_all_caught_up")}
         actions={
           <button
             onClick={() => markAllReadMutation.mutate()}

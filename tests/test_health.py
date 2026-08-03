@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from apps.api.routers import health as health_router
+from packages.core.credentials import HealthResult
 
 pytestmark = pytest.mark.oss_smoke
 
@@ -20,6 +21,30 @@ async def test_health(client):
 
 
 @pytest.mark.asyncio
+async def test_client_config_defaults_flows_to_coming_soon_in_prod(client, monkeypatch):
+    monkeypatch.delenv("FLOWS_AVAILABLE", raising=False)
+    monkeypatch.setenv("MANOR_ENV", "prod")
+
+    response = await client.get("/config")
+
+    assert response.status_code == 200
+    assert response.json()["flows_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_client_config_enables_flows_locally_or_by_override(client, monkeypatch):
+    monkeypatch.delenv("FLOWS_AVAILABLE", raising=False)
+    monkeypatch.setenv("MANOR_ENV", "local")
+    local_response = await client.get("/config")
+    assert local_response.json()["flows_available"] is True
+
+    monkeypatch.setenv("MANOR_ENV", "production")
+    monkeypatch.setenv("FLOWS_AVAILABLE", "true")
+    override_response = await client.get("/config")
+    assert override_response.json()["flows_available"] is True
+
+
+@pytest.mark.asyncio
 async def test_deep_health(client):
     """Deep health check returns postgres status (at minimum)."""
     resp = await client.get("/health/deep")
@@ -29,6 +54,32 @@ async def test_deep_health(client):
     assert "checks" in data
     assert "postgres" in data["checks"]
     assert data["checks"]["postgres"]["status"] == "ok"
+    assert "credentials" in data["checks"]
+
+
+@pytest.mark.asyncio
+async def test_deep_health_reports_credential_backend_failure(client, monkeypatch):
+    """A bad Vault token must degrade /health/deep instead of looking healthy."""
+
+    import packages.core.credentials as credentials
+
+    class BrokenCredentialService:
+        def health(self):
+            return HealthResult(ok=False, detail="invalid token")
+
+    monkeypatch.setattr(
+        credentials,
+        "get_credential_service",
+        lambda: BrokenCredentialService(),
+    )
+
+    resp = await client.get("/health/deep")
+
+    assert resp.status_code == 503
+    data = resp.json()
+    assert data["status"] == "degraded"
+    assert data["checks"]["credentials"]["status"] == "error"
+    assert "invalid token" in data["checks"]["credentials"]["detail"]
 
 
 @pytest.mark.asyncio

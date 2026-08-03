@@ -82,22 +82,106 @@ async def list_scheduled_jobs(
     workspace_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    search: str | None = None,
+    status: str = "all",
+    agent_id: str | None = None,
+    include_workflows: bool = True,
 ) -> tuple[list[ScheduledJob], int]:
-    q = select(ScheduledJob).where(ScheduledJob.entity_id == entity_id)
-    count_q = select(func.count()).select_from(ScheduledJob).where(ScheduledJob.entity_id == entity_id)
+    filters = _scheduled_job_filters(
+        entity_id,
+        workspace_id=workspace_id,
+        search=search,
+        agent_id=agent_id,
+        include_workflows=include_workflows,
+    )
+    q = select(ScheduledJob).where(*filters)
+    count_q = select(func.count()).select_from(ScheduledJob).where(*filters)
 
     if enabled_only:
         q = q.where(ScheduledJob.enabled == True)  # noqa: E712
         count_q = count_q.where(ScheduledJob.enabled == True)  # noqa: E712
-    if workspace_id:
-        q = q.where(ScheduledJob.workspace_id == workspace_id)
-        count_q = count_q.where(ScheduledJob.workspace_id == workspace_id)
+    elif status == "enabled":
+        q = q.where(ScheduledJob.enabled == True)  # noqa: E712
+        count_q = count_q.where(ScheduledJob.enabled == True)  # noqa: E712
+    elif status == "paused":
+        q = q.where(ScheduledJob.enabled == False)  # noqa: E712
+        count_q = count_q.where(ScheduledJob.enabled == False)  # noqa: E712
+    elif status == "attention":
+        q = q.where(ScheduledJob.consecutive_errors > 0)
+        count_q = count_q.where(ScheduledJob.consecutive_errors > 0)
 
-    q = q.order_by(ScheduledJob.created_at.desc()).limit(limit).offset(offset)
+    q = q.order_by(
+        ScheduledJob.created_at.desc(),
+        ScheduledJob.id.desc(),
+    ).limit(limit).offset(offset)
 
     result = await db.execute(q)
     count_result = await db.execute(count_q)
     return list(result.scalars().all()), count_result.scalar_one()
+
+
+async def summarize_scheduled_jobs(
+    db: AsyncSession,
+    entity_id: str,
+    *,
+    workspace_id: str | None = None,
+    search: str | None = None,
+    agent_id: str | None = None,
+    include_workflows: bool = True,
+) -> dict[str, int]:
+    """Return list-level totals without applying the selected status tab."""
+    filters = _scheduled_job_filters(
+        entity_id,
+        workspace_id=workspace_id,
+        search=search,
+        agent_id=agent_id,
+        include_workflows=include_workflows,
+    )
+    count_q = select(func.count()).select_from(ScheduledJob).where(*filters)
+    enabled_q = count_q.where(ScheduledJob.enabled == True)  # noqa: E712
+    attention_q = count_q.where(ScheduledJob.consecutive_errors > 0)
+    total = (await db.execute(count_q)).scalar_one()
+    enabled = (await db.execute(enabled_q)).scalar_one()
+    attention = (await db.execute(attention_q)).scalar_one()
+    return {
+        "total": int(total or 0),
+        "enabled": int(enabled or 0),
+        "attention": int(attention or 0),
+    }
+
+
+def _scheduled_job_filters(
+    entity_id: str,
+    *,
+    workspace_id: str | None = None,
+    search: str | None = None,
+    agent_id: str | None = None,
+    include_workflows: bool = True,
+) -> list:
+    filters = [ScheduledJob.entity_id == entity_id]
+    if workspace_id:
+        filters.append(ScheduledJob.workspace_id == workspace_id)
+    if agent_id:
+        filters.append(ScheduledJob.agent_id == agent_id)
+    if not include_workflows:
+        filters.append(
+            or_(
+                ScheduledJob.execution_type.is_(None),
+                ScheduledJob.execution_type != "workflow",
+            )
+        )
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        filters.append(
+            or_(
+                ScheduledJob.name.ilike(pattern),
+                ScheduledJob.job_id.ilike(pattern),
+                ScheduledJob.job_type.ilike(pattern),
+                ScheduledJob.payload_message.ilike(pattern),
+            )
+        )
+    return filters
 
 
 async def get_scheduled_job(

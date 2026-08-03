@@ -381,11 +381,20 @@ def _tool_display_metadata(
     target = summary
 
     if lower_name == "manor":
+        manor_params = args.get("params") if isinstance(args.get("params"), dict) else {}
         action = str(
             _first_argument(args, "action", "operation", "tool", "name") or ""
         ).strip().lower()
-        query = _param_text(_first_argument(args, "query", "q", "search", "keyword"))
-        doc_target = _param_text(_path_basename(_first_argument(args, "path", "file", "filename", "name")))
+        query = _param_text(
+            _first_argument(args, "query", "q", "search", "keyword")
+            or _first_argument(manor_params, "query", "q", "search", "keyword")
+        )
+        doc_target = _param_text(
+            _path_basename(
+                _first_argument(args, "path", "file", "filename", "name")
+                or _first_argument(manor_params, "path", "file", "filename", "name")
+            )
+        )
         if action in {"list_tasks", "tasks"}:
             return {
                 "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.manor.list_tasks",
@@ -414,6 +423,11 @@ def _tool_display_metadata(
             return {
                 "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.manor.read_document",
                 "display_params": {"target": doc_target or target or "document"},
+            }
+        if action == "search_documents":
+            return {
+                "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.manor.search_documents",
+                "display_params": {"target": query or target or "documents"},
             }
         if "search" in action:
             return {
@@ -456,7 +470,26 @@ def _tool_display_metadata(
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.discovery.skill_details",
             "display_params": {"target": _tool_target(args, fallback=target or "skill")},
         }
-    if lower_name in {"rag", "search_documents", "search_tasks"}:
+    if lower_name == "rag":
+        rag_has_content = (
+            result.get("content_evidence_available")
+            if isinstance(result, dict)
+            else None
+        )
+        return {
+            "display_key": (
+                f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.knowledge.rag_no_content"
+                if rag_has_content is False
+                else f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.knowledge.rag"
+            ),
+            "display_params": {"target": _tool_target(args, fallback=target or "knowledge")},
+        }
+    if lower_name == "search_documents":
+        return {
+            "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.knowledge.document_search",
+            "display_params": {"target": _tool_target(args, fallback=target or "documents")},
+        }
+    if lower_name == "search_tasks":
         return {
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.workspace.search",
             "display_params": {"target": _tool_target(args, fallback=target or "workspace")},
@@ -974,8 +1007,20 @@ class AssistantBlocksBuilder:
             for step in steps
             if isinstance(step.get("duration_ms"), int | float)
         ]
-        if durations:
+        timestamped_steps = [
+            step
+            for step in steps
+            if isinstance(step.get("started_at_ms"), int | float)
+            and isinstance(step.get("ended_at_ms"), int | float)
+        ]
+        if steps and len(timestamped_steps) == len(steps):
+            started_at_ms = min(int(step["started_at_ms"]) for step in timestamped_steps)
+            ended_at_ms = max(int(step["ended_at_ms"]) for step in timestamped_steps)
+            process["duration_ms"] = max(0, ended_at_ms - started_at_ms)
+        elif durations and not timestamped_steps:
             process["duration_ms"] = sum(durations)
+        else:
+            process.pop("duration_ms", None)
 
 
 def assistant_blocks_stream_payload(builder: AssistantBlocksBuilder) -> dict[str, Any]:

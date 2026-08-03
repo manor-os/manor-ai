@@ -55,6 +55,7 @@ async def runtime_workspace_search(
                 status=status,
                 external_client=external_customer,
                 public_agent_client=public_customer,
+                user_id=context.user_id,
             )
     except Exception as exc:
         logger.warning("workspace_search failed: %s", exc, exc_info=True)

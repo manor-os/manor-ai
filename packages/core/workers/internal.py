@@ -25,10 +25,21 @@ import json
 import logging
 import os
 import re
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import create_engine, select
+from sqlalchemy import text as sa_text
+from sqlalchemy.engine import Engine
 
+from packages.core.constants.execution import (
+    WorkLeaseStatus,
+    WorkerStatus,
+)
+from packages.core.config import get_settings
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import async_session
 from packages.core.services.hitl_options import approval_options
 from packages.core.dispatcher import Dispatcher
@@ -42,15 +53,38 @@ from packages.core.ai.runtime import (
     runtime_metadata_from_context,
     runtime_persist_internal_worker_runtime_events,
     runtime_prompt_with_output_schema,
+    runtime_tool_call_error,
 )
+from packages.core.models.base import generate_ulid
 from packages.core.models.document import Integration
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.worker import Worker, WorkLease
+from packages.core.workers.execution_claim import (
+    claim_lease_for_execution,
+    release_execution_claim,
+)
+from packages.core.ai.terminal_stops import is_terminal_tool_success
+from packages.core.models.media_job import MediaJobStatus
+from packages.core.workers.submit_result import (
+    SUBMIT_RESULT_PROMPT_SUFFIX,
+    SUBMIT_RESULT_TERMINAL_POLICY,
+    SUBMIT_RESULT_TOOL_NAME,
+    build_submit_result_tool,
+    step_result_from_submit,
+    submit_result_capture,
+    submit_result_followup_message,
+)
 from packages.core.workers.registry import (
     INTERNAL_WORKER_KIND,
     ensure_internal_worker,
 )
+from packages.core.services.step_deadline import (
+    DEFAULT_MAX_RUNTIME_SECONDS,
+    resolve_step_deadline,
+    step_deadline_error,
+)
 from packages.core.contracts.shapes import coerce_to_shape, get_shape
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 from packages.core.contracts.envelope import Success, Failure, StepResult
 from packages.core.contracts.workspace_paths import default_fs_path_into_workspace
 
@@ -59,6 +93,17 @@ logger = logging.getLogger(__name__)
 _PROMPT_PARAM_KEYS = ("prompt", "user_prompt", "instructions", "instruction", "message", "task")
 LEASE_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("MANOR_INTERNAL_LEASE_HEARTBEAT_SECONDS", "60"))
 LEASE_HEARTBEAT_EXTEND_SECONDS = float(os.getenv("MANOR_INTERNAL_LEASE_EXTEND_SECONDS", "300"))
+# Slack when deciding whether a TimeoutError came from our own deadline or
+# from inside the step body (a socket/client timeout is an ordinary failure).
+_DEADLINE_TOLERANCE_SECONDS = 0.05
+
+
+class _StepDeadlineExceeded(Exception):
+    """Internal signal: the step body outlived its resolved runtime budget."""
+
+    def __init__(self, *, elapsed_seconds: float) -> None:
+        super().__init__("step deadline exceeded")
+        self.elapsed_seconds = elapsed_seconds
 
 
 def _step_prompt(params: dict[str, Any]) -> Any:
@@ -217,14 +262,14 @@ _ARTIFACT_TOOL_KEYS = {
     "saved_to",
     "document_id",
 }
-_ARTIFACT_LIST_KEYS = ("files", "artifacts", "documents", "images", "image_urls")
+_ARTIFACT_LIST_KEYS = ("files", "artifacts", "documents", "images", "image_urls", "jobs")
 _ARTIFACT_CREATION_FLAGS = {
     "created", "written", "edited", "saved", "generated", "uploaded",
     "downloaded", "exported",
 }
 _REFERENCE_ONLY_KEYS = {
     "context", "sources", "source_count", "scope", "groups", "knowledge_nets",
-    "entries", "matches",
+    "entries", "matches", "evidence_mode", "content_evidence_available",
 }
 
 
@@ -255,6 +300,33 @@ def _artifact_value_is_path(source_key: str, value: Any) -> bool:
             and _looks_like_relative_artifact_path(value)
         )
     )
+
+
+def _collect_step_evidence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Structured evidence of externally-verified effects (envelope part ③).
+
+    Sourced ONLY from successful tool results in the transcript — model
+    claims never count. Flows worker → complete_lease(evidence_refs=) →
+    step.evidence_refs, where the plan supervisor checks it against the
+    step's declared ``expects``.
+    """
+    evidence: list[dict[str, Any]] = []
+    for payload in _publish_tool_payloads_from_agent_messages(messages):
+        if payload.get("error") or payload.get("ok") is False:
+            continue
+        fields = {
+            key: payload[key]
+            for key in (
+                "tweet_id", "tweet_url", "post_url", "share_url", "urn",
+                "post_urn", "id", "published_at", "platform",
+            )
+            if _has_output_value(payload.get(key))
+        }
+        evidence.append({"kind": "tool_effect", "effect": "publish", "fields": fields})
+    for ref in _collect_artifact_refs_from_agent_messages(messages):
+        if isinstance(ref, dict):
+            evidence.append({"kind": "artifact", **ref})
+    return evidence
 
 
 def _collect_artifact_refs_from_agent_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -301,27 +373,17 @@ def _pending_action_from_tool_payload(payload: dict[str, Any]) -> dict[str, Any]
     if not isinstance(operation, dict):
         operation = hitl.get("operation") if isinstance(hitl.get("operation"), dict) else {}
 
-    if operation.get("kind") == "workspace_operation_review":
-        draft_id = str(
-            operation.get("draft_id")
-            or hitl.get("id")
-            or payload.get("approval_token")
-            or ""
-        ).strip()
-        if not draft_id:
-            return None
-        return {
-            "kind": "workspace_operation_review",
-            "draft_id": draft_id,
-            "approval_token": draft_id,
-            "prompt": hitl.get("prompt") or "Apply this workspace operation draft?",
-            "action": hitl.get("action") or "workspace.operation.apply",
-            "tool": hitl.get("tool") or "workspace_operation",
-            "content": hitl.get("content"),
-            "args_preview": hitl.get("args_preview"),
-            "operation": operation,
-            "options": hitl.get("options") if isinstance(hitl.get("options"), list) else approval_options(),
-        }
+    if operation.get("kind") == PendingActionKind.WORKSPACE_OPERATION_REVIEW:
+        # One producer for this card, not two. This branch used to rebuild the
+        # blob field by field alongside the identical builder in
+        # hitl_requests — so the typed review payload (the part that says a
+        # hard block is being removed) reached the durable card on one path
+        # and was silently dropped on the other.
+        from packages.core.services.hitl_requests import (
+            workspace_operation_pending_action_from_data,
+        )
+
+        return workspace_operation_pending_action_from_data(payload)
 
     action = hitl.get("action") or payload.get("approval_action") or "tool.approve"
     tool = hitl.get("tool") or payload.get("tool")
@@ -340,7 +402,14 @@ def _pending_action_from_tool_payload(payload: dict[str, Any]) -> dict[str, Any]
 
 def _raise_if_agentic_loop_failed(result: Any) -> None:
     stop_reason = str(getattr(result, "stop_reason", "completed") or "completed")
-    if stop_reason == "completed":
+    if stop_reason in {"completed", "submit_result"}:
+        return
+    # A terminal-tool policy ending the loop is a deliberate SUCCESS, not an
+    # error: submit_result, skill terminals, media generation and friends all
+    # report their own stop_reason. Generalized via the shared registry so a
+    # new terminal policy never re-introduces this bug (a compliant subagent
+    # ending with stop_reason="submit_result" used to fail its step outright).
+    if is_terminal_tool_success(result):
         return
     content = str(getattr(result, "content", "") or "").strip()
     if stop_reason == "max_rounds" and content:
@@ -387,6 +456,29 @@ def _artifact_refs_from_tool_payload(payload: dict[str, Any]) -> list[dict[str, 
     for key in _ARTIFACT_LIST_KEYS:
         value = payload.get(key)
         if key in {"documents", "files"} and not _has_artifact_creation_signal(payload):
+            continue
+        if key == "jobs":
+            # Async media pipeline: the finished file's fs_path / document_id
+            # lives on each job, not at the payload root. Without this the
+            # evidence channel could not see a single generated video, so a
+            # step that produced 12 of them recorded no artifact at all.
+            # Only completed jobs — a pending one has no file yet, a failed
+            # one never will.
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                if not MediaJobStatus.is_completed(item.get("status")):
+                    continue
+                for value_key in ("fs_path", "document_id", "result_url"):
+                    if item.get(value_key):
+                        add_ref(
+                            str(item.get("kind") or "media"),
+                            item[value_key],
+                            source_key=value_key,
+                        )
+                        break
             continue
         if key == "image_urls" and isinstance(value, list):
             for url in value:
@@ -436,6 +528,39 @@ def _is_reference_only_payload(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _artifact_ref_identity(ref: Any) -> str | None:
+    """What makes two artifact refs the same file.
+
+    The location, not the whole dict: the same PNG discovered through a tool
+    payload, a step result and the evidence sweep arrives with different
+    ``type``/``source`` labels but one path. Comparing whole dicts left the
+    run output listing six images as eighteen.
+    """
+    if not isinstance(ref, dict):
+        return None
+    for key in ("fs_path", "document_id", "url"):
+        value = str(ref.get(key) or "").strip()
+        if value:
+            return f"{key}:{value}"
+    return None
+
+
+def _dedupe_artifact_refs(refs: list[Any]) -> list[Any]:
+    """Keep first occurrence of each artifact, order preserved."""
+    seen: set[str] = set()
+    out: list[Any] = []
+    for ref in refs:
+        identity = _artifact_ref_identity(ref)
+        if identity is None:
+            out.append(ref)
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        out.append(ref)
+    return out
+
+
 def _merge_artifact_refs(result: Any, refs: list[dict[str, Any]]) -> Any:
     if not refs:
         return result
@@ -443,9 +568,9 @@ def _merge_artifact_refs(result: Any, refs: list[dict[str, Any]]) -> Any:
         result = {"value": result}
     existing = result.get("files")
     if isinstance(existing, list):
-        result["files"] = existing + refs
+        result["files"] = _dedupe_artifact_refs(existing + refs)
     else:
-        result["files"] = refs
+        result["files"] = _dedupe_artifact_refs(refs)
     for ref in refs:
         ref_type = str(ref.get("type") or "")
         if ref_type.startswith("image") and ref.get("url") and not result.get("image_url"):
@@ -539,7 +664,7 @@ async def _workspace_scoped_artifact_path(s: dict, prompt: Any) -> str:
         scope_workspace_artifact_path(
             target_path,
             workspace_base_dir,
-            default_subdir="artifacts",
+            default_subdir=WorkspaceArtifactDir.ARTIFACTS.value,
         )
     )
 
@@ -584,7 +709,7 @@ async def tick_one_internal_worker(worker_id: str, *, max_n: int = 4) -> dict:
         )).scalar_one_or_none()
         if worker is None:
             return {"worker_id": worker_id, "error": "not_found"}
-        if worker.status != "active":
+        if worker.status != WorkerStatus.ACTIVE:
             return {"worker_id": worker_id, "skipped": True, "status": worker.status}
 
         dispatcher = Dispatcher()
@@ -628,7 +753,7 @@ async def tick_all_internal_workers(*, max_n: int = 4) -> int:
             worker_ids = list((await db.execute(
                 select(Worker.id).where(
                     Worker.kind == INTERNAL_WORKER_KIND,
-                    Worker.status == "active",
+                    Worker.status == WorkerStatus.ACTIVE,
                 )
             )).scalars().all())
         except Exception as exc:  # noqa: BLE001
@@ -650,52 +775,256 @@ async def tick_all_internal_workers(*, max_n: int = 4) -> int:
 
 # ── Per-lease execution ───────────────────────────────────────────────
 
-async def _heartbeat_active_lease(
-    lease_id: str,
-    *,
-    interval_seconds: float | None = None,
-    extend_seconds: float | None = None,
-) -> None:
-    """Keep a long-running in-process lease active until its handler exits."""
-    interval = (
-        LEASE_HEARTBEAT_INTERVAL_SECONDS
-        if interval_seconds is None
-        else float(interval_seconds)
-    )
-    extend_by = (
-        LEASE_HEARTBEAT_EXTEND_SECONDS
-        if extend_seconds is None
-        else float(extend_seconds)
-    )
-    if interval <= 0:
-        return
+# The heartbeat runs in its OWN OS thread, not as an asyncio task.
+#
+# It used to be ``asyncio.create_task(...)`` in the same event loop as the step
+# body. That works only while the body cooperates: any step that blocks the
+# loop — CPU-bound work, a synchronous vendor SDK, blocking IO — starves the
+# heartbeat's ``await asyncio.sleep`` for exactly as long as it blocks. The
+# lease then sails past its 300s TTL, ``cleanup_expired_leases`` reclaims it,
+# and a step that is very much alive gets retried underneath a still-running
+# worker. The longer the legitimate budget (now up to 6h), the likelier that is.
+#
+# A thread cannot be starved by the loop, so liveness no longer depends on
+# every tool author remembering ``asyncio.to_thread``.
+#
+# The thread must NOT touch ``async_session``: the async engine's asyncpg
+# connections are bound to the main loop and are not safe to use from another
+# thread. It gets its own small SYNC engine instead (same pattern as
+# ``packages/core/credentials/audit.py``), and its one statement is a single
+# conditional UPDATE — the sync twin of ``Dispatcher.extend_lease``.
 
-    dispatcher = Dispatcher()
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            async with async_session() as db:
-                await dispatcher.extend_lease(db, lease_id, extra_seconds=extend_by)
-                await db.commit()
-        except Exception as exc:  # noqa: BLE001
-            if exc.__class__.__name__ == "LeaseNotActive":
-                logger.debug("execute_lease %s heartbeat stopped: lease no longer active", lease_id)
+_LEASE_HEARTBEAT_ENGINE: Engine | None = None
+_LEASE_HEARTBEAT_ENGINE_LOCK = threading.Lock()
+
+# How often the async side refreshes its liveness marker, and how many missed
+# refreshes it takes before the heartbeat thread calls the loop blocked.
+_LOOP_MARKER_REFRESH_SECONDS = 5.0
+_LOOP_STALL_INTERVALS = 3
+
+_EXTEND_ACTIVE_LEASE_SQL = sa_text(
+    """
+    UPDATE work_leases
+       SET lease_until = :lease_until,
+           last_heartbeat_at = :now,
+           heartbeat_count = COALESCE(heartbeat_count, 0) + 1,
+           extended_count = COALESCE(extended_count, 0) + 1
+     WHERE id = :lease_id
+       AND status = 'active'
+    """
+)
+
+
+def _lease_heartbeat_database_url() -> str:
+    """Sync DSN for the heartbeat thread.
+
+    Read from the environment at call time (falling back to ``Settings``,
+    which reads the same variable) so a process that configures its database
+    after import — the test suite does exactly that — still heartbeats against
+    the database the rest of the run is using.
+    """
+    return os.getenv("DATABASE_URL_SYNC") or get_settings().DATABASE_URL_SYNC
+
+
+def _lease_heartbeat_engine() -> Engine:
+    """Lazily built, process-wide sync engine.
+
+    Small pool on purpose: every concurrent lease in this process shares it,
+    but each one borrows a connection for a single UPDATE once per interval.
+    Built lazily so importing this module never opens a connection (and so a
+    prefork Celery child builds its own rather than inheriting the parent's).
+    """
+    global _LEASE_HEARTBEAT_ENGINE
+    with _LEASE_HEARTBEAT_ENGINE_LOCK:
+        if _LEASE_HEARTBEAT_ENGINE is None:
+            _LEASE_HEARTBEAT_ENGINE = create_engine(
+                _lease_heartbeat_database_url(),
+                pool_size=4,
+                max_overflow=4,
+                pool_pre_ping=True,
+                pool_recycle=1800,
+                future=True,
+            )
+        return _LEASE_HEARTBEAT_ENGINE
+
+
+def _reset_lease_heartbeat_engine() -> None:
+    """Drop the cached engine (tests re-point the database between runs)."""
+    global _LEASE_HEARTBEAT_ENGINE
+    with _LEASE_HEARTBEAT_ENGINE_LOCK:
+        engine, _LEASE_HEARTBEAT_ENGINE = _LEASE_HEARTBEAT_ENGINE, None
+    if engine is not None:
+        with contextlib.suppress(Exception):
+            engine.dispose()
+
+
+def extend_active_lease_sync(lease_id: str, *, extra_seconds: float) -> bool:
+    """Push ``lease_until`` out by ``extra_seconds`` — only while active.
+
+    Returns False when the row is gone or no longer ``active``; that is the
+    signal to stop heartbeating (the async twin raises ``LeaseNotActive``).
+    """
+    now = datetime.now(timezone.utc)
+    with _lease_heartbeat_engine().begin() as conn:
+        result = conn.execute(
+            _EXTEND_ACTIVE_LEASE_SQL,
+            {
+                "lease_id": lease_id,
+                "now": now,
+                "lease_until": now + timedelta(seconds=float(extra_seconds)),
+            },
+        )
+    return bool(result.rowcount)
+
+
+class _EventLoopLivenessMarker:
+    """Last time the main event loop was demonstrably making progress.
+
+    The async side bumps ``touched_at`` between awaits; the heartbeat thread
+    reads it. A marker that stops moving means the loop is blocked — which is
+    precisely the condition that used to kill the heartbeat silently.
+    """
+
+    __slots__ = ("touched_at",)
+
+    def __init__(self) -> None:
+        self.touched_at = time.monotonic()
+
+    def touch(self) -> None:
+        self.touched_at = time.monotonic()
+
+    def stalled_for(self) -> float:
+        return time.monotonic() - self.touched_at
+
+
+class LeaseHeartbeat:
+    """A lease heartbeat running on a dedicated daemon thread."""
+
+    def __init__(
+        self,
+        lease_id: str,
+        *,
+        interval_seconds: float,
+        extend_seconds: float,
+        loop_marker: _EventLoopLivenessMarker | None = None,
+    ) -> None:
+        self.lease_id = lease_id
+        self.interval_seconds = float(interval_seconds)
+        self.extend_seconds = float(extend_seconds)
+        self._stop = threading.Event()
+        self._marker = loop_marker or _EventLoopLivenessMarker()
+        self._marker_task: asyncio.Task | None = None
+        self._warned_blocked = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"lease-heartbeat-{lease_id}",
+            daemon=True,
+        )
+
+    # ── lifecycle ─────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        self._thread.start()
+        # The marker refresher IS an asyncio task, on purpose: it is the probe.
+        # When the step body blocks the loop this task cannot run, the marker
+        # goes stale, and the thread reports the stall.
+        with contextlib.suppress(RuntimeError):
+            self._marker_task = asyncio.create_task(self._refresh_loop_marker())
+
+    def stop(self, *, join_timeout: float = 10.0) -> None:
+        """Signal + join. Called from ``finally`` — must never raise."""
+        self._stop.set()
+        if self._marker_task is not None:
+            self._marker_task.cancel()
+            self._marker_task = None
+        if self._thread.is_alive():
+            self._thread.join(timeout=join_timeout)
+            if self._thread.is_alive():
+                logger.warning(
+                    "execute_lease %s heartbeat thread did not stop within %.0fs",
+                    self.lease_id, join_timeout,
+                )
+
+    @property
+    def thread(self) -> threading.Thread:
+        return self._thread
+
+    @property
+    def marker_task(self) -> asyncio.Task | None:
+        return self._marker_task
+
+    # ── the two loops ─────────────────────────────────────────────────
+
+    def _marker_refresh_interval(self) -> float:
+        return min(_LOOP_MARKER_REFRESH_SECONDS, max(self.interval_seconds, 0.01))
+
+    async def _refresh_loop_marker(self) -> None:
+        interval = self._marker_refresh_interval()
+        while True:
+            self._marker.touch()
+            await asyncio.sleep(interval)
+
+    def _run(self) -> None:
+        # ``Event.wait`` returns True the moment stop() fires, so a finished
+        # step never waits out a full interval before the thread exits.
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                still_active = extend_active_lease_sync(
+                    self.lease_id, extra_seconds=self.extend_seconds,
+                )
+            except Exception:  # noqa: BLE001 — a heartbeat must never fail a step
+                logger.warning(
+                    "execute_lease %s heartbeat failed", self.lease_id, exc_info=True,
+                )
+                continue
+            if not still_active:
+                logger.debug(
+                    "execute_lease %s heartbeat stopped: lease no longer active",
+                    self.lease_id,
+                )
                 return
-            logger.warning("execute_lease %s heartbeat failed", lease_id, exc_info=True)
+            self._report_loop_stall()
+
+    def _report_loop_stall(self) -> None:
+        stalled = self._marker.stalled_for()
+        # Scales with whichever cadence is slower, so a compressed test
+        # interval still fires and a 60s production interval doesn't cry wolf
+        # over one slow await.
+        threshold = _LOOP_STALL_INTERVALS * max(
+            self.interval_seconds, self._marker_refresh_interval()
+        )
+        if stalled >= threshold:
+            self._warned_blocked = True
+            logger.warning(
+                "lease %s: event loop appears blocked for %.0fs (heartbeat still extending)",
+                self.lease_id, stalled,
+            )
+        elif self._warned_blocked:
+            self._warned_blocked = False
+            logger.info("lease %s: event loop is responsive again", self.lease_id)
 
 
-def _start_lease_heartbeat(lease_id: str) -> asyncio.Task | None:
+def _start_lease_heartbeat(lease_id: str) -> LeaseHeartbeat | None:
     if LEASE_HEARTBEAT_INTERVAL_SECONDS <= 0:
         return None
-    return asyncio.create_task(_heartbeat_active_lease(lease_id))
+    heartbeat = LeaseHeartbeat(
+        lease_id,
+        interval_seconds=LEASE_HEARTBEAT_INTERVAL_SECONDS,
+        extend_seconds=LEASE_HEARTBEAT_EXTEND_SECONDS,
+    )
+    heartbeat.start()
+    return heartbeat
 
 
-async def _stop_lease_heartbeat(task: asyncio.Task | None) -> None:
-    if task is None:
+async def _stop_lease_heartbeat(heartbeat: LeaseHeartbeat | None) -> None:
+    """Always called from ``finally`` — the thread must not outlive the step."""
+    if heartbeat is None:
         return
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    marker_task = heartbeat.marker_task
+    heartbeat.stop()
+    if marker_task is not None:
+        with contextlib.suppress(asyncio.CancelledError):
+            await marker_task
 
 
 async def execute_lease_inproc(lease_id: str) -> dict:
@@ -704,14 +1033,40 @@ async def execute_lease_inproc(lease_id: str) -> dict:
     ``execute_lease`` Celery task wraps this. Each kind routes to its
     handler; failures inside a handler bubble to ``fail_lease`` so the
     DB is always the source of truth on lease state.
+
+    Re-delivery safety lives here, not in the handlers. Celery may deliver the
+    same ``execute_lease`` message twice — the broker's visibility timeout
+    lapsing, or ``task_reject_on_worker_lost`` requeueing after a worker dies
+    mid-step. Before anything else, this takes a database-level execution claim
+    on the lease (``packages/core/workers/execution_claim.py``); of N
+    simultaneous deliveries exactly one gets it and the rest return
+    ``{"skipped": True}`` without touching the step. The claim is released on
+    every exit path so a retry can re-take it.
     """
+    claim_id = generate_ulid()
+    async with async_session() as db:
+        claim = await claim_lease_for_execution(db, lease_id, claim_id=claim_id)
+        await db.commit()
+    if not claim:
+        return {"lease_id": lease_id, "skipped": True, "reason": claim.reason}
+
+    try:
+        return await _execute_claimed_lease(lease_id)
+    finally:
+        async with async_session() as db:
+            await release_execution_claim(db, lease_id, claim_id=claim_id)
+            await db.commit()
+
+
+async def _execute_claimed_lease(lease_id: str) -> dict:
+    """The body of ``execute_lease_inproc``, run under a held execution claim."""
     dispatcher = Dispatcher()
 
     async with async_session() as db:
         lease = (await db.execute(
             select(WorkLease).where(WorkLease.id == lease_id)
         )).scalar_one_or_none()
-        if lease is None or lease.status != "active":
+        if lease is None or lease.status != WorkLeaseStatus.ACTIVE:
             logger.info("execute_lease %s: lease not active (state=%s)", lease_id,
                         lease.status if lease else "missing")
             return {"lease_id": lease_id, "skipped": True}
@@ -724,15 +1079,25 @@ async def execute_lease_inproc(lease_id: str) -> dict:
         )).scalar_one()
         conversation_id = None
         user_id = None
+        task_binding_constraints: list[str] = []
         if plan.task_id:
             try:
                 from packages.core.models.task import Task
                 task_row = (await db.execute(
-                    select(Task.conversation_id, Task.creator_id).where(Task.id == plan.task_id)
+                    select(
+                        Task.conversation_id, Task.creator_id, Task.details,
+                    ).where(Task.id == plan.task_id)
                 )).first()
                 if task_row:
                     conversation_id = task_row[0]
                     user_id = task_row[1]
+                    # The user's verbatim task constraints, carried to the
+                    # executing subagent so a prohibition like "no essay" is
+                    # not lost between planning and execution.
+                    from packages.core.plans.task_constraints import (
+                        extract_binding_constraints,
+                    )
+                    task_binding_constraints = extract_binding_constraints(task_row[2])
             except Exception:
                 conversation_id = None
                 user_id = None
@@ -761,15 +1126,62 @@ async def execute_lease_inproc(lease_id: str) -> dict:
             "user_id": user_id,
             "task_id": plan.task_id,
             "conversation_id": conversation_id,
+            "task_binding_constraints": task_binding_constraints,
             "expected_output_schema": step.expected_output_schema,
+            "attempt_count": step.attempt_count,
+            "prior_error": step.error if isinstance(step.error, dict) else None,
         }
 
-    # Execute outside the session. A background heartbeat keeps long-running
-    # subagent/tool leases from expiring while the handler is awaiting models
-    # or artifact generation.
-    heartbeat_task = _start_lease_heartbeat(lease_id)
+        # Explicit runtime budget for THIS attempt, resolved from the same
+        # step/plan/workspace layering the retry policy uses. Carried on the
+        # work item so the worker enforces the configured policy, not a
+        # process-level timeout.
+        deadline = await resolve_step_deadline(db, step, plan=plan)
+        snapshot["max_runtime_seconds"] = deadline.max_runtime_seconds
+        snapshot["max_runtime_source"] = deadline.source
+
+    # Execute outside the session. A background heartbeat THREAD keeps
+    # long-running subagent/tool leases from expiring while the handler is
+    # awaiting models or artifact generation — liveness is proven by the
+    # heartbeat, and the only thing that ends a live step is its explicit
+    # deadline below. It is a thread, not a task, so a step body that blocks
+    # this event loop cannot starve it (see LeaseHeartbeat).
+    heartbeat = _start_lease_heartbeat(lease_id)
+    max_runtime_seconds = float(snapshot.get("max_runtime_seconds") or DEFAULT_MAX_RUNTIME_SECONDS)
+    started_at = time.monotonic()
     try:
-        result = await _execute_by_kind(snapshot)
+        try:
+            # asyncio.wait_for cancels the body cleanly on expiry (the handler
+            # sees CancelledError and unwinds); the heartbeat thread keeps the
+            # lease alive until the body settles, and is stopped in `finally`.
+            result = await asyncio.wait_for(
+                _execute_by_kind(snapshot),
+                timeout=max_runtime_seconds,
+            )
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            elapsed = time.monotonic() - started_at
+            if elapsed + _DEADLINE_TOLERANCE_SECONDS < max_runtime_seconds:
+                # A timeout raised INSIDE the step body (socket / client
+                # timeout) — an ordinary failure, not our deadline.
+                raise
+            raise _StepDeadlineExceeded(elapsed_seconds=elapsed) from exc
+    except _StepDeadlineExceeded as deadline_exc:
+        elapsed = deadline_exc.elapsed_seconds
+        error = step_deadline_error(
+            max_runtime_seconds=max_runtime_seconds,
+            elapsed_seconds=elapsed,
+            source=str(snapshot.get("max_runtime_source") or "default"),
+        )
+        logger.warning(
+            "execute_lease %s exceeded its %ss runtime budget (elapsed %.1fs)",
+            lease_id, max_runtime_seconds, elapsed,
+        )
+        async with async_session() as db:
+            # A normal step failure — flows through the retry policy exactly
+            # like any other error, instead of a SIGKILL'd process.
+            await dispatcher.fail_lease(db, lease_id, error=error)
+            await db.commit()
+        return {"lease_id": lease_id, "outcome": "failed", "error": error}
     except _NeedsHumanInput as exc:
         async with async_session() as db:
             await dispatcher.lease_needs_human(
@@ -789,7 +1201,7 @@ async def execute_lease_inproc(lease_id: str) -> dict:
             await db.commit()
         return {"lease_id": lease_id, "outcome": "failed"}
     finally:
-        await _stop_lease_heartbeat(heartbeat_task)
+        await _stop_lease_heartbeat(heartbeat)
 
     # Success path.
     async with async_session() as db:
@@ -805,6 +1217,17 @@ async def execute_lease_inproc(lease_id: str) -> dict:
 
 
 # ── Kind dispatch ─────────────────────────────────────────────────────
+
+class EmptyModelOutput(Exception):
+    """The model finished normally but produced nothing to record.
+
+    Raised instead of returning an empty result: an empty completion is a step
+    FAILURE, not a success holding ``{"text": ""}``. Empty completions are
+    frequently transient, so this deliberately bubbles to ``fail_lease`` and
+    lets the dispatcher's retry policy own the retry — the worker never retries
+    silently on its own.
+    """
+
 
 class _NeedsHumanInput(Exception):
     """Worker signals that the step needs the user before it can finish.
@@ -837,18 +1260,30 @@ async def _execute_by_kind(s: dict) -> dict:
     """Route a snapshot to the right handler. Returns
     ``{result, cost, evidence_refs}`` envelope."""
     kind = s["kind"]
-    if kind == "human":
-        return await _exec_human(s)
-    if kind == "action":
-        return await _exec_action(s)
-    if kind == "llm":
-        return await _exec_llm(s)
-    if kind == "subagent":
-        return await _exec_subagent(s)
+    handler = _KIND_HANDLERS.get(kind)
+    if handler is not None:
+        return await handler(s)
     if kind == "code":
-        # M5+ — not in scope yet.
+        # M5+ — not implemented, and deliberately not advertised to the
+        # dispatcher, so a lease for it should never reach this worker.
         raise NotImplementedError("kind=code not yet supported")
     raise NotImplementedError(f"InternalWorker doesn't handle kind={kind!r}")
+
+
+async def _exec_sleep(s: dict) -> dict:
+    """Complete a timer step.
+
+    ``PlanExecutor`` normally resolves sleep inline, but the kind is
+    advertised to the dispatcher, so the worker must be able to honour a
+    lease it is legally handed.
+    """
+    params = s.get("params") if isinstance(s.get("params"), dict) else {}
+    seconds = params.get("seconds") or params.get("duration_seconds") or 0
+    try:
+        seconds = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        seconds = 0
+    return {"result": {"slept": seconds}, "cost": {"usd": 0}}
 
 
 async def _exec_human(s: dict) -> dict:
@@ -949,6 +1384,49 @@ async def _exec_action(s: dict) -> dict:
     }
 
 
+def _prior_attempt_feedback(prior_error: Any) -> str | None:
+    """Turn the previous attempt's stored error into a prompt note.
+
+    Dispatcher retries re-lease the step with identical params, so without
+    this the model re-runs the exact prompt that just failed — attempts 2
+    and 3 are indistinguishable from attempt 1. Surfacing the validation
+    errors is the only signal that lets a retry do better."""
+    if not isinstance(prior_error, dict) or not prior_error:
+        return None
+    err_type = str(prior_error.get("type") or "").strip()
+    message = str(prior_error.get("message") or "").strip()[:300]
+    headline = ": ".join(part for part in (err_type, message) if part) or "unknown error"
+    lines = [f"[Retry context] The previous attempt of this step failed — {headline}"]
+    errors = prior_error.get("errors")
+    if isinstance(errors, list) and errors:
+        lines.append("Validation errors:")
+        for item in errors[:6]:
+            if isinstance(item, dict):
+                path = str(item.get("path") or "$")
+                msg = str(item.get("message") or "")[:160]
+                lines.append(f"- {path}: {msg}")
+            else:
+                lines.append(f"- {str(item)[:160]}")
+    lines.append(
+        "Fix this in your output now: satisfy the required output contract "
+        "exactly, and do not repeat the same mistake."
+    )
+    return "\n".join(lines)
+
+
+def _with_binding_constraints(prompt: str, s: dict) -> str:
+    """Prepend the user's verbatim task constraints so the executing model
+    obeys them directly — the transmission the planner paraphrase used to drop.
+    Bounded (a short list, not chat history), so it can't blow the context."""
+    constraints = s.get("task_binding_constraints") or []
+    if not constraints:
+        return prompt
+    from packages.core.plans.task_constraints import render_constraints_block
+
+    block = render_constraints_block(constraints)
+    return f"{block}\n\n{prompt}" if block else prompt
+
+
 async def _exec_llm(s: dict) -> dict:
     """Single LLM call — uses shared context builder for model resolution."""
     from packages.core.ai.context import build_agent_context
@@ -957,6 +1435,10 @@ async def _exec_llm(s: dict) -> dict:
     prompt = _step_prompt(s["params"])
     if not prompt:
         raise ValueError("llm step requires params.prompt (or instructions/instruction/user_prompt/message/task)")
+    prompt = _with_binding_constraints(prompt, s)
+    feedback = _prior_attempt_feedback(s.get("prior_error"))
+    if feedback:
+        prompt = f"{feedback}\n\n{prompt}"
 
     entity_id = s.get("entity_id")
     agent_id = s.get("resolved_agent_id")
@@ -972,39 +1454,101 @@ async def _exec_llm(s: dict) -> dict:
                     agent_id=agent_id,
                     workspace_id=s.get("workspace_id"),
                     conversation_id=s.get("conversation_id"),
+                    # Without these the step's RuntimeEventLog rows land with
+                    # task_id/conversation_id NULL and can only be matched
+                    # back to the step by timestamp proximity.
+                    task_id=s.get("task_id"),
                     model_role="worker",
                 )
                 model = ctx.model
         except Exception:
             pass
 
-    completion = await runtime_execute_internal_worker_llm_step(
-        prompt=prompt,
-        expected_output_schema=s.get("expected_output_schema"),
-        system_prompt=s["params"].get("system_prompt") or getattr(ctx, "system_prompt", None),
-        entity_id=entity_id,
-        user_id=s.get("user_id"),
-        agent_id=agent_id,
-        workspace_id=s.get("workspace_id"),
-        model=model,
-        byok=bool(getattr(ctx, "byok", False)),
-        metadata=getattr(ctx, "llm_metadata", None),
-    )
+    # Evidence is written in `finally` so it survives every exit path —
+    # including the provider raising and the lease deadline cancelling us.
+    # See docs/EXECUTION_OBSERVABILITY_DESIGN_ZH.md §3 principle 3.
+    try:
+        completion = await runtime_execute_internal_worker_llm_step(
+            prompt=prompt,
+            expected_output_schema=s.get("expected_output_schema"),
+            system_prompt=s["params"].get("system_prompt") or getattr(ctx, "system_prompt", None),
+            entity_id=entity_id,
+            user_id=s.get("user_id"),
+            agent_id=agent_id,
+            workspace_id=s.get("workspace_id"),
+            model=model,
+            byok=bool(getattr(ctx, "byok", False)),
+            metadata=getattr(ctx, "llm_metadata", None),
+        )
 
-    usage = completion.usage or {}
-    if ctx is not None:
+        usage = completion.usage or {}
+        # An empty completion produced nothing — never coerce it into a
+        # `{"text": ""}` "success". Fail so the retry policy gets a turn.
+        if not str(completion.content or "").strip():
+            raise EmptyModelOutput("model returned no content")
+        return {
+            "result": _coerce_llm_text_result(completion.content, s.get("expected_output_schema")),
+            "cost": {
+                "llm_tokens_input": usage.get("prompt_tokens"),
+                "llm_tokens_output": usage.get("completion_tokens"),
+                "usd": 0,
+            },
+            "metadata": runtime_metadata_from_context(ctx),
+        }
+    finally:
         await runtime_persist_internal_worker_runtime_events(
             getattr(ctx, "runtime_envelope", None),
         )
-    return {
-        "result": _coerce_llm_text_result(completion.content, s.get("expected_output_schema")),
-        "cost": {
-            "llm_tokens_input": usage.get("prompt_tokens"),
-            "llm_tokens_output": usage.get("completion_tokens"),
-            "usd": 0,
-        },
-        "metadata": runtime_metadata_from_context(ctx),
-    }
+
+
+WORKER_SUBAGENT_TOOL_CALL_SOURCE = "worker_subagent"
+"""``tool_call_logs.source`` for rows written from a plan step's subagent."""
+
+
+def _worker_tool_call_log_callbacks(s: dict) -> tuple[Any, Any]:
+    """Return ``(on_tool_start, on_tool_end)`` that log a step's tool calls.
+
+    The chat path has always written ``tool_call_logs`` rows; the worker
+    path passed no ``on_tool_end`` at all, so a plan step's tool calls left
+    zero rows — precisely the rows an operator needs when the step fails
+    (design doc §2.2 defect B). Same writer, same fire-and-forget
+    discipline: a logging failure must never fail the step.
+    """
+    round_counter = [0]
+
+    def on_tool_start(name: str, args: dict[str, Any]) -> None:
+        round_counter[0] += 1
+
+    def on_tool_end(
+        name: str,
+        result: str,
+        duration_ms: float = 0,
+        args: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            from packages.core.ai import chat_logger
+
+            text = result if isinstance(result, str) else str(result)
+            error = runtime_tool_call_error(text)
+            chat_logger.schedule_tool_call_log(
+                entity_id=s.get("entity_id") or "",
+                workspace_id=s.get("workspace_id"),
+                agent_id=s.get("resolved_agent_id"),
+                user_id=s.get("user_id"),
+                conversation_id=s.get("conversation_id"),
+                tool_name=name,
+                round_num=round_counter[0],
+                duration_ms=int(duration_ms or 0),
+                result_chars=len(text),
+                success=error is None,
+                error=error,
+                tool_args=chat_logger.safe_tool_args(args),
+                source=WORKER_SUBAGENT_TOOL_CALL_SOURCE,
+            )
+        except Exception:
+            logger.debug("worker tool-call log failed (best-effort)", exc_info=True)
+
+    return on_tool_start, on_tool_end
 
 
 async def _exec_subagent(s: dict) -> dict:
@@ -1015,7 +1559,12 @@ async def _exec_subagent(s: dict) -> dict:
     original_prompt = _step_prompt(s["params"])
     if not original_prompt:
         raise ValueError("subagent step requires params.prompt (or instructions/instruction/user_prompt/message/task)")
+    original_prompt = _with_binding_constraints(original_prompt, s)
+    feedback = _prior_attempt_feedback(s.get("prior_error"))
+    if feedback:
+        original_prompt = f"{feedback}\n\n{original_prompt}"
     prompt = runtime_prompt_with_output_schema(original_prompt, s.get("expected_output_schema"))
+    prompt = f"{prompt}{SUBMIT_RESULT_PROMPT_SUFFIX}"
 
     entity_id = s.get("entity_id")
     agent_id = s.get("resolved_agent_id")
@@ -1025,6 +1574,11 @@ async def _exec_subagent(s: dict) -> dict:
             db, entity_id=entity_id or "", agent_id=agent_id,
             user_id=s.get("user_id"),
             workspace_id=s.get("workspace_id"),
+            # Without these the step's RuntimeEventLog rows land with
+            # task_id/conversation_id NULL and can only be matched back to
+            # the step by timestamp proximity (design doc §2.2 defect D).
+            conversation_id=s.get("conversation_id"),
+            task_id=s.get("task_id"),
             active_user_message=prompt,
             model_role="primary",
         )
@@ -1032,75 +1586,206 @@ async def _exec_subagent(s: dict) -> dict:
     system_prompt = s["params"].get("system_prompt") or ctx.system_prompt
     params = s.get("params") if isinstance(s.get("params"), dict) else {}
 
-    loop_result = await runtime_execute_worker_subagent_loop(
-        runtime_envelope=ctx.runtime_envelope,
-        system_prompt=system_prompt,
-        user_message=prompt,
-        tools=ctx.tools,
-        entity_id=entity_id or "",
-        agent_id=agent_id,
-        workspace_id=s.get("workspace_id"),
-        conversation_id=s.get("conversation_id"),
-        task_id=s.get("task_id"),
-        active_user_message=prompt,
-        legacy_tool_profile=ctx.legacy_runtime_profile,
-        allowed_tool_names=ctx.allowed_tool_names,
-        model=ctx.model,
-        metadata=getattr(ctx, "llm_metadata", None),
-        requested_name=params.get("subagent") or params.get("subagent_name"),
-        requested_max_rounds=params.get("max_rounds"),
-    )
-    result = loop_result.result
+    # ── forced submit_result finalization (StepResult envelope part ②) ──
+    # The loop carries a submit_result tool and terminates on its call; the
+    # captured payload IS the step result. Text-coercion heuristics below
+    # remain as fallback only.
+    submit_tool = build_submit_result_tool(s.get("expected_output_schema"))
+    submit_handler, get_submit_payload = submit_result_capture()
+    allowed_tool_names = ctx.allowed_tool_names
+    if allowed_tool_names is not None:
+        allowed_tool_names = [*allowed_tool_names, SUBMIT_RESULT_TOOL_NAME]
+    on_tool_start, on_tool_end = _worker_tool_call_log_callbacks(s)
 
-    usage = result.usage or {}
-    _raise_if_agentic_loop_failed(result)
-    pending_action = _pending_action_from_agent_messages(result.messages or [])
-    if pending_action:
-        raise _NeedsHumanInput(
-            prompt=str(pending_action.get("prompt") or pending_action.get("title") or ""),
-            pending_action=pending_action,
+    # Evidence is written in `finally` so it survives every exit path —
+    # a failed subagent step used to discard its whole runtime event list
+    # with the process, because the persist call sat after every raise
+    # (design doc §2.2 defect A, §3 principle 3). The persist itself is
+    # idempotent per event, so this cannot double-write a run.
+    try:
+        loop_result = await runtime_execute_worker_subagent_loop(
+            runtime_envelope=ctx.runtime_envelope,
+            system_prompt=system_prompt,
+            user_message=prompt,
+            tools=[*ctx.tools, submit_tool],
+            entity_id=entity_id or "",
+            agent_id=agent_id,
+            workspace_id=s.get("workspace_id"),
+            conversation_id=s.get("conversation_id"),
+            task_id=s.get("task_id"),
+            active_user_message=prompt,
+            tool_profile=ctx.tool_profile,
+            allowed_tool_names=allowed_tool_names,
+            model=ctx.model,
+            metadata=getattr(ctx, "llm_metadata", None),
+            requested_name=params.get("subagent") or params.get("subagent_name"),
+            requested_max_rounds=params.get("max_rounds"),
+            dynamic_tool_handlers={SUBMIT_RESULT_TOOL_NAME: submit_handler},
+            terminal_tool_result_policy=SUBMIT_RESULT_TERMINAL_POLICY,
+            on_tool_start=on_tool_start,
+            on_tool_end=on_tool_end,
         )
+        result = loop_result.result
 
-    step_result = _coerce_llm_text_result(result.content, s.get("expected_output_schema"))
-    step_result = _merge_artifact_refs(
-        step_result,
-        _collect_artifact_refs_from_agent_messages(result.messages or []),
-    )
-    step_result = _infer_prompt_backed_fields(
-        step_result,
-        prompt=original_prompt,
-        schema=s.get("expected_output_schema"),
-    )
-    step_result = _merge_tool_backed_fields_for_schema(
-        step_result,
-        result.messages or [],
-        schema=s.get("expected_output_schema"),
-    )
-    if (
-        _schema_requires_materialized_artifact(s.get("expected_output_schema"))
-        and isinstance(step_result, dict)
-        and not any(step_result.get(field) for field in _MATERIALIZED_ARTIFACT_SCHEMA_FIELDS)
-    ):
-        step_result = await _persist_subagent_text_artifact(
-            s,
+        usage = result.usage or {}
+        # Capture the submitted deliverable BEFORE judging the loop's stop reason.
+        # The deliverable is the contract; a stop reason is bookkeeping. Raising
+        # first threw away a result the model had already handed over — a captured
+        # payload must never be lost to an exception about how the loop ended.
+        submit_payload = get_submit_payload()
+        if submit_payload is None:
+            _raise_if_agentic_loop_failed(result)
+        pending_action = _pending_action_from_agent_messages(result.messages or [])
+        if pending_action:
+            raise _NeedsHumanInput(
+                prompt=str(pending_action.get("prompt") or pending_action.get("title") or ""),
+                pending_action=pending_action,
+            )
+
+        fallback_usage: dict[str, Any] = {}
+        if submit_payload is None:
+            # The model finished without submitting. One cheap follow-up round —
+            # transcript continued, submit_result the ONLY tool — turns the
+            # trailing prose into a deliberate submission.
+            submit_payload, fallback_usage = await _force_submit_result_round(
+                s, ctx=ctx, prompt=prompt, system_prompt=system_prompt,
+                prior_messages=result.messages or [],
+                submit_tool=submit_tool, submit_handler=submit_handler,
+                get_submit_payload=get_submit_payload,
+            )
+
+        artifact_refs = _collect_artifact_refs_from_agent_messages(result.messages or [])
+        evidence_refs = _collect_step_evidence(result.messages or [])
+        if (
+            submit_payload is None
+            and not str(result.content or "").strip()
+            and not artifact_refs
+            and not evidence_refs
+        ):
+            # No submitted payload, no prose, no artifact, no tool effect — the
+            # loop produced nothing. Same rule as _exec_llm: fail, don't dress an
+            # empty string up as a result.
+            raise EmptyModelOutput("model returned no content")
+
+        if submit_payload is not None:
+            step_result = step_result_from_submit(submit_payload)
+        else:
+            step_result = _coerce_llm_text_result(result.content, s.get("expected_output_schema"))
+        step_result = _merge_artifact_refs(step_result, artifact_refs)
+        step_result = _infer_prompt_backed_fields(
+            step_result,
             prompt=original_prompt,
-            content=result.content,
-            result=step_result,
+            schema=s.get("expected_output_schema"),
         )
-    await runtime_persist_internal_worker_runtime_events(
-        getattr(ctx, "runtime_envelope", None),
-    )
-    return {
-        "result": step_result,
-        "cost": {
-            "llm_tokens_input": usage.get("prompt_tokens"),
-            "llm_tokens_output": usage.get("completion_tokens"),
-            "llm_rounds": result.rounds,
-            "tool_call_count": len(result.tool_calls_made or []),
-            "usd": 0,
-        },
-        "metadata": runtime_metadata_from_context(ctx),
-    }
+        step_result = _merge_tool_backed_fields_for_schema(
+            step_result,
+            result.messages or [],
+            schema=s.get("expected_output_schema"),
+        )
+        if (
+            _schema_requires_materialized_artifact(s.get("expected_output_schema"))
+            and isinstance(step_result, dict)
+            and not any(step_result.get(field) for field in _MATERIALIZED_ARTIFACT_SCHEMA_FIELDS)
+        ):
+            step_result = await _persist_subagent_text_artifact(
+                s,
+                prompt=original_prompt,
+                content=result.content,
+                result=step_result,
+            )
+        return {
+            "result": step_result,
+            "evidence_refs": evidence_refs,
+            "cost": {
+                "llm_tokens_input": (usage.get("prompt_tokens") or 0)
+                + (fallback_usage.get("prompt_tokens") or 0),
+                "llm_tokens_output": (usage.get("completion_tokens") or 0)
+                + (fallback_usage.get("completion_tokens") or 0),
+                "llm_rounds": (result.rounds or 0) + (1 if fallback_usage else 0),
+                "tool_call_count": len(result.tool_calls_made or []),
+                "usd": 0,
+            },
+            "metadata": runtime_metadata_from_context(ctx),
+        }
+    finally:
+        await runtime_persist_internal_worker_runtime_events(
+            getattr(ctx, "runtime_envelope", None),
+        )
+
+
+_KIND_HANDLERS: dict[str, Any] = {
+    "human": _exec_human,
+    "action": _exec_action,
+    "llm": _exec_llm,
+    "subagent": _exec_subagent,
+    "sleep": _exec_sleep,
+}
+"""Single source of truth for what this worker can actually run.
+
+``registry.DEFAULT_INTERNAL_CAPABILITIES['supported_kinds']`` derives from
+this map, because the dispatcher leases a step to any worker advertising
+its kind. Advertising a kind with no handler is what produced the
+``InternalWorker doesn't handle kind='human'`` failures: the registry
+listed ``human`` from 2026-04-26 but the handler only landed 2026-06-11,
+so every human step leased in between burned all 3 attempts and skipped
+its dependents. Add the handler and the advertisement in the same change.
+"""
+
+INTERNAL_WORKER_SUPPORTED_KINDS: tuple[str, ...] = tuple(_KIND_HANDLERS)
+
+
+async def _force_submit_result_round(
+    s: dict,
+    *,
+    ctx: Any,
+    prompt: str,
+    system_prompt: str,
+    prior_messages: list[dict[str, Any]],
+    submit_tool: dict[str, Any],
+    submit_handler: Any,
+    get_submit_payload: Any,
+) -> tuple[Optional[dict], dict[str, Any]]:
+    """One follow-up round whose ONLY tool is submit_result.
+
+    Runs when the main loop ended without a submission: the transcript is
+    continued with a direct instruction to submit. Best-effort — any failure
+    returns (None, usage) and the caller falls back to text coercion, so this
+    can only improve on the legacy behavior, never regress it.
+    """
+    from packages.core.ai.runtime import runtime_execute_worker_subagent_followup
+
+    try:
+        followup = await runtime_execute_worker_subagent_followup(
+            runtime_envelope=getattr(ctx, "runtime_envelope", None),
+            system_prompt=system_prompt,
+            user_message=prompt,
+            initial_messages=[
+                *prior_messages,
+                {
+                    "role": "user",
+                    "content": submit_result_followup_message(
+                        s.get("expected_output_schema")
+                    ),
+                },
+            ],
+            tools=[submit_tool],
+            entity_id=s.get("entity_id") or "",
+            agent_id=s.get("resolved_agent_id"),
+            workspace_id=s.get("workspace_id"),
+            conversation_id=s.get("conversation_id"),
+            task_id=s.get("task_id"),
+            active_user_message=prompt,
+            allowed_tool_names=[SUBMIT_RESULT_TOOL_NAME],
+            model=ctx.model,
+            metadata=getattr(ctx, "llm_metadata", None),
+            max_rounds=1,
+            dynamic_tool_handlers={SUBMIT_RESULT_TOOL_NAME: submit_handler},
+            terminal_tool_result_policy=SUBMIT_RESULT_TERMINAL_POLICY,
+        )
+        return get_submit_payload(), dict(getattr(followup, "usage", None) or {})
+    except Exception:
+        logger.warning("forced submit_result round failed", exc_info=True)
+        return None, {}
 
 
 def _infer_prompt_backed_fields(result: Any, *, prompt: Any, schema: Optional[dict]) -> Any:
@@ -1150,6 +1835,7 @@ def _merge_tool_backed_fields_for_schema(
         "tweet_url",
         "post_text",
         "tweet_text",
+        "platform",
     }
     if not any(name in props or name in required for name in wanted):
         return result
@@ -1198,7 +1884,14 @@ def _looks_like_publish_tool_payload(tool_name: str, payload: dict[str, Any]) ->
     name = tool_name.lower()
     if "twitter_x" in name and ("create_tweet" in name or "post_tweet" in name):
         return True
+    if "linkedin" in name and any(verb in name for verb in ("create_post", "create_share", "publish", "share_post")):
+        return True
     if payload.get("tweet_id") or payload.get("tweet_url"):
+        return True
+    if payload.get("post_url") or payload.get("share_url"):
+        return True
+    urn = payload.get("urn") or payload.get("post_urn") or payload.get("id")
+    if isinstance(urn, str) and urn.startswith("urn:li:"):
         return True
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     return bool(data.get("edit_history_tweet_ids"))

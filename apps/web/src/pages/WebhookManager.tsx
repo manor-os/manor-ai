@@ -9,10 +9,10 @@ import SmartToolbar from "../components/ui/SmartToolbar";
 import StatusBadge from "../components/ui/StatusBadge";
 import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
-import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
+import { TableRowsSkeleton } from "../components/ui/Skeleton";
 import { IconChevronRight, IconEdit, IconPlay, IconTrash, IconFlow } from "../components/icons";
 import { t } from "../lib/i18n";
 
@@ -52,7 +52,7 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
     queryFn: () => api.webhooks.list(),
   });
 
-  const { data: deliveries = [] } = useQuery({
+  const { data: deliveries = [], isLoading: deliveriesLoading } = useQuery({
     queryKey: ["webhook-deliveries", expandedId],
     queryFn: () => (expandedId ? api.webhooks.deliveries(expandedId) : Promise.resolve([])),
     enabled: !!expandedId,
@@ -148,7 +148,7 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
   };
 
   return (
-    <div style={embedded ? undefined : { maxWidth: 1060, margin: "0 auto" }}>
+    <div style={embedded ? undefined : { maxWidth: 1060 }}>
       {!embedded && (
       <PageHeader
         title={t("page.webhooks.title")}
@@ -178,8 +178,8 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
 
       {/* Loading */}
       {isLoading && (
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "64px 0" }}>
-          <LoadingSpinner size={28} />
+        <div className="glass-card" style={{ overflow: "hidden", padding: 0 }}>
+          <TableRowsSkeleton rows={5} cols={5} />
         </div>
       )}
 
@@ -270,7 +270,9 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
                         <td colSpan={5} style={{ padding: "12px 16px", background: "rgba(250,250,249,0.5)" }}>
                           <div style={{ paddingLeft: 24 }}>
                             <h4 style={{ fontSize: 11, fontWeight: 700, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>{t("page.webhooks.recent_deliveries")}</h4>
-                            {(deliveries as WebhookDelivery[]).length === 0 ? (
+                            {deliveriesLoading ? (
+                              <TableRowsSkeleton rows={3} cols={4} showHeader={false} />
+                            ) : (deliveries as WebhookDelivery[]).length === 0 ? (
                               <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.webhooks.no_deliveries_yet")}</p>
                             ) : (
                               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -318,9 +320,10 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
             <Button
               variant="primary"
               onClick={handleSubmit}
-              disabled={!formUrl.trim() || formEvents.length === 0 || createMutation.isPending || updateMutation.isPending}
+              disabled={!formUrl.trim() || formEvents.length === 0}
+              loading={createMutation.isPending || updateMutation.isPending}
             >
-              {createMutation.isPending || updateMutation.isPending ? t("page.webhooks.saving") : editHook ? t("action.update") : t("page.webhooks.add_webhook")}
+              {editHook ? t("action.update") : t("page.webhooks.add_webhook")}
             </Button>
           </>
         }

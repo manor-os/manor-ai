@@ -1,4 +1,4 @@
-import type { ReactNode, KeyboardEvent } from "react";
+import type { ReactNode, KeyboardEvent, MouseEvent } from "react";
 
 /**
  * CompactCard — a small, dense, clickable card (Manus / Codex style).
@@ -28,6 +28,8 @@ interface CompactCardProps {
   selected?: boolean;
   /** Opens the detail pop-up (clicking the card body). */
   onClick?: () => void;
+  /** Opens contextual card actions without triggering the primary click. */
+  onContextMenu?: (event: MouseEvent<HTMLDivElement>) => void;
   className?: string;
 }
 
@@ -40,10 +42,13 @@ export default function CompactCard({
   action,
   selected = false,
   onClick,
+  onContextMenu,
   className = "",
 }: CompactCardProps) {
   const handleKey = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (!onClick) return;
+    // Nested action buttons own their keyboard events. Without this guard,
+    // pressing Enter on Run/Delete also opens the parent card.
+    if (!onClick || e.target !== e.currentTarget) return;
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       onClick();
@@ -55,6 +60,7 @@ export default function CompactCard({
       role={onClick ? "button" : undefined}
       tabIndex={onClick ? 0 : undefined}
       onClick={onClick}
+      onContextMenu={onContextMenu}
       onKeyDown={handleKey}
       className={`compact-card ${selected ? "is-selected" : ""} ${className}`}
     >

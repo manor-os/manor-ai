@@ -59,15 +59,24 @@ async def install_strategist_schedule(
     )).scalar_one_or_none()
 
     if existing:
+        updates = {
+            "schedule_kind": schedule_kind,
+            "cron_expr": fields.get("cron_expr"),
+            "every_seconds": fields.get("every_seconds"),
+            "execution_type": "strategist_review",
+            "execution_target": {"workspace_id": workspace.id},
+            "enabled": True,
+        }
+        changed = {k: v for k, v in updates.items() if getattr(existing, k) != v}
         existing.entity_id = workspace.entity_id
         existing.workspace_id = workspace.id
-        existing.schedule_kind = schedule_kind
-        existing.cron_expr = fields.get("cron_expr")
-        existing.every_seconds = fields.get("every_seconds")
-        existing.execution_type = "strategist_review"
-        existing.execution_target = {"workspace_id": workspace.id}
-        existing.enabled = True
         existing.consecutive_errors = 0
+        for key, value in changed.items():
+            setattr(existing, key, value)
+        if changed:
+            # M11: config actually changed — bump the revision + audit.
+            from packages.core.revisions import bump_revision
+            await bump_revision(db, existing, patch=changed)
         await db.flush()
         return existing
 

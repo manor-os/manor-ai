@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
@@ -44,6 +44,7 @@ from packages.core.services.conversation_records import (
     is_channel_history_conversation,
     list_conversations,
     list_messages,
+    list_messages_before,
 )
 from packages.core.services.conversation_export import (
     export_as_markdown, export_as_json, export_as_text,
@@ -91,6 +92,45 @@ class ChatMessageFeedbackResponse(BaseModel):
     message_id: str
     rating: str
     updated_at: str | None = None
+
+
+class MessagesPageResponse(BaseModel):
+    items: list[MessageResponse]
+    has_more: bool
+    next_cursor: str | None = None
+
+
+def _encode_message_cursor(message: Message | None) -> str | None:
+    if not message or not message.created_at or not message.id:
+        return None
+    return f"{message.created_at.isoformat()}|{message.id}"
+
+
+def _decode_message_cursor(value: str | None) -> tuple[datetime | None, str | None]:
+    if not value:
+        return None, None
+    timestamp, separator, message_id = value.partition("|")
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid message cursor") from exc
+    return parsed, message_id if separator and message_id else None
+
+
+def _to_chat_message_response(message: Message) -> MessageResponse:
+    return MessageResponse(
+        id=message.id,
+        conversation_id=message.conversation_id,
+        role=message.role,
+        content=message.content,
+        tool_calls=message.tool_calls,
+        assistant_blocks=_message_assistant_blocks(message),
+        token_usage=message.token_usage,
+        attachments=message.attachments,
+        hitl_requests=_message_hitl_requests(message),
+        **_message_limit_meta(message),
+        created_at=message.created_at.isoformat() if message.created_at else None,
+    )
 
 
 def _reference_url_variants(ref_url: str | None) -> set[str]:
@@ -877,12 +917,15 @@ def _runtime_metadata_for_chat_mode(
     *,
     chat_mode_prompt: str | None,
     direct_tool_calls: list[dict] | None,
+    approval_runtime_metadata: dict | None = None,
 ) -> dict:
     metadata = dict(file_context_turn.runtime_metadata or {})
     if chat_mode_prompt:
         metadata["chat_mode_prompt"] = chat_mode_prompt
     if direct_tool_calls:
         metadata["forced_tool_calls"] = direct_tool_calls
+    if approval_runtime_metadata:
+        metadata.update(approval_runtime_metadata)
     return metadata
 
 
@@ -931,6 +974,83 @@ async def chat_stream(
     )
     message = file_context_turn.cleaned_message
     attachments = file_context_turn.attachments
+
+    # Workspace-configured Workflow Starters may claim an ordinary Chat turn
+    # before Manor AI runs. Explicit Chat controls always win, and any uncertain
+    # or failed classification falls through to the existing path below.
+    from packages.core.services.workspace_workflow_router import (
+        auto_routing_allowed,
+        classify_workspace_intent,
+        conversation_message_is_pending_action_reply,
+        get_workspace_chat_entrypoint,
+        list_workspace_chat_entrypoints,
+        start_workspace_chat_entrypoint,
+        workflow_intent_attachment_descriptors,
+    )
+
+    if auto_routing_allowed(
+        workspace_id=workspace_id,
+        message=message,
+        agent_id=agent_id,
+        manual_skill_ids=manual_skill_ids,
+        chat_mode=chat_mode,
+        ephemeral=ephemeral,
+        editor_context=editor_context,
+        thread_ref_kind=thread_ref_kind,
+        thread_ref_id=thread_ref_id,
+        disable_tools=disable_tools,
+        blocked_tools=blocked_tools,
+    ) and not await conversation_message_is_pending_action_reply(
+        db,
+        conversation_id,
+        message,
+    ):
+        entrypoints = await list_workspace_chat_entrypoints(
+            db,
+            entity_id=user.entity_id,
+            workspace_id=workspace_id or "",
+            intent_only=True,
+        )
+        decision = await classify_workspace_intent(
+            entrypoints=entrypoints,
+            message=message,
+            attachment_refs=workflow_intent_attachment_descriptors(attachments),
+            entity_id=user.entity_id,
+            user_id=user.id,
+            workspace_id=workspace_id or "",
+        )
+        if decision is not None:
+            resolved = await get_workspace_chat_entrypoint(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=workspace_id or "",
+                binding_id=decision.entrypoint.binding_id,
+            )
+            if resolved is not None:
+                entrypoint, binding, _workflow = resolved
+                started = await start_workspace_chat_entrypoint(
+                    db,
+                    entrypoint=entrypoint,
+                    binding=binding,
+                    entity_id=user.entity_id,
+                    user_id=user.id,
+                    workspace_id=workspace_id or "",
+                    message=message,
+                    attachments=attachments,
+                    conversation_id=conversation_id,
+                    route_source="intent",
+                    confidence=decision.confidence,
+                    reason=decision.reason,
+                )
+                from apps.api.routers.workspace_chat import (
+                    _workspace_entrypoint_started_stream,
+                )
+
+                return StreamingResponse(
+                    _workspace_entrypoint_started_stream(started),
+                    media_type="text/event-stream",
+                    headers=_SSE_HEADERS,
+                )
     manual_skill_turn = await _prepare_manual_skill_turn(
         db,
         entity_id=user.entity_id,
@@ -1017,8 +1137,9 @@ async def chat_stream(
         )
 
     approval_saved_text: str | None = None
+    approval_runtime_metadata: dict | None = None
     save_user_message = True
-    replacement, resolved_saved_text, save_user_message = await resolve_chat_approval_turn(
+    replacement, resolved_saved_text, save_user_message, approval_runtime_metadata = await resolve_chat_approval_turn(
         db,
         conversation_id=conv.id,
         entity_id=user.entity_id,
@@ -1079,6 +1200,7 @@ async def chat_stream(
                 file_context_turn,
                 chat_mode_prompt=chat_mode_prompt,
                 direct_tool_calls=direct_tool_calls,
+                approval_runtime_metadata=approval_runtime_metadata,
             ),
         ),
         media_type="text/event-stream",
@@ -1206,8 +1328,9 @@ async def chat_message(
         )
 
     approval_saved_text: str | None = None
+    approval_runtime_metadata: dict | None = None
     save_user_message = True
-    replacement, resolved_saved_text, save_user_message = await resolve_chat_approval_turn(
+    replacement, resolved_saved_text, save_user_message, approval_runtime_metadata = await resolve_chat_approval_turn(
         db,
         conversation_id=conv.id,
         entity_id=user.entity_id,
@@ -1254,6 +1377,7 @@ async def chat_message(
             file_context_turn,
             chat_mode_prompt=chat_mode_prompt,
             direct_tool_calls=direct_tool_calls,
+            approval_runtime_metadata=approval_runtime_metadata,
         ),
     )
 
@@ -1383,20 +1507,41 @@ async def get_messages(
     )
     if len(msgs) > limit:
         msgs = msgs[-limit:]
-    return [
-        MessageResponse(
-            id=m.id, conversation_id=m.conversation_id,
-            role=m.role, content=m.content,
-            tool_calls=m.tool_calls,
-            assistant_blocks=_message_assistant_blocks(m),
-            token_usage=m.token_usage,
-            attachments=m.attachments,
-            hitl_requests=_message_hitl_requests(m),
-            **_message_limit_meta(m),
-            created_at=m.created_at.isoformat() if m.created_at else None,
-        )
-        for m in msgs
-    ]
+    return [_to_chat_message_response(m) for m in msgs]
+
+
+@router.get(
+    "/conversations/{conversation_id}/messages/page",
+    response_model=MessagesPageResponse,
+)
+async def get_messages_page(
+    conversation_id: str,
+    limit: int = Query(75, ge=1, le=200),
+    before: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_accessible_conversation(db, user, conversation_id)
+
+    before_created_at, before_id = _decode_message_cursor(before)
+    raw_limit = min(max((limit + 1) * 4, limit + 1), 800)
+    raw_msgs = await list_messages_before(
+        db,
+        conversation_id,
+        limit=raw_limit,
+        before_created_at=before_created_at,
+        before_id=before_id,
+    )
+    visible = _visible_chat_messages(raw_msgs)
+    has_more = len(visible) > limit
+    if has_more:
+        visible = visible[-limit:]
+    next_cursor = _encode_message_cursor(visible[0]) if has_more and visible else None
+    return MessagesPageResponse(
+        items=[_to_chat_message_response(m) for m in visible],
+        has_more=has_more,
+        next_cursor=next_cursor,
+    )
 
 
 @router.post(

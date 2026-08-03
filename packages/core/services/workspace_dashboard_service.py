@@ -4,6 +4,7 @@ from __future__ import annotations
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskStatus
 from packages.core.models.task import Task
 from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.workspace import AgentSubscription
@@ -26,10 +27,10 @@ async def get_workspace_stats(
     # ── Tasks by status ──
     task_q = select(
         func.count().label("total"),
-        func.count().filter(Task.status == "pending").label("pending"),
-        func.count().filter(Task.status == "in_progress").label("in_progress"),
-        func.count().filter(Task.status == "completed").label("completed"),
-        func.count().filter(Task.status == "cancelled").label("cancelled"),
+        func.count().filter(Task.status == TaskStatus.PENDING).label("pending"),
+        func.count().filter(Task.status == TaskStatus.IN_PROGRESS).label("in_progress"),
+        func.count().filter(Task.status == TaskStatus.COMPLETED).label("completed"),
+        func.count().filter(Task.status == TaskStatus.CANCELLED).label("cancelled"),
         func.count().filter(
             task_deadline_overdue_expr(
                 Task.deadline,

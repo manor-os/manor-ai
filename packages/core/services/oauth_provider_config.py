@@ -58,6 +58,7 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
         "scopes": (
+            "openid email profile "
             "https://www.googleapis.com/auth/gmail.send "
             "https://www.googleapis.com/auth/gmail.readonly "
             "https://www.googleapis.com/auth/gmail.modify"
@@ -68,7 +69,7 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
     "google_calendar": {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
-        "scopes": "https://www.googleapis.com/auth/calendar",
+        "scopes": "openid email profile https://www.googleapis.com/auth/calendar",
         "client_id_env": "GOOGLE_CLIENT_ID",
         "client_secret_env": "GOOGLE_CLIENT_SECRET",
     },
@@ -76,6 +77,7 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
         "scopes": (
+            "openid email profile "
             "https://www.googleapis.com/auth/drive.file "
             "https://www.googleapis.com/auth/drive.readonly"
         ),
@@ -88,6 +90,7 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
         "scopes": (
+            "openid email profile "
             "https://www.googleapis.com/auth/youtube.readonly "
             "https://www.googleapis.com/auth/youtube.force-ssl"
         ),
@@ -347,6 +350,21 @@ _BASIC_AUTH_PROVIDERS: frozenset[str] = frozenset({"twitter_x"})
 # endpoints reject ``client_id`` with a 400 / invalid_request.
 _CLIENT_KEY_PROVIDERS: frozenset[str] = frozenset({"tiktok"})
 
+# Google-family providers. They share one OAuth client (GOOGLE_CLIENT_ID) and
+# the accounts.google.com authorize endpoint, and a user commonly holds several
+# distinct Google accounts (personal + work). These are the only providers
+# where account selection on the authorize screen is a first-class need, so the
+# authorize request adds ``select_account`` — see
+# ``apply_authorize_param_conventions``.
+_GOOGLE_PROVIDERS: frozenset[str] = frozenset(
+    {"gmail", "google_calendar", "google_drive", "youtube"}
+)
+
+
+def is_google_provider(server_key: str) -> bool:
+    """True for the Google-family OAuth providers (shared GOOGLE_CLIENT_ID)."""
+    return server_key in _GOOGLE_PROVIDERS
+
 
 def apply_authorize_param_conventions(
     config: "OAuthProviderConfig",
@@ -355,12 +373,25 @@ def apply_authorize_param_conventions(
     """Adjust authorize-URL query params for provider-specific naming.
 
     For ``_CLIENT_KEY_PROVIDERS`` the standard ``client_id`` key is renamed
-    to ``client_key`` (TikTok rejects ``client_id``). Returns a new dict;
-    the input is left untouched.
+    to ``client_key`` (TikTok rejects ``client_id``).
+
+    For ``_GOOGLE_PROVIDERS`` the ``prompt`` is upgraded to
+    ``select_account consent`` so a second connect lets the user pick a
+    *different* Google account instead of silently reusing the one already
+    signed in. ``consent`` is retained (Google accepts multiple
+    space-delimited prompt values) so ``access_type=offline`` still yields a
+    refresh_token. Other providers are left untouched.
+
+    Returns a new dict; the input is left untouched.
     """
     out = dict(params)
     if config.server_key in _CLIENT_KEY_PROVIDERS and "client_id" in out:
         out["client_key"] = out.pop("client_id")
+    if config.server_key in _GOOGLE_PROVIDERS:
+        existing = str(out.get("prompt") or "").split()
+        out["prompt"] = " ".join(
+            ["select_account"] + [v for v in existing if v != "select_account"]
+        )
     return out
 
 

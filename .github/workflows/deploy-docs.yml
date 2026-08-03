@@ -1,9 +1,17 @@
 name: Deploy Docs to GitHub Pages
 
 on:
+  # Auto-deploy whenever docs content lands on dev, so the public site never
+  # lags behind merged docs changes. workflow_dispatch remains for ad-hoc
+  # republishing. (The old v* tag trigger was removed: no tag has ever been
+  # pushed here, and with dev-push deploys the site already tracks the same
+  # content a release tag would carry. A paths filter alongside a tags filter
+  # would also silently skip tag deploys whose commit didn't touch docs-site.)
   push:
-    tags:
-      - "v*"
+    branches: [dev]
+    paths:
+      - "docs-site/**"
+      - ".github/workflows/deploy-docs.yml"
   workflow_dispatch:
     inputs:
       publish:

@@ -15,6 +15,11 @@ import posixpath
 import re
 from typing import Any
 
+from packages.core.contracts.envelope import (
+    build_step_result_envelope,
+    is_step_result_envelope_schema,
+)
+
 
 _TEXT_KEYS = (
     "text",
@@ -56,6 +61,11 @@ def coerce_step_output_for_schema(schema: dict | None, result: Any) -> Any:
     evidence. If a required field cannot be inferred, it stays missing and the
     normal JSON Schema validator will fail the step.
     """
+    # StepResult-envelope steps can never fail validation: the deterministic
+    # constructor always yields a schema-valid envelope, whatever the worker
+    # produced. Custom/action schemas keep the evidence-based path below.
+    if is_step_result_envelope_schema(schema):
+        return build_step_result_envelope(result)
     if not isinstance(schema, dict) or result is None:
         return result
 
@@ -524,26 +534,39 @@ def _infer_social_publish_fields(output: dict[str, Any], props: dict[str, Any], 
         "tweet_url",
         "post_text",
         "tweet_text",
+        "platform",
     }
     if not any(_field_requested(name, props, required) for name in wanted):
         return
 
     payload = _tweet_publish_payload(output)
-    if not payload:
+    if payload:
+        _infer_tweet_publish_fields(output, props, required, payload)
         return
 
-    tweet_id = _tweet_payload_value(payload, ("tweet_id", "id"))
+    payload = _linkedin_publish_payload(output)
+    if payload:
+        _infer_linkedin_publish_fields(output, props, required, payload)
+
+
+def _infer_tweet_publish_fields(
+    output: dict[str, Any],
+    props: dict[str, Any],
+    required: set[str],
+    payload: dict[str, Any],
+) -> None:
+    tweet_id = _publish_payload_value(payload, ("tweet_id", "id"))
     if not tweet_id:
         return
 
     if _field_requested("tweet_id", props, required) and not _has_value(output.get("tweet_id")):
         output["tweet_id"] = tweet_id
 
-    status = _tweet_payload_value(payload, ("status",)) or _default_publish_status(props.get("status"))
+    status = _publish_payload_value(payload, ("status",)) or _default_publish_status(props.get("status"))
     if _field_requested("status", props, required) and not _has_value(output.get("status")) and status:
         output["status"] = status
 
-    published_at = _tweet_payload_value(payload, ("published_at", "created_at"))
+    published_at = _publish_payload_value(payload, ("published_at", "created_at"))
     if (
         not published_at
         and "published_at" in required
@@ -553,20 +576,136 @@ def _infer_social_publish_fields(output: dict[str, Any], props: dict[str, Any], 
     if _field_requested("published_at", props, required) and not _has_value(output.get("published_at")) and published_at:
         output["published_at"] = published_at
 
-    post_text = _tweet_payload_value(payload, ("post_text", "tweet_text", "text"))
+    post_text = _publish_payload_value(payload, ("post_text", "tweet_text", "text"))
     for key in ("post_text", "tweet_text"):
         if _field_requested(key, props, required) and not _has_value(output.get(key)) and post_text:
             output[key] = post_text
 
-    tweet_url = _tweet_payload_value(payload, ("tweet_url", "post_url", "url"))
+    tweet_url = _publish_payload_value(payload, ("tweet_url", "post_url", "url"))
     if not tweet_url:
         tweet_url = f"https://x.com/i/web/status/{tweet_id}"
     for key in ("tweet_url", "post_url"):
         if _field_requested(key, props, required) and not _has_value(output.get(key)):
             output[key] = tweet_url
 
+    _fill_platform_field(output, props, required, "X", ("x", "twitter"))
+    _fill_singleton_fields(output, props, required)
+
+
+def _infer_linkedin_publish_fields(
+    output: dict[str, Any],
+    props: dict[str, Any],
+    required: set[str],
+    payload: dict[str, Any],
+) -> None:
+    post_url = _publish_payload_value(payload, ("post_url", "share_url", "url"))
+    urn = _publish_payload_value(payload, ("urn", "post_urn", "id"))
+    if not post_url and urn and urn.startswith("urn:li:"):
+        post_url = f"https://www.linkedin.com/feed/update/{urn}/"
+    if not post_url and not (urn and urn.startswith("urn:li:")):
+        return
+
+    if post_url and _field_requested("post_url", props, required) and not _has_value(output.get("post_url")):
+        output["post_url"] = post_url
+
+    status = _publish_payload_value(payload, ("status",)) or _default_publish_status(props.get("status"))
+    if _field_requested("status", props, required) and not _has_value(output.get("status")) and status:
+        output["status"] = status
+
+    published_at = _publish_payload_value(payload, ("published_at", "created_at"))
+    if (
+        not published_at
+        and "published_at" in required
+        and _field_requested("published_at", props, required)
+    ):
+        published_at = _utc_now_iso()
+    if _field_requested("published_at", props, required) and not _has_value(output.get("published_at")) and published_at:
+        output["published_at"] = published_at
+
+    post_text = _publish_payload_value(payload, ("post_text", "text", "commentary"))
+    if _field_requested("post_text", props, required) and not _has_value(output.get("post_text")) and post_text:
+        output["post_text"] = post_text
+
+    _fill_platform_field(output, props, required, "LinkedIn", ("linkedin",))
+    _fill_singleton_fields(output, props, required)
+
+
+def _fill_platform_field(
+    output: dict[str, Any],
+    props: dict[str, Any],
+    required: set[str],
+    canonical: str,
+    aliases: tuple[str, ...],
+) -> None:
+    """Fill a requested ``platform`` field from the payload kind we just proved.
+
+    The publish payload itself is the evidence of which platform ran; the enum
+    (when present) constrains the spelling. Never fights an enum that doesn't
+    contain the proven platform."""
+    if not _field_requested("platform", props, required) or _has_value(output.get("platform")):
+        return
+    prop_schema = props.get("platform")
+    if isinstance(prop_schema, dict):
+        const = prop_schema.get("const")
+        if isinstance(const, str) and const.strip():
+            output["platform"] = const
+            return
+        enum_values = [str(v) for v in (prop_schema.get("enum") or []) if isinstance(v, str)]
+        if enum_values:
+            for value in enum_values:
+                normalized = value.strip().lower().replace(" ", "").replace("/", "").replace("(", "").replace(")", "")
+                if any(alias in normalized for alias in aliases):
+                    output["platform"] = value
+                    return
+            if len(enum_values) == 1:
+                output["platform"] = enum_values[0]
+            return
+        if _schema_type(prop_schema) not in (None, "string"):
+            return
+    output["platform"] = canonical
+
+
+def _fill_singleton_fields(output: dict[str, Any], props: dict[str, Any], required: set[str]) -> None:
+    """Fill requested-but-missing fields whose schema pins exactly one value.
+
+    A ``const`` or single-value ``enum`` leaves no degree of freedom — the
+    planner already decided the only acceptable value, so echoing it back is
+    tautological, not fabrication. Only runs after a concrete publish payload
+    proved the step actually published."""
+    for key, prop_schema in props.items():
+        if not isinstance(prop_schema, dict):
+            continue
+        if not _field_requested(key, props, required) or _has_value(output.get(key)):
+            continue
+        const = prop_schema.get("const")
+        if const is not None:
+            output[key] = const
+            continue
+        enum_values = prop_schema.get("enum")
+        if isinstance(enum_values, list) and len(enum_values) == 1 and enum_values[0] is not None:
+            output[key] = enum_values[0]
+
 
 def _tweet_publish_payload(output: dict[str, Any]) -> dict[str, Any] | None:
+    for payload in _publish_payload_candidates(output):
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        tweet = payload.get("tweet") if isinstance(payload.get("tweet"), dict) else {}
+        if _looks_like_tweet_publish_payload(payload, data, tweet):
+            return payload
+    return None
+
+
+def _linkedin_publish_payload(output: dict[str, Any]) -> dict[str, Any] | None:
+    for payload in _publish_payload_candidates(output):
+        if payload.get("post_url") or payload.get("share_url"):
+            return payload
+        urn = _publish_payload_value(payload, ("urn", "post_urn", "id"))
+        if urn and urn.startswith("urn:li:"):
+            return payload
+    return None
+
+
+def _publish_payload_candidates(output: dict[str, Any]) -> list[dict[str, Any]]:
     payloads = [output]
     content = output.get("content")
     if isinstance(content, list):
@@ -580,13 +719,7 @@ def _tweet_publish_payload(output: dict[str, Any]) -> dict[str, Any] | None:
         value = output.get(key)
         if isinstance(value, dict):
             payloads.append(value)
-
-    for payload in payloads:
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        tweet = payload.get("tweet") if isinstance(payload.get("tweet"), dict) else {}
-        if _looks_like_tweet_publish_payload(payload, data, tweet):
-            return payload
-    return None
+    return payloads
 
 
 def _looks_like_tweet_publish_payload(
@@ -605,7 +738,7 @@ def _looks_like_tweet_publish_payload(
     return False
 
 
-def _tweet_payload_value(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+def _publish_payload_value(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     candidates: list[dict[str, Any]] = [payload]
     for key in ("data", "tweet", "post", "result"):
         value = payload.get(key)
@@ -616,6 +749,10 @@ def _tweet_payload_value(payload: dict[str, Any], keys: tuple[str, ...]) -> str 
         if value:
             return value
     return None
+
+
+# Backwards-compatible alias; tweet- and LinkedIn-payload lookups share the logic.
+_tweet_payload_value = _publish_payload_value
 
 
 def _default_publish_status(schema: Any) -> str:

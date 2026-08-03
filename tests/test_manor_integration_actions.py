@@ -1,8 +1,142 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.mark.asyncio
+async def test_manor_send_email_uses_selected_integration_account(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ai.runtime.manor_actions import runtime_manor_send_email
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.channel import ChannelConfig
+    from packages.core.services import channel_service
+
+    entity_id = "ent_selected_email"
+    first_account_id = generate_ulid()
+    selected_account_id = generate_ulid()
+    first_config = ChannelConfig(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        channel_type="email",
+        provider="smtp",
+        name="Support",
+        config={"integration_id": first_account_id},
+        credentials={},
+        status="active",
+    )
+    selected_config = ChannelConfig(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        channel_type="email",
+        provider="smtp",
+        name="Sales",
+        config={"integration_id": selected_account_id},
+        credentials={},
+        status="active",
+    )
+    db_session.add_all([first_config, selected_config])
+    await db_session.commit()
+
+    captured = {}
+
+    async def fake_send_message(_db, _entity_id, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            id="message-selected-account",
+            status="sent",
+            error_message=None,
+        )
+
+    monkeypatch.setattr(channel_service, "send_message", fake_send_message)
+    result = json.loads(await runtime_manor_send_email(
+        db_session,
+        entity_id=entity_id,
+        params={
+            "integration_account_id": selected_account_id,
+            "to": "customer@example.com",
+            "subject": "From Sales",
+            "content": "Hello",
+        },
+    ))
+
+    assert captured["channel_config_id"] == selected_config.id
+    assert result["integration_account_id"] == selected_account_id
+    assert result["channel_config_id"] == selected_config.id
+
+
+@pytest.mark.asyncio
+async def test_manor_send_email_channel_account_fans_out_per_recipient(
+    db_session,
+    monkeypatch,
+):
+    """Regression: the connected-channel branch must fan out one
+    single-recipient send per address — never a stringified list To (Gmail
+    555 5.5.2) — and aggregate into the same partial-success shape as the
+    platform-SMTP path."""
+    from packages.core.ai.runtime.manor_actions import runtime_manor_send_email
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.channel import ChannelConfig
+    from packages.core.services import channel_service
+
+    entity_id = "ent_channel_fanout"
+    config = ChannelConfig(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        channel_type="email",
+        provider="smtp",
+        name="Support",
+        config={"integration_id": generate_ulid()},
+        credentials={},
+        status="active",
+    )
+    db_session.add(config)
+    await db_session.commit()
+
+    calls: list[dict] = []
+
+    async def fake_send_message(_db, _entity_id, **kwargs):
+        calls.append(kwargs)
+        # One address refused → the batch must still deliver the rest.
+        bad = kwargs["to_address"] == "bad@corp.com"
+        return SimpleNamespace(
+            id=f"log-{len(calls)}",
+            status="failed" if bad else "sent",
+            error_message="555 5.5.2 Syntax error" if bad else None,
+        )
+
+    monkeypatch.setattr(channel_service, "send_message", fake_send_message)
+
+    result = json.loads(await runtime_manor_send_email(
+        db_session,
+        entity_id=entity_id,
+        params={
+            "to": ["a@corp.com", "bad@corp.com", "b@corp.com"],
+            "subject": "Team update",
+            "content": "Hello",
+        },
+    ))
+
+    # One call per recipient, each with a single clean to_address.
+    assert [c["to_address"] for c in calls] == ["a@corp.com", "bad@corp.com", "b@corp.com"]
+    for c in calls:
+        assert isinstance(c["to_address"], str)
+        assert "," not in c["to_address"]
+        assert "[" not in c["to_address"]
+
+    # Aggregated partial-success shape, symmetric with platform SMTP.
+    assert result["delivery"] == "channel_account"
+    assert result["sent"] is True
+    assert result["status"] == "partial"
+    assert result["total"] == 3
+    assert result["delivered"] == 2
+    assert result["failed"] == [{"to": "bad@corp.com", "error": "555 5.5.2 Syntax error"}]
+    assert result["to"] == ["a@corp.com", "bad@corp.com", "b@corp.com"]
+    assert len(result["message_log_ids"]) == 3
 
 
 @pytest.mark.asyncio
@@ -15,10 +149,11 @@ async def test_manor_lists_ready_integrations_for_current_user(client):
     entity_id = "ent_ready_integrations"
     user_id = "user_ready_integrations"
 
+    telegram_account_id = generate_ulid()
     async with db_module.async_session() as db:
         db.add(
             Integration(
-                id=generate_ulid(),
+                id=telegram_account_id,
                 entity_id=entity_id,
                 provider="telegram",
                 status="active",
@@ -53,6 +188,15 @@ async def test_manor_lists_ready_integrations_for_current_user(client):
     assert result["ready_only"] is True
     assert ready_mcp["telegram"]["agent_can_use"] is True
     assert ready_mcp["telegram"]["scope"] == "entity"
+    assert ready_mcp["telegram"]["default_account_id"] == telegram_account_id
+    assert ready_mcp["telegram"]["account_options"] == [
+        {
+            "id": telegram_account_id,
+            "display_name": f"telegram account {telegram_account_id[-6:]}",
+            "scope": "entity",
+            "is_default": False,
+        }
+    ]
     assert "discord" not in ready_mcp
     assert configured["telegram"]["ready"] is True
     assert "discord" not in configured
@@ -83,7 +227,7 @@ def test_manor_merge_action_params_keeps_params_explicit():
             "task_id": "top-level-task",
             "workspace_id": "context-workspace",
             "_active_user_message_from_context": "assign this to Simon",
-            "_legacy_tool_profile_from_context": "workspace_agent",
+            "_tool_profile_from_context": "workspace_agent",
             "_allowed_tool_names_from_context": ["manor"],
             "params": {
                 "task_id": "nested-task",

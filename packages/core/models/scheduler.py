@@ -44,6 +44,11 @@ class ScheduledJob(Base, TimestampMixin):
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_status: Mapped[Optional[str]] = mapped_column(String(20))
     consecutive_errors: Mapped[int] = mapped_column(Integer, default=0)
+    # M11 config revision — bumped via packages.core.revisions.bump_revision
+    # on every operator/system config change; stamped into dispatch events.
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
 
 
 class ScheduledJobRun(Base):

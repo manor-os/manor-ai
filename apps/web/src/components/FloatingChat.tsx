@@ -37,6 +37,7 @@ import ChatMessageActions, {
   displayContentForAssistantMessage,
   isRetryableAssistantMessage,
 } from "./chat/ChatMessageActions";
+import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import ManorAvatar from "./ui/ManorAvatar";
 import UserAvatar from "./ui/UserAvatar";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
@@ -44,6 +45,7 @@ import ApprovalActionBar from "./ui/ApprovalActionBar";
 import { DEFAULT_APPROVAL_OPTIONS } from "../lib/approvalOptions";
 import SessionSwitcher from "./SessionSwitcher";
 import ToolCallList from "./ui/ToolCallList";
+import { ChatMessagesSkeleton } from "./ui/Skeleton";
 import CreditLimitNotice from "./ui/CreditLimitNotice";
 import ChatInputFooter, {
   createChatMessageAttachmentSnapshot,
@@ -72,6 +74,10 @@ import {
   savePendingChatRetry,
   type PendingChatRetry,
 } from "../lib/chatRetry";
+import {
+  OPEN_FLOATING_CHAT_EVENT,
+  type OpenFloatingChatDetail,
+} from "../lib/selectionActions";
 
 function maybeLocalCodingRunNoticeForTools(_tools: ToolCall[]): string | null {
   return null;
@@ -1162,6 +1168,7 @@ export default function FloatingChat() {
   const [messageFeedback, setMessageFeedback] = useState<
     Record<string, ChatMessageFeedbackRating>
   >({});
+  const [conversationLoading, setConversationLoading] = useState(false);
   const setSessionMessages = useChatStreamStore((s) => s.setSessionMessages);
   const createDraftSession = useChatStreamStore((s) => s.createDraftSession);
   const startStream = useChatStreamStore((s) => s.startStream);
@@ -1182,6 +1189,7 @@ export default function FloatingChat() {
   useEffect(() => {
     currentSessionKeyRef.current = currentSessionKey;
   }, [currentSessionKey]);
+  const showConversationSkeleton = conversationLoading && messages.length === 0;
   const setMessages = useCallback(
     (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
       const key = currentSessionKeyRef.current;
@@ -1350,6 +1358,14 @@ export default function FloatingChat() {
         limit_detail: m.limit_detail,
       }));
 
+  const loadRecentMessages = useCallback(async (convId: string) => {
+    const page = await api.chat.getMessagesPage(convId, {
+      silent: true,
+      limit: 75,
+    });
+    return parseMessages(page.items || []);
+  }, []);
+
   const handleOpenMessageReference = useCallback(
     async (refItem: ChatMessageDisplayReference) => {
       const directUrl = refItem.previewUrl || refItem.url;
@@ -1388,6 +1404,7 @@ export default function FloatingChat() {
       editorLiveAppliedRef.current = { content: "" };
       setSelectedMentions([]);
       setMentionedAgentId(undefined);
+      setConversationLoading(false);
       resumedRef.current = false;
       userIdRef.current = currentUserId;
     }
@@ -1397,23 +1414,25 @@ export default function FloatingChat() {
     if (!open || resumedRef.current) return;
     if (streamingRef.current) return;
     resumedRef.current = true;
-    api.chat.listConversations().then((convs) => {
-      const latest = (convs || []).find(
-        (conv: any) => !conv.agent_id && !conv.workspace_id,
-      );
-      if (latest) {
+    setConversationLoading(true);
+    api.chat.listConversations()
+      .then((convs) => {
+        const latest = (convs || []).find(
+          (conv: any) => !conv.agent_id && !conv.workspace_id,
+        );
+        if (!latest) return undefined;
         setCurrentConvId(latest.id);
         setDraftSessionKey(undefined);
-        api.chat
-          .getMessages(latest.id)
+        return loadRecentMessages(latest.id)
           .then((msgs) => {
             if (streamingRef.current) return;
-            setSessionMessages(latest.id, parseMessages(msgs));
+            setSessionMessages(latest.id, msgs);
           })
           .catch(() => {});
-      }
-    });
-  }, [open, setSessionMessages]);
+      })
+      .catch(() => {})
+      .finally(() => setConversationLoading(false));
+  }, [loadRecentMessages, open, setSessionMessages]);
 
   useEffect(() => {
     const handleOpenEditorLiveChat = (event: Event) => {
@@ -1450,7 +1469,8 @@ export default function FloatingChat() {
       setEditorLiveSessionActive(true);
       setEditorLiveInfo(detail);
       setEditorSessionLabel(
-        detail.documentName ? `Live edit: ${detail.documentName}` : "Live edit",
+        detail.sessionLabel?.trim() ||
+          (detail.documentName ? `Live edit: ${detail.documentName}` : "Live edit"),
       );
       setSelectedMentions([]);
       setMentionedAgentId(undefined);
@@ -1468,6 +1488,32 @@ export default function FloatingChat() {
       );
   }, [createDraftSession, setSessionMessages]);
 
+  useEffect(() => {
+    const handleOpenFloatingChat = (event: Event) => {
+      const detail =
+        (event as CustomEvent<OpenFloatingChatDetail>).detail || {};
+      const prompt = (detail.prompt || "").trim();
+      if (!prompt) return;
+
+      setOpen(true);
+      setInput((prev) => {
+        const current = prev.trim();
+        return current ? `${current}\n\n${prompt}` : prompt;
+      });
+      window.setTimeout(() => textareaRef.current?.focus(), 0);
+    };
+
+    window.addEventListener(
+      OPEN_FLOATING_CHAT_EVENT,
+      handleOpenFloatingChat as EventListener,
+    );
+    return () =>
+      window.removeEventListener(
+        OPEN_FLOATING_CHAT_EVENT,
+        handleOpenFloatingChat as EventListener,
+      );
+  }, []);
+
   /* ---- Reload messages from DB when reopened (catches interrupted streams) ---- */
   const prevOpenRef = useRef(false);
   useEffect(() => {
@@ -1481,16 +1527,17 @@ export default function FloatingChat() {
         // Messages are already live from the store — no DB reload needed
       } else if (currentConvId) {
         // Not streaming — reload from DB to get final state
-        api.chat
-          .getMessages(currentConvId)
+        setConversationLoading(true);
+        loadRecentMessages(currentConvId)
           .then((msgs) => {
             if (streamingRef.current) return;
-            setSessionMessages(currentConvId, parseMessages(msgs));
+            setSessionMessages(currentConvId, msgs);
           })
-          .catch(() => {});
+          .catch(() => {})
+          .finally(() => setConversationLoading(false));
       }
     }
-  }, [open, currentConvId, setSessionMessages, streaming, streamingConvId]);
+  }, [open, currentConvId, loadRecentMessages, setSessionMessages, streaming, streamingConvId]);
 
   /* Auto-scroll — throttled during streaming to avoid queuing hundreds of scroll animations */
   const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1559,17 +1606,16 @@ export default function FloatingChat() {
         detail.conversation_id === currentConvId &&
         !streamingRef.current
       ) {
-        api.chat
-          .getMessages(detail.conversation_id)
+        loadRecentMessages(detail.conversation_id)
           .then((msgs) => {
-            setMessages(parseMessages(msgs));
+            setMessages(msgs);
           })
           .catch(() => {});
       }
     };
     window.addEventListener("manor:video-ready", handler);
     return () => window.removeEventListener("manor:video-ready", handler);
-  }, [currentConvId]);
+  }, [currentConvId, loadRecentMessages, setMessages]);
 
   /* Auto-resize textarea */
   useEffect(() => {
@@ -2232,6 +2278,7 @@ export default function FloatingChat() {
     editorLiveAppliedRef.current = { content: "" };
     setSelectedMentions([]);
     setMentionedAgentId(undefined);
+    setConversationLoading(false);
   };
 
   const handleSwitchSession = (convId: string) => {
@@ -2248,12 +2295,13 @@ export default function FloatingChat() {
     editorLiveAppliedRef.current = { content: "" };
     setSelectedMentions([]);
     setMentionedAgentId(undefined);
-    api.chat
-      .getMessages(convId)
+    setConversationLoading(true);
+    loadRecentMessages(convId)
       .then((msgs) => {
-        setSessionMessages(convId, parseMessages(msgs));
+        setSessionMessages(convId, msgs);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setConversationLoading(false));
   };
 
   /* ---- HITL action handler ---- */
@@ -2482,9 +2530,15 @@ export default function FloatingChat() {
 
   const editorLiveFileName =
     editorLiveInfo?.documentName?.trim() || "this file";
-  const editorLiveEmptyDescription = `Tell me what you want changed. I will update ${editorLiveFileName} directly in the editor as the answer streams.`;
-  const editorLivePlaceholder = `Describe the edit you want in ${editorLiveFileName}...`;
-  const editorLiveExamples = ["Rewrite", "Format", "Add content", "Fix layout"];
+  const editorLiveEmptyDescription =
+    editorLiveInfo?.emptyDescription?.trim() ||
+    `Tell me what you want changed. I will update ${editorLiveFileName} directly in the editor as the answer streams.`;
+  const editorLivePlaceholder =
+    editorLiveInfo?.placeholder?.trim() ||
+    `Describe the edit you want in ${editorLiveFileName}...`;
+  const editorLiveExamples = editorLiveInfo?.examples?.length
+    ? editorLiveInfo.examples
+    : ["Rewrite", "Format", "Add content", "Fix layout"];
 
   /* ================================================================ */
   /*  Render                                                           */
@@ -2507,7 +2561,19 @@ export default function FloatingChat() {
       <button
         className="float-chat-btn"
         data-tour="chat-input"
-        onClick={() => setOpen(!open)}
+        onClick={() => {
+          const nextOpen = !open;
+          if (
+            nextOpen &&
+            !resumedRef.current &&
+            !streamingRef.current &&
+            messages.length === 0
+          ) {
+            setConversationLoading(true);
+          }
+          if (!nextOpen) setConversationLoading(false);
+          setOpen(nextOpen);
+        }}
         style={{
           position: "fixed",
           bottom: 24,
@@ -2697,7 +2763,9 @@ export default function FloatingChat() {
             gap: 10,
           }}
         >
-          {messages.length === 0 && (
+          {showConversationSkeleton ? (
+            <ChatMessagesSkeleton rows={4} compact maxWidth="100%" />
+          ) : messages.length === 0 && (
             <div
               style={{
                 display: "flex",
@@ -2788,7 +2856,7 @@ export default function FloatingChat() {
             </div>
           )}
 
-          {messages.map((msg, i) => {
+          {!showConversationSkeleton && messages.map((msg, i) => {
             const rawContent = toDisplayText(msg.content);
             const content = msg.role === "assistant"
               ? stripEditorLiveEditBlocks(rawContent)
@@ -2976,15 +3044,21 @@ export default function FloatingChat() {
                       >
                         {cleanContent && (
                           <>
-                            <ChatMarkdown
-                              content={cleanContent}
-                              isUser={msg.role === "user"}
-                              streaming={
-                                streaming &&
-                                i === messages.length - 1 &&
-                                msg.role === "assistant"
-                              }
-                            />
+                            {msg.role === "user" ? (
+                              <CollapsibleSentMessage text={cleanContent}>
+                                <ChatMarkdown content={cleanContent} isUser />
+                              </CollapsibleSentMessage>
+                            ) : (
+                              <ChatMarkdown
+                                content={cleanContent}
+                                isUser={false}
+                                streaming={
+                                  streaming &&
+                                  i === messages.length - 1 &&
+                                  msg.role === "assistant"
+                                }
+                              />
+                            )}
                             {streaming &&
                               i === messages.length - 1 &&
                               msg.role === "assistant" && (
@@ -3009,8 +3083,11 @@ export default function FloatingChat() {
                     );
                   })()}
 
-                  {/* Streaming cursor when no content yet */}
+                  {/* Streaming cursor when no content yet. Tool-only turns already
+                    show progress via ToolCallList, so avoid a second empty bubble. */}
                   {!content &&
+                    visibleTools.length === 0 &&
+                    !hasAssistantBlocks &&
                     streaming &&
                     i === messages.length - 1 &&
                     msg.role === "assistant" && (

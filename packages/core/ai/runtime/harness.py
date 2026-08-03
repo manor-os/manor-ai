@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from packages.core.ai.runtime.approvals import RuntimeApprovalMiddleware, RuntimeApprovalRequest
@@ -24,6 +24,7 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_WORKSPACE_ARCHITECT_SOURCE,
 )
 from packages.core.ai.runtime.subagents import RuntimeSubAgentDecision, SubAgentSpec, runtime_select_subagent
+from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
 from packages.core.ai.runtime.traces import RuntimeTrace
 
 
@@ -223,10 +224,11 @@ async def runtime_execute_agentic_loop(
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     manual_skill_slugs: Iterable[str] | None = None,
-    legacy_tool_profile: str | None = None,
+    tool_profile: str | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     model: str | None = None,
     temperature: float | None = None,
+    max_tokens: int | None = None,
     billing_source: str = RUNTIME_AGENTIC_LOOP_SOURCE,
     max_rounds: int | None = None,
     initial_messages: list[dict[str, Any]] | None = None,
@@ -237,7 +239,9 @@ async def runtime_execute_agentic_loop(
     metadata: dict[str, Any] | None = None,
     forced_tool_calls: list[dict[str, Any]] | None = None,
     terminal_tool_result_policy: dict[str, Any] | None = None,
+    output_schema: dict[str, Any] | None = None,
     dynamic_tool_handlers: Mapping[str, RuntimeDynamicToolHandler] | None = None,
+    runtime_tool_context: Mapping[str, Any] | None = None,
     tool_executor: ToolExecutor | None = None,
     tool_schema_resolver: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> Any:
@@ -278,6 +282,26 @@ async def runtime_execute_agentic_loop(
         if allowed_tool_names is not None
         else None
     )
+    dynamic_handlers = dict(dynamic_tool_handlers or {})
+    registered_tool_context = {
+        key: value
+        for key, value in dict(runtime_tool_context or {}).items()
+        if key in RUNTIME_TOOL_CONTEXT_KEYS
+    }
+    if runtime_envelope is not None and allowed_tool_set and dynamic_handlers:
+        scoped_dynamic_names = set(dynamic_handlers) & allowed_tool_set
+        if scoped_dynamic_names:
+            runtime_envelope = replace(
+                runtime_envelope,
+                tool_names=tuple(dict.fromkeys((
+                    *runtime_envelope.tool_names,
+                    *sorted(scoped_dynamic_names),
+                ))),
+                allowed_tool_names=tuple(dict.fromkeys((
+                    *runtime_envelope.allowed_tool_names,
+                    *sorted(scoped_dynamic_names),
+                ))),
+            )
     resolved_tool_schema = tool_schema_resolver or runtime_tool_schema_resolver(
         get_schema=runtime_tool_schema,
         allowed_tool_names=allowed_tool_set,
@@ -285,8 +309,6 @@ async def runtime_execute_agentic_loop(
     tool_context_message = active_user_message
     if tool_context_message is None and isinstance(user_message, str):
         tool_context_message = user_message
-    dynamic_handlers = dict(dynamic_tool_handlers or {})
-
     async def _runtime_tool_executor(name: str, args: dict[str, Any]) -> str:
         tool_name = str(name or "")
         arguments = args if isinstance(args, dict) else {}
@@ -298,9 +320,11 @@ async def runtime_execute_agentic_loop(
                 handler=handler,
                 runtime_envelope=runtime_envelope,
             )
+        registered_arguments = dict(arguments)
+        registered_arguments.update(registered_tool_context)
         return await runtime_execute_tool(
             tool_name,
-            arguments,
+            registered_arguments,
             entity_id=entity_id,
             user_id=user_id,
             agent_id=agent_id,
@@ -310,7 +334,7 @@ async def runtime_execute_agentic_loop(
             active_user_message=tool_context_message,
             manual_skill_selected=manual_skill_selected,
             manual_skill_slugs=list(manual_skill_slugs or []),
-            legacy_tool_profile=legacy_tool_profile,
+            tool_profile=tool_profile,
             allowed_tool_names=allowed_tool_set,
             llm_metadata=resolved_metadata,
             llm_model=resolved_model,
@@ -339,9 +363,12 @@ async def runtime_execute_agentic_loop(
         "tool_schema_resolver": resolved_tool_schema,
         "forced_tool_calls": forced_tool_calls,
         "terminal_tool_result_policy": terminal_tool_result_policy,
+        "output_schema": output_schema,
     }
     if temperature is not None:
         loop_kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        loop_kwargs["max_tokens"] = max_tokens
     if max_rounds is not None:
         loop_kwargs["max_rounds"] = max_rounds
     with runtime_artifact_tracking_scope():
@@ -406,7 +433,7 @@ async def runtime_execute_subagent_loop(
     conversation_id: str | None,
     task_id: str | None = None,
     active_user_message: str | None = None,
-    legacy_tool_profile: str | None = None,
+    tool_profile: str | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     model: str | None = None,
     metadata: dict[str, Any] | None = None,
@@ -414,6 +441,10 @@ async def runtime_execute_subagent_loop(
     requested_name: str | None = None,
     requested_max_rounds: Any = None,
     default_max_rounds: int = 20,
+    dynamic_tool_handlers: Mapping[str, RuntimeDynamicToolHandler] | None = None,
+    terminal_tool_result_policy: dict[str, Any] | None = None,
+    on_tool_start: Callable[[str, dict[str, Any]], Any] | None = None,
+    on_tool_end: Callable[..., Any] | None = None,
 ) -> RuntimeSubAgentLoopResult:
     """Run a bounded subagent loop through the Runtime Harness adapters."""
 
@@ -434,12 +465,16 @@ async def runtime_execute_subagent_loop(
         conversation_id=conversation_id,
         task_id=task_id,
         active_user_message=active_user_message,
-        legacy_tool_profile=legacy_tool_profile,
+        tool_profile=tool_profile,
         allowed_tool_names=allowed_tool_names,
         model=model,
         max_rounds=subagent_run.max_rounds or default_max_rounds,
         metadata=metadata,
         billing_source=billing_source,
+        dynamic_tool_handlers=dynamic_tool_handlers,
+        terminal_tool_result_policy=terminal_tool_result_policy,
+        on_tool_start=on_tool_start,
+        on_tool_end=on_tool_end,
     )
     subagent_run.record_end(rounds=getattr(result, "rounds", None))
     return RuntimeSubAgentLoopResult(result=result, run=subagent_run)
@@ -449,6 +484,23 @@ async def runtime_execute_worker_subagent_loop(**loop_kwargs: Any) -> RuntimeSub
     """Run an InternalWorker subagent loop with Runtime-owned billing source."""
 
     return await runtime_execute_subagent_loop(
+        **loop_kwargs,
+        billing_source=RUNTIME_WORKER_SUBAGENT_BILLING_SOURCE,
+    )
+
+
+async def runtime_execute_worker_subagent_followup(**loop_kwargs: Any) -> Any:
+    """One bounded follow-up round continuing a worker subagent transcript.
+
+    Used by the forced submit_result finalization: when the main loop ends
+    without a submission, the InternalWorker asks for exactly one more round
+    whose only tool is submit_result. Runtime-owned so the worker never
+    touches the loop layer directly; billing stays on the worker-subagent
+    source.
+    """
+
+    loop_kwargs.setdefault("max_rounds", 1)
+    return await runtime_execute_agentic_loop(
         **loop_kwargs,
         billing_source=RUNTIME_WORKER_SUBAGENT_BILLING_SOURCE,
     )

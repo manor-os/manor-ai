@@ -15,6 +15,9 @@ Usage:
 """
 from __future__ import annotations
 
+# The project root must be added to sys.path before application imports below.
+# ruff: noqa: E402
+
 import asyncio
 import logging
 import sys
@@ -29,21 +32,16 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from packages.core.config import get_settings
 from packages.core.models.base import generate_ulid
-from packages.core.ai.tool_pool import ALWAYS_LOADED
+from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
+from packages.core.ai.runtime.tool_visibility import ALWAYS_LOADED
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
 async def seed_system_tool_definitions(engine) -> None:
-    """Upsert system tool_definitions derived from ALWAYS_LOADED + runtime tool pool."""
-    from packages.core.ai.tool_pool import tool_pool
-
-    # Ensure runtime tools are loaded so we can seed a complete practical baseline.
-    if not tool_pool._tools:
-        tool_pool.initialize()
-
-    tool_names = set(ALWAYS_LOADED) | set(tool_pool._tools.keys())
+    """Upsert system tool_definitions from eager tools and the runtime registry."""
+    tool_names = set(ALWAYS_LOADED) | set(runtime_registered_tool_names())
 
     async with engine.begin() as conn:
         for tool_name in sorted(tool_names):

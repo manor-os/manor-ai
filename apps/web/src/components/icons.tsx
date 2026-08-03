@@ -81,6 +81,15 @@ export function IconEdit(props: IconProps) {
   );
 }
 
+/** Horizontal ellipsis — secondary / overflow actions */
+export function IconMoreHorizontal(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M5.25 12h.01M12 12h.01M18.75 12h.01" strokeWidth={2.5} />
+    </Svg>
+  );
+}
+
 /** Text cursor / add text */
 export function IconText(props: IconProps) {
   return (

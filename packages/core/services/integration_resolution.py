@@ -11,6 +11,9 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    WorkerStatus,
+)
 from packages.core.models.document import Integration
 from packages.core.models.mcp import MCPServer
 from packages.core.models.user import OAuthAccount
@@ -60,6 +63,49 @@ class MissingIntegrationResolution:
         return self.provider != self.original_provider
 
 
+@dataclass(frozen=True)
+class IntegrationProviderReadiness:
+    provider: str
+    ready: bool
+    reason: str
+    scope: str
+    setup_kind: str | None = None
+
+
+async def integration_provider_readiness(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    provider_keys: list[str] | set[str] | tuple[str, ...],
+    user_id: str | None = None,
+) -> dict[str, IntegrationProviderReadiness]:
+    """Resolve runtime readiness without changing MCP capability bindings."""
+    from packages.core.services.agent_permission_service import can_use_mcp_server
+
+    providers = list(dict.fromkeys(
+        canonical_provider_key(key) for key in provider_keys if canonical_provider_key(key)
+    ))
+    out: dict[str, IntegrationProviderReadiness] = {}
+    for provider in providers:
+        decision = await can_use_mcp_server(
+            db,
+            user_id=user_id or "",
+            entity_id=entity_id,
+            server_key=provider,
+            allow_env_fallback=False,
+        )
+        reason = decision.reason
+        setup_kind = None
+        out[provider] = IntegrationProviderReadiness(
+            provider=provider,
+            ready=decision.allowed,
+            reason=reason,
+            scope=decision.scope or "none",
+            setup_kind=setup_kind,
+        )
+    return out
+
+
 async def supported_integration_provider_keys(db: AsyncSession) -> set[str]:
     rows = (await db.execute(
         select(MCPServer.server_key).where(MCPServer.status == "active")
@@ -82,12 +128,15 @@ async def connected_integration_provider_keys(
 ) -> set[str]:
     keys: set[str] = set()
     integration_rows = (await db.execute(
-        select(Integration.provider).where(
+        select(Integration).where(
             Integration.entity_id == entity_id,
             Integration.status == "active",
         )
     )).scalars().all()
-    keys.update(canonical_provider_key(provider) for provider in integration_rows)
+    for integration in integration_rows:
+        config = integration.config or {}
+        if integration.credentials or integration.credential_ref or config.get("nango"):
+            keys.add(canonical_provider_key(integration.provider))
 
     if user_id:
         oauth_rows = (await db.execute(

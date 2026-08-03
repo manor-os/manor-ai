@@ -59,7 +59,16 @@ curl -sS http://localhost:18080/api/v1/auth/login \
 | Agents | `GET /api/v1/agents`, `POST /api/v1/agents`, `POST /api/v1/agents/generate`, `GET /api/v1/agents/{agent_id}/tools` | Create agents, generate agents from prompts, and attach tools |
 | Skills | `GET /api/v1/skills`, `POST /api/v1/skills`, `POST /api/v1/skills/generate`, `POST /api/v1/skills/install-github` | Manage reusable skills available to agents |
 | Tasks | `GET /api/v1/tasks`, `POST /api/v1/tasks`, `GET /api/v1/tasks/{task_id}` | Track work, approvals, comments, automation logs, and task state |
-| Goals and plans | `GET /api/v1/goals`, `POST /api/v1/goals`, `GET /api/v1/plans`, `GET /api/v1/executions` | Define objectives, run plans, and inspect agent execution state |
+| Goals and plans | `GET /api/v1/goals`, `POST /api/v1/goals`, `GET /api/v1/plans`, `POST /api/v1/plans/{plan_id}/approve`, `GET /api/v1/executions` | Define objectives, run plans, approve pending plans, and inspect agent execution state — see [Goals & Plans](concepts/goals) |
+| Workflows | `GET/POST /api/v1/workflows`, `POST /api/v1/workflows/{id}/run`, `GET /api/v1/workflows/runs`, `POST /api/v1/workflows/webhook/{token}` | Build, deploy, trigger, and inspect node-graph automations — see [Workflows](concepts/workflows) |
+| Scheduled jobs | `GET/POST /api/v1/jobs`, `POST /api/v1/jobs/{job_id}/run_now`, `GET /api/v1/jobs/{job_id}/runs` | Recurring automations with run history — see [Automations](concepts/automations) |
+| Memories | `GET/POST /api/v1/memories`, `POST /api/v1/memories/extract` | Durable agent and workspace memory — see [Memories](concepts/memories) |
+| Reports | `GET /api/v1/reports/tasks`, `/usage`, `/activity`, `POST /api/v1/reports/email` | On-demand HTML/JSON reports — see [Reports](concepts/reports) |
+| Search | `GET /api/v1/search?q=` | Global substring search over tasks, documents, agents, conversations |
+| Blueprints | `GET /api/v1/blueprints`, `POST /api/v1/blueprints/{id}/install`, `POST /api/v1/workspaces/{id}/export-blueprint` | Package and install workspace configurations — see [Blueprints](concepts/blueprints) |
+| Calendar and booking | `GET/PUT /api/v1/calendar-settings`, `POST .../booking-links`, `GET .../public/booking-links/{slug}` | Working hours, booking links, agenda — see [Calendar & Booking](concepts/calendar-booking) |
+| Browser sessions | `POST /api/v1/browser/sessions`, `POST .../{id}/navigate`, `.../action` | Server-side Chromium automation — see [Browser Sessions](concepts/browser-sessions) |
+| Channels and pairing | `/api/v1/channels/*` webhooks, `POST /api/v1/channel-pairings`, `GET/POST /api/v1/messages` | Inbound message channels, identity pairing, internal DMs — see [Message Channels](integrations/channels) |
 | Documents | `GET /api/v1/documents`, `POST /api/v1/documents/upload`, `GET /api/v1/shared-doc/{token}` | Upload, create, share, and permission documents |
 | Integrations | `GET /api/v1/integrations/mcp-servers`, `POST /api/v1/integration-sessions/start`, `GET /api/v1/webhooks` | Connect MCP servers, external accounts, OAuth/Nango flows, and outbound webhooks |
 | Workers and sandbox | `GET /api/v1/workers`, `POST /api/v1/workers/heartbeat`, `POST /api/v1/workspaces/sandbox` | Register workers and run sandbox-backed execution where configured |
@@ -157,6 +166,8 @@ operator creates a share or public token:
 | Public task review | `/api/v1/public/task`, `/update-status`, `/complete`, `/evaluate` |
 | Public chat widgets | `/api/v1/public/chat/{token}`, `/session`, `/message`, `/message/stream`, `/embed.js` |
 | Channel webhooks | `/api/v1/channels/*` callback endpoints |
+| Workflow webhooks | `/api/v1/workflows/webhook/{token}` |
+| Public booking | `/api/v1/calendar-settings/public/booking-links/{slug}`, `.../book` |
 
 Treat share tokens and channel webhook secrets as credentials. Rotate them if
 they are exposed.

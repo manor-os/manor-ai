@@ -1,6 +1,7 @@
 """Workspace service — operating model, agent mapping, and activity logging."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from sqlalchemy import select, desc
@@ -276,6 +277,9 @@ async def get_workspace_agent_mappings(
 # ── Activity Logging ──
 
 
+_logger = logging.getLogger(__name__)
+
+
 async def record_activity(
     db: AsyncSession,
     workspace_id: str,
@@ -287,7 +291,7 @@ async def record_activity(
     user_id: str = None,
     agent_id: str = None,
 ) -> None:
-    """Record a workspace activity event."""
+    """Record an activity and dispatch matching workspace workflow triggers."""
     activity = WorkspaceActivity(
         id=generate_ulid(),
         workspace_id=workspace_id,
@@ -300,6 +304,52 @@ async def record_activity(
     )
     db.add(activity)
     await db.flush()
+
+    await _dispatch_workspace_event_triggers(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        event_type=event_type,
+        summary=summary,
+        details=details,
+        started_by=user_id,
+    )
+
+
+async def _dispatch_workspace_event_triggers(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    event_type: str,
+    summary: str,
+    details: dict | None,
+    started_by: str | None,
+) -> None:
+    """Fire subscribed workflow bindings without blocking activity logging."""
+    try:
+        from packages.core.ai.workflow_runner import WorkflowRunner
+        from packages.core.services import workflow_service
+
+        runs = await workflow_service.dispatch_trigger(
+            db,
+            entity_id,
+            trigger_type="workspace_event",
+            event_name=event_type,
+            workspace_id=workspace_id,
+            trigger_data={
+                "event": event_type,
+                "summary": summary,
+                "details": details or {},
+            },
+            started_by=started_by,
+        )
+        # The caller owns the transaction. Give it time to commit before a worker
+        # attempts to load the newly-created run.
+        for run in runs:
+            WorkflowRunner.enqueue(run.id, delay_seconds=5)
+    except Exception as exc:  # noqa: BLE001 - activity logging must remain reliable
+        _logger.warning("workspace workflow trigger dispatch failed: %s", exc)
 
 
 def _activity_details(value: Any) -> dict[str, Any]:

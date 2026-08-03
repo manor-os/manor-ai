@@ -17,6 +17,11 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from packages.core.constants.task import TaskLogType, TaskStatus
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
 from packages.core.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -74,19 +79,57 @@ def _hitl_last_reminded_at(plan, step_id: str) -> datetime | None:
     return _parse_iso_datetime(item)
 
 
+#: How the gap between reminders grows with the length of the wait, and where
+#: reminding stops. A flat 4-hour cooldown with no ceiling sent ~60 notices
+#: about one governance approval that had been waiting ten days — every one of
+#: them into an inbox with a 100% unread rate. Past the last threshold the
+#: request is not forgotten (it stays waiting, and the task still shows it);
+#: we simply stop saying the same thing into the same void.
+HITL_REMINDER_BACKOFF_STEPS: tuple[tuple[int, int], ...] = (
+    # (waited at least N minutes, remind at most every M minutes)
+    (0, 60),          # first hour of waiting → hourly
+    (60 * 4, 240),    # after 4h → every 4h
+    (60 * 24, 1440),  # after a day → daily
+)
+#: Waiting longer than this stops the reminders entirely.
+HITL_REMINDER_GIVE_UP_MINUTES = int(
+    os.getenv("HITL_REMINDER_GIVE_UP_MINUTES", str(60 * 24 * 3))
+)
+
+
+def hitl_reminder_interval_minutes(waited_minutes: float) -> int | None:
+    """Minutes to wait before the next reminder, or None to stop reminding."""
+    if waited_minutes >= HITL_REMINDER_GIVE_UP_MINUTES:
+        return None
+    interval = HITL_REMINDER_BACKOFF_STEPS[0][1]
+    for threshold, step_interval in HITL_REMINDER_BACKOFF_STEPS:
+        if waited_minutes >= threshold:
+            interval = step_interval
+    return interval
+
+
 def _hitl_reminder_due(
     *,
     wait_started_at: datetime,
     last_reminded_at: datetime | None,
     now: datetime,
     after_minutes: int = HITL_REMINDER_AFTER_MINUTES,
-    cooldown_minutes: int = HITL_REMINDER_COOLDOWN_MINUTES,
+    cooldown_minutes: int | None = None,
 ) -> bool:
     wait_started_at = _aware_utc(wait_started_at) or now
     last_reminded_at = _aware_utc(last_reminded_at)
     if wait_started_at > now - timedelta(minutes=after_minutes):
         return False
-    if last_reminded_at and last_reminded_at > now - timedelta(minutes=cooldown_minutes):
+
+    waited_minutes = (now - wait_started_at).total_seconds() / 60
+    interval = (
+        cooldown_minutes
+        if cooldown_minutes is not None
+        else hitl_reminder_interval_minutes(waited_minutes)
+    )
+    if interval is None:
+        return False
+    if last_reminded_at and last_reminded_at > now - timedelta(minutes=interval):
         return False
     return True
 
@@ -273,7 +316,7 @@ async def _query_task_stats(db, entity_id: str, now: datetime, today_start: date
     r = await db.execute(
         select(func.count()).select_from(Task).where(
             Task.entity_id == entity_id,
-            Task.status.in_(["pending", "in_progress", "blocked"]),
+            Task.status.in_((TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED,)),
         )
     )
     open_count = r.scalar_one()
@@ -282,7 +325,7 @@ async def _query_task_stats(db, entity_id: str, now: datetime, today_start: date
     r = await db.execute(
         select(func.count()).select_from(Task).where(
             Task.entity_id == entity_id,
-            Task.status.in_(["pending", "in_progress", "blocked"]),
+            Task.status.in_((TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED,)),
             Task.deadline.isnot(None),
             task_deadline_overdue_expr(Task.deadline, now_expr=now, current_date_expr=today_start.date()),
         )
@@ -293,7 +336,7 @@ async def _query_task_stats(db, entity_id: str, now: datetime, today_start: date
     r = await db.execute(
         select(func.count()).select_from(Task).where(
             Task.entity_id == entity_id,
-            Task.status == "blocked",
+            Task.status == TaskStatus.BLOCKED,
         )
     )
     blocked_count = r.scalar_one()
@@ -302,7 +345,7 @@ async def _query_task_stats(db, entity_id: str, now: datetime, today_start: date
     r = await db.execute(
         select(func.count()).select_from(Task).where(
             Task.entity_id == entity_id,
-            Task.status == "completed",
+            Task.status == TaskStatus.COMPLETED,
             Task.completed_at >= today_start,
         )
     )
@@ -313,7 +356,7 @@ async def _query_task_stats(db, entity_id: str, now: datetime, today_start: date
     r = await db.execute(
         select(func.count()).select_from(Task).where(
             Task.entity_id == entity_id,
-            Task.status == "in_progress",
+            Task.status == TaskStatus.IN_PROGRESS,
             Task.updated_at < stale_cutoff,
         )
     )
@@ -430,7 +473,7 @@ async def _query_goal_stats(db, entity_id: str) -> dict:
     r = await db.execute(
         select(func.count()).select_from(ExecutionPlan).where(
             ExecutionPlan.entity_id == entity_id,
-            ExecutionPlan.status.in_(["running", "pending_approval", "paused"]),
+            ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.PENDING_APPROVAL, ExecutionPlanStatus.PAUSED,)),
         )
     )
     active_plans = r.scalar_one()
@@ -439,7 +482,7 @@ async def _query_goal_stats(db, entity_id: str) -> dict:
     r = await db.execute(
         select(func.count(func.distinct(ExecutionStep.plan_id))).where(
             ExecutionStep.entity_id == entity_id,
-            ExecutionStep.step_status == "waiting_human",
+            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
         )
     )
     stuck_plans = r.scalar_one()
@@ -639,7 +682,7 @@ async def _check_conversation_attention(
         select(func.count()).select_from(Task).where(
             Task.entity_id == conv.entity_id,
             Task.agent_id == conv.agent_id,
-            Task.status.in_(["pending", "in_progress"]),
+            Task.status.in_((TaskStatus.PENDING, TaskStatus.IN_PROGRESS,)),
             Task.deadline.isnot(None),
             task_deadline_overdue_expr(Task.deadline, now_expr=now, current_date_expr=now.date()),
         )
@@ -654,7 +697,7 @@ async def _check_conversation_attention(
         select(func.count()).select_from(Task).where(
             Task.entity_id == conv.entity_id,
             Task.agent_id == conv.agent_id,
-            Task.status == "in_progress",
+            Task.status == TaskStatus.IN_PROGRESS,
             Task.updated_at < stale_cutoff,
         )
     )
@@ -671,7 +714,7 @@ async def _check_conversation_attention(
     r = await db.execute(
         select(func.count(func.distinct(ExecutionStep.plan_id))).where(
             ExecutionStep.entity_id == conv.entity_id,
-            ExecutionStep.step_status == "waiting_human",
+            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
         )
     )
     stuck_plans = r.scalar_one()
@@ -716,7 +759,7 @@ async def _async_hitl_waiting_reminder(
     *,
     now: datetime | None = None,
     after_minutes: int = HITL_REMINDER_AFTER_MINUTES,
-    cooldown_minutes: int = HITL_REMINDER_COOLDOWN_MINUTES,
+    cooldown_minutes: int | None = None,
     limit: int = HITL_REMINDER_LIMIT,
 ) -> int:
     from sqlalchemy import func, select
@@ -734,8 +777,8 @@ async def _async_hitl_waiting_reminder(
             .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
             .join(Task, Task.id == ExecutionPlan.task_id)
             .where(
-                ExecutionStep.step_status == "waiting_human",
-                ExecutionPlan.status.in_(("running", "paused", "needs_attention")),
+                ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
+                ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.PAUSED, ExecutionPlanStatus.NEEDS_ATTENTION,)),
                 func.coalesce(
                     ExecutionStep.updated_at,
                     ExecutionStep.started_at,
@@ -796,6 +839,7 @@ async def _deliver_hitl_reminder(
     wait_minutes: int,
 ) -> tuple[int, dict[str, Any]]:
     from packages.core.services.event_emitter import emit_in_session
+    from packages.core.constants.task_actors import TaskActor
     from packages.core.services.task_service import add_task_log
 
     prompt = (step.human_input_prompt or "This task is waiting for your input.").strip()
@@ -811,8 +855,9 @@ async def _deliver_hitl_reminder(
     await add_task_log(
         db,
         task.id,
-        "ai_hitl_reminder",
+        TaskLogType.AI_HITL_REMINDER,
         f"Reminder sent: step '{step.step_key}' has waited {wait_minutes} minute(s) for human input.",
+        actor=TaskActor.SYSTEM,
         created_by="system",
         metadata=meta,
     )
@@ -957,8 +1002,15 @@ async def _async_readiness_check() -> int:
                         new = current[key]
                         if new > old:
                             diff_parts.append(f"{key}: {old}->{new}")
+                    from packages.core.strategist import (
+                        ReviewTrigger, ReviewTriggerKind,
+                    )
                     run_strategist_review.apply_async(
-                        args=[ws.id, f"readiness_changed: {', '.join(diff_parts)}"],
+                        args=[ws.id],
+                        kwargs=ReviewTrigger(
+                            kind=ReviewTriggerKind.EVENT,
+                            detail=f"readiness changed: {', '.join(diff_parts)}",
+                        ).celery_kwargs(),
                         countdown=5,
                     )
                     triggered += 1
@@ -975,3 +1027,36 @@ async def _async_readiness_check() -> int:
 
         await db.commit()
     return triggered
+
+
+# ---------------------------------------------------------------------------
+# Experiment guardrail tick (M13) — deterministic, no LLM
+# ---------------------------------------------------------------------------
+
+@celery_app.task(bind=True, name="experiments.guardrail_tick", max_retries=0)
+def experiment_guardrail_tick(self):
+    """Sweep running experiments against their guardrails (M13).
+
+    Stops an experiment (and removes its overlay from the target) on
+    consecutive cohort failures, on reaching ``scope.max_runs``, or when
+    ``ends_at`` has passed — then auto-evaluates it. Pure DB arithmetic.
+    """
+    if not MONITOR_ENABLED:
+        return
+    try:
+        acted = _run_async(_async_experiment_guardrail_tick())
+        if acted:
+            logger.info("experiment_guardrail_tick: acted on %d experiment(s): %s",
+                        len(acted), acted)
+    except Exception as exc:
+        logger.error("experiment_guardrail_tick failed: %s", exc, exc_info=True)
+
+
+async def _async_experiment_guardrail_tick() -> list[dict]:
+    from packages.core.database import create_worker_session
+    from packages.core.experiments import check_experiment_guardrails
+
+    async with create_worker_session()() as db:
+        results = await check_experiment_guardrails(db)
+        await db.commit()
+    return results

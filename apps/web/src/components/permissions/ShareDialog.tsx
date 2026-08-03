@@ -19,8 +19,14 @@
  *   - Role dropdown describes what each role can do (Viewer = 只读 etc).
  *   - Workspace-inherited grants are visibly distinct + locked so users
  *     understand they need to manage them at the workspace level.
- *   - Classification + visibility stay as passive labels (no badges
- *     elsewhere — cloud-drive principle).
+ *   - Classification stays a passive label (no badges elsewhere —
+ *     cloud-drive principle).
+ *   - General access tells the TRUTH about both dimensions (RFC §13.1):
+ *     the internal-visibility line reflects the resource's `visibility`
+ *     (entity/NULL ⇒ the whole organization reads it + finds it via
+ *     search/AI), and the link line reflects external link sharing. When
+ *     the caller wires `onChangeVisibility` the section also carries the
+ *     internal-visibility switcher so state and control live together.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Classification, Visibility } from "../../lib/types";
@@ -38,6 +44,12 @@ import ClassificationBadge from "./ClassificationBadge";
 import VisibilityIcon from "./VisibilityIcon";
 import PeoplePicker, { type StaffOption } from "./PeoplePicker";
 import PersonRow, { type ShareRole } from "./PersonRow";
+import {
+  effectiveVisibility,
+  generalAccessCopy,
+  type GeneralAccessLine,
+  type GeneralAccessMode,
+} from "./generalAccessCopy";
 
 // ── Local types ──────────────────────────────────────────────────────────
 
@@ -66,7 +78,7 @@ interface ExternalShare {
   url?: string;
 }
 
-export type GeneralAccessMode = "restricted" | "anyone_link" | "domain";
+export type { GeneralAccessMode } from "./generalAccessCopy";
 
 interface Props {
   open: boolean;
@@ -92,6 +104,12 @@ interface Props {
   onCreateExternal?: (config: NewExternalShareConfig) => Promise<{ url?: string; pending?: boolean }>;
   onRevokeExternal?: (shareId: string) => Promise<void>;
   externalShareNeedsApproval?: boolean;
+  /** Change the resource's internal visibility (private/workspace/entity).
+   *  When provided, the General access section shows a switcher so the
+   *  stated access level and the control to change it live together.
+   *  When absent, the section shows a read-only pointer to file properties
+   *  (per UX doc §2.2 the manage_metadata control lives there too). */
+  onChangeVisibility?: (visibility: Visibility) => Promise<void>;
 }
 
 export interface NewExternalShareConfig {
@@ -158,6 +176,7 @@ export default function ShareDialog({
   onCreateExternal,
   onRevokeExternal,
   externalShareNeedsApproval = false,
+  onChangeVisibility,
 }: Props) {
   // ── Find the active "general" share (anonymous or domain) ──
   const generalShare = useMemo(
@@ -182,6 +201,11 @@ export default function ShareDialog({
 
   const [mode, setMode] = useState<GeneralAccessMode>(initialMode);
   const [anonRole, setAnonRole] = useState<AnonRole>(initialAnonRole);
+  // Local copy of the resource's internal visibility. Callers often pass a
+  // snapshot object (e.g. the context-menu target in Knowledge.tsx), so a
+  // successful onChangeVisibility would not flow back through props —
+  // track it here and update optimistically after the API call succeeds.
+  const [vis, setVis] = useState<Visibility>(effectiveVisibility(visibility));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingNote, setPendingNote] = useState<string | null>(null);
@@ -214,12 +238,13 @@ export default function ShareDialog({
     if (open && !wasOpen) {
       setMode(initialMode);
       setAnonRole(initialAnonRole);
+      setVis(effectiveVisibility(visibility));
       setError(null);
       setPendingNote(null);
       setLinkCopied(false);
       setLastCreatedUrl(null);
     }
-  }, [open, initialMode, initialAnonRole]);
+  }, [open, initialMode, initialAnonRole, visibility]);
 
   const isRestrictedDoc = classification === "restricted";
   // Prefer the prop URL when it exists (rare — only the create response
@@ -245,6 +270,22 @@ export default function ShareDialog({
       // ignore — best effort
     }
   };
+
+  async function changeVisibility(next: Visibility) {
+    if (!onChangeVisibility || next === vis) return;
+    const prev = vis;
+    setBusy(true);
+    setError(null);
+    setVis(next); // optimistic — the select reflects the choice immediately
+    try {
+      await onChangeVisibility(next);
+    } catch (err: any) {
+      setVis(prev);
+      setError(translateApiError(err, t("permissions.error.generic")));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function applyGeneralAccess(nextMode: GeneralAccessMode, nextRole: AnonRole) {
     if (isRestrictedDoc && nextMode !== "restricted") return;
@@ -322,8 +363,8 @@ export default function ShareDialog({
             gap: 4,
           }}
         >
-          <VisibilityIcon visibility={visibility} size={12} />
-          {visibility ?? "—"}
+          <VisibilityIcon visibility={vis} size={12} />
+          {t(`permissions.visibility.${vis}.label`)}
         </span>
       </div>
 
@@ -348,6 +389,7 @@ export default function ShareDialog({
       <GeneralAccessSection
         mode={mode}
         anonRole={anonRole}
+        visibility={vis}
         isRestrictedDoc={isRestrictedDoc}
         confidentialApproval={externalShareNeedsApproval}
         entityDomain={entityDomain}
@@ -360,6 +402,7 @@ export default function ShareDialog({
           setAnonRole(r);
           if (mode !== "restricted") applyGeneralAccess(mode, r);
         }}
+        onVisibilityChange={onChangeVisibility ? changeVisibility : undefined}
       />
 
       {/* Status row */}
@@ -831,24 +874,48 @@ function PeopleWithAccessSection({
 
 // ── Section 3: General access ────────────────────────────────────────────
 
+const _TONE_COLOR: Record<GeneralAccessLine["tone"], string> = {
+  neutral: "#a8a29e",
+  warning: "#7c4a2e",
+  error: "#a23e38",
+};
+
+function _lineText(line: GeneralAccessLine): string {
+  return t(line.key, line.params);
+}
+
+function _visibilityOptions(): { value: Visibility; label: string }[] {
+  // Same option set as DocumentPropertiesDialog / the upload wizard —
+  // `public` is deliberately absent (link sharing covers that dimension).
+  return [
+    { value: "private", label: t("permissions.upload.visibility.private.label") },
+    { value: "workspace", label: t("permissions.upload.visibility.workspace.label") },
+    { value: "entity", label: t("permissions.upload.visibility.entity.label") },
+  ];
+}
+
 function GeneralAccessSection({
   mode,
   anonRole,
+  visibility,
   isRestrictedDoc,
   confidentialApproval,
   entityDomain,
   busy,
   onModeChange,
   onRoleChange,
+  onVisibilityChange,
 }: {
   mode: GeneralAccessMode;
   anonRole: AnonRole;
+  visibility: Visibility;
   isRestrictedDoc: boolean;
   confidentialApproval: boolean;
   entityDomain?: string;
   busy: boolean;
   onModeChange: (m: GeneralAccessMode) => void;
   onRoleChange: (r: AnonRole) => void;
+  onVisibilityChange?: (v: Visibility) => void;
 }) {
   const modeOptions: { value: GeneralAccessMode; label: string }[] = [
     { value: "restricted", label: t("permissions.share.general.restricted") },
@@ -861,26 +928,81 @@ function GeneralAccessSection({
     });
   }
 
-  const description: string = (() => {
-    if (isRestrictedDoc) return t("permissions.share.desc.restricted_doc");
-    if (mode === "restricted") return t("permissions.share.desc.list_only");
-    if (mode === "anyone_link")
-      return confidentialApproval
-        ? t("permissions.share.desc.anyone_link_approval")
-        : t("permissions.share.desc.anyone_link");
-    if (mode === "domain")
-      return confidentialApproval
-        ? t("permissions.share.desc.domain_approval", { domain: entityDomain ?? "" })
-        : t("permissions.share.desc.domain", { domain: entityDomain ?? "" });
-    return "";
-  })();
+  // Truthful combined state — internal visibility line + link-sharing line
+  // (see generalAccessCopy.ts for why both are always rendered).
+  const copy = generalAccessCopy({
+    mode,
+    visibility,
+    classification: isRestrictedDoc ? "restricted" : undefined,
+    entityDomain,
+    needsApproval: confidentialApproval,
+  });
+
+  const visibilityOptions = _visibilityOptions();
+  // A doc can carry `public` visibility (legacy / API-set). The switcher
+  // must not silently misreport it, so surface the current value as a
+  // locked-in extra option in that case.
+  if (!visibilityOptions.some((o) => o.value === visibility)) {
+    visibilityOptions.push({
+      value: visibility,
+      label: t(`permissions.visibility.${visibility}.label`),
+    });
+  }
 
   return (
     <section>
       <SectionLabel>{t("permissions.share.section.general_access")}</SectionLabel>
+
+      {/* Internal visibility — real state + (when wired) the control */}
       <div
         style={{
           marginTop: 8,
+          display: "grid",
+          gridTemplateColumns: onVisibilityChange ? "1fr 180px" : "1fr",
+          gap: 6,
+          alignItems: "start",
+        }}
+      >
+        <div>
+          <p
+            style={{
+              fontSize: 11,
+              color: _TONE_COLOR[copy.internal.tone],
+              fontWeight: copy.internal.tone === "warning" ? 600 : 400,
+              margin: 0,
+              lineHeight: 1.5,
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 6,
+            }}
+          >
+            <span style={{ flexShrink: 0, display: "inline-flex", marginTop: 1 }}>
+              <VisibilityIcon visibility={visibility} size={12} />
+            </span>
+            <span>{_lineText(copy.internal)}</span>
+          </p>
+          {!onVisibilityChange && (
+            <p style={{ fontSize: 11, color: "#a8a29e", margin: "4px 0 0", lineHeight: 1.5 }}>
+              {t("permissions.share.visibility_readonly_hint")}
+            </p>
+          )}
+        </div>
+        {onVisibilityChange && (
+          <div title={t("permissions.share.visibility_label")}>
+            <Select
+              value={visibility}
+              onChange={(v) => onVisibilityChange(v as Visibility)}
+              options={visibilityOptions}
+              disabled={busy}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Link sharing */}
+      <div
+        style={{
+          marginTop: 10,
           display: "grid",
           gridTemplateColumns: "1fr 120px",
           gap: 6,
@@ -902,12 +1024,12 @@ function GeneralAccessSection({
       <p
         style={{
           fontSize: 11,
-          color: isRestrictedDoc ? "#a23e38" : "#a8a29e",
+          color: _TONE_COLOR[copy.link.tone],
           margin: "8px 0 0",
           lineHeight: 1.5,
         }}
       >
-        {description}
+        {_lineText(copy.link)}
       </p>
       {busy && (
         <p style={{ fontSize: 11, color: "#a8a29e", margin: "6px 0 0" }}>

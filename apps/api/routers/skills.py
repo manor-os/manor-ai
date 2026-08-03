@@ -9,10 +9,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import runtime_invoke_skill
 from packages.core.database import get_db
+from packages.core.models.permission import Capability, ResourceType, Visibility
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.skill import AgentSkillBinding, Skill
 from packages.core.models.user import User
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+from packages.core.services.resource_access import (
+    ResourceDescriptor,
+    is_read_capability,
+    user_can_access_resource,
+)
+from packages.core.services.workspace_access import user_can_write_workspace_id
 from packages.core.services.skill_service import (
     list_skills, get_skill, create_skill,
     update_skill, delete_skill,
@@ -29,6 +36,92 @@ from packages.core.services.github_skill_installer import install_from_github
 from apps.api.deps import get_current_user
 
 router = APIRouter(prefix="/api/v1/skills", tags=["skills"])
+
+
+async def _require_writable_agent(db: AsyncSession, user: User, agent_id: str) -> Agent:
+    """Authorize mutating an agent's skill bindings.
+
+    Binding a skill changes the *agent*, so the agent is the resource being
+    written. ``unbind_skill_from_agent`` takes no entity argument at all, which
+    left these two endpoints with no ownership check of any kind.
+    """
+    agent = (
+        await db.execute(select(Agent).where(Agent.id == agent_id).limit(1))
+    ).scalar_one_or_none()
+    if not agent or not agent.entity_id:
+        raise HTTPException(404, "Agent not found")
+
+    descriptor = ResourceDescriptor.from_row(agent, ResourceType.AGENT)
+    if await user_can_access_resource(
+        db,
+        descriptor=descriptor,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+        capability=Capability.EDIT,
+    ):
+        return agent
+    if await user_can_access_resource(
+        db,
+        descriptor=descriptor,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+        capability=Capability.VIEW,
+    ):
+        raise HTTPException(403, "Insufficient permissions for this agent")
+    raise HTTPException(404, "Agent not found")
+
+
+async def _require_skill(
+    db: AsyncSession,
+    user: User,
+    skill_id: str,
+    capability: str = Capability.VIEW,
+) -> Skill:
+    """Load a skill and authorize the caller through the unified gateway.
+
+    Platform skills (``entity_id IS NULL``) are the catalog every entity sees:
+    readable by all, writable by none. That was already the effective
+    behaviour, but only as a side effect of ``skill.entity_id != entity_id``
+    being trivially true for NULL — here it is an explicit rule, and writes
+    fail loudly instead of silently returning None.
+
+    A failed read yields 404 so the endpoint never confirms a skill the caller
+    cannot see exists; a failed write on a readable skill yields 403.
+    """
+    skill = await get_skill(db, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+
+    if skill.entity_id is None:
+        if is_read_capability(capability):
+            return skill
+        raise HTTPException(403, "Platform skills are read-only")
+
+    descriptor = ResourceDescriptor.from_row(skill, ResourceType.SKILL)
+    if await user_can_access_resource(
+        db,
+        descriptor=descriptor,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+        capability=capability,
+    ):
+        return skill
+
+    if is_read_capability(capability):
+        raise HTTPException(404, "Skill not found")
+    if await user_can_access_resource(
+        db,
+        descriptor=descriptor,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+        capability=Capability.VIEW,
+    ):
+        raise HTTPException(403, "Insufficient permissions for this skill")
+    raise HTTPException(404, "Skill not found")
 
 
 # ── Schemas ──
@@ -78,6 +171,11 @@ class SkillCreateRequest(BaseModel):
     type: str = ""
     scripts: dict[str, str] = {}
     requirements: str = ""
+    extra_files: dict[str, str] = {}
+    # Scope. A null workspace keeps the skill shared entity-wide; naming one
+    # binds it to that workspace's membership rules.
+    workspace_id: str | None = None
+    visibility: str = Visibility.ENTITY
 
 
 class SkillUpdateRequest(BaseModel):
@@ -97,6 +195,7 @@ class SkillUpdateRequest(BaseModel):
     type: str | None = None
     scripts: dict[str, str] | None = None
     requirements: str | None = None
+    extra_files: dict[str, str] | None = None
 
 
 class SkillGenerateRequest(BaseModel):
@@ -434,8 +533,43 @@ async def list_skills_endpoint(
     skills = await list_skills(db, user.entity_id, category=category)
     if not include_platform:
         skills = [s for s in skills if s.entity_id == user.entity_id]
+    # Platform skills stay visible to everyone; entity skills go through the
+    # gateway so private and workspace-scoped ones drop out of the list.
+    visible: list[Skill] = []
+    for candidate in skills:
+        if candidate.entity_id is None:
+            visible.append(candidate)
+            continue
+        if await user_can_access_resource(
+            db,
+            descriptor=ResourceDescriptor.from_row(candidate, ResourceType.SKILL),
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=getattr(user, "role", None),
+            capability=Capability.VIEW,
+        ):
+            visible.append(candidate)
+    skills = visible
     bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id)
     return [_to_response(s, bindings=bindings.get(s.id, [])) for s in skills]
+
+
+def _bundle_paths(cfg: dict) -> list[str]:
+    """Relative paths of every bundled file recorded in config."""
+    paths: set[str] = set()
+    scripts = cfg.get("scripts")
+    if isinstance(scripts, dict):
+        for name in scripts:
+            n = str(name).replace("\\", "/").lstrip("/")
+            if n:
+                paths.add(n if n.startswith("scripts/") else f"scripts/{n}")
+    extras = cfg.get("extra_files")
+    if isinstance(extras, dict):
+        for rel in extras:
+            r = str(rel).replace("\\", "/").lstrip("/")
+            if r:
+                paths.add(r)
+    return sorted(paths)
 
 
 @router.post("", response_model=SkillResponse, status_code=201)
@@ -452,12 +586,31 @@ async def create_skill_endpoint(
         config["scripts"] = body.scripts
     if body.requirements:
         config["requirements"] = body.requirements
+    if body.extra_files:
+        config["extra_files"] = {
+            **dict(config.get("extra_files") or {}),
+            **body.extra_files,
+        }
+    if (body.scripts or body.extra_files) and "extra_file_paths" not in config:
+        config["extra_file_paths"] = _bundle_paths(config)
+
+    if body.workspace_id and not await user_can_write_workspace_id(
+        db,
+        workspace_id=body.workspace_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+    ):
+        raise HTTPException(403, "Cannot create a skill in this workspace")
 
     skill = await create_skill(
         db,
         entity_id=user.entity_id,
         name=body.name,
         system_prompt=body.system_prompt,
+        owner_user_id=user.id,
+        workspace_id=body.workspace_id,
+        visibility=body.visibility,
         slug=body.slug or None,
         display_name=body.display_name or None,
         description=body.description or None,
@@ -588,6 +741,7 @@ async def ai_update_skill_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """AI-powered skill update from a natural-language change description."""
+    await _require_skill(db, user, skill_id, Capability.EDIT)
     try:
         skill = await ai_update_skill(
             skill_id=skill_id,
@@ -620,11 +774,7 @@ async def save_skill_credentials(
     Values are stored in MinIO (skills/{entity_id}/{skill_id}/credentials.json)
     and the DB config is updated with credential status flags only (no raw values).
     """
-    skill = await get_skill(db, skill_id)
-    if not skill:
-        raise HTTPException(404, "Skill not found")
-    if skill.entity_id and skill.entity_id != user.entity_id:
-        raise HTTPException(403, "Access denied")
+    skill = await _require_skill(db, user, skill_id, Capability.EDIT)
 
     cfg = dict(skill.config or {})
     env_vars = cfg.get("env_vars") or []
@@ -675,12 +825,7 @@ async def get_skill_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Get a skill by ID."""
-    skill = await get_skill(db, skill_id)
-    if not skill:
-        raise HTTPException(404, "Skill not found")
-    # Allow access if platform skill or owned by entity
-    if skill.entity_id is not None and skill.entity_id != user.entity_id:
-        raise HTTPException(404, "Skill not found")
+    skill = await _require_skill(db, user, skill_id, Capability.VIEW)
     bindings = await _binding_contexts_for_skills(db, [skill], entity_id=user.entity_id)
     return _to_response(skill, bindings=bindings.get(skill.id, []))
 
@@ -693,26 +838,52 @@ async def update_skill_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a skill."""
+    await _require_skill(db, user, skill_id, Capability.EDIT)
     updates = body.model_dump(exclude_none=True)
 
-    # Merge type/scripts/requirements into config so they are persisted
-    extra_config_keys = ("type", "scripts", "requirements")
+    # Merge type/scripts/requirements/extra_files into config so they persist.
+    # scripts/extra_files use REPLACE semantics — the file editor sends the
+    # full bundle, so an omitted file is a deletion.
+    extra_config_keys = ("type", "scripts", "requirements", "extra_files")
     extra_config: dict = {}
     for key in extra_config_keys:
         if key in updates:
             extra_config[key] = updates.pop(key)
 
+    removed_paths: list[str] = []
     if extra_config:
         # Load current config and patch only the supplied keys
         existing = await get_skill(db, skill_id)
         if existing and (existing.entity_id is None or existing.entity_id == user.entity_id):
-            merged = dict(existing.config or {})
+            old_config = dict(existing.config or {})
+            merged = dict(old_config)
             merged.update(extra_config)
+            if "scripts" in extra_config or "extra_files" in extra_config:
+                new_paths = _bundle_paths(merged)
+                merged["extra_file_paths"] = new_paths
+                removed_paths = sorted(set(_bundle_paths(old_config)) - set(new_paths))
             updates["config"] = merged
 
     skill = await update_skill(db, skill_id, user.entity_id, **updates)
     if not skill:
         raise HTTPException(404, "Skill not found or not owned by your entity")
+
+    # Deleted bundle files must also leave MinIO, or /files resurrects them.
+    if removed_paths and skill.entity_id:
+        try:
+            from packages.core.services.skill_file_storage import delete_skill_paths
+            cfg = skill.config or {}
+            delete_skill_paths(
+                skill.entity_id, skill_id, removed_paths,
+                skill_dir=cfg.get("minio_dir") or None,
+                config=cfg,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "MinIO bundle-file delete failed skill=%s: %s", skill_id, exc
+            )
+
     bindings = await _binding_contexts_for_skills(db, [skill], entity_id=user.entity_id)
     return _to_response(skill, bindings=bindings.get(skill.id, []))
 
@@ -723,14 +894,16 @@ async def get_skill_files(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the full skill bundle (prompt + extra files) from MinIO.
+    """Return the full skill bundle (prompt + extra files).
 
-    Useful for editors that need the raw script content without re-loading
-    it from the config JSONB field.
+    Entity skills load from MinIO with a fallback to the config JSONB copy
+    (dev/CI environments without MinIO). Platform/built-in skills load from
+    their packaged on-disk directory. The ``files`` key is the canonical map
+    the skill viewer renders (``SKILL.md`` at the root plus every bundled
+    file); ``skipped_files`` lists binary/oversized entries that are listed
+    but not previewable.
     """
-    skill = await get_skill(db, skill_id)
-    if not skill:
-        raise HTTPException(404, "Skill not found")
+    skill = await _require_skill(db, user, skill_id, Capability.VIEW)
     if skill.entity_id is not None and skill.entity_id != user.entity_id:
         raise HTTPException(404, "Skill not found")
 
@@ -746,12 +919,63 @@ async def get_skill_files(
     prompt = (_load_prompt(entity_id, skill_id, **_kw) if entity_id else None) or skill.system_prompt
     extra_files = _load_extras(entity_id, skill_id, **_kw) if entity_id else {}
     requirements = (_load_reqs(entity_id, skill_id, **_kw) if entity_id else "") or cfg.get("requirements") or ""
+    skipped_files: list[dict] = []
+
+    if entity_id:
+        if not extra_files:
+            # MinIO unavailable or bundle never uploaded — fall back to the
+            # copies kept in config JSONB.
+            scripts = cfg.get("scripts")
+            if isinstance(scripts, dict):
+                for name, content in scripts.items():
+                    if isinstance(content, str):
+                        rel = name if name.startswith("scripts/") else f"scripts/{name}"
+                        extra_files[rel] = content
+            cfg_extras = cfg.get("extra_files")
+            if isinstance(cfg_extras, dict):
+                for rel, content in cfg_extras.items():
+                    if isinstance(content, str):
+                        extra_files.setdefault(rel, content)
+    else:
+        from pathlib import Path
+
+        from packages.core.services.builtin_skill_loader import read_skill_dir_files
+
+        disk_dir = cfg.get("skill_dir")
+        disk_files: dict[str, str] = {}
+        if isinstance(disk_dir, str) and disk_dir:
+            disk_files, skipped_files = read_skill_dir_files(Path(disk_dir))
+        if disk_files:
+            prompt = disk_files.pop("SKILL.md", None) or prompt
+            extra_files = disk_files
+        else:
+            # Guide skills seeded from config-stored bundles (or a missing
+            # packaged directory) — use the JSONB copies.
+            cfg_extras = cfg.get("extra_files")
+            if isinstance(cfg_extras, dict):
+                extra_files = {
+                    rel: content
+                    for rel, content in cfg_extras.items()
+                    if isinstance(content, str)
+                }
+            scripts = cfg.get("scripts")
+            if isinstance(scripts, dict):
+                for name, content in scripts.items():
+                    if isinstance(content, str):
+                        rel = name if name.startswith("scripts/") else f"scripts/{name}"
+                        extra_files.setdefault(rel, content)
+
+    files = {"SKILL.md": prompt or "", **dict(sorted(extra_files.items()))}
+    if requirements and "requirements.txt" not in files:
+        files["requirements.txt"] = requirements
 
     return {
         "skill_id": skill_id,
         "prompt": prompt,
         "extra_files": extra_files,
         "requirements": requirements,
+        "files": files,
+        "skipped_files": skipped_files,
     }
 
 
@@ -762,6 +986,7 @@ async def delete_skill_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a skill."""
+    await _require_skill(db, user, skill_id, Capability.DELETE)
     deleted = await delete_skill(db, skill_id, user.entity_id)
     if not deleted:
         raise HTTPException(404, "Skill not found or not owned by your entity")
@@ -775,6 +1000,9 @@ async def invoke_skill_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Invoke a skill."""
+    # Invoking runs a skill without altering it, so it takes the read path —
+    # a viewer may use skills, just not change them.
+    await _require_skill(db, user, skill_id, Capability.VIEW)
     import json as _json
     # Stringify dict inputs into JSON so the skill's LLM gets a clean,
     # parseable user message. Skills with structured input_schema
@@ -787,7 +1015,7 @@ async def invoke_skill_endpoint(
     result = await runtime_invoke_skill(
         db, skill_id, user.entity_id, input_payload, user_id=user.id,
     )
-    if "error" in result:
+    if result.get("error"):
         raise HTTPException(404, result["error"])
     return result
 
@@ -874,6 +1102,8 @@ async def bind_skill(
     db: AsyncSession = Depends(get_db),
 ):
     """Bind a skill to an agent."""
+    await _require_writable_agent(db, user, agent_id)
+    await _require_skill(db, user, skill_id, Capability.VIEW)
     binding = await bind_skill_to_agent(
         db,
         agent_id,
@@ -900,6 +1130,7 @@ async def unbind_skill(
     db: AsyncSession = Depends(get_db),
 ):
     """Remove a skill binding from an agent."""
+    await _require_writable_agent(db, user, agent_id)
     removed = await unbind_skill_from_agent(db, agent_id, skill_id)
     if not removed:
         raise HTTPException(404, "Binding not found")

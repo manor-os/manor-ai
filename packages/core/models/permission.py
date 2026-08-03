@@ -1,9 +1,9 @@
 """Permission-v1 ORM models.
 
 Companions to the alembic migration ``20260506_02_permissions_v1_schema``.
-The high-volume audit tables (``permission_audit``, ``document_access_log``)
-are intentionally written to via raw SQL from the authz layer rather than
-the ORM — they are append-only and do not need ORM mapping for read paths.
+The high-volume audit table ``document_access_log`` is intentionally written
+via raw SQL from the document-permissions layer rather than the ORM — it is
+append-only and does not need ORM mapping for read paths.
 The models here cover the resources business code reads/writes:
 
   * ResourceGrant         — row-level capability grant
@@ -34,6 +34,9 @@ class ResourceType:
     WORKSPACE = "workspace"
     CONVERSATION = "conversation"
     INTEGRATION = "integration"
+    AGENT = "agent"
+    SKILL = "skill"
+    WORKFLOW = "workflow"
 
 
 class SubjectType:
@@ -60,7 +63,6 @@ class Capability:
     RECLASSIFY = "reclassify"
     DELETE = "delete"
     GRANT_ACCESS = "grant_access"
-    LEGAL_HOLD = "legal_hold"
 
 
 class Visibility:
@@ -222,49 +224,13 @@ class Share(Base):
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, server_default="{}")
 
 
-# ── Audit tables (append-only; rarely read from the ORM) ─────────────────
+# ── Audit table (append-only; rarely read from the ORM) ──────────────────
 #
-# These are listed in the ORM only so test fixtures using ``Base.metadata.
-# create_all()`` pick them up. Production code writes through the raw-SQL
-# helpers in ``packages.core.auth.authz`` and ``apps/api/routers/
-# document_permissions.py`` — going through the ORM here would invite N+1
-# loads on a hot path. Reads (admin audit panels, owner self-service) can
-# use the ORM models for convenience.
-
-
-class PermissionAudit(Base):
-    """Per-decision audit row for authorize() — see docs/PERMISSIONS_DESIGN_ZH.md §9.
-
-    Append-only. Sampled (deny=always, sensitive-verb allow=always, other
-    allow=skipped). Partitioned by month in production via a follow-up
-    migration; the base table lives here.
-    """
-    __tablename__ = "permission_audit"
-    __table_args__ = (
-        Index("ix_permission_audit_ts", "ts"),
-        Index("ix_permission_audit_actor", "actor_type", "actor_id", "ts"),
-        Index("ix_permission_audit_resource", "resource_type", "resource_id", "ts"),
-        Index("ix_permission_audit_decision", "decision", "ts"),
-    )
-
-    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
-    ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=text_fn("now()"),
-        nullable=False,
-    )
-    entity_id: Mapped[Optional[str]] = mapped_column(String(26))
-    actor_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    actor_id: Mapped[Optional[str]] = mapped_column(String(120))
-    action: Mapped[str] = mapped_column(String(80), nullable=False)
-    resource_type: Mapped[Optional[str]] = mapped_column(String(40))
-    resource_id: Mapped[Optional[str]] = mapped_column(String(26))
-    decision: Mapped[str] = mapped_column(String(10), nullable=False)
-    reason: Mapped[Optional[str]] = mapped_column(String(120))
-    request_id: Mapped[Optional[str]] = mapped_column(String(80))
-    ip: Mapped[Optional[str]] = mapped_column(String(45))
-    user_agent: Mapped[Optional[str]] = mapped_column(Text)
-    context: Mapped[dict] = mapped_column(JSONB, server_default="{}")
+# Listed in the ORM only so test fixtures using ``Base.metadata.create_all()``
+# pick it up. Production writes go through the raw-SQL helper in
+# ``apps/api/routers/document_permissions.py`` — going through the ORM here
+# would invite N+1 loads on a hot path. Reads (admin audit panels, owner
+# self-service) can use the ORM model for convenience.
 
 
 class DocumentAccessLog(Base):

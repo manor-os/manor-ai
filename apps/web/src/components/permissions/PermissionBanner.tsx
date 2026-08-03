@@ -12,7 +12,6 @@ import { IconWarning, IconLock } from "../icons";
 import { t } from "../../lib/i18n";
 
 export type PermissionBannerReason =
-  | "legal_hold"
   | "quarantine"
   | "pii"
   | "no_access"
@@ -43,13 +42,6 @@ const REASON_DEFAULTS: Record<
     messageKey: string;
   }
 > = {
-  legal_hold: {
-    icon: "warning",
-    bg: "#f3ecd6",
-    border: "#cf9b44",
-    fg: "#76502c",
-    messageKey: "permissions.banner.legal_hold",
-  },
   quarantine: {
     icon: "warning",
     bg: "#f9f4ec",

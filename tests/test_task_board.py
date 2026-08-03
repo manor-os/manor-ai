@@ -57,6 +57,55 @@ async def test_task_board_grouped(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_task_board_preferences_are_user_scoped(client: AsyncClient):
+    first_headers = await _auth(client, "boardprefsfirst")
+    second_headers = await _auth(client, "boardprefssecond")
+
+    default_response = await client.get(
+        "/api/v1/tasks/board-preferences",
+        headers=first_headers,
+    )
+    assert default_response.status_code == 200
+    assert default_response.json() == {
+        "mode": "kanban",
+        "visible_columns": ["todo", "scheduled", "in_progress", "review", "done"],
+        "column_order": ["todo", "scheduled", "in_progress", "review", "done"],
+        "configured": False,
+    }
+
+    update_response = await client.put(
+        "/api/v1/tasks/board-preferences",
+        headers=first_headers,
+        json={
+            "mode": "list",
+            "visible_columns": ["done", "todo", "done", "unknown"],
+            "column_order": ["done", "todo"],
+        },
+    )
+    assert update_response.status_code == 200
+    assert update_response.json() == {
+        "mode": "list",
+        "visible_columns": ["done", "todo"],
+        "column_order": ["done", "todo", "scheduled", "in_progress", "review"],
+        "configured": True,
+    }
+
+    first_read = await client.get(
+        "/api/v1/tasks/board-preferences",
+        headers=first_headers,
+    )
+    assert first_read.json() == update_response.json()
+
+    second_read = await client.get(
+        "/api/v1/tasks/board-preferences",
+        headers=second_headers,
+    )
+    assert second_read.status_code == 200
+    assert second_read.json()["configured"] is False
+    assert second_read.json()["mode"] == "kanban"
+
+
+@pytest.mark.asyncio
 async def test_move_task(client: AsyncClient):
     """Move a task from pending to in_progress via the move endpoint, verify started_at is set."""
     headers = await _auth(client, "boardmove")

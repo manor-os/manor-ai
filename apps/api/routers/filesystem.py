@@ -186,8 +186,66 @@ def _assert_user_visible_rel(rel_path: str, *, is_dir: bool, action: str) -> Non
         raise HTTPException(403, f"Cannot {action} hidden/system path")
 
 
+async def _unreadable_doc_paths(
+    db: AsyncSession,
+    entity_id: str,
+    rel_paths: list[str],
+    user: User,
+) -> set[str]:
+    """Of ``rel_paths``, return the normalized paths that map to a Knowledge
+    ``Document`` the caller may NOT read.
+
+    Knowledge documents live as real files under the entity FS root, so the
+    raw ``/fs/*`` surface would otherwise serve a document's bytes without
+    consulting ``Document.visibility`` — letting a same-entity member read a
+    private file they cannot see in the Knowledge Base. We gate each path on
+    the same ``user_can_read_document`` guard the ``/documents`` API uses.
+
+    Paths with no matching ``Document`` row (avatars, workspace artifacts,
+    agent scratch) are never blocked here — the existing entity + hidden-path
+    checks already scope those.
+    """
+    from packages.core.models.document import Document
+    from packages.core.services.document_access import user_can_read_document
+
+    wanted = {normalize_rel_path(p) for p in rel_paths if p}
+    if not wanted:
+        return set()
+    rows = (
+        await db.execute(
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.fs_path.in_(wanted),
+                Document.is_trashed == False,  # noqa: E712
+            )
+        )
+    ).scalars().all()
+    blocked: set[str] = set()
+    for doc in rows:
+        if not await user_can_read_document(
+            db, doc, entity_id=entity_id, user_id=user.id, role=user.role
+        ):
+            blocked.add(normalize_rel_path(doc.fs_path))
+    return blocked
+
+
+async def _assert_path_readable(
+    db: AsyncSession, entity_id: str, rel_path: str, user: User
+) -> None:
+    """404 if ``rel_path`` is a Knowledge document the caller cannot read.
+
+    Raises the same not-found error as a missing file so the endpoint never
+    confirms the existence of a private document to an unauthorized member.
+    """
+    if await _unreadable_doc_paths(db, entity_id, [rel_path], user):
+        raise _file_not_found()
+
+
 _PUBLIC_RAW_PREFIXES: tuple[str, ...] = (
     "avatars/",
+    # Files under this prefix are explicit Marketplace publication copies,
+    # never the original private Workspace/Knowledge artifacts.
+    "marketplace/blueprints/",
 )
 
 
@@ -278,6 +336,7 @@ async def list_directory(
     user: User = Depends(get_current_user),
     path: str = Query(".", description="Relative path from entity root"),
     show_system: bool = Query(False, description="Show system files (MANOR.md, index.md, log.md)"),
+    db: AsyncSession = Depends(get_db),
 ):
     """List contents of a directory."""
     _require_fs()
@@ -302,6 +361,15 @@ async def list_directory(
     items = await asyncio.to_thread(_list)
     if items is None:
         raise HTTPException(404, f"Directory not found: {path}")
+    # Drop files that map to a Knowledge document the caller cannot read.
+    blocked = await _unreadable_doc_paths(
+        db,
+        user.entity_id,
+        [i["path"] for i in items if i["type"] != "directory"],
+        user,
+    )
+    if blocked:
+        items = [i for i in items if normalize_rel_path(i["path"]) not in blocked]
     return {"items": items, "path": os.path.relpath(full, root), "count": len(items)}
 
 
@@ -310,6 +378,7 @@ async def directory_tree(
     user: User = Depends(get_current_user),
     max_depth: int = Query(3, ge=1, le=10),
     show_system: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
 ):
     """Full directory tree for sidebar file browser."""
     _require_fs()
@@ -341,6 +410,31 @@ async def directory_tree(
         return items
 
     tree = await asyncio.to_thread(walk, root, 1)
+
+    # Prune files that map to a Knowledge document the caller cannot read.
+    file_paths: list[str] = []
+
+    def _collect(nodes: list[dict]) -> None:
+        for node in nodes:
+            if node["type"] == "directory":
+                _collect(node.get("children", []))
+            else:
+                file_paths.append(node["path"])
+
+    _collect(tree)
+    blocked = await _unreadable_doc_paths(db, user.entity_id, file_paths, user)
+    if blocked:
+        def _prune(nodes: list[dict]) -> list[dict]:
+            kept = []
+            for node in nodes:
+                if node["type"] == "directory":
+                    node["children"] = _prune(node.get("children", []))
+                    kept.append(node)
+                elif normalize_rel_path(node["path"]) not in blocked:
+                    kept.append(node)
+            return kept
+
+        tree = _prune(tree)
     return {"tree": tree, "entity_id": user.entity_id}
 
 
@@ -348,6 +442,7 @@ async def directory_tree(
 async def read_file(
     user: User = Depends(get_current_user),
     path: str = Query(..., description="Relative path to file"),
+    db: AsyncSession = Depends(get_db),
 ):
     """Read file content. Returns text for text files, base64 for binary."""
     _require_fs()
@@ -355,6 +450,7 @@ async def read_file(
     root = _entity_root(user.entity_id)
     rel = normalize_rel_path(os.path.relpath(full, root))
     _assert_user_visible_rel(rel, is_dir=False, action="read")
+    await _assert_path_readable(db, user.entity_id, rel, user)
 
     def _read():
         if not os.path.isfile(full):
@@ -388,6 +484,7 @@ async def read_file(
 async def file_info(
     user: User = Depends(get_current_user),
     path: str = Query(...),
+    db: AsyncSession = Depends(get_db),
 ):
     """Get file/directory metadata."""
     _require_fs()
@@ -396,6 +493,8 @@ async def file_info(
     if os.path.exists(full):
         rel = normalize_rel_path(os.path.relpath(full, root))
         _assert_user_visible_rel(rel, is_dir=os.path.isdir(full), action="inspect")
+        if not os.path.isdir(full):
+            await _assert_path_readable(db, user.entity_id, rel, user)
 
     def _info():
         if not os.path.exists(full):
@@ -631,6 +730,7 @@ async def search_files(
     query: str = Query(..., description="Search text (ripgrep)"),
     glob_pattern: str = Query("*.md", alias="glob", description="File pattern to search"),
     max_results: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
 ):
     """Search file contents using ripgrep."""
     _require_fs()
@@ -668,6 +768,14 @@ async def search_files(
         if len(results) >= max_results:
             break
 
+    # Drop hits inside Knowledge documents the caller cannot read — otherwise
+    # ripgrep would leak private-document content snippets across the entity.
+    blocked = await _unreadable_doc_paths(
+        db, user.entity_id, [r["path"] for r in results], user
+    )
+    if blocked:
+        results = [r for r in results if normalize_rel_path(r["path"]) not in blocked]
+
     return {"results": results, "query": query, "count": len(results)}
 
 
@@ -681,6 +789,9 @@ async def resolve_wiki_links(
     _require_fs()
     full = _resolve(user.entity_id, path)
     _assert_user_visible_rel(path, is_dir=False, action="read")
+    await _assert_path_readable(
+        db, user.entity_id, normalize_rel_path(path), user
+    )
 
     from packages.core.models.document import Document
     from packages.core.services.document_service import get_document_content
@@ -979,6 +1090,26 @@ async def wiki_index(
             allowed_paths = set()
 
     graph = await asyncio.to_thread(build_wiki_graph, user.entity_id, allowed_paths=allowed_paths)
+    # Drop pages backed by a Knowledge document the caller cannot read, so the
+    # wiki graph never exposes a private document's name, links, or inline
+    # markdown to a same-entity member.
+    _graph_pages = graph.get("pages") if isinstance(graph, dict) else None
+    if isinstance(_graph_pages, list) and _graph_pages:
+        _page_paths = [
+            p.get("path") for p in _graph_pages if isinstance(p, dict) and p.get("path")
+        ]
+        _blocked_pages = await _unreadable_doc_paths(
+            db, user.entity_id, _page_paths, user
+        )
+        if _blocked_pages:
+            graph["pages"] = [
+                p
+                for p in _graph_pages
+                if not (
+                    isinstance(p, dict)
+                    and normalize_rel_path(str(p.get("path") or "")) in _blocked_pages
+                )
+            ]
     if requested_net_ids or workspace_id:
         graph["scope"] = {
             "kind": "knowledge_net" if requested_net_ids else "workspace",
@@ -1128,10 +1259,11 @@ async def serve_entity_file(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Serve a raw file from the entity filesystem (avatars, public uploads).
+    """Serve a raw file from the entity filesystem (avatars, Marketplace media).
 
-    Avatars are public assets. All other entity files require bearer auth and
-    must belong to the authenticated user's entity.
+    Avatars and explicitly published Marketplace media are public assets. All
+    other entity files require bearer auth and must belong to the
+    authenticated user's entity.
 
     Stale-URL cleanup: when an avatar path 404s, schedule a background task
     that clears any User / Staff row still pointing at the missing file.
@@ -1177,6 +1309,10 @@ async def serve_entity_file(
             raise HTTPException(403, "Access denied")
         if not is_user_visible_path(rel_path):
             raise HTTPException(403, "Access denied")
+        # A Knowledge document served as raw bytes must still honor
+        # Document.visibility — otherwise a same-entity member could fetch a
+        # private file directly by URL.
+        await _assert_path_readable(db, entity_id, rel_path, user)
 
     content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     return FileResponse(

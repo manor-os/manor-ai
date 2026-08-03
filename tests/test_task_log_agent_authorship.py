@@ -5,15 +5,21 @@ The workspace agent runtime used to stamp a literal ``"workspace-agent"`` as
 the author of every task log/comment, so the activity UI showed a generic
 label instead of the specific persona (e.g. "X Growth Analyst") that actually
 did the work. ``agent_log_authorship`` now resolves the running agent into
-``(created_by, metadata)`` where ``metadata`` carries ``agent_id`` (+ name),
-which the task-log serializer surfaces as ``author_agent_id`` /
-``author_agent_name`` for the frontend to resolve.
+``(created_by, metadata, actor)`` where ``metadata`` carries ``agent_id``
+(+ name), which the task-log serializer surfaces as ``author_agent_id`` /
+``author_agent_name`` for the frontend to resolve, and ``actor`` says which
+kind of thing acted (see TaskActor).
+
+With no agent id at all there is still no "generic agent": the master agent
+is the one running as the workspace agent, so that is what it resolves to.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from packages.core.constants.agents import MANOR_AGENT_NAME
+from packages.core.constants.task_actors import TaskActor
 from packages.core.services import agent_service, task_service
 
 
@@ -28,34 +34,52 @@ def fake_agent(monkeypatch):
     monkeypatch.setattr(agent_service, "get_agent", _get_agent)
 
 
-async def test_no_agent_falls_back_to_generic(fake_agent):
-    created_by, meta = await task_service.agent_log_authorship(object(), None)
-    assert created_by == "workspace-agent"
+async def test_no_agent_resolves_to_the_master_agent(fake_agent):
+    """Work does not run un-owned. No agent id means the master agent ran it,
+    which is a determinate answer — not a placeholder."""
+    created_by, meta, actor = await task_service.agent_log_authorship(object(), None)
+    assert created_by == MANOR_AGENT_NAME
     assert meta is None
+    assert actor is TaskActor.MANOR
 
 
 async def test_no_agent_uses_human_fallback(fake_agent):
-    created_by, meta = await task_service.agent_log_authorship(object(), "", fallback="user-123")
+    created_by, meta, actor = await task_service.agent_log_authorship(
+        object(), "", fallback="user-123",
+    )
     assert created_by == "user-123"
     assert meta is None
+    assert actor is TaskActor.USER
+
+
+async def test_a_legacy_placeholder_fallback_is_not_mistaken_for_a_person(fake_agent):
+    """Old call sites passed a placeholder as the fallback. It names an agent
+    that failed to be recorded, never a user."""
+    created_by, meta, actor = await task_service.agent_log_authorship(
+        object(), None, fallback="workspace-agent",
+    )
+    assert created_by == MANOR_AGENT_NAME
+    assert actor is TaskActor.MANOR
 
 
 async def test_agent_stamps_id_and_name(fake_agent):
-    created_by, meta = await task_service.agent_log_authorship(
+    created_by, meta, actor = await task_service.agent_log_authorship(
         object(),
         "01AGENTX",
         fallback="user-123",
     )
     assert created_by == "01AGENTX"
     assert meta == {"agent_id": "01AGENTX", "agent_name": "X Growth Analyst"}
+    assert actor is TaskActor.AGENT
 
 
 async def test_unknown_agent_still_stamps_id(fake_agent):
     # Even if the name can't be resolved server-side, stamping the id lets the
     # frontend resolve it against the workspace's agent list.
-    created_by, meta = await task_service.agent_log_authorship(object(), "01MISSING")
+    created_by, meta, actor = await task_service.agent_log_authorship(object(), "01MISSING")
     assert created_by == "01MISSING"
     assert meta == {"agent_id": "01MISSING"}
+    assert actor is TaskActor.AGENT
 
 
 async def test_task_comment_routes_and_attributes_to_task_agent(monkeypatch):
@@ -103,14 +127,14 @@ async def test_task_comment_routes_and_attributes_to_task_agent(monkeypatch):
         captured["turn_agent_id"] = kw.get("agent_id")
         return {"content": "answer", "message_id": "M1", "tool_calls_made": []}
 
-    async def _add_task_log(db, task_id, log_type, content, *, created_by="system", metadata=None):
-        logs.append({"log_type": log_type, "created_by": created_by, "metadata": metadata})
+    async def _add_task_log(db, task_id, log_type, content, *, actor, created_by="system", metadata=None):
+        logs.append({"log_type": log_type, "created_by": created_by, "metadata": metadata, "actor": actor})
         return types.SimpleNamespace(id="L1")
 
     async def _authorship(db, agent_id, *, fallback=None):
         if not agent_id:
-            return (fallback or "workspace-agent"), None
-        return agent_id, {"agent_id": agent_id, "agent_name": "X Growth Analyst"}
+            return (fallback or MANOR_AGENT_NAME), None, TaskActor.MANOR
+        return agent_id, {"agent_id": agent_id, "agent_name": "X Growth Analyst"}, TaskActor.AGENT
 
     import packages.core.database as database
     import packages.core.services.conversation_messages as conversation_messages

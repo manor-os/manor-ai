@@ -3,6 +3,7 @@ import { Suspense, lazy, useEffect } from "react";
 import AppLayout from "./layouts/AppLayout";
 import ProtectedRoute from "./components/ProtectedRoute";
 import RouteErrorBoundary from "./components/RouteErrorBoundary";
+import { PageLoading } from "./components/ui/Skeleton";
 import { t } from "./lib/i18n";
 import { useConfigStore } from "./stores/config";
 
@@ -36,7 +37,6 @@ const Users = lazy(() => import("./pages/Users"));
 const Activity = lazy(() => import("./pages/Activity"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Notifications = lazy(() => import("./pages/Notifications"));
-const Announcements = lazy(() => import("./pages/Announcements"));
 const Account = lazy(() => import("./pages/Account"));
 const ScheduledJobs = lazy(() => import("./pages/ScheduledJobs"));
 const BrowserSessions = lazy(() => import("./pages/BrowserSessions"));
@@ -62,28 +62,7 @@ const JobLogs = lazy(() => import("./pages/JobLogs"));
 
 // Loading fallback
 function PageLoader() {
-  return (
-    <div className="flex items-center justify-center h-full min-h-[200px]">
-      <div className="flex items-center gap-3 text-stone-400">
-        <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-          <circle
-            className="opacity-25"
-            cx="12"
-            cy="12"
-            r="10"
-            stroke="currentColor"
-            strokeWidth="4"
-          />
-          <path
-            className="opacity-75"
-            fill="currentColor"
-            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-          />
-        </svg>
-        <span className="text-sm font-medium">{t("status.loading")}</span>
-      </div>
-    </div>
-  );
+  return <PageLoading label={t("status.loading")} minHeight={200} />;
 }
 
 // Wrap each element with Suspense
@@ -407,14 +386,6 @@ export const router = createBrowserRouter([
           {
             path: "/inbox",
             element: <Navigate to="/messages" replace />,
-          },
-          {
-            path: "/announcements",
-            element: (
-              <S>
-                <Announcements />
-              </S>
-            ),
           },
           {
             path: "/account",

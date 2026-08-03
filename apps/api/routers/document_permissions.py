@@ -1,8 +1,7 @@
 """Document share / grant / access-log endpoints (RFC §13, P3).
 
 Companions to ``permissions_v1.py`` which already handles classify /
-visibility / legal-hold / access-request CREATE via the ``authorize()``
-entry. This module adds what wasn't covered there:
+visibility / access-request CREATE. This module adds what wasn't covered there:
 
   * Grants CRUD — internal sharing (``ResourceGrant`` rows)
   * Shares CRUD — external sharing (``Share`` rows; opaque tokens)
@@ -13,16 +12,12 @@ entry. This module adds what wasn't covered there:
   * Public view (``/shared-doc/{token}``) — unauthenticated access via
               share token; verifies hash, applies capability, writes log
 
-Permission gating is intentionally light in this P3 commit: enforcement
-proper lives behind the ``permissions_v1_enforce`` feature flag in
-``packages/core/auth/authz.py``. Here we apply two minimum invariants
-that must hold even with the flag off:
+Permission gating follows the effective-capability model in
+``packages.core.services.document_access``. Two invariants always hold:
 
   1. Cross-entity isolation — you cannot touch a document outside your
      own entity, period.
   2. Owner + admin only for write actions (grant/share).
-
-Anything finer (e.g. workspace-role-based view) waits for the flag flip.
 """
 from __future__ import annotations
 
@@ -889,7 +884,6 @@ async def view_shared_doc_content(
     browser tab / iframe / <img> rather than downloading.
     """
     from fastapi.responses import FileResponse
-    from packages.core.config import get_settings as _get_settings
 
     token_hash = _hash_token(token)
     share = (
@@ -987,7 +981,6 @@ async def download_shared_doc(
     bytes via which link.
     """
     from fastapi.responses import FileResponse
-    from packages.core.config import get_settings as _get_settings
 
     token_hash = _hash_token(token)
     share = (
@@ -1584,6 +1577,6 @@ async def decide_share_approval(
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Note: legal-hold + classify endpoints live in permissions_v1.py,
-# under /api/v1/permissions/documents/:id/{legal-hold,classify}.
+# Note: classify endpoints live in permissions_v1.py,
+# under /api/v1/permissions/documents/:id/classify.
 # ─────────────────────────────────────────────────────────────────────────

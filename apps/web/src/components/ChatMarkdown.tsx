@@ -7,7 +7,7 @@
  * Uses react-markdown v10 (named export: Markdown).
  */
 import { memo, useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import Markdown from "react-markdown";
+import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -35,7 +35,8 @@ import {
   looksLikeTaskRouteReference,
   looksLikeViewerRouteReference,
 } from "../lib/chatRouteReferences";
-import { decodeFileReferenceHref, linkifyFileReferencesInMarkdown, looksLikeFileReference } from "../lib/fileReferences";
+import { stripEditorLiveEditBlocks } from "../lib/editorLiveChat";
+import { decodeFileReferenceHref, isOpenableFileReference, linkifyFileReferencesInMarkdown, looksLikeFileReference } from "../lib/fileReferences";
 
 
 SyntaxHighlighter.registerLanguage("tsx", tsx);
@@ -198,7 +199,7 @@ function stripManorFinalResponseMarker(value: string): string {
 }
 
 function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, returnTo }: ChatMarkdownProps) {
-  const rawText = stripManorFinalResponseMarker(toMarkdownText(content));
+  const rawText = stripEditorLiveEditBlocks(stripManorFinalResponseMarker(toMarkdownText(content)));
   const routeLinkedText = enableFileCards ? linkifyChatRouteReferencesInMarkdown(rawText) : rawText;
   const text = enableFileCards ? linkifyFileReferencesInMarkdown(routeLinkedText) : routeLinkedText;
 
@@ -206,6 +207,12 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
     <div className={isUser ? "chat-md chat-md--user" : `chat-md${streaming ? " chat-md--streaming" : ""}`}>
       <Markdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
+        urlTransform={(url) => {
+          if (url.startsWith("manor-route:") || url.startsWith("manor-file:")) {
+            return url;
+          }
+          return defaultUrlTransform(url);
+        }}
         components={{
           /* Override pre to handle fenced code blocks */
           pre({ children }) {
@@ -218,8 +225,13 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
             const match = /language-(\w+)/.exec(className);
             const codeString = getTextContent(codeEl.props.children).replace(/\n$/, "");
             const lang = match?.[1] || "";
+            const normalizedLang = lang.toLowerCase();
+            const isLongTechnicalJson =
+              codeString.length > 800 &&
+              (normalizedLang === "json" ||
+                (!normalizedLang && /^[\s]*[\[{]/.test(codeString)));
 
-            return (
+            const renderedCode = (
               <div className={`chat-code-block${isUser ? " chat-code-block--user" : ""}`}>
                 {lang && (
                   <div className="chat-code-block-label">
@@ -242,6 +254,20 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
                 </SyntaxHighlighter>
               </div>
             );
+
+            if (isLongTechnicalJson) {
+              return (
+                <details className="chat-technical-details">
+                  <summary>
+                    <span>{t("component.chat_markdown.technical_details")}</span>
+                    <span className="chat-technical-details-meta">JSON</span>
+                  </summary>
+                  {renderedCode}
+                </details>
+              );
+            }
+
+            return renderedCode;
           },
 
           /* Inline code only */
@@ -270,13 +296,16 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
                 />
               );
             }
+            // A card promises that clicking opens the file, so the link must
+            // carry an address. `looksLikeFileReference(label)` used to be
+            // enough: any link text ending in a known extension produced a
+            // card, whether or not anything could resolve it.
             if (
               enableFileCards &&
               (
                 fileReference ||
                 looksLikeViewerRouteReference(targetReference) ||
-                looksLikeFileReference(targetReference) ||
-                looksLikeFileReference(label)
+                isOpenableFileReference(targetReference)
               )
             ) {
               return (

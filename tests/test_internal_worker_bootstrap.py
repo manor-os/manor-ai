@@ -8,6 +8,10 @@ from sqlalchemy import select
 from packages.core.models.base import generate_ulid
 from packages.core.models.worker import SubscriptionWorker, Worker
 from packages.core.models.workspace import AgentSubscription, Workspace
+from packages.core.services.workspace_artifacts import (
+    artifact_folder_id_from_storage_path,
+    workspace_artifact_storage_base,
+)
 from packages.core.workers.registry import INTERNAL_WORKER_KIND, ensure_internal_worker
 
 
@@ -99,9 +103,12 @@ async def test_subagent_text_artifact_materializes_under_workspace_folder(db_ses
         result={"summary": "Ready."},
     )
 
-    assert captured["rel_path"] == "Workspaces/Social Ops/artifacts/draft_pack.md"
-    assert result["fs_path"] == "Workspaces/Social Ops/artifacts/draft_pack.md"
-    assert result["files"][0]["fs_path"] == "Workspaces/Social Ops/artifacts/draft_pack.md"
+    artifact_folder_id = artifact_folder_id_from_storage_path(str(captured["rel_path"]))
+    assert artifact_folder_id
+    expected_path = f"{workspace_artifact_storage_base(artifact_folder_id)}/artifacts/draft_pack.md"
+    assert captured["rel_path"] == expected_path
+    assert result["fs_path"] == expected_path
+    assert result["files"][0]["fs_path"] == expected_path
     assert result["document_id"] == "doc_123"
     assert captured["sync"]["workspace_id"] == workspace_id
 

@@ -151,7 +151,7 @@ export default function Memories() {
   }
 
   return (
-    <div style={{ maxWidth: 1060, margin: "0 auto" }}>
+    <div style={{ maxWidth: 1060 }}>
       <PageHeader
         title={t("page.memories.agent_memories")}
         subtitle={t("page.memories.subtitle")}

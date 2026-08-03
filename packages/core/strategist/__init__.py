@@ -31,10 +31,18 @@ from packages.core.strategist.scheduling import (
     install_strategist_schedule,
     remove_strategist_schedule,
 )
+from packages.core.strategist.triggers import (
+    ReviewTrigger,
+    ReviewTriggerKind,
+    classify_legacy_trigger,
+)
 
 __all__ = [
     "Proposal",
     "ProposedTask",
+    "ReviewTrigger",
+    "ReviewTriggerKind",
+    "classify_legacy_trigger",
     "run_review",
     "approve_proposal",
     "reject_proposal",

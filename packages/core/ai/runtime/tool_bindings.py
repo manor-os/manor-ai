@@ -199,7 +199,7 @@ def tool_bindings_for_profile_tools(
             RuntimeToolBinding(
                 name=tool_name,
                 capability_id=None,
-                source="unclassified_legacy_tool",
+                source="unclassified_tool",
             )
         )
     return tuple(sorted(bindings, key=lambda item: (item.name, item.capability_id or "")))

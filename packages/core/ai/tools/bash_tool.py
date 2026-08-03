@@ -229,6 +229,47 @@ def _segment_may_create_files(segment: list[str]) -> bool:
     return False
 
 
+# Local filesystem commands that read file *contents* (as opposed to just
+# listing names). Their non-flag arguments are candidate file paths.
+_READ_CONTENT_CMDS = {
+    "cat", "head", "tail", "wc", "file", "nl", "tac", "od", "xxd",
+    "strings", "base64", "less", "more", "sort", "uniq", "cut", "tr",
+    "diff", "column", "fold", "fmt", "rev",
+}
+# Commands whose first non-flag argument is a pattern/script, not a path.
+_READ_PATTERN_CMDS = {"grep", "rg", "egrep", "fgrep"}
+_READ_SCRIPT_CMDS = {"awk", "sed"}
+
+
+def _visible_read_paths(command: str) -> list[str]:
+    """Best-effort detection of paths a local bash command reads the contents of.
+
+    Over-extraction is safe: the caller resolves each candidate against the
+    ``documents`` table, so flag values / non-document paths never match and are
+    never blocked. Covers the common ``cat priv.md`` / ``grep x priv.md`` /
+    ``cat priv.md | ...`` forms; command substitution and variables are not
+    resolved (a known gap — content execution routes to the mountless sandbox,
+    only these local commands touch the entity FS).
+    """
+    paths: list[str] = []
+    for segment in _shell_command_segments(command):
+        if not segment:
+            continue
+        base_cmd = segment[0].rsplit("/", 1)[-1]
+        args = segment[1:]
+        non_flags = [a for a in args if a and not a.startswith("-")]
+        if base_cmd in _READ_CONTENT_CMDS:
+            paths.extend(non_flags)
+        elif base_cmd in _READ_PATTERN_CMDS:
+            paths.extend(non_flags[1:])  # drop the leading pattern
+        elif base_cmd in _READ_SCRIPT_CMDS:
+            # `sed -i` is a mutation (guarded elsewhere); read-only sed/awk take
+            # a script as the first non-flag argument, then file paths.
+            if not any(a.startswith("-i") for a in args):
+                paths.extend(non_flags[1:])
+    return list(dict.fromkeys(paths))
+
+
 def _get_entity_cwd(entity_id: str) -> str:
     """Get entity filesystem root, falling back to /tmp."""
     from packages.core.config import get_settings
@@ -267,6 +308,37 @@ async def _bash(entity_id: str, **kwargs: Any) -> str:
     may_mutate_entity_fs = False
 
     if cwd_in_entity_fs:
+        # Reads: a local `cat`/`grep`/`head` … must not surface a private
+        # Knowledge document the caller cannot view. Content-executing commands
+        # route to the mountless sandbox, so only these local commands can read
+        # entity files. When the turn has no user_id (background/system agent)
+        # nothing is blocked — matching the other document tools.
+        read_user_id = kwargs.get("user_id") or runtime_context.user_id
+        if read_user_id:
+            read_paths = _visible_read_paths(command)
+            if read_paths:
+                from packages.core.database import async_session
+                from packages.core.services.document_access import (
+                    unreadable_document_paths,
+                )
+
+                async with async_session() as _db:
+                    blocked_reads = await unreadable_document_paths(
+                        _db,
+                        entity_id=entity_id,
+                        rel_paths=read_paths,
+                        user_id=read_user_id,
+                        actor_type="agent",
+                    )
+                if blocked_reads:
+                    return json.dumps({
+                        "error": (
+                            "Access denied: this command reads a document you do "
+                            "not have permission to view "
+                            f"({', '.join(sorted(blocked_reads))}). It was not executed."
+                        )
+                    })
+
         mutation_paths = _visible_mutation_paths(command)
         may_mutate_entity_fs = bool(mutation_paths) or _may_create_files(command)
         if mutation_paths:
@@ -310,12 +382,12 @@ async def _bash(entity_id: str, **kwargs: Any) -> str:
                 source="bash",
                 created_by=kwargs.get("user_id") or runtime_context.user_id or "ai-agent",
                 sync_files=True,
-                trash_missing=True,
+                mark_missing=True,
             )
             if reconciled.synced_files:
                 data["synced_files"] = reconciled.synced_files
-            if reconciled.trashed_missing_documents:
-                data["trashed_missing_documents"] = reconciled.trashed_missing_documents
+            if reconciled.missing_documents:
+                data["missing_documents"] = reconciled.missing_documents
             if reconciled.limited:
                 data["sync_limited"] = True
             result = json.dumps(data)

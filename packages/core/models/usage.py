@@ -26,6 +26,7 @@ class TokenUsageLog(Base):
         Index("ix_token_usage_entity", "entity_id", "created_at"),
         Index("ix_token_usage_agent", "entity_id", "agent_id"),
         Index("ix_token_usage_workspace", "entity_id", "workspace_id", "created_at"),
+        Index("ix_token_usage_source_created", "source", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -58,6 +59,10 @@ class TokenUsageLog(Base):
     """
     cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6))
     duration_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    rounds: Mapped[Optional[int]] = mapped_column(Integer)
+    """Number of LLM calls the agentic loop made for this logical request
+    (``AgenticResult.rounds``). Chat-only for now — other sources leave
+    this null rather than a fabricated 0."""
     source: Mapped[Optional[str]] = mapped_column(String(50))
     billing_mode: Mapped[Optional[str]] = mapped_column(String(20))
     """Billing route for the call: platform / byok / mixed."""
@@ -83,6 +88,8 @@ class ToolCallLog(Base):
         Index("ix_tool_call_entity_created", "entity_id", "created_at"),
         Index("ix_tool_call_workspace", "entity_id", "workspace_id", "created_at"),
         Index("ix_tool_call_tool_name", "entity_id", "tool_name", "created_at"),
+        Index("ix_tool_call_source_created", "source", "created_at"),
+        Index("ix_tool_call_outcome", "outcome", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -98,6 +105,12 @@ class ToolCallLog(Base):
     result_chars: Mapped[Optional[int]] = mapped_column(Integer)
     success: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
     error: Mapped[Optional[str]] = mapped_column(Text)
+    outcome: Mapped[str] = mapped_column(String(20), server_default="success", nullable=False)
+    """"success" | "error" | "empty_result" — additive detail on top of
+    the ``success``/``error`` pair (kept for the shipped /tools/usage
+    success/error split). Distinguishes a real tool failure from
+    search_tools legitimately finding nothing, which the boolean alone
+    cannot: both look like "not an error" today."""
     tool_args: Mapped[Optional[Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

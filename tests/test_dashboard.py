@@ -1442,3 +1442,490 @@ async def test_recent_activity_filters_workspace_and_automation_tasks(client: As
     assert resp.status_code == 200
     names = [a["name"] for a in resp.json()]
     assert names == ["A visible task"]
+
+
+# ── Async generation jobs ──
+
+
+async def _poll_dashboard_job(
+    client: AsyncClient,
+    headers: dict,
+    job_id: str,
+    *,
+    attempts: int = 200,
+) -> dict:
+    import asyncio
+
+    for _ in range(attempts):
+        resp = await client.get(
+            f"/api/v1/dashboard/layout/suggest/jobs/{job_id}",
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        if body["status"] != "running":
+            return body
+        await asyncio.sleep(0.01)
+    raise AssertionError("Dashboard generation job did not finish in time")
+
+
+@pytest.mark.asyncio
+async def test_dashboard_generation_job_succeeds_and_returns_preview(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import dashboard as dashboard_router
+
+    async def fake_agent(db, *, user, **_kwargs):
+        return await _dashboard_agent_result(
+            db,
+            user,
+            {
+                "widgets": [
+                    {"id": widget_id, "visible": True}
+                    for widget_id in dashboard_router.DASHBOARD_WIDGET_IDS
+                ],
+                "module_changes": [
+                    {
+                        "action": "create",
+                        "title": "Failed tasks",
+                        "description": "Recent failed tasks",
+                        "size": "wide",
+                        "code": _generated_code(
+                            source="tasks",
+                            key="failed_tasks",
+                            params={"statuses": ["failed"], "limit": 8},
+                        ),
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(dashboard_router, "run_dashboard_agent_turn", fake_agent)
+    headers = await _auth(client, "dashjobok")
+    defaults = (await client.get("/api/v1/dashboard/layout", headers=headers)).json()
+
+    start = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json={
+            "prompt": "Show recent failed tasks",
+            "widgets": defaults["widgets"],
+            "modules": defaults["modules"],
+        },
+    )
+    assert start.status_code == 200
+    job = start.json()
+    assert job["status"] == "running"
+    assert job["job_id"].startswith("dashjob_")
+
+    finished = await _poll_dashboard_job(client, headers, job["job_id"])
+    assert finished["status"] == "succeeded"
+    result = finished["result"]
+    assert result["preview_created"] is True
+    assert result["conversation_id"]
+    titles = [module["title"] for module in result["modules"]]
+    assert "Failed tasks" in titles
+
+    blank = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json={"prompt": "   ", "widgets": defaults["widgets"]},
+    )
+    assert blank.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_dashboard_generation_job_reports_agent_failure(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import dashboard as dashboard_router
+
+    async def failing_agent(db, *, user, **_kwargs):
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(dashboard_router, "run_dashboard_agent_turn", failing_agent)
+    headers = await _auth(client, "dashjobfail")
+    defaults = (await client.get("/api/v1/dashboard/layout", headers=headers)).json()
+
+    start = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json={"prompt": "Break please", "widgets": defaults["widgets"]},
+    )
+    assert start.status_code == 200
+
+    finished = await _poll_dashboard_job(client, headers, start.json()["job_id"])
+    assert finished["status"] == "failed"
+    assert finished["error_code"] == "agent_error"
+    assert finished["error"] == "Could not interpret dashboard request"
+    assert finished.get("result") in (None,)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_generation_job_cancel_stops_the_run(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import asyncio
+
+    from apps.api.routers import dashboard as dashboard_router
+
+    started = asyncio.Event()
+
+    async def slow_agent(db, *, user, **_kwargs):
+        started.set()
+        await asyncio.sleep(30)
+        raise AssertionError("cancelled agent should never complete")
+
+    monkeypatch.setattr(dashboard_router, "run_dashboard_agent_turn", slow_agent)
+    headers = await _auth(client, "dashjobcancel")
+    defaults = (await client.get("/api/v1/dashboard/layout", headers=headers)).json()
+
+    start = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json={"prompt": "Take forever", "widgets": defaults["widgets"]},
+    )
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    cancelled = await client.post(
+        f"/api/v1/dashboard/layout/suggest/jobs/{job_id}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200
+    body = cancelled.json()
+    if body["status"] == "running":
+        body = await _poll_dashboard_job(client, headers, job_id)
+    assert body["status"] == "cancelled"
+    assert body["error_code"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_generation_job_is_private_to_its_user(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import dashboard as dashboard_router
+
+    async def fake_agent(db, *, user, **_kwargs):
+        return await _dashboard_agent_result(db, user, None)
+
+    monkeypatch.setattr(dashboard_router, "run_dashboard_agent_turn", fake_agent)
+    owner_headers = await _auth(client, "dashjobowner")
+    defaults = (
+        await client.get("/api/v1/dashboard/layout", headers=owner_headers)
+    ).json()
+
+    start = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=owner_headers,
+        json={"prompt": "Anything", "widgets": defaults["widgets"]},
+    )
+    job_id = start.json()["job_id"]
+
+    intruder_headers = await _auth(client, "dashjobintruder")
+    peek = await client.get(
+        f"/api/v1/dashboard/layout/suggest/jobs/{job_id}",
+        headers=intruder_headers,
+    )
+    assert peek.status_code == 404
+    cancel = await client.post(
+        f"/api/v1/dashboard/layout/suggest/jobs/{job_id}/cancel",
+        headers=intruder_headers,
+    )
+    assert cancel.status_code == 404
+
+    finished = await _poll_dashboard_job(client, owner_headers, job_id)
+    assert finished["status"] == "succeeded"
+    assert finished["result"]["preview_created"] is False
+
+
+@pytest.mark.asyncio
+async def test_dashboard_generation_jobs_run_concurrently_with_deltas(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Two dashboard-level generations run in parallel; each returns its own
+    module as a delta so the client can merge them without clobbering."""
+    import asyncio
+
+    from apps.api.routers import dashboard as dashboard_router
+
+    release = asyncio.Event()
+    started_prompts: list[str] = []
+
+    async def gated_agent(db, *, user, message, **_kwargs):
+        started_prompts.append(message)
+        await release.wait()
+        title = f"Module for {message}"
+        return await _dashboard_agent_result(
+            db,
+            user,
+            {
+                "widgets": [
+                    {"id": widget_id, "visible": True}
+                    for widget_id in dashboard_router.DASHBOARD_WIDGET_IDS
+                ],
+                "module_changes": [
+                    {
+                        "action": "create",
+                        "title": title,
+                        "description": "generated",
+                        "size": "compact",
+                        "code": _generated_code(
+                            source="tasks",
+                            key="items",
+                            params={"limit": 5},
+                        ),
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(dashboard_router, "run_dashboard_agent_turn", gated_agent)
+    headers = await _auth(client, "dashjobpair")
+    defaults = (await client.get("/api/v1/dashboard/layout", headers=headers)).json()
+
+    job_ids = []
+    for prompt in ("first news", "second stocks"):
+        resp = await client.post(
+            "/api/v1/dashboard/layout/suggest/jobs",
+            headers=headers,
+            json={
+                "prompt": prompt,
+                "widgets": defaults["widgets"],
+                "modules": defaults["modules"],
+            },
+        )
+        assert resp.status_code == 200
+        job_ids.append(resp.json()["job_id"])
+
+    for _ in range(200):
+        if len(started_prompts) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert len(started_prompts) == 2, "both jobs should run concurrently"
+    release.set()
+
+    results = [
+        await _poll_dashboard_job(client, headers, job_id) for job_id in job_ids
+    ]
+    assert all(item["status"] == "succeeded" for item in results)
+    for item in results:
+        changes = item["result"]["applied_module_changes"]
+        assert len(changes) == 1
+        assert changes[0]["action"] == "create"
+        assert changes[0]["module"]["title"].startswith("Module for ")
+
+
+@pytest.mark.asyncio
+async def test_dashboard_generation_enforces_concurrency_and_target_mutex(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import asyncio
+
+    from apps.api.routers import dashboard as dashboard_router
+
+    release = asyncio.Event()
+
+    async def gated_agent(db, *, user, **_kwargs):
+        await release.wait()
+        return await _dashboard_agent_result(db, user, None)
+
+    monkeypatch.setattr(dashboard_router, "run_dashboard_agent_turn", gated_agent)
+    headers = await _auth(client, "dashjoblimit")
+    defaults = (await client.get("/api/v1/dashboard/layout", headers=headers)).json()
+
+    module = {
+        "id": "module_target_one",
+        "title": "Target module",
+        "description": None,
+        "visible": True,
+        "size": "compact",
+        "conversation_id": None,
+        "code": _generated_code(source="tasks", key="items"),
+    }
+
+    def payload(prompt: str, target: str | None = None) -> dict:
+        body = {
+            "prompt": prompt,
+            "widgets": defaults["widgets"],
+            "modules": [module],
+        }
+        if target:
+            body["target_module_id"] = target
+        return body
+
+    first_edit = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json=payload("edit it", "module_target_one"),
+    )
+    assert first_edit.status_code == 200
+
+    duplicate_edit = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json=payload("edit it again", "module_target_one"),
+    )
+    assert duplicate_edit.status_code == 409
+    assert duplicate_edit.json()["detail"]["conflict"] == "target_busy"
+
+    for prompt in ("create one", "create two"):
+        resp = await client.post(
+            "/api/v1/dashboard/layout/suggest/jobs",
+            headers=headers,
+            json=payload(prompt),
+        )
+        assert resp.status_code == 200
+
+    over_limit = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json=payload("one too many"),
+    )
+    assert over_limit.status_code == 409
+    assert over_limit.json()["detail"]["conflict"] == "concurrency_limit"
+
+    release.set()
+    # Drain the released jobs so no background task outlives the test engine.
+    from packages.core.services import dashboard_generation as generation_module
+
+    pending_tasks = [
+        job.task
+        for job in generation_module._jobs.values()
+        if job.status == "running" and job.task is not None
+    ]
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_news_builds_gdelt_safe_queries(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """GDELT rejects parentheses around non-OR queries with a plain-text 200,
+    which silently emptied every plain-keyword news module."""
+    from packages.core.services import dashboard_news
+
+    captured: list[str] = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"articles": []}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            captured.append(params["query"])
+            return FakeResponse()
+
+    monkeypatch.setattr(dashboard_news.httpx, "AsyncClient", FakeClient)
+    dashboard_news._news_cache.clear()
+
+    await dashboard_news.get_dashboard_news(query="AI", days=1, limit=5, locale="zh")
+    await dashboard_news.get_dashboard_news(
+        query="AI OR robotics", days=1, limit=5, locale="en"
+    )
+    await dashboard_news.get_dashboard_news(query=None, days=1, limit=5, locale="en")
+
+    assert captured == [
+        "AI sourcelang:Chinese",
+        "(AI OR robotics) sourcelang:English",
+        "sourcelang:English",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_news_falls_back_to_duckduckgo_when_gdelt_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from packages.core.services import dashboard_news
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("GDELT returned plain text")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            return FakeResponse()
+
+    async def fake_ddg(query, language, days, limit):
+        assert query == "AI"
+        assert language == "Chinese"
+        return [
+            {
+                "id": "ddg-1",
+                "title": "Fallback headline",
+                "url": "https://example.com/fallback",
+                "source": "Example",
+                "published_at": None,
+                "language": language,
+            }
+        ]
+
+    monkeypatch.setattr(dashboard_news.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(dashboard_news, "_duckduckgo_news", fake_ddg)
+    dashboard_news._news_cache.clear()
+
+    items = await dashboard_news.get_dashboard_news(
+        query="AI", days=1, limit=5, locale="zh"
+    )
+    assert [item["title"] for item in items] == ["Fallback headline"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_module_conversations_stay_out_of_chat_history(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import dashboard as dashboard_router
+
+    async def fake_agent(db, *, user, **_kwargs):
+        return await _dashboard_agent_result(db, user, None)
+
+    monkeypatch.setattr(dashboard_router, "run_dashboard_agent_turn", fake_agent)
+    headers = await _auth(client, "dashconvhidden")
+    defaults = (await client.get("/api/v1/dashboard/layout", headers=headers)).json()
+
+    start = await client.post(
+        "/api/v1/dashboard/layout/suggest/jobs",
+        headers=headers,
+        json={"prompt": "Anything at all", "widgets": defaults["widgets"]},
+    )
+    finished = await _poll_dashboard_job(client, headers, start.json()["job_id"])
+    module_conversation_id = finished["result"]["conversation_id"]
+    assert module_conversation_id
+
+    listing = await client.get("/api/v1/chat/conversations", headers=headers)
+    assert listing.status_code == 200
+    listed_ids = {conv["id"] for conv in listing.json()}
+    assert module_conversation_id not in listed_ids

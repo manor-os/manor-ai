@@ -10,6 +10,9 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import (
+    TaskLogType,
+)
 from packages.core.models.base import generate_ulid
 from packages.core.models.people import Client
 from packages.core.models.task import Task
@@ -111,11 +114,13 @@ async def add_ticket_comment(db: AsyncSession, ticket_id: str, client_id: str, e
     if not ticket:
         raise ValueError("Ticket not found")
 
+    from packages.core.constants.task_actors import TaskActor
     from packages.core.services.task_service import add_task_log
     log = await add_task_log(
         db, ticket_id,
-        log_type="client_comment",
+        log_type=TaskLogType.CLIENT_COMMENT,
         content=content,
+        actor=TaskActor.CLIENT,
         created_by=f"client:{client_id}",
     )
     return {"id": log.id, "content": content, "created_at": log.created_at.isoformat() if log.created_at else None}

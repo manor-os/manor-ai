@@ -251,6 +251,7 @@ async def test_workspace_evaluation_rolls_up_runtime_dimensions(db_session) -> N
 @pytest.mark.asyncio
 async def test_strategist_review_records_workspace_evaluation_snapshot(db_session) -> None:
     from packages.core.strategist.service import _record_strategist_review_evidence
+    from packages.core.strategist.triggers import ReviewTrigger, ReviewTriggerKind
 
     entity_id = generate_ulid()
     workspace = Workspace(
@@ -298,7 +299,7 @@ async def test_strategist_review_records_workspace_evaluation_snapshot(db_sessio
         db_session,
         workspace=workspace,
         proposal=proposal,
-        trigger="scheduled",
+        trigger=ReviewTrigger(kind=ReviewTriggerKind.SCHEDULED),
         task_ids=[],
         ctx=ctx,
     )

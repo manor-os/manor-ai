@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
 from packages.core.models.user import User
-from packages.core.models.document import VectorStatus
+from packages.core.models.document import Document, VectorStatus
 from packages.core.config import get_settings
 from packages.core.services.document_service import (
     create_document, delete_document,
@@ -30,6 +30,7 @@ from packages.core.services.document_service import (
     upsert_document_by_fs_path,
 )
 from packages.core.services.document_access import (
+    DocumentAccessContext,
     effective_document_capabilities_for_user,
     folder_grant_capabilities_for_user,
     get_visible_document,
@@ -67,6 +68,7 @@ class DocumentResponse(BaseModel):
     entity_id: str
     name: str
     fs_path: str | None = None
+    display_path: str | None = None
     file_size: int | None = None
     file_type: str | None = None
     mime_type: str | None = None
@@ -81,8 +83,6 @@ class DocumentResponse(BaseModel):
     classification: str | None = None
     owner_id: str | None = None
     client_visible: bool | None = None
-    legal_hold: bool | None = None
-    legal_hold_reason: str | None = None
     pii_detected: bool | None = None
     quarantine_status: str | None = None
     editor_recipe_document_id: str | None = None
@@ -154,7 +154,6 @@ _DOCUMENT_CAPABILITY_ORDER = [
     Capability.RECLASSIFY,
     Capability.DELETE,
     Capability.GRANT_ACCESS,
-    Capability.LEGAL_HOLD,
 ]
 _DOCUMENT_OWNER_CAPABILITIES = set(_DOCUMENT_CAPABILITY_ORDER) - {Capability.UPLOAD_TO}
 _FOLDER_OWNER_CAPABILITIES = set(_DOCUMENT_CAPABILITY_ORDER)
@@ -166,7 +165,12 @@ def _ordered_capabilities(capabilities: set[str]) -> list[str]:
     return ordered
 
 
-def _doc_resp(d, *, current_user_capabilities: set[str] | None = None) -> DocumentResponse:
+def _doc_resp(
+    d,
+    *,
+    current_user_capabilities: set[str] | None = None,
+    display_path: str | None = None,
+) -> DocumentResponse:
     meta = d.metadata_ if hasattr(d, "metadata_") else None
     indexing = meta.get("indexing") if isinstance(meta, dict) else None
     artifact_meta = meta.get("artifact") if isinstance(meta, dict) else None
@@ -175,7 +179,7 @@ def _doc_resp(d, *, current_user_capabilities: set[str] | None = None) -> Docume
     generation_meta = generation_meta if isinstance(generation_meta, dict) else {}
     return DocumentResponse(
         id=d.id, entity_id=d.entity_id, name=d.name,
-        fs_path=d.fs_path, file_size=d.file_size,
+        fs_path=d.fs_path, display_path=display_path or d.fs_path, file_size=d.file_size,
         file_type=d.file_type, mime_type=d.mime_type,
         source=d.source, vector_status=d.vector_status,
         indexing_progress=indexing,
@@ -186,8 +190,6 @@ def _doc_resp(d, *, current_user_capabilities: set[str] | None = None) -> Docume
         classification=getattr(d, "classification", None),
         owner_id=getattr(d, "owner_id", None),
         client_visible=getattr(d, "client_visible", None),
-        legal_hold=getattr(d, "legal_hold", None),
-        legal_hold_reason=getattr(d, "legal_hold_reason", None),
         pii_detected=getattr(d, "pii_detected", None),
         quarantine_status=getattr(d, "quarantine_status", None),
         editor_recipe_document_id=artifact_meta.get("editor_recipe_document_id") or generation_meta.get("editor_recipe_document_id"),
@@ -197,16 +199,48 @@ def _doc_resp(d, *, current_user_capabilities: set[str] | None = None) -> Docume
     )
 
 
-async def _doc_resp_for_user(db: AsyncSession, d, user: User) -> DocumentResponse:
-    capabilities = await effective_document_capabilities_for_user(
-        db,
-        document=d,
-        user_id=user.id,
-        role=user.role,
-    )
+async def _doc_resp_for_user(
+    db: AsyncSession,
+    d,
+    user: User,
+    access_ctx: DocumentAccessContext | None = None,
+) -> DocumentResponse:
+    if access_ctx is not None:
+        capabilities = await access_ctx.effective_document_capabilities(db, d)
+    else:
+        capabilities = await effective_document_capabilities_for_user(
+            db,
+            document=d,
+            user_id=user.id,
+            role=user.role,
+        )
     if _can_manage_document(user, d):
         capabilities.update(_DOCUMENT_OWNER_CAPABILITIES)
-    return _doc_resp(d, current_user_capabilities=capabilities)
+    display_path = None
+    from packages.core.services.workspace_artifacts import (
+        artifact_folder_id_from_storage_path,
+        workspace_artifact_display_path,
+    )
+    artifact_folder_id = artifact_folder_id_from_storage_path(getattr(d, "fs_path", None))
+    if artifact_folder_id:
+        from packages.core.models.document import DocumentFolder
+
+        folder_name = (await db.execute(
+            select(DocumentFolder.name).where(
+                DocumentFolder.id == artifact_folder_id,
+                DocumentFolder.entity_id == d.entity_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        display_path = workspace_artifact_display_path(
+            d.fs_path,
+            artifact_folder_id=artifact_folder_id,
+            display_folder_name=folder_name,
+        )
+    return _doc_resp(
+        d,
+        current_user_capabilities=capabilities,
+        display_path=display_path,
+    )
 
 
 def _can_manage_document(user: User, doc) -> bool:
@@ -441,12 +475,16 @@ def _require_document_filesystem_ready() -> None:
         ) from exc
 
 
-def _unique_document_rel_path(entity_id: str, filename: str) -> str:
+def _unique_document_rel_path(entity_id: str, filename: str, *, rel_dir: str | None = None) -> str:
     entity_root = _entity_root(entity_id)
     os.makedirs(entity_root, exist_ok=True)
     root_norm = os.path.normpath(entity_root)
     candidate = _safe_visible_filename(filename, "document")
-    target = os.path.normpath(os.path.join(entity_root, candidate))
+    target_dir = os.path.normpath(os.path.join(entity_root, rel_dir or ""))
+    if os.path.commonpath([root_norm, target_dir]) != root_norm:
+        raise HTTPException(400, "Invalid folder path")
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.normpath(os.path.join(target_dir, candidate))
     if os.path.commonpath([root_norm, target]) != root_norm:
         raise HTTPException(400, "Invalid filename")
     if os.path.exists(target):
@@ -456,13 +494,30 @@ def _unique_document_rel_path(entity_id: str, filename: str) -> str:
             base, ext = os.path.splitext(candidate)
         stamp = int(time.time())
         candidate = f"{base}_{stamp}{ext}"
-        target = os.path.normpath(os.path.join(entity_root, candidate))
+        target = os.path.normpath(os.path.join(target_dir, candidate))
         suffix = 1
         while os.path.exists(target):
             candidate = f"{base}_{stamp}_{suffix}{ext}"
-            target = os.path.normpath(os.path.join(entity_root, candidate))
+            target = os.path.normpath(os.path.join(target_dir, candidate))
             suffix += 1
     return os.path.relpath(target, entity_root)
+
+
+async def _workspace_storage_for_folder(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    folder_id: str | None,
+):
+    if not folder_id:
+        return None
+    from packages.core.services.workspace_artifacts import resolve_workspace_folder_binding
+
+    return await resolve_workspace_folder_binding(
+        db,
+        entity_id=entity_id,
+        folder_id=folder_id,
+    )
 
 
 async def _write_document_bytes_atomic(
@@ -717,7 +772,11 @@ async def list_my_documents(
     from packages.core.services.plan_gate import check as _plan_check
     gate = await _plan_check(db, user.entity_id, "storage_mb")
 
-    items = [await _doc_resp_for_user(db, d, user) for d in docs]
+    access_ctx = await DocumentAccessContext.load(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
+    await access_ctx.preload_documents(db, docs)
+    items = [await _doc_resp_for_user(db, d, user, access_ctx) for d in docs]
     return DocumentListResponse(
         items=items, total=total, total_files=total_files, total_size=total_size,
         storage_used_mb=gate.current, storage_limit_mb=gate.limit,
@@ -794,10 +853,19 @@ async def upload_document(
     fs_path = None
     file_size = 0
     resolved_folder_id = folder_id
+    workspace_binding = await _workspace_storage_for_folder(
+        db,
+        entity_id=user.entity_id,
+        folder_id=folder_id,
+    )
 
     if settings.MANOR_FS_ENABLED:
         _require_document_filesystem_ready()
-        rel_target = _unique_document_rel_path(user.entity_id, filename)
+        rel_target = _unique_document_rel_path(
+            user.entity_id,
+            filename,
+            rel_dir=workspace_binding.storage_dir if workspace_binding else None,
+        )
         fd, tmp_path = tempfile.mkstemp(prefix="manor-doc-upload-", suffix=".tmp")
         os.close(fd)
         # Stream to disk in chunks — avoids loading entire file into memory
@@ -837,6 +905,7 @@ async def upload_document(
             created_by=(user.display_name or user.email),
             force=True,
             folder_id=resolved_folder_id,
+            workspace_id=workspace_binding.workspace_id if workspace_binding else None,
         )
         doc = await get_document(db, sync.document_id, user.entity_id) if sync.document_id else None
         if not doc:
@@ -1475,17 +1544,27 @@ async def upload_from_google_drive(
     actual_mime = export_mime or body.mime_type
 
     fs_path = None
+    workspace_binding = await _workspace_storage_for_folder(
+        db,
+        entity_id=user.entity_id,
+        folder_id=body.folder_id,
+    )
     if settings.MANOR_FS_ENABLED:
         _require_document_filesystem_ready()
         fs_path = await _write_document_bytes_atomic(
             user.entity_id,
-            _unique_document_rel_path(user.entity_id, filename),
+            _unique_document_rel_path(
+                user.entity_id,
+                filename,
+                rel_dir=workspace_binding.storage_dir if workspace_binding else None,
+            ),
             content,
             allow_empty=False,
         )
 
     # Store external sync metadata for future refreshes.
     metadata = merge_document_metadata(
+        origin={"workspace_id": workspace_binding.workspace_id} if workspace_binding else None,
         external={
             "google_drive": {
                 "file_id": body.file_id,
@@ -2305,6 +2384,8 @@ class DocumentBrowseResponse(DocumentListResponse):
     documents: list[DocumentResponse] = Field(default_factory=list)
     total_folders: int = 0
     total_documents: int = 0
+    direct_total_files: int = 0
+    direct_total_size: int = 0
 
 
 def _folder_resp(
@@ -2331,17 +2412,21 @@ async def _folder_resp_for_user(
     user: User,
     *,
     document_count: int = 0,
+    access_ctx: DocumentAccessContext | None = None,
 ) -> FolderResponse:
     capabilities: set[str]
     if _can_manage_folder(user, f):
         capabilities = set(_FOLDER_OWNER_CAPABILITIES)
     else:
-        capabilities = await folder_grant_capabilities_for_user(
-            db,
-            entity_id=user.entity_id,
-            folder_id=getattr(f, "id", None),
-            user_id=user.id,
-        )
+        if access_ctx is not None:
+            capabilities = access_ctx.folder_capabilities(getattr(f, "id", None))
+        else:
+            capabilities = await folder_grant_capabilities_for_user(
+                db,
+                entity_id=user.entity_id,
+                folder_id=getattr(f, "id", None),
+                user_id=user.id,
+            )
         capabilities.add(Capability.VIEW)
     return _folder_resp(
         f,
@@ -2467,18 +2552,42 @@ async def _user_can_read_folder_path(
 async def _visible_document_folders_for_user(
     db: AsyncSession,
     user: User,
-) -> tuple[list, dict[str, object]]:
+) -> tuple[list, dict[str, object], DocumentAccessContext]:
+    from packages.core.models.workspace import Workspace
     from packages.core.services.knowledge_visibility import is_user_visible_folder_path
 
+    access_ctx = await DocumentAccessContext.load(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+    )
     folders, folder_by_id = await _load_document_folders(db, user.entity_id)
+    deleted_workspace_root_ids = {
+        str(folder_id)
+        for folder_id in (await db.execute(
+            select(Workspace.artifact_folder_id).where(
+                Workspace.entity_id == user.entity_id,
+                Workspace.deleted_at.is_not(None),
+                Workspace.artifact_folder_id.is_not(None),
+            )
+        )).scalars().all()
+        if folder_id
+    }
+    hidden_folder_ids: set[str] = set()
+    for root_id in deleted_workspace_root_ids:
+        if root_id in folder_by_id:
+            hidden_folder_ids.update(_folder_subtree_ids(folders, root_id))
     visible_folders = []
     for f in folders:
+        if f.id in hidden_folder_ids:
+            continue
         if not is_user_visible_folder_path(_folder_rel_path(f, folder_by_id)):
             continue
-        if not await _user_can_read_folder_path(db, f, folder_by_id, user):
+        if not access_ctx.folder_path_readable(f.id):
             continue
         visible_folders.append(f)
-    return visible_folders, {f.id: f for f in visible_folders}
+    return visible_folders, {f.id: f for f in visible_folders}, access_ctx
 
 
 @router.get("/browse", response_model=DocumentBrowseResponse)
@@ -2498,7 +2607,7 @@ async def browse_documents(
     global_document_scope = scope == "all" or bool(workspace_id)
     browse_folder_id = None if folder_id in (None, "", "root") else folder_id
 
-    visible_folders, visible_folder_by_id = await _visible_document_folders_for_user(db, user)
+    visible_folders, visible_folder_by_id, access_ctx = await _visible_document_folders_for_user(db, user)
     if browse_folder_id and browse_folder_id not in visible_folder_by_id:
         raise HTTPException(404, "Folder not found")
 
@@ -2535,7 +2644,11 @@ async def browse_documents(
 
     direct_folders = sorted(direct_folders, key=lambda f: (f.name or "").lower())
     folder_responses = [
-        await _folder_resp_for_user(db, f, user, document_count=folder_counts.get(f.id, 0))
+        await _folder_resp_for_user(
+            db, f, user,
+            document_count=folder_counts.get(f.id, 0),
+            access_ctx=access_ctx,
+        )
         for f in direct_folders
     ]
 
@@ -2551,6 +2664,22 @@ async def browse_documents(
         limit=None,
         offset=0,
     )
+    if not workspace_id and (search_query or scope == "all"):
+        docs = [
+            document for document in docs
+            if not document.folder_id or document.folder_id in visible_folder_by_id
+        ]
+        total = len(docs)
+
+    include_root_documents_in_storage = False
+    if workspace_id:
+        storage_folder_ids = None
+    elif browse_folder_id and not search_query and scope != "all":
+        storage_folder_ids = _folder_subtree_ids(visible_folders, browse_folder_id)
+    else:
+        storage_folder_ids = set(visible_folder_by_id)
+        include_root_documents_in_storage = True
+
     total_size, total_files = await visible_storage_usage(
         db,
         user.entity_id,
@@ -2561,8 +2690,17 @@ async def browse_documents(
         workspace_id=workspace_id,
         include_generated_assets=include_generated_assets,
     )
+    if include_root_documents_in_storage:
+        root_documents = [document for document in docs if not document.folder_id]
+        total_files += len(root_documents)
+        total_size += sum(
+            int(getattr(document, "file_size", None) or 0)
+            for document in root_documents
+        )
     gate = await _plan_check(db, user.entity_id, "storage_mb")
-    items = [await _doc_resp_for_user(db, d, user) for d in docs]
+    await access_ctx.preload_documents(db, docs)
+    items = [await _doc_resp_for_user(db, d, user, access_ctx) for d in docs]
+    direct_total_size = sum(int(getattr(document, "file_size", None) or 0) for document in docs)
 
     return DocumentBrowseResponse(
         items=items,
@@ -2571,6 +2709,8 @@ async def browse_documents(
         total=total,
         total_documents=total,
         total_folders=len(folder_responses),
+        direct_total_files=total,
+        direct_total_size=direct_total_size,
         total_files=total_files,
         total_size=total_size,
         storage_used_mb=gate.current,
@@ -2583,7 +2723,7 @@ async def document_folder_tree(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    visible_folders, _ = await _visible_document_folders_for_user(db, user)
+    visible_folders, _, access_ctx = await _visible_document_folders_for_user(db, user)
     folder_counts = await _visible_folder_counts(
         db,
         user.entity_id,
@@ -2592,7 +2732,11 @@ async def document_folder_tree(
         role=user.role,
     )
     return [
-        await _folder_resp_for_user(db, f, user, document_count=folder_counts.get(f.id, 0))
+        await _folder_resp_for_user(
+            db, f, user,
+            document_count=folder_counts.get(f.id, 0),
+            access_ctx=access_ctx,
+        )
         for f in sorted(visible_folders, key=lambda f: ((f.parent_id or ""), (f.name or "").lower()))
     ]
 
@@ -2650,7 +2794,7 @@ async def list_folders(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    visible_folders, _ = await _visible_document_folders_for_user(db, user)
+    visible_folders, _, access_ctx = await _visible_document_folders_for_user(db, user)
     visible_folders = sorted(visible_folders, key=lambda f: f.created_at, reverse=True)
     folder_counts = await _visible_folder_counts(
         db,
@@ -2661,7 +2805,11 @@ async def list_folders(
     )
 
     return [
-        await _folder_resp_for_user(db, f, user, document_count=folder_counts.get(f.id, 0))
+        await _folder_resp_for_user(
+            db, f, user,
+            document_count=folder_counts.get(f.id, 0),
+            access_ctx=access_ctx,
+        )
         for f in visible_folders
     ]
 
@@ -2721,19 +2869,53 @@ async def rename_folder(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    _, folder_by_id = await _load_document_folders(db, user.entity_id)
+    folders, folder_by_id = await _load_document_folders(db, user.entity_id)
     folder = folder_by_id.get(folder_id)
     if not folder:
         raise HTTPException(404, "Folder not found")
     _require_folder_manager(user, folder)
+    clean_name = body.name.strip()
     await _validate_folder_position(
         db,
         user.entity_id,
-        name=body.name,
+        name=clean_name,
         parent_id=folder.parent_id,
         folder_id=folder_id,
     )
-    folder.name = body.name.strip()
+    from packages.core.services.workspace_artifacts import (
+        contains_workspace_artifact_root,
+        resolve_workspace_folder_binding,
+    )
+    workspace_binding = await resolve_workspace_folder_binding(
+        db,
+        entity_id=user.entity_id,
+        folder_id=folder.id,
+    )
+    is_workspace_root = (
+        workspace_binding is not None
+        and workspace_binding.artifact_folder_id == folder.id
+        and not workspace_binding.relative_parts
+    )
+    if is_workspace_root:
+        from packages.core.services.entity_service import update_workspace
+
+        workspace = await update_workspace(
+            db,
+            workspace_binding.workspace_id,
+            user.entity_id,
+            name=clean_name,
+        )
+        if workspace is None:
+            raise HTTPException(404, "Workspace not found")
+        await db.refresh(folder)
+    else:
+        if await contains_workspace_artifact_root(
+            db,
+            entity_id=user.entity_id,
+            folder_ids=_folder_subtree_ids(folders, folder_id),
+        ):
+            raise HTTPException(409, "Folders containing Workspaces cannot be renamed")
+        folder.name = clean_name
     await db.flush()
     return await _folder_resp_for_user(db, folder, user, document_count=0)
 
@@ -2745,6 +2927,7 @@ async def delete_folder(
     db: AsyncSession = Depends(get_db),
 ):
     from packages.core.models.document import Document, DocumentFolder, DocumentGroupMember
+    from packages.core.models.workspace import Workspace
 
     folders, folder_by_id = await _load_document_folders(db, user.entity_id)
     folder = folder_by_id.get(folder_id)
@@ -2752,6 +2935,16 @@ async def delete_folder(
         raise HTTPException(404, "Folder not found")
     _require_folder_manager(user, folder)
     folder_ids = _folder_subtree_ids(folders, folder_id)
+    workspace_roots = list((await db.execute(
+        select(Workspace).where(
+            Workspace.entity_id == user.entity_id,
+            Workspace.artifact_folder_id.in_(folder_ids),
+        ).with_for_update()
+    )).scalars().all())
+    if any(workspace.deleted_at is None for workspace in workspace_roots):
+        raise HTTPException(409, "Workspace folders cannot be deleted from Knowledge")
+    for workspace in workspace_roots:
+        workspace.artifact_folder_id = None
     folder_id_list = list(folder_ids)
     docs = list((await db.execute(
         select(Document).where(
@@ -2792,10 +2985,17 @@ async def move_folder(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    _, folder_by_id = await _load_document_folders(db, user.entity_id)
+    folders, folder_by_id = await _load_document_folders(db, user.entity_id)
     folder = folder_by_id.get(folder_id)
     if not folder:
         raise HTTPException(404, "Folder not found")
+    from packages.core.services.workspace_artifacts import contains_workspace_artifact_root
+    if await contains_workspace_artifact_root(
+        db,
+        entity_id=user.entity_id,
+        folder_ids=_folder_subtree_ids(folders, folder_id),
+    ):
+        raise HTTPException(409, "Workspace folders cannot be moved")
     _require_folder_manager(user, folder)
     if body.parent_id:
         parent = folder_by_id.get(body.parent_id)
@@ -2844,6 +3044,7 @@ async def move_document_to_folder(
         "Only the document owner/admin or a user with metadata access can move this document",
     )
     target_folder_path = None
+    workspace_binding = None
     if body.folder_id:
         from sqlalchemy import select as sel
         from packages.core.models.document import DocumentFolder
@@ -2867,6 +3068,13 @@ async def move_document_to_folder(
         target_folder_path = _folder_rel_path(folder, folder_by_id)
         if not is_user_visible_folder_path(target_folder_path):
             raise HTTPException(404, "Folder not found")
+        workspace_binding = await _workspace_storage_for_folder(
+            db,
+            entity_id=user.entity_id,
+            folder_id=body.folder_id,
+        )
+        if workspace_binding:
+            target_folder_path = workspace_binding.storage_dir
     # RFC §13.3: moving into a folder auto-applies the folder's classification
     # floor and visibility ceiling. We do this before setting folder_id so
     # the audit trail and response reflect the post-move state.
@@ -2898,6 +3106,11 @@ async def move_document_to_folder(
     if fs_move.reason == "missing_source":
         mark_document_file_missing(doc, source="document_move", trash=False)
     doc.folder_id = body.folder_id
+    if workspace_binding:
+        doc.metadata_ = merge_document_metadata(
+            doc.metadata_,
+            origin={"workspace_id": workspace_binding.workspace_id},
+        )
     await db.flush()
     from packages.core.services.tool_cache_version import bump_tool_cache_version
     await bump_tool_cache_version(user.entity_id, "documents")
@@ -2968,6 +3181,14 @@ async def delete_one_document(
         role=user.role,
     )
     if not doc:
+        doc = (await db.execute(
+            select(Document).where(
+                Document.id == doc_id,
+                Document.entity_id == user.entity_id,
+                Document.is_trashed.is_(True),
+            )
+        )).scalar_one_or_none()
+    if not doc:
         raise HTTPException(404, "Document not found")
     await _require_document_capability(
         db,
@@ -2980,7 +3201,12 @@ async def delete_one_document(
         full = _document_full_path(doc, user.entity_id)
         if full and os.path.isfile(full):
             os.remove(full)
-    ok = await delete_document(db, doc_id, user.entity_id)
+    ok = await delete_document(
+        db,
+        doc_id,
+        user.entity_id,
+        include_trashed=bool(doc.is_trashed),
+    )
     if not ok:
         raise HTTPException(404, "Document not found")
 

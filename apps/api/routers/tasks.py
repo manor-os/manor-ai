@@ -3,15 +3,21 @@ from __future__ import annotations
 
 import logging
 import asyncio
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
 from packages.core.database import get_db
 from packages.core.models.user import User
-from packages.core.constants.task import TASK_STATUSES, TASK_PRIORITIES, TASK_CATEGORIES, TASK_TYPES
+from packages.core.constants.task_actors import TaskActor
+from packages.core.constants.task import TaskLogType, TaskStatus, TASK_STATUSES, TASK_PRIORITIES, TASK_CATEGORIES, TASK_TYPES
 from packages.core.constants.task_notifications import (
     task_notification_channels,
     task_notification_events,
@@ -29,8 +35,16 @@ from packages.core.services.task_comment_mentions import (
     notify_mentioned_users,
     validate_mentions,
 )
-from packages.core.services.task_state_machine import TaskStatusTransitionError
-from apps.api.deps import get_current_user
+from packages.core.services.task_state_machine import (
+    TERMINAL_STATUSES,
+    TaskStatusTransitionError,
+)
+from packages.core.services.settings_service import update_user_preferences
+from apps.api.deps import (
+    get_current_user,
+    require_workspace_readable,
+    require_workspace_writable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +60,8 @@ _APPROVAL_REVISION_CHOICES = {
     "request_changes",
 }
 _APPROVAL_CHOICES = _APPROVAL_ACCEPT_CHOICES | _APPROVAL_REVISION_CHOICES
+_TASK_BOARD_COLUMNS = ("todo", "scheduled", "in_progress", "review", "done")
+_TASK_BOARD_PREFERENCES_KEY = "task_board"
 
 
 def _schedule_background(coro) -> None:
@@ -278,6 +294,16 @@ class TaskListResponse(BaseModel):
     total: int
 
 
+class TaskBoardPreferencesRequest(BaseModel):
+    mode: Literal["kanban", "list"] = "kanban"
+    visible_columns: list[str] = Field(default_factory=lambda: list(_TASK_BOARD_COLUMNS))
+    column_order: list[str] = Field(default_factory=lambda: list(_TASK_BOARD_COLUMNS))
+
+
+class TaskBoardPreferencesResponse(TaskBoardPreferencesRequest):
+    configured: bool = False
+
+
 class TaskLogResponse(BaseModel):
     id: str
     task_id: str
@@ -299,7 +325,9 @@ class TaskLogResponse(BaseModel):
 
 class AddLogRequest(BaseModel):
     content: str
-    log_type: str = "comment"
+    # Typed against the log vocabulary: an unknown type is a 422 here rather
+    # than a row the frontend has no icon (and no meaning) for.
+    log_type: TaskLogType = TaskLogType.COMMENT
     attachments: list[dict] = []
     mentions: list[dict] = Field(default_factory=list, max_length=50)
 
@@ -809,12 +837,18 @@ async def list_my_tasks(
     db: AsyncSession = Depends(get_db),
 ):
     effective_workspace_id = workspace_id or workspace_id_alias
+    await require_workspace_readable(db, user, effective_workspace_id)
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
+    readable_ws = await readable_workspace_ids_for_user(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
     tasks, total = await list_tasks(
         db, user.entity_id,
         status=status, workspace_id=effective_workspace_id,
         category_id=category_id,
         parent_task_id=parent_task_id,
         limit=limit, offset=offset,
+        readable_workspace_ids=readable_ws,
     )
     users, agents, staff, workspaces = await _resolve_lookups(db, tasks)
     return TaskListResponse(items=[_to_response(t, users, agents, staff, workspaces) for t in tasks], total=total)
@@ -826,6 +860,7 @@ async def create_new_task(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_writable(db, user, req.workspace_id)
     task = await create_task(
         db, user.entity_id,
         title=req.title, description=req.description,
@@ -860,6 +895,7 @@ async def create_from_template(
 ):
     """Create a new task pre-filled from a task template."""
     overrides = req.model_dump(exclude={"template_id"}, exclude_none=True)
+    await require_workspace_writable(db, user, overrides.get("workspace_id"))
     from packages.core.services.template_service import instantiate_template
     try:
         task = await instantiate_template(
@@ -872,6 +908,78 @@ async def create_from_template(
     return _to_response(task, users, agents, staff, workspaces)
 
 
+def _normalize_task_board_columns(
+    value: object,
+    *,
+    append_missing: bool,
+) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    if isinstance(value, list):
+        for key in value:
+            if key in _TASK_BOARD_COLUMNS and key not in seen:
+                seen.add(key)
+                normalized.append(key)
+    if append_missing:
+        normalized.extend(key for key in _TASK_BOARD_COLUMNS if key not in seen)
+    return normalized
+
+
+def _task_board_preferences_response(
+    value: object,
+    *,
+    configured: bool,
+) -> TaskBoardPreferencesResponse:
+    preferences = value if isinstance(value, dict) else {}
+    mode = preferences.get("mode")
+    visible_columns = _normalize_task_board_columns(
+        preferences.get("visible_columns"),
+        append_missing=False,
+    )
+    return TaskBoardPreferencesResponse(
+        mode=mode if mode in {"kanban", "list"} else "kanban",
+        visible_columns=visible_columns or list(_TASK_BOARD_COLUMNS),
+        column_order=_normalize_task_board_columns(
+            preferences.get("column_order"),
+            append_missing=True,
+        ),
+        configured=configured,
+    )
+
+
+@router.get("/board-preferences", response_model=TaskBoardPreferencesResponse)
+async def get_task_board_preferences(
+    user: User = Depends(get_current_user),
+):
+    """Get the current user's cross-device task board preferences."""
+    preferences = user.preferences or {}
+    stored = preferences.get(_TASK_BOARD_PREFERENCES_KEY)
+    return _task_board_preferences_response(
+        stored,
+        configured=isinstance(stored, dict),
+    )
+
+
+@router.put("/board-preferences", response_model=TaskBoardPreferencesResponse)
+async def put_task_board_preferences(
+    req: TaskBoardPreferencesRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist task board preferences on the authenticated user."""
+    normalized = _task_board_preferences_response(
+        req.model_dump(),
+        configured=True,
+    )
+    stored = normalized.model_dump(exclude={"configured"})
+    await update_user_preferences(
+        db,
+        user.id,
+        {_TASK_BOARD_PREFERENCES_KEY: stored},
+    )
+    return normalized
+
+
 @router.get("/board", response_model=dict)
 async def task_board(
     workspace_id: str | None = Query(None),
@@ -881,7 +989,15 @@ async def task_board(
 ):
     """Get tasks grouped by status for Kanban board view."""
     effective_workspace_id = workspace_id or workspace_id_alias
-    board = await get_tasks_by_status(db, user.entity_id, workspace_id=effective_workspace_id)
+    await require_workspace_readable(db, user, effective_workspace_id)
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
+    readable_ws = await readable_workspace_ids_for_user(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
+    board = await get_tasks_by_status(
+        db, user.entity_id, workspace_id=effective_workspace_id,
+        readable_workspace_ids=readable_ws,
+    )
     counts = board.pop("_counts", {})
     all_tasks = [t for tasks in board.values() for t in tasks]
     users, agents, staff, workspaces = await _resolve_lookups(db, all_tasks)
@@ -898,6 +1014,10 @@ async def move_task_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Move a task to a different status column (Kanban drag-and-drop)."""
+    existing = await get_task(db, task_id, user.entity_id)
+    if not existing:
+        raise HTTPException(404, "Task not found")
+    await require_workspace_writable(db, user, existing.workspace_id)
     try:
         task = await move_task(db, task_id, user.entity_id, req.status)
     except TaskStatusTransitionError as exc:
@@ -925,9 +1045,10 @@ async def retry_task_endpoint(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    if task.status in ("completed", "cancelled"):
+    await require_workspace_writable(db, user, task.workspace_id)
+    if task.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED,):
         raise HTTPException(409, f"Task is {task.status} and cannot be retried")
-    if task.status == "in_progress":
+    if task.status == TaskStatus.IN_PROGRESS:
         raise HTTPException(409, "Task is already in progress")
 
     note = (req.note if req else None) or None
@@ -968,7 +1089,7 @@ async def retry_task_endpoint(
         ).order_by(ExecutionPlan.created_at.desc()).limit(1)
     )).scalar_one_or_none()
 
-    if plan and plan.status not in ("completed", "cancelled"):
+    if plan and plan.status not in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.CANCELLED,):
         mode = "plan"
         plan_id = plan.id
         steps = list((await db.execute(
@@ -977,7 +1098,7 @@ async def retry_task_endpoint(
         retryable_statuses = {"failed", "skipped", "waiting_human", "paused", "cancelled"}
         for step in steps:
             if step.step_status in retryable_statuses:
-                step.step_status = "pending"
+                step.step_status = ExecutionStepStatus.PENDING.value
                 step.current_lease_id = None
                 step.human_input_prompt = None
                 step.human_input_response = (
@@ -989,8 +1110,8 @@ async def retry_task_endpoint(
                 step.attempt_count = 0
                 reset_steps += 1
                 reset_step_ids.append(step.id)
-        if plan.status in ("failed", "needs_attention", "paused"):
-            plan.status = "draft"
+        if plan.status in (ExecutionPlanStatus.FAILED, ExecutionPlanStatus.NEEDS_ATTENTION, ExecutionPlanStatus.PAUSED,):
+            plan.status = ExecutionPlanStatus.DRAFT.value
             plan.completed_at = None
             plan.last_error = None
         dispatch = ("plan", plan.id)
@@ -1009,14 +1130,17 @@ async def retry_task_endpoint(
             raise HTTPException(409, "Task has no plan, owner subscription, or assigned agent to retry")
 
     from packages.core.services.task_state_machine import apply_task_status_transition
-    apply_task_status_transition(task, "in_progress", now=now)
+    await apply_task_status_transition(
+        task, "in_progress", now=now, db=db, actor_kind="user", actor_id=user.id,
+    )
     task.started_at = now
     task.completed_at = None
     task.details = details
     task.actual_output = None
     await add_task_log(
-        db, task.id, "manual_retry",
+        db, task.id, TaskLogType.MANUAL_RETRY,
         "Manual retry requested" + (f": {note}" if note else ""),
+        actor=TaskActor.USER,
         created_by=user.display_name or user.email,
         metadata={
             "mode": mode,
@@ -1101,45 +1225,72 @@ async def _resume_hitl(
             select(ExecutionPlan).where(
                 ExecutionPlan.task_id == task.id,
                 ExecutionPlan.entity_id == user.entity_id,
-                ExecutionPlan.status.in_(("running", "paused", "needs_attention")),
+                ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.PAUSED, ExecutionPlanStatus.NEEDS_ATTENTION,)),
             ).order_by(ExecutionPlan.created_at.desc()).limit(1)
         )).scalar_one_or_none()
         if plan:
             waiting_step = (await db.execute(
                 select(ExecutionStep).where(
                     ExecutionStep.plan_id == plan.id,
-                    ExecutionStep.step_status == "waiting_human",
+                    ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
                 ).order_by(ExecutionStep.created_at.desc()).limit(1)
             )).scalar_one_or_none()
             if waiting_step:
+                # If the step is paused on an approval, the operator's Resume
+                # IS the approval — grant the open unified request so the
+                # dispatcher gate lets the reparked step through instead of
+                # re-pausing it on the same request (#317 loop).
+                try:
+                    from packages.core.governance.approvals import (
+                        grant_open_request_for_step,
+                    )
+                    await grant_open_request_for_step(
+                        db,
+                        entity_id=user.entity_id,
+                        step_id=waiting_step.id,
+                        by_user_id=user.id,
+                        via="task_resume",
+                    )
+                except Exception:
+                    logger.warning(
+                        "task resume: approval grant failed for step %s",
+                        waiting_step.id, exc_info=True,
+                    )
                 waiting_step.human_input_response = {
                     **meta,
                     "user": submitted_by,
                     "payload": payload,
                 }
-                waiting_step.step_status = "pending"
+                # M9.2 — the human just delivered the awaited input: fulfil
+                # any open commitment rows for this step (best-effort).
+                try:
+                    from packages.core.humans import resolve_commitments_for_step
+                    await resolve_commitments_for_step(
+                        db, waiting_step.id,
+                        {"kind": "hitl_response"},
+                    )
+                except Exception:
+                    logger.warning(
+                        "human commitment resolve failed for step %s (ignored)",
+                        waiting_step.id, exc_info=True,
+                    )
+                waiting_step.step_status = ExecutionStepStatus.PENDING.value
                 waiting_step.human_input_prompt = None
                 waiting_step.current_lease_id = None
-                plan.status = "running"
+                plan.status = ExecutionPlanStatus.RUNNING.value
                 plan.completed_at = None
                 plan.last_error = None
-                if task.status == "waiting_on_customer":
-                    apply_task_status_transition(task, "in_progress", now=now)
-                if waiting_step.kind == "human":
-                    try:
-                        from packages.core.temporal_app import signal_human_input
-                        await signal_human_input(
-                            plan.id,
-                            waiting_step.step_key,
-                            waiting_step.human_input_response,
-                        )
-                    except Exception:
-                        pass
+                if task.status == TaskStatus.WAITING_ON_CUSTOMER:
+                    await apply_task_status_transition(
+                        task, "in_progress", now=now, db=db,
+                        actor_kind="user", actor_id=user.id,
+                    )
                 await add_task_log(
                     db,
                     task.id,
-                    "ai_hitl_resumed",
+                    TaskLogType.AI_HITL_RESUMED,
                     f"Human input received: {response_text[:300]}" if response_text else "Human input received.",
+                    actor=TaskActor.USER,
                     created_by=submitted_by,
                     metadata={
                         **meta,
@@ -1166,10 +1317,22 @@ async def _resume_hitl(
     except Exception as exc:
         logger.warning("Plan HITL structured response failed: %s", exc)
 
-    # Legacy TaskRunner HITL: stash the structured response and re-dispatch.
-    from packages.core.constants.agents import MANOR_AGENT_ID, is_master_agent
-    has_agent = task.agent_id or is_master_agent(task.agent_id, task.agent_type)
-    if task.status == "waiting_on_customer" and has_agent:
+    # Agent-run HITL: stash the structured response and re-dispatch.
+    #
+    # This used to require `task.agent_id or is_master_agent(...)`, which is
+    # false for a task with no assigned agent — is_master_agent returns False
+    # when both arguments are None, by design. Plan-driven tasks routinely
+    # have no agent_id (the agent is resolved per step), so replying to one
+    # returned resumed=False and left it in waiting_on_customer forever, even
+    # though the comment thread went on to run the work and finish it.
+    #
+    # Work does not run un-owned: with no assigned agent the master agent
+    # runs it. Resume on the status alone, and dispatch to whichever agent
+    # actually did the work.
+    from packages.core.constants.agents import MANOR_AGENT_ID
+    from packages.core.services.task_service import task_executing_agent_id
+
+    if task.status == TaskStatus.WAITING_ON_CUSTOMER:
         details = dict(task.details or {})
         details["_hitl_response"] = response_text
         details["_hitl_payload"] = payload
@@ -1178,12 +1341,13 @@ async def _resume_hitl(
         await add_task_log(
             db,
             task.id,
-            "ai_hitl_resumed",
+            TaskLogType.AI_HITL_RESUMED,
             f"Human input received: {response_text[:300]}" if response_text else "Human input received.",
+            actor=TaskActor.USER,
             created_by=submitted_by,
             metadata={**meta, "mode": "agent"},
         )
-        dispatch_id = task.agent_id or MANOR_AGENT_ID
+        dispatch_id = await task_executing_agent_id(db, task) or MANOR_AGENT_ID
         await db.commit()
         dispatched = False
         try:
@@ -1284,7 +1448,7 @@ async def decide_approval_task(
         raise HTTPException(404, "Task not found")
     if not _is_approval_task(task):
         raise HTTPException(400, "Task is not an approval task")
-    if task.status in {"completed", "cancelled", "failed"}:
+    if task.status in TERMINAL_STATUSES:
         raise HTTPException(409, "Approval task is already closed")
 
     choice = (req.choice or "").strip().lower()
@@ -1324,12 +1488,13 @@ async def decide_approval_task(
     log = await add_task_log(
         db,
         task.id,
-        "approval_decision",
+        TaskLogType.APPROVAL_DECISION,
         (
             f"{actor} approved this task."
             if approved else
             f"{actor} requested changes for this approval task."
         ) + (f"\n\n{note}" if note else ""),
+        actor=TaskActor.USER,
         created_by=actor,
         metadata=details["approval_decision"],
     )
@@ -1433,6 +1598,7 @@ async def delete_one_task(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_writable(db, user, task.workspace_id)
     await db.delete(task)
     await db.flush()
 
@@ -1446,6 +1612,13 @@ async def update_one_task(
 ):
     # Capture old agent_id before update
     old_task = await get_task(db, task_id, user.entity_id)
+    if old_task:
+        # Gate on the task's CURRENT workspace, and on the target workspace
+        # when the update moves the task into a different one.
+        await require_workspace_writable(db, user, old_task.workspace_id)
+        new_ws = getattr(req, "workspace_id", None)
+        if new_ws and new_ws != old_task.workspace_id:
+            await require_workspace_writable(db, user, new_ws)
     old_agent_id = old_task.agent_id if old_task else None
     old_agent_type = old_task.agent_type if old_task else None
     old_status = old_task.status if old_task else None
@@ -1489,7 +1662,7 @@ async def update_one_task(
     was_master = _is_master(old_agent_id, old_agent_type)
     now_master = _is_master(new_agent_id, new_agent_type)
     is_new_agent = (new_agent_id and new_agent_id != old_agent_id) or (now_master and not was_master)
-    if is_new_agent and task.status not in ("completed", "cancelled", "failed"):
+    if is_new_agent and task.status not in (TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED,):
         try:
             from packages.core.tasks.ai_tasks import run_agent_task
             dispatch_id = new_agent_id or _MANOR_ID
@@ -1590,7 +1763,7 @@ async def add_log(
         meta["attachments"] = req.attachments
     mention_agent_items: list[dict] = []
     mention_user_items: list[dict] = []
-    if req.log_type == "comment" and req.mentions:
+    if req.log_type == TaskLogType.COMMENT and req.mentions:
         mention_agent_items, mention_user_items = await validate_mentions(
             db, entity_id=user.entity_id, raw=req.mentions,
         )
@@ -1598,6 +1771,7 @@ async def add_log(
             meta["mentions"] = mention_agent_items + mention_user_items
     log = await add_task_log(
         db, task_id, req.log_type, req.content,
+        actor=TaskActor.USER,
         created_by=(user.display_name or user.email),
         metadata=meta if meta else None,
     )
@@ -1605,7 +1779,7 @@ async def add_log(
     hitl_result = {"resumed": False}
     queued_learning_ids: list[str] = []
     # HITL resumption: comment on a waiting task resumes execution
-    if task.status in ("waiting_on_customer", "in_progress") and req.log_type == "comment":
+    if task.status in (TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.IN_PROGRESS,) and req.log_type == TaskLogType.COMMENT:
         payload = {"response": req.content, "fields": {}, "source": "comment"}
         hitl_result = await _resume_hitl(db, task, user, response_text=req.content.strip(), payload=payload)
         if hitl_result.get("resumed"):
@@ -1627,7 +1801,7 @@ async def add_log(
             ))
 
     if (
-        req.log_type == "comment"
+        req.log_type == TaskLogType.COMMENT
         and bool((req.content or "").strip())
         and not _is_attachment_only_comment(req.content, req.attachments)
     ):
@@ -1683,7 +1857,7 @@ async def add_log(
             responder_agent_ids.append(item["id"])
 
     should_process_workspace_comment = (
-        req.log_type == "comment"
+        req.log_type == TaskLogType.COMMENT
         and bool((req.content or "").strip())
         and bool(task.workspace_id)
         and not bool(hitl_result.get("resumed"))

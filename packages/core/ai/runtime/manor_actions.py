@@ -431,6 +431,21 @@ async def _runtime_load_document_folders(
     return folders, {folder.id: folder for folder in folders}
 
 
+def _runtime_folder_subtree_ids(folders: list[Any], folder_id: str) -> set[str]:
+    child_ids_by_parent: dict[str | None, list[str]] = {}
+    for folder in folders:
+        child_ids_by_parent.setdefault(folder.parent_id, []).append(folder.id)
+    subtree: set[str] = set()
+    stack = [folder_id]
+    while stack:
+        current_id = stack.pop()
+        if current_id in subtree:
+            continue
+        subtree.add(current_id)
+        stack.extend(child_ids_by_parent.get(current_id, []))
+    return subtree
+
+
 async def _runtime_validate_document_folder_position(
     db: Any,
     entity_id: str,
@@ -1270,17 +1285,19 @@ async def runtime_manor_add_task_comment(
 ) -> str:
     """Add a task comment/log entry via the Runtime Manor task boundary."""
 
+    from packages.core.constants.task import TaskLogType
     from packages.core.services.task_service import add_task_log, agent_log_authorship
 
     raw_params = params or {}
-    created_by, meta = await agent_log_authorship(
+    created_by, meta, actor = await agent_log_authorship(
         db, actor_agent_id, fallback=raw_params.get("user_id"),
     )
     log = await add_task_log(
         db,
         raw_params.get("task_id", ""),
-        raw_params.get("action_type", "comment"),
+        TaskLogType.coerce(raw_params.get("action_type"), default=TaskLogType.COMMENT),
         raw_params.get("content") or raw_params.get("comment", ""),
+        actor=actor,
         created_by=created_by,
         metadata=meta,
     )
@@ -1298,58 +1315,15 @@ async def runtime_manor_list_documents(
 ) -> str:
     """List Knowledge documents via the Runtime Manor document boundary."""
 
-    from packages.core.services.document_access import list_visible_documents
+    from packages.core.ai.runtime.document_actions import runtime_list_documents_action
 
-    raw_params = dict(params or {})
-    workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
-    if "search" in raw_params:
-        raw_params["name_search"] = raw_params.pop("search")
-    if "folder" in raw_params and "folder_id" not in raw_params:
-        folder = raw_params.pop("folder")
-        if folder:
-            raw_params["folder_id"] = folder
-    raw_params["limit"] = _runtime_bounded_int(raw_params.get("limit"), 20, 50, 1)
-    raw_params["offset"] = _runtime_bounded_int(raw_params.get("offset"), 0, 10_000, 0)
-    include_details = _runtime_want_details(raw_params)
-    raw_params["detail"] = "details" if include_details else "summary"
-    raw_params["user_id"] = user_id
-    raw_params["workspace_id"] = workspace_scope
-
-    cached = await _runtime_manor_get_cached_read(entity_id, "list_documents", raw_params)
-    if cached is not None:
-        return cached
-
-    service_params = {
-        key: value
-        for key, value in raw_params.items()
-        if key not in {"detail", "details", "user_id", "workspace_id"}
-    }
-    docs, total = await list_visible_documents(
-        db,
-        entity_id,
+    return await runtime_list_documents_action(
+        entity_id=entity_id,
         user_id=user_id,
-        workspace_id=workspace_scope,
-        actor_type="agent",
-        **service_params,
+        workspace_id=workspace_id,
+        params=dict(params or {}),
+        db=db,
     )
-    result = json.dumps({
-        "total": total,
-        "count": len(docs),
-        "limit": raw_params["limit"],
-        "offset": raw_params["offset"],
-        "next_offset": (
-            raw_params["offset"] + len(docs)
-            if raw_params["offset"] + len(docs) < total
-            else None
-        ),
-        "has_more": raw_params["offset"] + len(docs) < total,
-        "documents": [
-            _runtime_doc_summary(doc, details=include_details)
-            for doc in docs
-        ],
-    }, default=str)
-    await _runtime_manor_set_cached_read(entity_id, "list_documents", raw_params, result)
-    return result
 
 
 async def runtime_manor_search_documents(
@@ -1362,54 +1336,15 @@ async def runtime_manor_search_documents(
 ) -> str:
     """Search Knowledge documents via the Runtime Manor document boundary."""
 
-    from packages.core.services.document_access import list_visible_documents
+    from packages.core.ai.runtime.document_actions import runtime_search_documents_action
 
-    raw_params = params or {}
-    workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
-    query = (
-        raw_params.get("query")
-        or raw_params.get("search")
-        or raw_params.get("name_search")
-        or ""
-    )
-    cache_params = {
-        "query": str(query),
-        "limit": _runtime_bounded_int(raw_params.get("limit"), 20, 50, 1),
-        "offset": _runtime_bounded_int(raw_params.get("offset"), 0, 10_000, 0),
-        "detail": "details" if _runtime_want_details(raw_params) else "summary",
-        "user_id": user_id,
-        "workspace_id": workspace_scope,
-    }
-    cached = await _runtime_manor_get_cached_read(entity_id, "search_documents", cache_params)
-    if cached is not None:
-        return cached
-
-    docs, total = await list_visible_documents(
-        db,
-        entity_id,
+    return await runtime_search_documents_action(
+        entity_id=entity_id,
         user_id=user_id,
-        workspace_id=workspace_scope,
-        actor_type="agent",
-        name_search=cache_params["query"],
-        limit=cache_params["limit"],
-        offset=cache_params["offset"],
+        workspace_id=workspace_id,
+        params=dict(params or {}),
+        db=db,
     )
-    result = json.dumps({
-        "total": total,
-        "count": len(docs),
-        "next_offset": (
-            cache_params["offset"] + len(docs)
-            if cache_params["offset"] + len(docs) < total
-            else None
-        ),
-        "has_more": cache_params["offset"] + len(docs) < total,
-        "documents": [
-            _runtime_doc_summary(doc, details=cache_params["detail"] == "details")
-            for doc in docs
-        ],
-    }, default=str)
-    await _runtime_manor_set_cached_read(entity_id, "search_documents", cache_params, result)
-    return result
 
 
 async def runtime_manor_list_workspace_artifacts(
@@ -1887,7 +1822,7 @@ async def runtime_manor_rename_document_folder(
     if not folder:
         return json.dumps({"error": "Folder not found"})
     try:
-        clean_name, _folders, folder_by_id = await _runtime_validate_document_folder_position(
+        clean_name, folders, folder_by_id = await _runtime_validate_document_folder_position(
             db,
             entity_id,
             name=new_name,
@@ -1896,7 +1831,40 @@ async def runtime_manor_rename_document_folder(
         )
     except (FileExistsError, LookupError, ValueError) as exc:
         return json.dumps({"error": str(exc)})
-    folder.name = clean_name
+    from packages.core.services.workspace_artifacts import (
+        contains_workspace_artifact_root,
+        resolve_workspace_folder_binding,
+    )
+    workspace_binding = await resolve_workspace_folder_binding(
+        db,
+        entity_id=entity_id,
+        folder_id=folder.id,
+    )
+    is_workspace_root = (
+        workspace_binding is not None
+        and workspace_binding.artifact_folder_id == folder.id
+        and not workspace_binding.relative_parts
+    )
+    if is_workspace_root:
+        from packages.core.services.entity_service import update_workspace
+
+        workspace = await update_workspace(
+            db,
+            workspace_binding.workspace_id,
+            entity_id,
+            name=clean_name,
+        )
+        if workspace is None:
+            return json.dumps({"error": "Workspace not found"})
+        await db.refresh(folder)
+    else:
+        if await contains_workspace_artifact_root(
+            db,
+            entity_id=entity_id,
+            folder_ids=_runtime_folder_subtree_ids(folders, folder.id),
+        ):
+            return json.dumps({"error": "Folders containing Workspaces cannot be renamed"})
+        folder.name = clean_name
     await db.flush()
     await db.commit()
     await _runtime_manor_invalidate_read_cache(
@@ -1938,7 +1906,7 @@ async def runtime_manor_move_document_folder(
     if not folder:
         return json.dumps({"error": "Folder not found"})
     try:
-        _clean_name, _folders, folder_by_id = await _runtime_validate_document_folder_position(
+        _clean_name, folders, folder_by_id = await _runtime_validate_document_folder_position(
             db,
             entity_id,
             name=folder.name,
@@ -1947,6 +1915,13 @@ async def runtime_manor_move_document_folder(
         )
     except (FileExistsError, LookupError, ValueError) as exc:
         return json.dumps({"error": str(exc)})
+    from packages.core.services.workspace_artifacts import contains_workspace_artifact_root
+    if await contains_workspace_artifact_root(
+        db,
+        entity_id=entity_id,
+        folder_ids=_runtime_folder_subtree_ids(folders, folder.id),
+    ):
+        return json.dumps({"error": "Workspace folders cannot be moved"})
     folder.parent_id = parent_id
     await db.flush()
     await db.commit()
@@ -1984,17 +1959,12 @@ async def runtime_manor_delete_document_folder(
     folder = folder_by_id.get(folder_id)
     if not folder:
         return json.dumps({"error": "Folder not found"})
-    child_ids_by_parent: dict[str | None, list[str]] = {}
-    for item in folders:
-        child_ids_by_parent.setdefault(item.parent_id, []).append(item.id)
-    folder_ids: set[str] = set()
-    stack = [folder_id]
-    while stack:
-        current_id = stack.pop()
-        if current_id in folder_ids:
-            continue
-        folder_ids.add(current_id)
-        stack.extend(child_ids_by_parent.get(current_id, []))
+    folder_ids = _runtime_folder_subtree_ids(folders, folder_id)
+    from packages.core.services.workspace_artifacts import contains_workspace_artifact_root
+    if await contains_workspace_artifact_root(
+        db, entity_id=entity_id, folder_ids=folder_ids,
+    ):
+        return json.dumps({"error": "Workspace folders cannot be deleted from Knowledge"})
     folder_id_list = list(folder_ids)
     doc_ids = list((await db.execute(
         select(Document.id).where(
@@ -2044,30 +2014,110 @@ async def runtime_manor_move_documents_to_folder(
 
     raw_params = params or {}
     workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
-    folder_id = raw_params.get("folder_id")
-    if folder_id in ("", "root"):
-        folder_id = None
+
+    # Contract: the move target is identified by 'folder_id' ONLY — a folder id
+    # from list_document_folders, or the literal 'root'. Misnamed keys return a
+    # corrective error instead of being silently ignored (which used to "move"
+    # documents to root while reporting success).
+    for wrong_key in (
+        "target_folder_id",
+        "destination_folder_id",
+        "folder",
+        "target_folder",
+        "destination_folder",
+        "destination",
+        "folder_path",
+        "folder_name",
+        "parent_id",
+    ):
+        if wrong_key in raw_params and "folder_id" not in raw_params:
+            return json.dumps({
+                "error": (
+                    f"Unsupported parameter '{wrong_key}': the move target is "
+                    "identified by 'folder_id' (an id from "
+                    "list_document_folders, or 'root')."
+                )
+            })
+    if "folder_id" not in raw_params:
+        return json.dumps({
+            "error": (
+                "folder_id required: pass a folder id from "
+                "list_document_folders, or 'root' to move documents to the "
+                "Knowledge root."
+            )
+        })
+
+    folder_id: str | None = None
     folder_by_id: dict[str, Any] = {}
     target_folder_path: str | None = None
-    if folder_id:
+    workspace_binding = None
+    target_text = str(raw_params.get("folder_id") or "").strip()
+    if not target_text:
+        return json.dumps({
+            "error": (
+                "folder_id must be a folder id from list_document_folders, "
+                "or 'root' to move documents to the Knowledge root."
+            )
+        })
+    if target_text != "root":
         from packages.core.services.knowledge_visibility import is_user_visible_folder_path
 
         _folders, folder_by_id = await _runtime_load_document_folders(db, entity_id)
-        folder = folder_by_id.get(folder_id)
+        folder = folder_by_id.get(target_text)
         if not folder:
-            return json.dumps({"error": "Folder not found"})
+            # Not a known id. If the value matches a folder name/path, return
+            # the correct id in the error so the caller can self-correct.
+            normalized = target_text.strip("/")
+            matches = [
+                candidate
+                for candidate in folder_by_id.values()
+                if _runtime_folder_rel_path(candidate, folder_by_id) == normalized
+                or candidate.name == normalized
+            ]
+            if matches:
+                return json.dumps({
+                    "error": (
+                        f"'{target_text}' is not a folder id. Pass the id "
+                        "from list_document_folders."
+                    ),
+                    "candidates": [
+                        {
+                            "id": candidate.id,
+                            "path": _runtime_folder_rel_path(candidate, folder_by_id),
+                        }
+                        for candidate in matches[:10]
+                    ],
+                })
+            return json.dumps({"error": f"Folder not found: '{target_text}'"})
+        folder_id = folder.id
         target_folder_path = _runtime_folder_rel_path(folder, folder_by_id)
         if not is_user_visible_folder_path(target_folder_path):
             return json.dumps({"error": "Folder not found"})
+        from packages.core.services.workspace_artifacts import resolve_workspace_folder_binding
+        workspace_binding = await resolve_workspace_folder_binding(
+            db,
+            entity_id=entity_id,
+            folder_id=folder_id,
+        )
+        if workspace_binding:
+            target_folder_path = workspace_binding.storage_dir
 
-    raw_ids = (
-        raw_params.get("document_ids")
-        or raw_params.get("doc_ids")
-        or raw_params.get("ids")
-        or raw_params.get("document_id")
-        or raw_params.get("doc_id")
-        or raw_params.get("id")
-    )
+    # Contract: documents are identified by 'document_ids' (list; single-move
+    # calls may pass 'document_id'). Misnamed keys get a corrective error.
+    for wrong_key in ("doc_ids", "ids", "doc_id", "id"):
+        if (
+            wrong_key in raw_params
+            and "document_ids" not in raw_params
+            and "document_id" not in raw_params
+        ):
+            return json.dumps({
+                "error": (
+                    f"Unsupported parameter '{wrong_key}': identify documents "
+                    "with 'document_ids' (list of ids from list_documents / "
+                    "search_documents), or 'document_id' for a single move."
+                )
+            })
+    raw_ids = raw_params.get("document_ids") or raw_params.get("document_id")
     document_ids: list[str] = []
     if raw_ids:
         if isinstance(raw_ids, str):
@@ -2121,12 +2171,18 @@ async def runtime_manor_move_documents_to_folder(
         if fs_move.reason == "fs_unavailable":
             return json.dumps({"error": "Document storage is temporarily unavailable"})
         if fs_move.reason == "missing_source":
-            mark_document_file_missing(doc, source="manor_move")
+            mark_document_file_missing(doc, source="manor_move", trash=False)
             missing_files.append(document_id)
             continue
         if fs_move.moved:
             filesystem_moved_count += 1
         doc.folder_id = folder_id
+        if workspace_binding:
+            from packages.core.services.document_metadata import merge_document_metadata
+            doc.metadata_ = merge_document_metadata(
+                doc.metadata_,
+                origin={"workspace_id": workspace_binding.workspace_id},
+            )
         moved.append(_runtime_doc_summary(doc, details=True))
     await db.flush()
     await db.commit()
@@ -2425,6 +2481,9 @@ async def runtime_manor_list_integrations(
 
     from packages.core.models.mcp import MCPServer
     from packages.core.services.agent_permission_service import can_use_mcp_server
+    from packages.core.services.integration_account_service import (
+        list_runtime_integration_accounts,
+    )
     from packages.core.services.integration_service import (
         coming_soon_servers,
         get_integration_inventory,
@@ -2502,6 +2561,12 @@ async def runtime_manor_list_integrations(
                 "coming_soon": True,
             }
         else:
+            accounts = await list_runtime_integration_accounts(
+                db,
+                user_id=user_id or "",
+                entity_id=entity_id,
+                provider=server.server_key,
+            )
             decision = await can_use_mcp_server(
                 db,
                 user_id=user_id or "",
@@ -2518,6 +2583,10 @@ async def runtime_manor_list_integrations(
                 "scope": decision.scope,
                 "reason": decision.reason,
                 "coming_soon": False,
+                "default_account_id": decision.account_id,
+                "account_options": [
+                    account.public_option() for account in accounts
+                ],
             }
         if ready_only and not item["ready"]:
             continue
@@ -2712,12 +2781,50 @@ async def runtime_manor_send_email(
     if not content and not html_content:
         return json.dumps({"error": "content/body is required"})
 
+    # ``to_addr`` may be a single address or a list. Normalize once so BOTH
+    # send paths (connected channel account + platform SMTP) fan out one
+    # clean single-recipient message per address — a stringified list in the
+    # To header is what Gmail refuses at RCPT with 555 5.5.2.
+    from packages.core.services.email_service import _normalize_recipients
+
+    recipients = _normalize_recipients(to_addr)
+    if not recipients:
+        return json.dumps({"error": "recipient email is required"})
+
+    integration_account_id = str(
+        raw_params.get("integration_account_id") or ""
+    ).strip()
     channel_config_id = raw_params.get("channel_config_id")
     target_workspace_id = raw_params.get("workspace_id") or workspace_id
     if not html_content and content:
         html_content = "<p>" + html.escape(str(content)).replace("\n", "<br>") + "</p>"
 
-    if not channel_config_id:
+    if integration_account_id:
+        q = select(ChannelConfig).where(
+            ChannelConfig.entity_id == entity_id,
+            ChannelConfig.channel_type == "email",
+            ChannelConfig.status == "active",
+            ChannelConfig.config["integration_id"].astext == integration_account_id,
+        )
+        if target_workspace_id:
+            q = q.where(
+                (ChannelConfig.workspace_id == target_workspace_id)
+                | (ChannelConfig.workspace_id.is_(None))
+            )
+        else:
+            q = q.where(ChannelConfig.workspace_id.is_(None))
+        selected_config = (await db.execute(q.limit(1))).scalar_one_or_none()
+        if not selected_config:
+            return json.dumps({
+                "error": "selected_email_account_unavailable",
+                "message": (
+                    "The selected email account is not connected, active, or "
+                    "available in this workspace."
+                ),
+                "integration_account_id": integration_account_id,
+            })
+        channel_config_id = selected_config.id
+    elif not channel_config_id:
         q = select(ChannelConfig).where(
             ChannelConfig.entity_id == entity_id,
             ChannelConfig.channel_type == "email",
@@ -2739,36 +2846,67 @@ async def runtime_manor_send_email(
     if channel_config_id:
         from packages.core.services.channel_service import send_message
 
-        log = await send_message(
-            db,
-            entity_id,
-            channel_config_id=channel_config_id,
-            to_address=str(to_addr),
-            subject=str(subject),
-            content=str(content or ""),
-            html_content=str(html_content or ""),
-            conversation_id=conversation_id,
-        )
+        # Fan out per-recipient: one send_message call per address so each
+        # message carries a single clean To (channel_service._send_email sets
+        # ``msg["To"] = to`` with no fan-out of its own) and one refused
+        # recipient can't take down the batch.
+        delivered: list[str] = []
+        failed: list[dict[str, str]] = []
+        message_log_ids: list[str] = []
+        for addr in recipients:
+            log = await send_message(
+                db,
+                entity_id,
+                channel_config_id=channel_config_id,
+                to_address=addr,
+                subject=str(subject),
+                content=str(content or ""),
+                html_content=str(html_content or ""),
+                conversation_id=conversation_id,
+            )
+            message_log_ids.append(log.id)
+            if log.status == "sent":
+                delivered.append(addr)
+            else:
+                failed.append({"to": addr, "error": log.error_message or "unknown error"})
         await db.commit()
         return json.dumps({
-            "sent": log.status == "sent",
-            "status": log.status,
-            "message_log_id": log.id,
+            "sent": len(delivered) > 0,
+            "status": (
+                "sent" if delivered and not failed
+                else "partial" if delivered
+                else "failed"
+            ),
+            "delivery": "channel_account",
             "channel_config_id": channel_config_id,
-            "to": to_addr,
+            "integration_account_id": integration_account_id or None,
+            "to": recipients,
             "subject": subject,
-            "error": log.error_message,
+            "total": len(recipients),
+            "delivered": len(delivered),
+            "failed": failed,
+            "message_log_ids": message_log_ids,
         }, default=str)
 
-    from packages.core.services.email_service import send_common_email
+    from packages.core.services.email_service import _render, send_bulk_email
 
-    ok = await send_common_email(str(to_addr), str(subject), str(html_content or content))
+    # Platform-SMTP fallback — same per-recipient fan-out. Wrap the body in
+    # the branded template exactly like ``send_common_email`` did.
+    wrapped_html = _render("common", content=str(html_content or content))
+    result = await send_bulk_email(recipients, str(subject), wrapped_html)
     return json.dumps({
-        "sent": bool(ok),
-        "status": "sent" if ok else "failed",
+        "sent": result["sent"] > 0,
+        "status": (
+            "sent" if result["sent"] and not result["failed"]
+            else "partial" if result["sent"]
+            else "failed"
+        ),
         "delivery": "platform_smtp",
-        "to": to_addr,
+        "to": recipients,
         "subject": subject,
+        "total": result["total"],
+        "delivered": result["sent"],
+        "failed": result["failed"],
     }, default=str)
 
 

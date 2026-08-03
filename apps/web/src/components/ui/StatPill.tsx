@@ -3,8 +3,7 @@
  *
  * Usage:
  *   <StatPill label="12 tasks" />
- *   <StatPill label="3 active" color="#437f6b" bg="#dceae3" />
- *   <StatPill label="2 errors" color="#c14a44" bg="#f1dddb" />
+ *   <StatPill label="3 active" color="var(--accent)" bg="var(--accent-soft)" />
  */
 
 interface StatPillProps {
@@ -13,7 +12,11 @@ interface StatPillProps {
   bg?: string;
 }
 
-export default function StatPill({ label, color = "#57534e", bg = "rgba(245,245,244,0.8)" }: StatPillProps) {
+export default function StatPill({
+  label,
+  color = "var(--text-faint)",
+  bg = "var(--surface-muted)",
+}: StatPillProps) {
   return (
     <span style={{
       fontSize: 11, fontWeight: 600,

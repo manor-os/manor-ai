@@ -3,10 +3,19 @@ from __future__ import annotations
 
 import logging
 
+from packages.core.constants.pending_actions import PendingActionKind
+from packages.core.constants.task import TaskStatus
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+)
 from packages.core.celery_app import celery_app
 from packages.core.tasks._runtime import run_in_worker as _run_async
 from packages.core.ai.llm_client import CreditExhaustedError
 from packages.core.plans.service import PlanContractError
+from packages.core.services.step_deadline import (
+    CELERY_LEASE_HARD_TIME_LIMIT_SECONDS,
+    CELERY_LEASE_SOFT_TIME_LIMIT_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,15 +39,15 @@ def _mark_plan_failed(plan_id: str, error_msg: str) -> None:
                     select(ExecutionPlan).where(ExecutionPlan.id == plan_id)
                 )).scalar_one_or_none()
                 event_payload = None
-                if plan and plan.status not in ("completed", "failed", "cancelled"):
-                    plan.status = "failed"
+                if plan and plan.status not in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.FAILED, ExecutionPlanStatus.CANCELLED,):
+                    plan.status = ExecutionPlanStatus.FAILED.value
                     plan.completed_at = datetime.now(timezone.utc)
                     if plan.task_id:
                         task = (await db.execute(
                             select(Task).where(Task.id == plan.task_id)
                         )).scalar_one_or_none()
-                        if task and task.status == "in_progress":
-                            apply_task_status_transition(task, "failed")
+                        if task and task.status == TaskStatus.IN_PROGRESS:
+                            await apply_task_status_transition(task, "failed", db=db)
                             task.actual_output = {
                                 "plan_id": plan.id,
                                 "plan_status": "failed",
@@ -81,8 +90,8 @@ def _mark_task_failed(task_id: str, error_msg: str) -> None:
                     select(Task).where(Task.id == task_id)
                 )).scalar_one_or_none()
                 event_payload = None
-                if task and task.status == "in_progress":
-                    apply_task_status_transition(task, "failed")
+                if task and task.status == TaskStatus.IN_PROGRESS:
+                    await apply_task_status_transition(task, "failed", db=db)
                     task.actual_output = {
                         "task_status": "failed",
                         "error_type": "TaskPlanningExhausted",
@@ -202,7 +211,7 @@ def _compact_error(error_msg: str, *, limit: int = 500) -> str:
 async def _post_strategist_failure_card(
     *,
     workspace_id: str,
-    trigger: str,
+    trigger,
     error_msg: str,
     run_id: str | None = None,
     job_id_str: str | None = None,
@@ -239,9 +248,11 @@ async def _post_strategist_failure_card(
             author_kind="system",
             refs=[{"type": "workspace", "id": workspace.id}],
             pending_action={
-                "kind": "retry_strategist_review",
+                "kind": PendingActionKind.RETRY_STRATEGIST_REVIEW.value,
                 "workspace_id": workspace.id,
-                "trigger": trigger,
+                # Display/audit only — the retry re-enqueues as
+                # HUMAN_REQUESTED because a person clicked the button.
+                "trigger": getattr(trigger, "label", trigger),
                 "run_id": run_id,
                 "job_id": job_id_str,
                 "error": reason,
@@ -321,7 +332,25 @@ def internal_worker_tick(self):
         logger.exception("internal_worker_tick failed")
 
 
-@celery_app.task(bind=True, max_retries=2, soft_time_limit=1800, time_limit=2100)
+@celery_app.task(
+    bind=True,
+    max_retries=2,
+    # These decorator values override the app-level ``task_soft_time_limit=300``
+    # / ``task_time_limit=600`` in packages/core/celery_app.py (a task's own
+    # attributes win over the global config), so THESE are the limits that
+    # apply to a lease.
+    #
+    # They are a LAST-RESORT BACKSTOP for a wedged worker process, not the
+    # execution policy. The real policy is the per-step deadline
+    # (``max_runtime_seconds``, resolved in packages/core/services/step_deadline.py
+    # and enforced in execute_lease_inproc), which always expires first and
+    # produces a diagnosable StepDeadlineExceeded failure that flows through
+    # the retry policy. Keeping both numbers derived from the step-deadline
+    # ceiling makes the invariant "celery limit > step deadline" impossible to
+    # invert silently — tests/test_step_deadline.py guards it.
+    soft_time_limit=CELERY_LEASE_SOFT_TIME_LIMIT_SECONDS,
+    time_limit=CELERY_LEASE_HARD_TIME_LIMIT_SECONDS,
+)
 def execute_lease(self, lease_id: str):
     """Execute one lease via the InternalWorker. Reports completion /
     failure / needs_human back to the Dispatcher.
@@ -523,6 +552,63 @@ def run_chat_insight_extraction(
     )
 
 
+@celery_app.task(bind=True, max_retries=1, name="memory.entity_chat_extraction_sweep")
+def run_entity_chat_extraction_sweep(self):
+    """Extract insights from entity-level (workspace-less) chats.
+
+    The per-workspace extraction job never sees the main assistant chat
+    (conversations with ``workspace_id IS NULL``), so preferences typed
+    there never reached long-term memory. This sweep finds entities with
+    recent entity-level operator messages and runs one bookmark-guarded
+    extraction pass per entity.
+    """
+    logger.info(
+        "Entity chat extraction sweep (attempt %d)", self.request.retries + 1
+    )
+
+    async def _go():
+        from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import text as sql_text
+
+        from packages.core.database import create_worker_session
+        from packages.core.memory.chat_extractor import (
+            LOOKBACK_HOURS,
+            extract_entity_chat_insights,
+        )
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+        results = []
+        async with create_worker_session()() as db:
+            entity_ids = [
+                row[0]
+                for row in (await db.execute(sql_text("""
+                    SELECT DISTINCT c.entity_id
+                    FROM conversations c
+                    JOIN messages m ON m.conversation_id = c.id
+                    WHERE c.workspace_id IS NULL
+                      AND m.author_kind = 'user'
+                      AND m.created_at > :cutoff
+                """), {"cutoff": cutoff})).all()
+            ]
+            for entity_id in entity_ids:
+                try:
+                    results.append(await extract_entity_chat_insights(db, entity_id))
+                except Exception:
+                    logger.warning(
+                        "Entity chat extraction failed for %s",
+                        entity_id, exc_info=True,
+                    )
+            await db.commit()
+        return {"entities": len(entity_ids), "results": results}
+
+    try:
+        return _run_async(_go())
+    except Exception as exc:
+        logger.error("Entity chat extraction sweep failed: %s", exc, exc_info=True)
+        raise self.retry(exc=exc, countdown=900)
+
+
 @celery_app.task(bind=True, max_retries=2, name="learning.apply_candidate")
 def apply_learning_candidate_async(
     self,
@@ -581,38 +667,167 @@ def apply_learning_candidate_async(
         raise self.retry(exc=exc, countdown=60)
 
 
+async def _execute_strategist_review_cycle(db, workspace_id: str, trigger) -> dict:
+    """One full Strategist review cycle over an open session.
+
+    Extracted from ``run_strategist_review`` so tests can exercise the
+    flag-gated v2 path (ReviewRun lifecycle + consolidation + briefing)
+    directly against a test session, without a Celery worker session.
+
+    ``trigger`` is a :class:`ReviewTrigger` (a ``ReviewTriggerKind`` plus
+    opaque detail prose); a bare kind or a legacy free-text string is
+    coerced. Suppression is decided inside ``run_review`` from the kind —
+    this layer never inspects the text.
+    """
+    from sqlalchemy import select
+
+    from packages.core.models.review_run import ReviewRun
+    from packages.core.models.workspace import Workspace
+    from packages.core.strategist import ReviewTrigger, run_review
+
+    trigger = ReviewTrigger.coerce(trigger)
+
+    # ── M2: wrap the review in a ReviewRun lifecycle when the
+    # strategist_review_v2 flag is on. Flag off (default) → identical
+    # legacy behavior, zero extra writes.
+    review = None
+    review_id: str | None = None
+    entity_id = (await db.execute(
+        select(Workspace.entity_id).where(
+            Workspace.id == workspace_id,
+            Workspace.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if entity_id is not None:
+        from packages.core.services.feature_flags import is_enabled
+        if await is_enabled(
+            db, "strategist_review_v2", entity_id=entity_id, fallback=False,
+        ):
+            from packages.core.review import ReviewAlreadyRunning, begin_review
+            try:
+                review = await begin_review(
+                    db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    trigger=trigger,
+                )
+                review_id = review.id
+                # The running row must be visible to concurrent
+                # triggers (the partial unique index is the lock).
+                await db.commit()
+            except ReviewAlreadyRunning:
+                logger.info(
+                    "Strategist: review already running for workspace %s; skipping",
+                    workspace_id,
+                )
+                return {
+                    "workspace_id": workspace_id,
+                    "skipped": True,
+                    "reason": "review_already_running",
+                }
+
+    try:
+        briefing_markdown: str | None = None
+        if review is not None:
+            # ── M5: deterministic consolidation + briefing, frozen onto
+            # the ReviewRun row before the Strategist reads anything.
+            # A failure anywhere in this block fails the review (below)
+            # and the watermark does not advance.
+            from packages.core.consolidators import run_all
+            from packages.core.review.briefing import build_briefing
+            from packages.core.review.briefing_render import render_briefing_markdown
+
+            report_rows = await run_all(db, review)
+            briefing = await build_briefing(db, review, report_rows)
+            review.briefing = briefing.model_dump(mode="json")
+            await db.flush()
+            briefing_markdown = render_briefing_markdown(briefing)
+
+        result = await run_review(
+            db, workspace_id, trigger=trigger,
+            briefing_markdown=briefing_markdown,
+            review_run=review,
+        )
+    except Exception as exc:
+        if review_id is not None:
+            from packages.core.review import fail_review
+            try:
+                await db.rollback()
+                review = await db.get(ReviewRun, review_id)
+                if review is not None:
+                    await fail_review(db, review, error=str(exc))
+                    await db.commit()
+            except Exception:
+                logger.exception(
+                    "Failed to mark review %s failed for workspace %s",
+                    review_id, workspace_id,
+                )
+        raise
+
+    if review_id is not None:
+        from packages.core.review import complete_review, mark_review_skipped
+        review = await db.get(ReviewRun, review_id)
+        if review is not None:
+            if isinstance(result, dict) and result.get("skipped"):
+                await mark_review_skipped(
+                    db, review, reason=str(result.get("reason") or "unknown"),
+                )
+            else:
+                await complete_review(db, review)
+            await db.commit()
+    return result
+
+
 @celery_app.task(bind=True, max_retries=2)
 def run_strategist_review(
-    self, workspace_id: str, trigger: str = "scheduled",
-    *, run_id: str | None = None, job_id_str: str | None = None,
+    self, workspace_id: str, trigger: str | None = None,
+    *,
+    trigger_kind: str | None = None,
+    trigger_detail: str | None = None,
+    run_id: str | None = None, job_id_str: str | None = None,
 ):
     """Trigger one Strategist review cycle.
 
     Cadence comes from a ScheduledJob row tagged
     ``execution_type='strategist_review'`` (see strategist.scheduling).
-    Manual triggers route through the same task via ``.delay()``.
+    Manual triggers route through the same task via ``.apply_async()``.
+
+    Wire format: producers send ``trigger_kind`` (a ``ReviewTriggerKind``
+    value) plus optional ``trigger_detail`` prose. The second positional
+    ``trigger`` argument is the legacy single-string form; it is kept ONLY
+    so a worker that restarts mid-deploy can still drain messages that
+    were queued before the split. Those are classified by
+    ``ReviewTrigger.from_wire`` with a deprecation warning instead of
+    crashing the worker.
     """
+    from packages.core.strategist import ReviewTrigger
+
+    review_trigger = ReviewTrigger.from_wire(
+        trigger=trigger,
+        trigger_kind=trigger_kind,
+        trigger_detail=trigger_detail,
+    )
     logger.info(
-        "Strategist review for workspace %s (attempt %d)",
-        workspace_id, self.request.retries + 1,
+        "Strategist review for workspace %s (trigger=%s, attempt %d)",
+        workspace_id, review_trigger.kind.value, self.request.retries + 1,
     )
 
     async def _go():
         from packages.core.database import create_worker_session
-        from packages.core.strategist import run_review
         from packages.core.ai.runtime import runtime_ensure_strategist_review_billing_context
         async with create_worker_session()() as db:
             await runtime_ensure_strategist_review_billing_context(
                 db,
                 workspace_id,
             )
-            skip_open = not trigger.startswith("user_feedback")
-            return await run_review(db, workspace_id, trigger=trigger, skip_if_open_proposals=skip_open)
+            return await _execute_strategist_review_cycle(
+                db, workspace_id, review_trigger,
+            )
 
     async def _notify_failure(error_msg: str):
         await _post_strategist_failure_card(
             workspace_id=workspace_id,
-            trigger=trigger,
+            trigger=review_trigger,
             error_msg=error_msg,
             run_id=run_id,
             job_id_str=job_id_str,
@@ -832,6 +1047,10 @@ def _update_job_run_status(session_factory, task_id: str, result: dict):
                         job.consecutive_errors = (job.consecutive_errors or 0) + 1
                     else:
                         job.consecutive_errors = 0
+                if job and run_id:
+                    # Ledger (M1): final automation run status, same transaction.
+                    from packages.core.ledger.adapters import record_automation_run_finished
+                    await record_automation_run_finished(db, job, run_id=run_id, status=status)
 
             await db.commit()
 
@@ -909,8 +1128,19 @@ def generate_job_skill(self, job_id: str, payload_message: str, job_name: str = 
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
-@celery_app.task(name='run_workflow', bind=True, max_retries=2)
-def run_workflow(self, workflow_run_id: str):
+@celery_app.task(
+    name='run_workflow',
+    bind=True,
+    max_retries=2,
+    soft_time_limit=10800,
+    time_limit=11100,
+)
+def run_workflow(
+    self,
+    workflow_run_id: str,
+    scheduled_run_id: str | None = None,
+    scheduled_job_id: str | None = None,
+):
     """Execute a workflow run.
 
     Called when a workflow is started. Delegates to WorkflowRunner which
@@ -921,11 +1151,76 @@ def run_workflow(self, workflow_run_id: str):
     logger.info("Running workflow %s (attempt %d)", workflow_run_id, self.request.retries + 1)
     try:
         from packages.core.ai.workflow_runner import WorkflowRunner
-        _run_async(WorkflowRunner().run(workflow_run_id))
-    except CreditExhaustedError:
+        from packages.core.database import create_worker_session
+        from packages.core.models.workflow import WorkflowRun
+        from sqlalchemy import select
+
+        async def _execute():
+            await WorkflowRunner().run(workflow_run_id)
+            async with create_worker_session()() as db:
+                run = (await db.execute(
+                    select(WorkflowRun).where(WorkflowRun.id == workflow_run_id)
+                )).scalar_one_or_none()
+                if not run:
+                    raise RuntimeError("workflow run disappeared during execution")
+                return {
+                    "workflow_run_id": run.id,
+                    "status": run.status,
+                    **({"error": run.error} if run.error else {}),
+                }
+
+        result = _run_async(_execute())
+        if result.get("status") == "failed":
+            _run_async(_finalize_scheduled_run(
+                run_id=scheduled_run_id,
+                job_id_str=scheduled_job_id,
+                error=result.get("error") or "workflow failed",
+            ))
+        else:
+            _run_async(_finalize_scheduled_run(
+                run_id=scheduled_run_id,
+                job_id_str=scheduled_job_id,
+                result=result,
+            ))
+        return result
+    except CreditExhaustedError as exc:
         logger.warning("Workflow %s aborted: credits exhausted", workflow_run_id)
+        _run_async(_finalize_scheduled_run(
+            run_id=scheduled_run_id,
+            job_id_str=scheduled_job_id,
+            error=f"credits_exhausted: {exc}",
+        ))
     except Exception as exc:
         logger.error("Workflow %s failed: %s", workflow_run_id, exc, exc_info=True)
+        if self.request.retries >= self.max_retries:
+            _run_async(_finalize_scheduled_run(
+                run_id=scheduled_run_id,
+                job_id_str=scheduled_job_id,
+                error=str(exc),
+            ))
+        raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+
+
+@celery_app.task(
+    name='resume_workflow',
+    bind=True,
+    max_retries=2,
+    soft_time_limit=10800,
+    time_limit=11100,
+)
+def resume_workflow(self, workflow_run_id: str):
+    """Resume a paused workflow timer and continue it to completion."""
+    logger.info(
+        "Resuming workflow %s (attempt %d)",
+        workflow_run_id,
+        self.request.retries + 1,
+    )
+    try:
+        from packages.core.ai.workflow_runner import WorkflowRunner
+
+        _run_async(WorkflowRunner.resume(workflow_run_id, execute=True))
+    except Exception as exc:
+        logger.error("Workflow resume %s failed: %s", workflow_run_id, exc, exc_info=True)
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
@@ -1080,8 +1375,9 @@ def send_agent_greetings(self, entity_id: str, workspace_id: str,
                          agent_data: list[dict]):
     """Post greeting messages from each subscribed agent to workspace chat.
 
-    Dispatched by finalize_setup() after workspace creation. Each agent
-    introduces itself with a short LLM-generated greeting.
+    Dispatched by dispatch_workspace_post_commit() after the workspace
+    materialization transaction commits. Each agent introduces itself with a
+    short LLM-generated greeting.
 
     agent_data: [{subscription_id, agent_name, service_key, system_prompt}, ...]
     """

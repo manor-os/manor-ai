@@ -33,6 +33,15 @@ _CONTEXT_KEYS = {
     "_user_id_from_context",
     "_active_user_message_from_context",
     "_manual_skill_selected_from_context",
+    # Browser page-snapshot version token. It changes every time the agent
+    # re-reads the page — which it must do to locate the element again after
+    # the user approves. Hashing it made every retry look like "the content
+    # changed after approval": the grant was superseded and a fresh card
+    # minted, so the user approved the same text repeatedly and the action
+    # never ran. It carries no content — the target stays pinned by `ref` /
+    # `tabId`, which remain hashed so approving a fill on one element can
+    # never authorize another.
+    "snapshot_id",
 }
 _BOOLEAN_CONTROL_KEYS = {"confirm"}
 _FILE_MUTATION_TOOL_NAMES = {

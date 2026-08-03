@@ -154,6 +154,84 @@ async def list_memories(
     return list(result.scalars().all())
 
 
+async def _relevance_ranked_memories(
+    db: AsyncSession,
+    entity_id: str,
+    *,
+    agent_id: str | None,
+    user_id: str | None,
+    query: str,
+    limit: int,
+) -> list[AgentMemory] | None:
+    """Rank the entity's memories by vector similarity to ``query``.
+
+    Returns None when relevance ranking is unavailable (no embedding service,
+    no embedding column) so the caller can fall back to importance ordering.
+    Rows without an embedding are appended after ranked rows by importance,
+    so un-embedded memories never become invisible.
+    """
+    import asyncio
+
+    from sqlalchemy import text
+
+    try:
+        await sync_agent_memory_files(
+            db, entity_id=entity_id, agent_id=agent_id, user_id=user_id,
+        )
+    except Exception:
+        logger.debug("agent memory file sync skipped", exc_info=True)
+
+    try:
+        from packages.core.services.embedding_service import generate_embedding
+
+        embedding = await asyncio.wait_for(generate_embedding(query), timeout=10.0)
+    except Exception:
+        return None
+    if not embedding:
+        return None
+
+    probe = await db.execute(text("""
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'agent_memories'
+          AND column_name = 'embedding'
+        LIMIT 1
+    """))
+    if probe.scalar_one_or_none() is None:
+        return None
+
+    vec_str = "[" + ",".join(f"{v:.7f}" for v in embedding) + "]"
+    sql = """
+        SELECT id
+        FROM agent_memories
+        WHERE entity_id = :entity
+          AND status = 'active'
+    """
+    params: dict = {"entity": entity_id, "vec": vec_str, "k": limit}
+    if agent_id is not None:
+        sql += " AND agent_id = :agent"
+        params["agent"] = agent_id
+    if user_id is not None:
+        sql += " AND user_id = :user"
+        params["user"] = user_id
+    sql += """
+        ORDER BY (embedding IS NULL) ASC,
+                 embedding <=> CAST(:vec AS vector) ASC NULLS LAST,
+                 importance DESC
+        LIMIT :k
+    """
+    ranked_ids = [row[0] for row in (await db.execute(text(sql), params)).all()]
+    if not ranked_ids:
+        return []
+
+    rows = (await db.execute(
+        select(AgentMemory).where(AgentMemory.id.in_(ranked_ids))
+    )).scalars().all()
+    by_id = {row.id: row for row in rows}
+    return [by_id[mem_id] for mem_id in ranked_ids if mem_id in by_id]
+
+
 async def get_context_memories(
     db: AsyncSession,
     entity_id: str,
@@ -161,12 +239,16 @@ async def get_context_memories(
     agent_id: str | None = None,
     user_id: str | None = None,
     max_tokens: int = 2000,
+    query: str | None = None,
 ) -> str:
     """Get relevant memories formatted for injection into system prompt.
 
-    Selects active, non-expired memories sorted by importance DESC.
-    Concatenates them until max_tokens budget is reached.
-    Returns a formatted string like:
+    When ``query`` is provided (the active user message) and embeddings are
+    available, memories are ranked by relevance to the query with importance
+    as the tie-breaker — importance-only ordering injects the same top
+    entries into every turn regardless of topic. Falls back to importance
+    DESC when relevance ranking is unavailable. Concatenates until the
+    max_tokens budget is reached. Returns a formatted string like:
 
     ## Your Memory
     - [fact] User prefers weekly email reports
@@ -176,16 +258,33 @@ async def get_context_memories(
     # Estimate ~4 chars per token
     max_chars = max_tokens * 4
 
-    memories = await list_memories(
-        db, entity_id, agent_id=agent_id, user_id=user_id, limit=100
-    )
+    memories: list[AgentMemory] | None = None
+    if query and query.strip():
+        try:
+            memories = await _relevance_ranked_memories(
+                db,
+                entity_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                query=query.strip(),
+                limit=100,
+            )
+        except Exception:
+            logger.debug("relevance memory ranking failed", exc_info=True)
+            memories = None
+    ranked_by_relevance = memories is not None
+    if memories is None:
+        memories = await list_memories(
+            db, entity_id, agent_id=agent_id, user_id=user_id, limit=100
+        )
 
     # Filter expired
     now = datetime.now(timezone.utc)
     active = [m for m in memories if not m.expires_at or m.expires_at > now]
 
-    # Sort by importance DESC (already sorted from query, but ensure)
-    active.sort(key=lambda m: m.importance, reverse=True)
+    if not ranked_by_relevance:
+        # Sort by importance DESC (already sorted from query, but ensure)
+        active.sort(key=lambda m: m.importance, reverse=True)
 
     lines = ["## Your Memory"]
     omitted = 0

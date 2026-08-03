@@ -85,6 +85,38 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+_BINDING_STRUCTURAL_KEYS = frozenset({"op", "operation", "type", "payload", "binding", "bindings"})
+
+
+def _binding_from_upsert_patch(raw_patch: Any) -> dict[str, Any]:
+    """Resolve a single capability/skill binding from an upsert patch.
+
+    Models place the binding fields at any of three depths, under alias names:
+    inside ``payload.binding`` (the documented shape), at the ``payload`` top
+    level as siblings of ``binding`` (prod card 01KY0XQG — four Chrome bindings
+    collapsed into one), or at the PATCH top level as siblings of ``payload``
+    (prod card 01KY1GERJK — ``_normalise_patch`` keeps only ``payload`` and would
+    otherwise drop ``scope`` / ``skill_key`` / ``service_key`` /
+    ``capability_type`` entirely). Merge all three levels — patch < payload <
+    payload.binding, most-specific wins — and normalize the ``scope`` ->
+    ``owner_scope`` and ``purpose`` -> ``description`` aliases, so the binding is
+    complete no matter where the model put the fields."""
+    raw_patch = _as_dict(raw_patch)
+    merged: dict[str, Any] = {
+        k: v for k, v in raw_patch.items() if k not in _BINDING_STRUCTURAL_KEYS
+    }
+    payload = _as_dict(raw_patch.get("payload"))
+    merged.update({k: v for k, v in payload.items() if k not in ("binding", "bindings")})
+    nested = payload.get("binding")
+    if isinstance(nested, dict):
+        merged.update(nested)
+    if not merged.get("owner_scope") and merged.get("scope"):
+        merged["owner_scope"] = merged.pop("scope")
+    if not merged.get("description") and merged.get("purpose"):
+        merged["description"] = merged["purpose"]
+    return merged
+
+
 def _as_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
 
@@ -663,7 +695,7 @@ def _apply_single_patch(
         return _sync_operating_model_from_state(state)
 
     if op in {"capability_binding.upsert", "tool_scope.update"}:
-        bindings = payload.get("bindings")
+        bindings = payload.get("bindings") or raw_patch.get("bindings")
         if isinstance(bindings, list):
             for binding in bindings:
                 if isinstance(binding, dict):
@@ -672,7 +704,7 @@ def _apply_single_patch(
                         binding,
                     )
         else:
-            binding = _as_dict(payload.get("binding") or payload)
+            binding = _binding_from_upsert_patch(raw_patch)
             state["capability_bindings"] = _upsert_capability_binding(
                 state.get("capability_bindings"),
                 binding,
@@ -690,7 +722,7 @@ def _apply_single_patch(
         return _sync_operating_model_from_state(state)
 
     if op in {"skill_binding.upsert", "skill_scope.update"}:
-        binding = _as_dict(payload.get("binding") or payload)
+        binding = _binding_from_upsert_patch(raw_patch)
         state["skill_bindings"] = _upsert_capability_binding(
             state.get("skill_bindings"),
             binding,
@@ -830,6 +862,193 @@ def _state_diff(base: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
         "changed_keys": list(changed.keys()),
         "changes": changed,
     }
+
+
+#: The policy lists ``rules.replace`` rebuilds from scratch. Everything else on
+#: the policy (risk ceiling, budget caps) survives the rebuild untouched.
+_REBUILT_GOVERNANCE_POLICY_KEYS: frozenset[str] = frozenset({
+    "never_allow_actions",
+    "hitl_required_actions",
+    "auto_approve_actions",
+    "never_allow_capabilities",
+    "hitl_required_capabilities",
+    "auto_approve_capabilities",
+})
+
+
+def _resolved_governance_policy(
+    state: dict[str, Any],
+    *,
+    operating_rules: list[dict[str, Any]],
+    rules_touched: bool,
+    changed_keys: set[str],
+):
+    """The governance policy that applying this draft WOULD write.
+
+    Shared by ``apply_operation_draft`` and the review card, and that sharing
+    is the point. ``rules.replace`` rebuilds ``never_allow`` from the draft's
+    rules — an agent can drop its own hard blocks that way — while the draft's
+    stored ``governance_policy`` still shows the OLD lists, because the rebuild
+    only happens at apply time. A review card computing its own version of
+    this would be showing the user a second opinion, not the change.
+
+    Returns ``None`` when the draft implies no policy at all (unchanged
+    behaviour from ``_build_governance_policy_from_rules``).
+    """
+    from packages.core.services.workspace_setup_service import (
+        _build_governance_policy_from_rules,
+    )
+
+    operating_model = _as_dict(state.get("operating_model"))
+    raw_governance_policy = _as_dict(
+        state.get("governance_policy") or operating_model.get("governance")
+    )
+    if rules_touched and "governance_policy" not in changed_keys:
+        # ``rules.replace`` must remove stale action gates that were inferred
+        # from previous rules. Preserve non-action policy knobs, but rebuild
+        # never_allow / HITL / auto-approve lists from the current rules.
+        raw_governance_policy = {
+            key: value
+            for key, value in raw_governance_policy.items()
+            if key not in _REBUILT_GOVERNANCE_POLICY_KEYS
+        }
+    return _build_governance_policy_from_rules(
+        operating_rules,
+        raw_governance_policy,
+    )
+
+
+def _draft_rules_touched(patches: Any) -> bool:
+    return any(
+        _normalise_patch(patch)[0] in {
+            "rule.add", "guardrail.add", "rules.replace", "guardrails.replace",
+        }
+        for patch in _as_list(patches)
+        if isinstance(patch, dict)
+    )
+
+
+def _policy_list(policy: Any, field: str) -> list[str]:
+    if policy is None:
+        return []
+    if isinstance(policy, dict):
+        return _unique_list(policy.get(field))
+    return _unique_list(getattr(policy, field, None))
+
+
+def operation_review_diff(draft_data: dict[str, Any]) -> dict[str, Any]:
+    """What this draft actually changes, in terms a person can act on.
+
+    The workspace-operation review card used to say, in full: "Apply this
+    workspace operation draft?" — a card demanding approval without saying
+    what for. That is the same defect as the incident this phase exists to
+    fix, and it is worse here than elsewhere: ``rules.replace`` REBUILDS the
+    ``never_allow`` list, so a draft can quietly delete the workspace's hard
+    blocks (``billing.*``, ``payments.refund``, ``*.delete_*``) — the one tier
+    of governance with no approval path at all — and the operator would have
+    read nothing about it before pressing Approve.
+
+    So the diff is mandatory (``HITL_REQUIRED_PAYLOAD_FIELDS["review"]``) and
+    carries ``removed_hard_blocks`` computed from the policy the apply would
+    really write, not from the draft's stale stored copy.
+    """
+    state = _as_dict(draft_data.get("current_state"))
+    stored_diff = _as_dict(draft_data.get("diff"))
+    changes = _as_dict(stored_diff.get("changes"))
+    changed_keys = _unique_list(stored_diff.get("changed_keys"))
+
+    added: list[str] = []
+    removed: list[str] = []
+    modified: list[str] = []
+    for key in changed_keys:
+        change = _as_dict(changes.get(key))
+        before, after = change.get("before"), change.get("after")
+        before_empty = before in (None, [], {}, "")
+        after_empty = after in (None, [], {}, "")
+        if before_empty and not after_empty:
+            added.append(key)
+        elif after_empty and not before_empty:
+            removed.append(key)
+        else:
+            modified.append(key)
+
+    # The hard-block delta. ``before`` is what governs the workspace right
+    # now; ``after`` is what an apply would install.
+    governance_change = _as_dict(changes.get("governance_policy"))
+    before_policy = (
+        _as_dict(governance_change.get("before"))
+        if governance_change
+        else _as_dict(state.get("governance_policy"))
+    )
+    from packages.core.services.workspace_setup_service import (
+        _enrich_operating_rules,
+    )
+
+    operating_rules = _enrich_operating_rules(
+        _as_dict(state.get("operating_model")).get("rules")
+        or _as_list(state.get("rules"))
+    )
+    after_policy = _resolved_governance_policy(
+        state,
+        operating_rules=operating_rules,
+        rules_touched=_draft_rules_touched(draft_data.get("patches")),
+        changed_keys=set(changed_keys),
+    )
+
+    removed_hard_blocks: list[str] = []
+    for field in ("never_allow_actions", "never_allow_capabilities"):
+        before_patterns = _policy_list(before_policy, field)
+        after_patterns = _policy_list(after_policy, field)
+        removed_hard_blocks.extend(
+            pattern for pattern in before_patterns
+            if pattern not in after_patterns
+        )
+
+    return {
+        "changed_keys": changed_keys,
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        # Named for what it means to the reader, not for the column it came
+        # from: these are the gates that stop being gates.
+        "removed_hard_blocks": _unique_list(removed_hard_blocks),
+    }
+
+
+def operation_review_hitl_payload(
+    draft_data: dict[str, Any],
+    *,
+    why: str | None = None,
+) -> dict[str, Any]:
+    """The ``HitlType.REVIEW`` payload for a workspace-operation draft.
+
+    Runs through the record layer's own validator even though this card is not
+    (yet) backed by an ``HitlRequest`` row: "a review must carry a diff" is
+    a rule of the record layer, and a rule enforced only on the path nothing
+    takes is not a rule.
+    """
+    from packages.core.constants.approvals import HitlType
+    from packages.core.governance.approvals import validate_hitl_payload
+
+    diff = operation_review_diff(draft_data)
+    removed_hard_blocks = diff.get("removed_hard_blocks") or []
+    if removed_hard_blocks:
+        reason = (
+            "This draft REMOVES hard blocks that currently cannot be approved "
+            "around at all: "
+            + ", ".join(removed_hard_blocks)
+            + ". After applying, agents may run those actions with no "
+            "approval standing in the way."
+        )
+    else:
+        changed = ", ".join(diff.get("changed_keys") or []) or "workspace runtime"
+        reason = (
+            f"These changes take effect workspace-wide once applied: {changed}."
+        )
+    return validate_hitl_payload(
+        HitlType.REVIEW.value,
+        {"diff": diff, "why": why or reason},
+    )
 
 
 async def get_current_operation_state(
@@ -1774,28 +1993,11 @@ async def apply_operation_draft(
         workspace.heartbeat_cadence = "daily"
     await sync_workspace_runtime_schedules(db, workspace)
 
-    raw_governance_policy = _as_dict(
-        state.get("governance_policy") or operating_model.get("governance")
-    )
-    if rules_touched and "governance_policy" not in changed_keys:
-        # ``rules.replace`` must remove stale action gates that were inferred
-        # from previous rules. Preserve non-action policy knobs, but rebuild
-        # never_allow / HITL / auto-approve lists from the current rules.
-        raw_governance_policy = {
-            key: value
-            for key, value in raw_governance_policy.items()
-            if key not in {
-                "never_allow_actions",
-                "hitl_required_actions",
-                "auto_approve_actions",
-                "never_allow_capabilities",
-                "hitl_required_capabilities",
-                "auto_approve_capabilities",
-            }
-        }
-    governance_policy = _build_governance_policy_from_rules(
-        operating_rules,
-        raw_governance_policy,
+    governance_policy = _resolved_governance_policy(
+        state,
+        operating_rules=operating_rules,
+        rules_touched=rules_touched,
+        changed_keys=changed_keys,
     )
     if governance_policy is not None and (rules_touched or {"rules", "governance_policy"} & changed_keys):
         operating_model["governance"] = policy_to_dict(governance_policy)
@@ -2218,8 +2420,14 @@ async def check_work_batch_completion(
     try:
         from packages.core.tasks.ai_tasks import run_strategist_review
 
+        from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
+
         run_strategist_review.apply_async(
-            args=[task.workspace_id, f"work_batch_completed:{batch.id}"],
+            args=[task.workspace_id],
+            kwargs=ReviewTrigger(
+                kind=ReviewTriggerKind.EVENT,
+                detail=f"work batch completed: {batch.id}",
+            ).celery_kwargs(),
             countdown=1,
         )
         batch_details["strategist_triggered_at"] = now.isoformat()

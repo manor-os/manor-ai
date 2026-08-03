@@ -17,6 +17,9 @@ import bcrypt
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    WorkerStatus,
+)
 from packages.core.models.base import generate_ulid
 from packages.core.models.workspace import AgentSubscription
 from packages.core.models.worker import (
@@ -32,8 +35,23 @@ INTERNAL_WORKER_KIND = "internal"
 """Reserved kind for the always-on, in-process worker."""
 
 
+def _internal_supported_kinds() -> list[str]:
+    """Derive the advertised kind set from the worker's actual handlers.
+
+    Imported lazily: ``workers.internal`` pulls in the AI runtime, and
+    this module is imported from request paths that must stay light.
+    """
+    from packages.core.workers.internal import INTERNAL_WORKER_SUPPORTED_KINDS
+
+    return list(INTERNAL_WORKER_SUPPORTED_KINDS)
+
+
 DEFAULT_INTERNAL_CAPABILITIES: dict[str, Any] = {
     "supported_kinds": ["llm", "action", "subagent", "sleep", "human"],
+    # Kept as a literal so importing this module stays cheap; the guard
+    # test in tests/test_worker_kind_coverage.py asserts it equals
+    # _internal_supported_kinds(), so it can never drift from the
+    # handlers again.
     "supported_providers": None,  # null = "all" — internal can call anything
     "max_concurrent_leases": 4,
     "max_risk_level": "high",
@@ -62,7 +80,7 @@ async def ensure_internal_worker(
     )).scalar_one_or_none()
     if existing:
         if existing.status != "active":
-            existing.status = "active"
+            existing.status = WorkerStatus.ACTIVE.value
         await _bind_active_subscriptions_to_worker(db, entity_id, existing.id)
         return existing
 
@@ -79,7 +97,7 @@ async def ensure_internal_worker(
         capabilities=dict(DEFAULT_INTERNAL_CAPABILITIES),
         secret_hash=None,           # internal doesn't authenticate over HTTP
         trust_level="high",
-        status="active",
+        status=WorkerStatus.ACTIVE.value,
     )
     db.add(worker)
     await db.flush()
@@ -155,7 +173,7 @@ async def register_external_worker(
         trust_level=trust_level,
         allowed_ips=allowed_ips,
         monthly_budget_usd=monthly_budget_usd,
-        status="active",
+        status=WorkerStatus.ACTIVE.value,
         last_rotated_at=datetime.now(timezone.utc),
         created_by_user_id=created_by_user_id,
         expires_at=expires_at or (
@@ -218,7 +236,7 @@ def verify_worker_secret(worker: Worker, presented_secret: str) -> bool:
     """
     if not worker.secret_hash:
         return False
-    if worker.status == "revoked":
+    if worker.status == WorkerStatus.REVOKED:
         return False
     if worker.expires_at and worker.expires_at < datetime.now(timezone.utc):
         return False
@@ -274,7 +292,7 @@ async def list_workers_for_subscription(
         .join(SubscriptionWorker, SubscriptionWorker.worker_id == Worker.id)
         .where(
             SubscriptionWorker.subscription_id == subscription_id,
-            Worker.status == "active",
+            Worker.status == WorkerStatus.ACTIVE,
         )
         .order_by(desc(SubscriptionWorker.is_preferred), SubscriptionWorker.priority)
     )).all()
@@ -297,7 +315,7 @@ async def update_worker_status(
     worker = await get_worker(db, worker_id)
     if worker is None:
         return None
-    if status not in {"pairing", "active", "paused", "offline", "revoked", "quarantined"}:
+    if status not in WorkerStatus.values():
         raise ValueError(f"unknown worker status {status!r}")
 
     worker.status = status

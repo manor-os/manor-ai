@@ -6,8 +6,8 @@ sqlite — shared MetaData mutation broke downstream tests in the same
 pytest process).
 
 Exercises:
-  * blueprint workflow shape (kind/depends_on) → WorkflowDefinition
-    shape (type/next) — dependency graph inversion
+  * blueprint workflow DSL (kind/depends_on) → canonical WorkflowDefinition
+    graph (type/next + explicit trigger) — dependency graph inversion
   * variables list → dict translation
   * idempotent re-install reuses (entity_id, name) row
   * post_install_checks: session_alive / agent_callable / cron_scheduled /
@@ -22,11 +22,16 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.blueprints.installer import InstallMode, install_blueprint
+from packages.core.blueprints.installer import (
+    InstallMode,
+    _install_workflow_binding,
+    install_blueprint,
+)
 from packages.core.models.base import generate_ulid
 from packages.core.models.integration_session import IntegrationSession
-from packages.core.models.workflow import WorkflowDefinition
+from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import Agent
+from packages.core.services.workflow_service import validate_workflow_steps
 
 
 @pytest.fixture
@@ -120,13 +125,20 @@ async def test_workflow_dependency_inversion(
     assert wf.variables == {"post_topic": "product_update"}
     assert wf.trigger_type == "scheduled"
     assert wf.trigger_config == {"trigger_ref": "morning-draft"}
+    validation = validate_workflow_steps(wf.steps)
+    assert validation["valid"], validation
+    assert validation["entry_step_id"] == "start"
     steps_by_id = {s["id"]: s for s in wf.steps}
+    assert steps_by_id["start"]["type"] == "trigger"
+    assert steps_by_id["start"]["next"] == ["draft"]
     assert steps_by_id["draft"]["next"] == ["review"]
     assert steps_by_id["review"]["next"] == ["post"]
     assert steps_by_id["post"]["next"] == []
-    assert steps_by_id["draft"]["type"] == "agent_call"
-    assert steps_by_id["review"]["type"] == "hitl_approval"
+    assert steps_by_id["draft"]["type"] == "agent"
+    assert steps_by_id["review"]["type"] == "wait"
+    assert steps_by_id["post"]["type"] == "tool"
     assert steps_by_id["draft"]["config"]["service_key"] == "social.x.poster"
+    assert steps_by_id["review"]["config"]["wait_type"] == "approval"
     assert steps_by_id["review"]["config"]["timeout_minutes"] == 60
 
 
@@ -151,6 +163,18 @@ async def test_workflow_idempotent_reinstall(
     )
     await install_blueprint(db_session, entity_id=entity_id, payload=payload)
     await db_session.commit()
+    first = (
+        await db_session.execute(
+            select(WorkflowDefinition).where(
+                WorkflowDefinition.entity_id == entity_id,
+                WorkflowDefinition.name == slug,
+            )
+        )
+    ).scalar_one()
+    first.steps = [{"id": "s1", "type": "agent_call", "name": "stale", "config": {}, "next": []}]
+    first.status = "draft"
+    await db_session.commit()
+
     await install_blueprint(db_session, entity_id=entity_id, payload=payload)
     await db_session.commit()
     rows = list(
@@ -166,6 +190,88 @@ async def test_workflow_idempotent_reinstall(
         .all()
     )
     assert len(rows) == 1
+    assert rows[0].id == first.id
+    assert rows[0].status == "active"
+    validation = validate_workflow_steps(rows[0].steps)
+    assert validation["valid"], validation
+    assert validation["entry_step_id"] == "start"
+    steps_by_id = {step["id"]: step for step in rows[0].steps}
+    assert steps_by_id["start"]["next"] == ["s1"]
+    assert steps_by_id["s1"]["type"] == "agent"
+
+
+async def test_workflow_binding_config_installs_and_resynchronizes(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    slug = f"chat-entrypoint-{entity_id}"
+    workflow = {
+        "slug": slug,
+        "trigger_type": "manual",
+        "variables": [{"key": "request", "default": ""}],
+        "run_inputs": [{
+            "key": "request",
+            "label": "Request",
+            "type": "string",
+            "required": True,
+        }],
+        "binding_config": {
+            "chat_entrypoint": {
+                "enabled": True,
+                "title": "Run workflow",
+            }
+        },
+        "steps": [{"id": "s1", "kind": "agent_call"}],
+    }
+    payload = _base_payload(**{"recipe.workflows": [workflow]})
+
+    first = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    await db_session.commit()
+    binding = (
+        await db_session.execute(
+            select(WorkflowBinding).where(WorkflowBinding.id == first.workflow_binding_ids[0])
+        )
+    ).scalar_one()
+    assert binding.config["source"] == "blueprint"
+    assert binding.config["chat_entrypoint"]["title"] == "Run workflow"
+    definition = (await db_session.execute(
+        select(WorkflowDefinition).where(WorkflowDefinition.id == binding.workflow_id)
+    )).scalar_one()
+    assert definition.steps[0]["config"]["run_inputs"] == workflow["run_inputs"]
+    assert definition.steps[0]["config"]["outputs"] == [{
+        "key": "request",
+        "type": "text",
+        "value": "{{start.request}}",
+    }]
+
+    binding.config = {
+        **dict(binding.config or {}),
+        "operator_setting": "preserve-me",
+    }
+    binding.variables = {
+        **dict(binding.variables or {}),
+        "operator_variable": "preserve-me",
+    }
+    await db_session.flush()
+    workflow["binding_config"]["chat_entrypoint"]["title"] = "Updated workflow"
+    workflow["variables"][0]["default"] = "updated request"
+    second_binding_id = await _install_workflow_binding(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=binding.workspace_id,
+        workflow_id=binding.workflow_id,
+        w=workflow,
+    )
+    await db_session.commit()
+    await db_session.refresh(binding)
+
+    assert second_binding_id == binding.id
+    assert binding.config["chat_entrypoint"]["title"] == "Updated workflow"
+    assert binding.config["operator_setting"] == "preserve-me"
+    assert binding.variables == {
+        "request": "updated request",
+        "operator_variable": "preserve-me",
+    }
 
 
 async def test_workflow_diamond_dependencies(
@@ -195,7 +301,10 @@ async def test_workflow_diamond_dependencies(
     await install_blueprint(db_session, entity_id=entity_id, payload=payload)
     await db_session.commit()
     wf = (await db_session.execute(select(WorkflowDefinition).where(WorkflowDefinition.name == slug))).scalar_one()
+    validation = validate_workflow_steps(wf.steps)
+    assert validation["valid"], validation
     steps_by_id = {s["id"]: s for s in wf.steps}
+    assert steps_by_id["start"]["next"] == ["root"]
     assert sorted(steps_by_id["root"]["next"]) == ["branch_a", "branch_b"]
     assert steps_by_id["branch_a"]["next"] == ["join"]
     assert steps_by_id["branch_b"]["next"] == ["join"]
@@ -374,7 +483,22 @@ async def test_check_workflow_present_pass(
                     "slug": slug,
                     "trigger_type": "manual",
                     "variables": [],
-                    "steps": [],
+                    "steps": [
+                        {
+                            "id": "start",
+                            "type": "trigger",
+                            "name": "Start",
+                            "config": {"trigger_type": "manual"},
+                            "next": ["end"],
+                        },
+                        {
+                            "id": "end",
+                            "type": "end",
+                            "name": "Done",
+                            "config": {},
+                            "next": [],
+                        },
+                    ],
                 }
             ],
             "policy.post_install_checks": [

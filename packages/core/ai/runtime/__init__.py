@@ -127,6 +127,14 @@ from packages.core.ai.runtime.completions import (
     runtime_text_completion_platform_configured,
     runtime_validation_retry_user_prompt,
 )
+from packages.core.ai.runtime.consolidation import (
+    RUNTIME_CONSOLIDATOR_L1_MAX_TOKENS,
+    RUNTIME_CONSOLIDATOR_L1_SYSTEM_PROMPT,
+    RUNTIME_CONSOLIDATOR_L1_TEMPERATURE,
+    runtime_consolidator_l1_messages,
+    runtime_consolidator_l1_user_prompt,
+    runtime_execute_consolidator_l1_completion,
+)
 from packages.core.ai.runtime.internal_worker import runtime_execute_internal_worker_llm_step
 from packages.core.ai.runtime.announcement_prompts import (
     runtime_execute_announcement_draft_completion,
@@ -191,6 +199,7 @@ from packages.core.ai.runtime.harness import (
     runtime_execute_chat_agent_loop,
     runtime_execute_skill_agent_loop,
     runtime_execute_subagent_loop,
+    runtime_execute_worker_subagent_followup,
     runtime_execute_worker_subagent_loop,
     runtime_execute_workspace_architect_loop,
     runtime_execute_workflow_agent_loop,
@@ -223,20 +232,24 @@ from packages.core.ai.runtime.file_actions import (
     runtime_trigger_document_embeddings,
     runtime_user_visible_file_path,
 )
-from packages.core.ai.runtime.legacy_tool_surface import (
-    LegacyResolvedToolSurface,
-    LegacyToolRegistrySurface,
-    LegacyToolSurfaceSpec,
-    legacy_search_always_loaded_tool_names,
-    legacy_search_bound_tool_names_for_profile,
-    legacy_shadowed_file_generation_tool,
-    legacy_tool_auto_pass_names,
-    legacy_tool_is_deferred,
-    legacy_tool_is_eager_for_profile,
-    legacy_tool_registry_surface_from_schemas,
-    legacy_tool_schemas_for_resolved_surface,
-    legacy_tool_visible_for_profile,
-    resolve_legacy_tool_surface,
+from packages.core.ai.runtime.tool_visibility import (
+    RuntimeResolvedToolSurface,
+    RuntimeToolRegistrySurface,
+    RuntimeToolSurfaceSpec,
+    WORKSPACE_AGENT_TOOL_PROFILE,
+    eager_tool_names_for_profile,
+    is_workspace_agent_tool_profile,
+    resolve_runtime_tool_surface,
+    runtime_search_always_loaded_tool_names,
+    runtime_search_bound_tool_names_for_profile,
+    runtime_shadowed_file_generation_tool,
+    runtime_tool_auto_pass_names,
+    runtime_tool_is_deferred,
+    runtime_tool_is_eager_for_profile,
+    runtime_tool_registry_surface_from_schemas,
+    runtime_tool_schemas_for_resolved_surface,
+    runtime_tool_surface_spec,
+    runtime_tool_visible_for_profile,
     runtime_workspace_capability_tool_groups,
 )
 from packages.core.ai.runtime.memory import (
@@ -361,7 +374,7 @@ from packages.core.ai.runtime.planning import (
     runtime_execute_planner_chat_turn,
     runtime_execute_planner_tool_call,
     runtime_execute_plan_supervisor_completion,
-    runtime_parse_plan_supervisor_verdict,
+    runtime_parse_plan_supervisor_decision,
     runtime_plan_supervisor_messages,
     runtime_plan_supervisor_prompt,
     runtime_planner_assistant_message,
@@ -536,6 +549,7 @@ from packages.core.ai.runtime.skill_routing import (
     local_coding_cli_intent,
     local_coding_provider_route,
     should_route_external_action_to_integration,
+    youtube_platform_action_intent,
 )
 from packages.core.ai.runtime.skill_forcing import (
     runtime_apply_manual_skill_tool_surface,
@@ -566,6 +580,7 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_CHAT_SOURCE,
     RUNTIME_CHAT_STREAM_SOURCE,
     RUNTIME_COMPLETION_SOURCE,
+    RUNTIME_CONSOLIDATOR_L1_SOURCE,
     RUNTIME_CONVERSATION_SUMMARY_SOURCE,
     RUNTIME_DOCGEN_SOURCE,
     RUNTIME_DOCUMENT_AI_DRAFT_SOURCE,
@@ -600,7 +615,6 @@ from packages.core.ai.runtime.sources import (
 )
 from packages.core.ai.runtime.streams import (
     RuntimeToolStreamSink,
-    runtime_delegated_invoke_skill_result,
     runtime_is_local_coding_tool_name,
     runtime_is_media_tool_name,
     runtime_persisted_tool_calls_history_summary,
@@ -609,6 +623,10 @@ from packages.core.ai.runtime.streams import (
     runtime_should_flush_stream_text,
     runtime_skill_nested_tool_callbacks,
     runtime_tool_arguments_for_chat,
+    runtime_tool_call_error,
+    runtime_tool_call_outcome,
+    runtime_tool_error_result,
+    runtime_tool_path_memory_outcome,
     runtime_tool_result_for_chat,
     runtime_tool_status_for_chat,
     runtime_tool_stream_sink_var,
@@ -685,6 +703,7 @@ from packages.core.ai.runtime.subagents import (
 )
 from packages.core.ai.runtime.strategist import (
     RUNTIME_STRATEGIST_DEFAULT_PREAMBLE,
+    RUNTIME_STRATEGIST_EMPTY_OK,
     RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT,
     runtime_execute_strategist_completion,
     runtime_strategist_assignee_classification,
@@ -694,6 +713,7 @@ from packages.core.ai.runtime.strategist import (
     runtime_strategist_task_capabilities_block,
     runtime_strategist_tasks_text,
     runtime_strategist_user_prompt,
+    runtime_strategist_user_prompt_v2,
 )
 from packages.core.ai.runtime.task_requirements import (
     STRATEGIST_TASK_CAPABILITY_IDS,
@@ -729,6 +749,7 @@ from packages.core.ai.runtime.tool_discovery import (
     DEFAULT_DEFERRED_TOOL_HINT_LIMIT,
     RuntimeToolSearchScope,
     runtime_apply_deferred_tool_discovery_hint,
+    runtime_apply_integration_account_options_to_schema,
     runtime_apply_mcp_availability,
     runtime_is_sensitive_first_party_tool,
     runtime_mark_match_available,
@@ -818,6 +839,7 @@ from packages.core.ai.runtime.workflow_tools import (
     RuntimeWorkflowToolStepResult,
     runtime_execute_workflow_tool_step,
     runtime_workflow_run_context,
+    runtime_workflow_tool_context_args,
 )
 from packages.core.ai.runtime.workspace_setup import (
     runtime_agent_greeting_messages,
@@ -942,6 +964,7 @@ __all__ = [
     "runtime_subagent_specs_from_envelope",
     "subagent_specs_for_surface",
     "RUNTIME_STRATEGIST_DEFAULT_PREAMBLE",
+    "RUNTIME_STRATEGIST_EMPTY_OK",
     "RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT",
     "runtime_execute_strategist_completion",
     "runtime_strategist_assignee_classification",
@@ -951,6 +974,7 @@ __all__ = [
     "runtime_strategist_task_capabilities_block",
     "runtime_strategist_tasks_text",
     "runtime_strategist_user_prompt",
+    "runtime_strategist_user_prompt_v2",
     "STRATEGIST_TASK_CAPABILITY_IDS",
     "TASK_RUNTIME_CAPABILITY_KEYS",
     "merge_task_runtime_capabilities",
@@ -967,6 +991,7 @@ __all__ = [
     "DEFAULT_DEFERRED_TOOL_HINT_LIMIT",
     "RuntimeToolSearchScope",
     "runtime_apply_deferred_tool_discovery_hint",
+    "runtime_apply_integration_account_options_to_schema",
     "runtime_apply_mcp_availability",
     "runtime_annotate_tool_availability",
     "runtime_blocked_mcp_call_result",
@@ -1055,6 +1080,7 @@ __all__ = [
     "RuntimeWorkflowToolStepResult",
     "runtime_execute_workflow_tool_step",
     "runtime_workflow_run_context",
+    "runtime_workflow_tool_context_args",
     "runtime_agent_greeting_messages",
     "runtime_agent_greeting_user_message",
     "runtime_execute_agent_greeting_completion",
@@ -1222,24 +1248,29 @@ __all__ = [
     "runtime_execute_chat_agent_loop",
     "runtime_execute_skill_agent_loop",
     "runtime_execute_subagent_loop",
+    "runtime_execute_worker_subagent_followup",
     "runtime_execute_worker_subagent_loop",
     "runtime_execute_workspace_architect_loop",
     "runtime_execute_workflow_agent_loop",
     "runtime_prepare_subagent_run",
     "runtime_wrap_tool_executor",
-    "LegacyToolSurfaceSpec",
-    "LegacyResolvedToolSurface",
-    "LegacyToolRegistrySurface",
-    "legacy_search_always_loaded_tool_names",
-    "legacy_search_bound_tool_names_for_profile",
-    "legacy_shadowed_file_generation_tool",
-    "legacy_tool_auto_pass_names",
-    "legacy_tool_is_deferred",
-    "legacy_tool_is_eager_for_profile",
-    "legacy_tool_registry_surface_from_schemas",
-    "legacy_tool_schemas_for_resolved_surface",
-    "legacy_tool_visible_for_profile",
-    "resolve_legacy_tool_surface",
+    "RuntimeToolSurfaceSpec",
+    "RuntimeResolvedToolSurface",
+    "RuntimeToolRegistrySurface",
+    "WORKSPACE_AGENT_TOOL_PROFILE",
+    "eager_tool_names_for_profile",
+    "is_workspace_agent_tool_profile",
+    "resolve_runtime_tool_surface",
+    "runtime_search_always_loaded_tool_names",
+    "runtime_search_bound_tool_names_for_profile",
+    "runtime_shadowed_file_generation_tool",
+    "runtime_tool_auto_pass_names",
+    "runtime_tool_is_deferred",
+    "runtime_tool_is_eager_for_profile",
+    "runtime_tool_registry_surface_from_schemas",
+    "runtime_tool_schemas_for_resolved_surface",
+    "runtime_tool_surface_spec",
+    "runtime_tool_visible_for_profile",
     "runtime_workspace_capability_tool_groups",
     "MEMORY_MOUNTS_METADATA_KEY",
     "MemoryMount",
@@ -1352,7 +1383,7 @@ __all__ = [
     "runtime_execute_planner_chat_turn",
     "runtime_execute_planner_tool_call",
     "runtime_execute_plan_supervisor_completion",
-    "runtime_parse_plan_supervisor_verdict",
+    "runtime_parse_plan_supervisor_decision",
     "runtime_plan_supervisor_messages",
     "runtime_plan_supervisor_prompt",
     "runtime_planner_assistant_message",
@@ -1491,6 +1522,7 @@ __all__ = [
     "local_coding_cli_intent",
     "local_coding_provider_route",
     "should_route_external_action_to_integration",
+    "youtube_platform_action_intent",
     "runtime_apply_manual_skill_tool_surface",
     "runtime_auto_skill_forced_tool_calls",
     "runtime_forced_tool_calls_for_turn",
@@ -1517,6 +1549,13 @@ __all__ = [
     "RUNTIME_CHANNEL_HOLD_SOURCE",
     "RUNTIME_CHANNEL_SOURCE",
     "RUNTIME_COMPLETION_SOURCE",
+    "RUNTIME_CONSOLIDATOR_L1_MAX_TOKENS",
+    "RUNTIME_CONSOLIDATOR_L1_SOURCE",
+    "RUNTIME_CONSOLIDATOR_L1_SYSTEM_PROMPT",
+    "RUNTIME_CONSOLIDATOR_L1_TEMPERATURE",
+    "runtime_consolidator_l1_messages",
+    "runtime_consolidator_l1_user_prompt",
+    "runtime_execute_consolidator_l1_completion",
     "RUNTIME_CONVERSATION_SUMMARY_SOURCE",
     "RUNTIME_DOCGEN_SOURCE",
     "RUNTIME_DOCUMENT_AI_DRAFT_SOURCE",
@@ -1549,7 +1588,6 @@ __all__ = [
     "RUNTIME_WORKSPACE_SETUP_SOURCE",
     "RUNTIME_WORKSPACE_ARCHITECT_SOURCE",
     "RuntimeToolStreamSink",
-    "runtime_delegated_invoke_skill_result",
     "runtime_is_local_coding_tool_name",
     "runtime_is_media_tool_name",
     "runtime_persisted_tool_calls_history_summary",
@@ -1558,6 +1596,10 @@ __all__ = [
     "runtime_should_flush_stream_text",
     "runtime_skill_nested_tool_callbacks",
     "runtime_tool_arguments_for_chat",
+    "runtime_tool_call_error",
+    "runtime_tool_call_outcome",
+    "runtime_tool_error_result",
+    "runtime_tool_path_memory_outcome",
     "runtime_tool_result_for_chat",
     "runtime_tool_status_for_chat",
     "runtime_tool_stream_sink_var",
@@ -1627,3 +1669,35 @@ __all__ = [
     "skill_descriptors_to_trace_dict",
     "with_skill_descriptors",
 ]
+
+
+def __getattr__(name: str):  # PEP 562 — deploy version-skew self-healing
+    """Resolve missing re-exports by scanning this package's submodules.
+
+    A long-running process (worker, uvicorn, staging container mid-deploy)
+    keeps the __init__ that was on disk at boot cached in sys.modules. When a
+    deploy or a concurrent edit adds a new re-export, lazily imported callers
+    read the NEW submodule from disk but resolve names against the STALE
+    cached __init__ — "ImportError: cannot import name ... from
+    packages.core.ai.runtime" (see PR #294 for one instance). Submodules are
+    always loaded fresh from disk, so on a miss we look for the name there,
+    cache it on the package, and future lookups are free. Real missing names
+    still raise AttributeError (Python turns it into the usual ImportError).
+    """
+    if name.startswith("__"):
+        raise AttributeError(name)
+    import importlib
+    import pkgutil
+
+    for module_info in pkgutil.iter_modules(__path__):
+        if module_info.ispkg:
+            continue
+        try:
+            module = importlib.import_module(f"{__name__}.{module_info.name}")
+        except Exception:  # noqa: BLE001 — a broken sibling must not mask the lookup
+            continue
+        if hasattr(module, name):
+            value = getattr(module, name)
+            globals()[name] = value
+            return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

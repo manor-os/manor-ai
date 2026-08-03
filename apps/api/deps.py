@@ -251,3 +251,63 @@ async def get_current_worker(
             )
 
     return worker
+
+
+async def require_workspace_readable(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+) -> None:
+    """404 unless ``user`` may read ``workspace_id`` (when one is supplied).
+
+    Workspace-scoped list endpoints on standalone routers (tasks, goals, plans,
+    dashboard) filter only by ``entity_id`` + an attacker-supplied
+    ``workspace_id``. Without this gate, an entity member who is not part of a
+    ``members_only`` workspace could read its tasks/goals/plans/activity by
+    passing its id — bypassing the ``_require_workspace_read`` checks on
+    ``/workspaces/{id}/*``. A falsy ``workspace_id`` (entity-wide query) is a
+    no-op here.
+    """
+    workspace_id = (workspace_id or "").strip()
+    if not workspace_id:
+        return
+    from packages.core.services.workspace_access import user_can_read_workspace_id
+
+    if not await user_can_read_workspace_id(
+        db,
+        workspace_id=workspace_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
+
+
+async def require_workspace_writable(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+) -> None:
+    """403 unless ``user`` may create/modify content in ``workspace_id``.
+
+    Writing is stricter than reading: an ``entity_visible`` workspace is
+    readable org-wide but only members may write to it, and ``viewer`` members
+    are read-only. Entity owner/admin keep the firm-wide override. A falsy
+    ``workspace_id`` (entity-level row with no workspace) is a no-op.
+    """
+    workspace_id = (workspace_id or "").strip()
+    if not workspace_id:
+        return
+    from packages.core.services.workspace_access import user_can_write_workspace_id
+
+    if not await user_can_write_workspace_id(
+        db,
+        workspace_id=workspace_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You do not have write access to this workspace",
+        )

@@ -152,3 +152,20 @@ test("batch selection actions stay viewport-floating and suppress per-item trash
   assert.match(knowledgeSource, /if\s*\(!silent\)\s+toast\.success\(t\("page\.knowledge\.moved_to_trash"\)\);/);
   assert.match(knowledgeSource, /docIds\.map\(\(id\)\s*=>\s*trashMutation\.mutateAsync\(\{\s*id,\s*silent:\s*true\s*\}\)\)/);
 });
+
+test("permanent document deletion refreshes the trash listing", () => {
+  const deleteMutationSource = knowledgeSource.slice(
+    knowledgeSource.indexOf("const deleteMutation = useMutation"),
+    knowledgeSource.indexOf("const moveMutation = useMutation"),
+  );
+  assert.match(
+    deleteMutationSource,
+    /queryClient\.invalidateQueries\(\{ queryKey: \["documents-trash"\] \}\);/,
+  );
+});
+
+test("Knowledge header uses recursive totals from the visible directory tree", () => {
+  assert.match(knowledgeSource, /data\?\.total_size/);
+  assert.match(knowledgeSource, /const\s+totalFiles\s*=\s*data\?\.total_files/);
+  assert.doesNotMatch(knowledgeSource, /data\?\.direct_total_(?:size|files)/);
+});

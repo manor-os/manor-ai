@@ -21,11 +21,13 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from email.header import Header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 from html import escape
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 try:
     import aiosmtplib
@@ -77,26 +79,68 @@ def _render(template_name: str, **kwargs) -> str:
 _BLOCKED_DOMAINS = {"example.com", "example.org", "example.net", "test.com", "localhost"}
 
 
-async def send_email(to: str, subject: str, html_body: str, text_body: str = None) -> bool:
-    """Send an email. Returns True on success, False on failure (never raises)."""
-    config = _get_smtp_config()
+def _needs_rfc2047(value: str) -> bool:
+    """True when a header value has non-ASCII bytes and must be encoded."""
+    try:
+        value.encode("ascii")
+        return False
+    except UnicodeEncodeError:
+        return True
+
+
+def _encode_header_text(value: str) -> str:
+    """RFC-2047 encode a header value if it is non-ASCII, else pass through.
+
+    Gmail (and every RFC-compliant MTA) rejects raw UTF-8 in ``Subject`` /
+    ``From`` display names. Chinese subjects must serialize to
+    ``=?utf-8?...?=`` encoded-words; ASCII stays human-readable so template
+    senders' headers don't change.
+    """
+    if _needs_rfc2047(value):
+        # ``.encode()`` yields the ``=?utf-8?...?=`` encoded-word; ``str()``
+        # would just hand back the raw Unicode.
+        return Header(value, "utf-8").encode()
+    return value
+
+
+def _format_from(name: str, email: str) -> str:
+    """Build a ``From`` header, RFC-2047 encoding a non-ASCII display name."""
+    if not name:
+        return email
+    return formataddr((_encode_header_text(name), email))
+
+
+async def _deliver_email(
+    to: str,
+    subject: str,
+    html_body: str,
+    text_body: Optional[str],
+    config: dict,
+) -> tuple[bool, Optional[str]]:
+    """Deliver to exactly ONE recipient. Returns ``(ok, error)``.
+
+    Single source of truth for the disabled / blocked-domain short-circuits,
+    RFC-2047 header encoding, and the actual SMTP send. Both ``send_email``
+    (single) and ``send_bulk_email`` (fan-out) route through here so one bad
+    address is always isolated to its own message.
+    """
     if not config["enabled"]:
         logger.info("Email disabled — would send to %s: %s", to, subject)
-        return True  # pretend success when disabled
+        return True, None  # pretend success when disabled
 
     # Block sending to test/throwaway domains
     domain = to.rsplit("@", 1)[-1].lower() if "@" in to else ""
     if domain in _BLOCKED_DOMAINS and not os.getenv("PYTEST_CURRENT_TEST"):
         logger.info("Blocked email to test domain %s: %s", to, subject)
-        return True  # pretend success
+        return True, None  # pretend success
 
     if aiosmtplib is None:
         logger.warning("aiosmtplib not installed — cannot send email to %s", to)
-        return False
+        return False, "aiosmtplib not installed"
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = f"{config['from_name']} <{config['from_email']}>"
+    msg["Subject"] = _encode_header_text(subject)
+    msg["From"] = _format_from(config["from_name"], config["from_email"])
     msg["To"] = to
 
     if text_body:
@@ -114,10 +158,75 @@ async def send_email(to: str, subject: str, html_body: str, text_body: str = Non
             use_tls=config["use_ssl"],
         )
         logger.info("Email sent to %s: %s", to, subject)
-        return True
+        return True, None
     except Exception as e:
         logger.error("Failed to send email to %s: %s", to, e)
-        return False
+        return False, str(e)
+
+
+async def send_email(to: str, subject: str, html_body: str, text_body: str = None) -> bool:
+    """Send an email to a single recipient. Returns True on success, False on
+    failure (never raises). For multiple recipients use ``send_bulk_email``,
+    which fans out one clean single-recipient message per address."""
+    config = _get_smtp_config()
+    ok, _error = await _deliver_email(to, subject, html_body, text_body, config)
+    return ok
+
+
+def _normalize_recipients(to: Union[str, list, tuple, set]) -> list[str]:
+    """Coerce a recipient argument (single address or iterable) to a
+    de-duplicated, order-preserving list of clean address strings."""
+    if isinstance(to, str):
+        candidates: list = [to]
+    elif isinstance(to, (list, tuple, set)):
+        candidates = list(to)
+    else:
+        candidates = [to]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        addr = str(raw).strip()
+        if addr and addr not in seen:
+            seen.add(addr)
+            out.append(addr)
+    return out
+
+
+async def send_bulk_email(
+    to: Union[str, list[str]],
+    subject: str,
+    html_body: str,
+    text_body: str = None,
+) -> dict:
+    """Send one email per recipient and return an aggregate delivery report.
+
+    Accepts either a single address string or a list. Each recipient gets an
+    individual single-recipient message, so one refused address (Gmail
+    ``555 5.5.2``) can't poison the whole batch and every ``To`` header holds
+    exactly one clean address.
+
+    Returns ``{total, sent, delivered_to, failed}`` where ``sent`` is the
+    success count and ``failed`` is a list of ``{"to", "error"}`` entries.
+    """
+    recipients = _normalize_recipients(to)
+    config = _get_smtp_config()
+
+    delivered_to: list[str] = []
+    failed: list[dict[str, str]] = []
+    for addr in recipients:
+        ok, error = await _deliver_email(addr, subject, html_body, text_body, config)
+        if ok:
+            delivered_to.append(addr)
+        else:
+            failed.append({"to": addr, "error": error or "unknown error"})
+
+    return {
+        "total": len(recipients),
+        "sent": len(delivered_to),
+        "delivered_to": delivered_to,
+        "failed": failed,
+    }
 
 
 # ── Template-based senders ──

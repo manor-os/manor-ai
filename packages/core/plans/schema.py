@@ -89,6 +89,13 @@ class PlanStep(BaseModel):
 
     max_attempts: int = Field(default=3, ge=1, le=10)
 
+    expects: Optional[list[str]] = None
+    """Deterministic completion expectations checked against CAPTURED tool
+    evidence, never model claims. Vocabulary: "publish" (an external
+    publish/send effect must be evidenced by a successful tool result),
+    "files" (a materialized artifact must be evidenced). Unmet expects on a
+    mechanically-completed plan trigger replan instead of false success."""
+
     description: Optional[str] = Field(default=None, max_length=500)
     """Human-readable one-liner shown in the workspace_chat step
     receipt and in the plan UI."""

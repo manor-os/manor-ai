@@ -40,6 +40,9 @@ STORAGE_ONLY_PREFIXES: tuple[str, ...] = (
     "images/",
     "videos/",
     "audio/",
+    # Physical workspace artifacts are projected through Document.folder_id
+    # into the mutable user-facing Workspaces/<name> tree.
+    "Workspaces/_by_id/",
 )
 
 PPTX_INTERMEDIATE_SVG_RE = re.compile(

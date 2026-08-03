@@ -7,6 +7,7 @@ recipe into the global REGISTRY.
 from packages.core.templates.recipes import (  # noqa: F401
     daily_briefing,
     email_triage,
+    product_video_studio,
     twitter_growth,
     solo_content_creator,
     solo_services,

@@ -4,10 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from packages.core.constants.task import TASK_STATUSES, VALID_STATUSES
+from packages.core.constants.task import TASK_STATUSES, VALID_STATUSES, TaskStatus
 
 
-TERMINAL_STATUSES = {"completed", "cancelled", "failed"}
+TERMINAL_STATUSES = {TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value, TaskStatus.FAILED.value}
 
 
 class TaskStatusTransitionError(ValueError):
@@ -114,8 +114,30 @@ def status_transition_map() -> dict[str, list[str]]:
     }
 
 
-def apply_task_status_transition(task, new_status: str, *, now: datetime | None = None) -> TaskStatusTransition:
-    """Validate and apply a status transition to a Task-like ORM object."""
+async def apply_task_status_transition(
+    task,
+    new_status: str,
+    *,
+    now: datetime | None = None,
+    db=None,
+    actor_kind: str = "system",
+    actor_id: str | None = None,
+    config_versions: dict | None = None,
+) -> TaskStatusTransition:
+    """Validate and apply a status transition to a Task-like ORM object.
+
+    This is the unified entry point for every task status change, so it is
+    also the wiring point for the workspace event ledger (M1): when the
+    caller passes its ``db`` session, an ``execution_*`` event is appended in
+    the same transaction for workspace-scoped tasks. The ledger write is
+    best-effort — the adapter swallows its own errors and can never make the
+    transition fail. ``actor_kind``/``actor_id`` attribute the event when the
+    caller knows who acted (defaults to ``system``).
+
+    ``config_versions`` (M11) is the optional agent/skill revision stamp
+    for the emitted event — passed by callers that already resolved which
+    config produced the run (see ``PlanExecutor._finalize``).
+    """
     old_status = task.status
     transition = assert_valid_transition(old_status, new_status)
     if transition.is_noop:
@@ -132,5 +154,15 @@ def apply_task_status_transition(task, new_status: str, *, now: datetime | None 
         task.completed_at = ts
     elif old_status in TERMINAL_STATUSES:
         task.completed_at = None
+
+    if db is not None:
+        from packages.core.ledger.adapters import record_task_transition
+
+        # Never fatal — see packages/core/ledger/adapters.py.
+        await record_task_transition(
+            db, task, new_status,
+            actor_kind=actor_kind, actor_id=actor_id, occurred_at=ts,
+            config_versions=config_versions,
+        )
 
     return transition

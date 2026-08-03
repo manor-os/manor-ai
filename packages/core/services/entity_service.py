@@ -61,7 +61,16 @@ async def list_workspaces(db: AsyncSession, entity_id: str) -> list[Workspace]:
         .where(Workspace.entity_id == entity_id, Workspace.deleted_at.is_(None))
         .order_by(Workspace.created_at.desc())
     )
-    return list(result.scalars().all())
+    workspaces = list(result.scalars().all())
+    missing = [workspace for workspace in workspaces if not workspace.artifact_folder_id]
+    if missing:
+        from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+        for workspace in missing:
+            await ensure_workspace_artifact_folder(db, workspace)
+            # Updating the binding expires server-managed columns such as
+            # ``updated_at``. Refresh before API serializers access them.
+            await db.refresh(workspace)
+    return workspaces
 
 
 async def get_workspace(db: AsyncSession, workspace_id: str, entity_id: str) -> Optional[Workspace]:
@@ -72,7 +81,12 @@ async def get_workspace(db: AsyncSession, workspace_id: str, entity_id: str) -> 
             Workspace.deleted_at.is_(None),
         )
     )
-    return result.scalar_one_or_none()
+    workspace = result.scalar_one_or_none()
+    if workspace is not None and not workspace.artifact_folder_id:
+        from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+        await ensure_workspace_artifact_folder(db, workspace)
+        await db.refresh(workspace)
+    return workspace
 
 
 async def create_workspace(
@@ -106,6 +120,8 @@ async def create_workspace(
             setattr(ws, k, v)
     db.add(ws)
     await db.flush()
+    from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+    await ensure_workspace_artifact_folder(db, ws)
     return ws
 
 
@@ -122,6 +138,9 @@ async def update_workspace(db: AsyncSession, workspace_id: str, entity_id: str, 
                 framing_touched = True
             setattr(ws, k, v)
     await db.flush()
+    if "name" in fields or not ws.artifact_folder_id:
+        from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+        await ensure_workspace_artifact_folder(db, ws)
     if framing_touched:
         # Subscriptions cache an auto-generated identity blurb. When the
         # workspace's name / primary_work / operating_context changes, those
@@ -172,6 +191,9 @@ async def restore_workspace(
     if not ws:
         return None
     ws.deleted_at = None
+    if not ws.artifact_folder_id:
+        from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+        await ensure_workspace_artifact_folder(db, ws)
     from packages.core.services.workspace_runtime import sync_workspace_runtime_schedules
     await sync_workspace_runtime_schedules(db, ws)
     await db.flush()

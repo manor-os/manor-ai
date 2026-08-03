@@ -39,23 +39,18 @@ async def runtime_approval_preference_mode(
     user_id: str | None,
     action_key: str | None,
     capability_id: str | None = None,
-    workspace_id: str | None = None,
 ) -> RuntimeApprovalPreferenceMode | None:
+    """Direct-chat-only standing preference. Workspace conversations have no
+    user-preference layer — their one standing store is the workspace policy
+    auto-approve set (see the unified approval core)."""
     if not user_id:
         return None
     row = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if row is None:
         return None
     policy = _policy_from_preferences(row.preferences)
-    scopes = []
-    if workspace_id:
-        scopes.append(f"workspace:{workspace_id}")
-    scopes.append("global")
-
-    for scope in scopes:
-        scoped = policy.get(scope)
-        if not isinstance(scoped, dict):
-            continue
+    scoped = policy.get("global")
+    if isinstance(scoped, dict):
         actions = scoped.get("actions")
         if action_key and isinstance(actions, dict):
             mode = _mode(actions.get(str(action_key)))
@@ -76,7 +71,6 @@ async def set_runtime_approval_preference(
     mode: RuntimeApprovalPreferenceMode,
     action_key: str | None = None,
     capability_id: str | None = None,
-    workspace_id: str | None = None,
 ) -> bool:
     if not user_id or mode not in {"always_approve", "approval", "deny"}:
         return False
@@ -90,7 +84,7 @@ async def set_runtime_approval_preference(
         return False
     prefs = dict(row.preferences or {})
     policy = _policy_from_preferences(prefs)
-    scope = f"workspace:{workspace_id}" if workspace_id else "global"
+    scope = "global"
     scoped = dict(policy.get(scope) or {})
 
     if action_key:

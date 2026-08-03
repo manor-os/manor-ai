@@ -81,7 +81,7 @@ async def run_channel_agent_turn(
             is_master=is_master,
         )
 
-    legacy_tool_profile = runtime.legacy_tool_profile
+    tool_profile = runtime.tool_profile
     if subscription and subscription.custom_prompt:
         base_prompt = subscription.custom_prompt
     else:
@@ -123,7 +123,7 @@ async def run_channel_agent_turn(
         appendix = await runtime_prepare_prompt_appendix_for_turn(
             db,
             request=runtime_request,
-            legacy_runtime_profile=legacy_tool_profile,
+            tool_profile=tool_profile,
             agent_id=resolved_agent_id,
             bound_tool_names=runtime.bound_tool_names,
             is_master=runtime.is_master,
@@ -136,6 +136,13 @@ async def run_channel_agent_turn(
     tool_schemas = appendix.tool_schemas
     allowed_tool_names = appendix.allowed_tool_names
     runtime_envelope = appendix.envelope
+    from packages.core.services.agent_runtime_config import (
+        agent_runtime_config_for,
+    )
+    appendix_context = getattr(appendix, "context", None)
+    agent_config = agent_runtime_config_for(
+        getattr(appendix_context, "agent", None)
+    )
     if RUNTIME_CHANNEL_ATTACHMENT_TOOL_NAME not in allowed_tool_names:
         attachment_handler = None
 
@@ -153,8 +160,11 @@ async def run_channel_agent_turn(
         conversation_id=conversation_id,
         task_id=runtime.task_id,
         active_user_message=current_message,
-        legacy_tool_profile=legacy_tool_profile,
+        tool_profile=tool_profile,
         allowed_tool_names=allowed_tool_names,
+        model=agent_config.model,
+        temperature=agent_config.temperature,
+        max_tokens=agent_config.max_tokens,
         max_rounds=_MAX_AGENTIC_ROUNDS,
         initial_messages=history or None,
         dynamic_tool_handlers=(

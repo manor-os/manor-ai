@@ -3,6 +3,7 @@
 .env.local
 .env.production
 .env.cloud
+.env.oss-test
 
 # Cloud-only paths (packages/cloud/, caddy/, docker-compose.cloud.yml,
 # scripts/cloud/, apps/api/routers/billing.py, etc.) ARE tracked in
@@ -44,6 +45,7 @@ docs-site/build/
 
 # ── Docker ──
 docker/data/
+docker-compose.oss-test.yml
 
 # ── Alembic / DB ──
 *.db
@@ -58,5 +60,6 @@ docker/data/
 
 # ── Scratch / build artifacts (sample generation, previews, screenshots) ──
 tmp/
+.superpowers/
 # git worktrees
 .worktrees/

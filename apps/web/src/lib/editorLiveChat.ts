@@ -19,6 +19,10 @@ export type EditorLiveChatDetail = {
   editorType?: string | null;
   sourcePath?: string | null;
   instruction?: string | null;
+  sessionLabel?: string | null;
+  emptyDescription?: string | null;
+  placeholder?: string | null;
+  examples?: string[];
   getContent?: () => string;
   applyContent?: (content: string, meta: EditorLiveApplyMeta) => void;
   localEditContent?: (userRequest: string, currentContent: string) => string | null;
@@ -435,13 +439,46 @@ export function extractEditorLivePatchPayloads(text: string) {
   return payloads;
 }
 
+const HIDDEN_EDITOR_LIVE_TAG_PREFIXES = [
+  "<manor-live-patch",
+  "</manor-live-patch",
+  "<manor-live-edit",
+  "</manor-live-edit",
+  // Old model output is hidden for display safety, but is never parsed or applied.
+  "<manor live patch",
+  "</manor live patch",
+  "<manor live edit",
+  "</manor live edit",
+] as const;
+
+function stripTrailingEditorLiveTagFragment(text: string) {
+  const tagStart = text.lastIndexOf("<");
+  if (tagStart < 0) return text;
+  const fragment = text.slice(tagStart).toLowerCase();
+  if (!fragment || fragment.includes(">")) return text;
+  if (!fragment.startsWith("<manor") && !fragment.startsWith("</manor")) return text;
+  return HIDDEN_EDITOR_LIVE_TAG_PREFIXES.some(
+    (prefix) => prefix.startsWith(fragment) || fragment.startsWith(prefix),
+  )
+    ? text.slice(0, tagStart)
+    : text;
+}
+
 export function stripEditorLiveEditBlocks(text: string) {
-  return text
-    .replace(/<manor-live-patch(?:\s[^>]*)?>[\s\S]*?<\/manor-live-patch>/gi, "")
-    .replace(/<manor-live-patch(?:\s[^>]*)?>[\s\S]*$/i, "")
-    .replace(/<manor-live-edit(?:\s[^>]*)?>[\s\S]*?<\/manor-live-edit>/gi, "")
-    .replace(/<manor-live-edit(?:\s[^>]*)?>[\s\S]*$/i, "")
-    .trim();
+  const withoutProtocolBlocks = text
+    .replace(
+      /<manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>[\s\S]*?<\/manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)\s*>/gi,
+      "",
+    )
+    .replace(
+      /<manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>[\s\S]*$/i,
+      "",
+    )
+    .replace(
+      /<\/?manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>/gi,
+      "",
+    );
+  return stripTrailingEditorLiveTagFragment(withoutProtocolBlocks).trim();
 }
 
 export function openEditorLiveChat(detail: EditorLiveChatDetail) {

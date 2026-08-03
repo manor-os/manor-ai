@@ -5,15 +5,21 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from sqlalchemy import select
+
+from packages.core.models.media_job import MediaJobStatus
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +38,9 @@ AUDIO_TIMELINE_TYPES = {
     "foley",
     "transition",
 }
-TERMINAL_JOB_STATUSES = {"completed", "failed"}
+
+# Single definition lives on the model; this alias keeps existing callers.
+TERMINAL_JOB_STATUSES = MediaJobStatus.terminal()
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 MAX_WAIT_SECONDS = 900.0
 
@@ -110,6 +118,30 @@ MERGE_VIDEOS_SCHEMA = {
                 "folder_path": {
                     "type": "string",
                     "description": "Optional Knowledge folder path. Video files inside it are merged by filename.",
+                },
+                "clips": {
+                    "type": "array",
+                    "description": (
+                        "Ordered clips with one source key and optional trim/speed. "
+                        "Do not mix with legacy source inputs."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "document_id": {"type": "string"},
+                            "job_id": {"type": "string"},
+                            "path": {"type": "string"},
+                            "start_seconds": {"type": "number", "minimum": 0},
+                            "end_seconds": {"type": "number", "minimum": 0},
+                            "speed": {
+                                "type": "number",
+                                "minimum": 0.25,
+                                "maximum": 8,
+                            },
+                            "label": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
                 },
                 "output_name": {
                     "type": "string",
@@ -222,6 +254,11 @@ COMPOSE_VIDEO_TIMELINE_SCHEMA = {
                     "default": True,
                     "description": "Mix timeline audio tracks into the output.",
                 },
+                "require_audio": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Reject composition when no usable timeline audio tracks resolve.",
+                },
                 "include_source_audio": {
                     "type": "boolean",
                     "default": False,
@@ -270,6 +307,10 @@ class VideoInput:
     rel_path: str
     abs_path: str
     document_id: str | None = None
+    start_seconds: float = 0.0
+    end_seconds: float | None = None
+    speed: float = 1.0
+    label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -300,6 +341,8 @@ class SubtitleCue:
     cue_type: str
     source_path: str = ""
     estimated: bool = False
+    measured: bool = False
+    timing_source: str = ""
 
 
 ALIGN_SUBTITLES_SCHEMA = {
@@ -307,15 +350,34 @@ ALIGN_SUBTITLES_SCHEMA = {
     "function": {
         "name": "align_subtitles",
         "description": (
-            "Create timed SRT/VTT/ASS subtitles from timeline or cue JSON. "
-            "Uses cue start/end times and can derive cue end from referenced "
-            "dialogue audio duration with ffprobe."
+            "Create SRT/VTT/ASS subtitles from canonical narration and timeline or cue JSON. "
+            "When final narration audio is supplied, uses measured speech timestamps and "
+            "ordered semantic sentence alignment."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "timeline_path": {"type": "string", "description": "Timeline JSON path or /api/v1/fs URL."},
                 "cues_path": {"type": "string", "description": "Dialogue/subtitle cue JSON path or /api/v1/fs URL."},
+                "transcript_path": {
+                    "type": "string",
+                    "description": "Canonical narration text file. Cue text must match it verbatim.",
+                },
+                "audio_path": {
+                    "type": "string",
+                    "description": (
+                        "Final rendered narration audio to transcribe for measured semantic "
+                        "sentence timing. Requires a timestamp-capable STT route."
+                    ),
+                },
+                "require_audio_transcript_match": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Fail when narration generation metadata cannot prove that its prompt "
+                        "matches transcript_path."
+                    ),
+                },
                 "output_name": {"type": "string", "description": "Output subtitle path/filename."},
                 "format": {"type": "string", "enum": ["srt", "vtt", "ass"], "default": "srt"},
                 "track_types": {
@@ -324,6 +386,7 @@ ALIGN_SUBTITLES_SCHEMA = {
                     "description": "Cue types to include; defaults to dialogue and narration.",
                 },
                 "max_chars_per_line": {"type": "integer", "minimum": 16, "maximum": 56, "default": 34},
+                "max_lines": {"type": "integer", "minimum": 1, "maximum": 2, "default": 2},
                 "style": {"type": "object", "description": "ASS/libass style: font_name, font_size, colors, alignment, outline, shadow, margin_v."},
             },
             "required": ["output_name"],
@@ -348,6 +411,164 @@ NORMALIZE_AUDIO_LOUDNESS_SCHEMA = {
                 "output_format": {"type": "string", "enum": ["wav", "mp3", "m4a", "flac"], "default": "wav"},
             },
             "required": ["input_path", "output_name"],
+        },
+    },
+}
+
+
+PROBE_MEDIA_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "probe_media",
+        "description": (
+            "Inspect a Knowledge media file with ffprobe and return deterministic "
+            "container, stream, duration, video, and audio evidence."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {
+                    "type": "string",
+                    "description": "Knowledge-relative media path or /api/v1/fs URL.",
+                },
+            },
+            "required": ["input_path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+RENDER_FRAME_SAMPLES_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "render_frame_samples",
+        "description": (
+            "Render bounded PNG evidence frames from a Knowledge video and register "
+            "each frame as a durable Workspace artifact."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string"},
+                "output_dir": {"type": "string"},
+                "timestamps": {
+                    "type": "array",
+                    "items": {"type": "number", "minimum": 0},
+                },
+                "scene_boundaries": {
+                    "type": "array",
+                    "items": {"type": "number", "minimum": 0},
+                },
+                "interval_seconds": {
+                    "type": "number",
+                    "minimum": 0.25,
+                    "maximum": 3600,
+                    "default": 10,
+                },
+                "max_samples": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 24,
+                    "default": 12,
+                },
+            },
+            "required": ["input_path", "output_dir"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+ANALYZE_AUDIO_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "analyze_audio",
+        "description": (
+            "Measure integrated loudness, true peak, and silence intervals for a "
+            "Knowledge audio or video file with ffmpeg."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string"},
+                "target_lufs_min": {"type": "number", "minimum": -40, "maximum": 0, "default": -20},
+                "target_lufs_max": {"type": "number", "minimum": -40, "maximum": 0, "default": -14},
+                "max_true_peak_dbfs": {"type": "number", "minimum": -12, "maximum": 0, "default": -1},
+                "silence_noise_db": {"type": "number", "minimum": -80, "maximum": -20, "default": -50},
+                "minimum_silence_seconds": {"type": "number", "minimum": 0.1, "maximum": 10, "default": 0.5},
+                "max_silence_ratio": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.35},
+            },
+            "required": ["input_path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+VALIDATE_SUBTITLES_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "validate_subtitles",
+        "description": (
+            "Validate SRT, WebVTT, or ASS cue timing, overlap, line count, media "
+            "bounds, and available ASS bottom-safe style evidence."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subtitle_path": {"type": "string"},
+                "media_path": {"type": "string"},
+                "media_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+                "max_lines": {"type": "integer", "minimum": 1, "maximum": 4, "default": 2},
+                "min_margin_v": {"type": "integer", "minimum": 0, "maximum": 500, "default": 28},
+            },
+            "required": ["subtitle_path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+STILL_TO_VIDEO_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "still_to_video",
+        "description": (
+            "Convert one explicitly planned Knowledge still image into a bounded "
+            "H.264 MP4 scene and register it as a Workspace artifact."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string"},
+                "output_name": {"type": "string"},
+                "duration_seconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 30,
+                    "default": 3,
+                },
+                "resolution": {
+                    "type": "string",
+                    "enum": ["480p", "720p", "1080p"],
+                    "default": "1080p",
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+                    "default": "16:9",
+                },
+                "fps": {"type": "integer", "minimum": 12, "maximum": 60, "default": 30},
+                "crf": {"type": "integer", "minimum": 14, "maximum": 28, "default": 18},
+                "preset": {
+                    "type": "string",
+                    "enum": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"],
+                    "default": "veryfast",
+                },
+            },
+            "required": ["input_path", "output_name"],
+            "additionalProperties": False,
         },
     },
 }
@@ -449,6 +670,7 @@ async def _merge_videos_handler(
     paths: list[str] | str | None = None,
     video_paths: list[str] | str | None = None,
     folder_path: str | None = None,
+    clips: list[dict[str, Any]] | None = None,
     output_name: str = "",
     resolution: str = "1080p",
     aspect_ratio: str = "16:9",
@@ -477,19 +699,45 @@ async def _merge_videos_handler(
         )
 
     try:
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
         target_width, target_height = _target_dimensions(resolution, aspect_ratio)
         target_fps = int(_clamp_float(fps, 12, 60, 30))
         target_crf = int(_clamp_float(crf, 14, 28, 18))
         allowed_presets = MERGE_VIDEOS_SCHEMA["function"]["parameters"]["properties"]["preset"]["enum"]
         target_preset = preset if preset in allowed_presets else "veryfast"
 
-        inputs = await _resolve_video_inputs(
-            entity_id=entity_id,
-            job_ids=_string_list(job_ids),
-            document_ids=_string_list(document_ids),
-            paths=[*_string_list(paths), *_string_list(video_paths)],
-            folder_path=folder_path,
+        legacy_sources_present = bool(
+            _string_list(job_ids)
+            or _string_list(document_ids)
+            or _string_list(paths)
+            or _string_list(video_paths)
+            or (folder_path or "").strip()
         )
+        if clips and legacy_sources_present:
+            return _json_error(
+                "clips cannot be combined with job_ids, document_ids, paths, video_paths, or folder_path."
+            )
+        if clips:
+            inputs = await _resolve_ordered_video_clips(
+                entity_id=entity_id,
+                clips=clips,
+                workspace_id=workspace_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+        else:
+            inputs = await _resolve_video_inputs(
+                entity_id=entity_id,
+                job_ids=_string_list(job_ids),
+                document_ids=_string_list(document_ids),
+                paths=[*_string_list(paths), *_string_list(video_paths)],
+                folder_path=folder_path,
+                workspace_id=workspace_id,
+                workspace_base_dir=workspace_base_dir,
+            )
         if not inputs:
             return _json_error("At least one video input is required to merge or normalize.")
 
@@ -499,6 +747,7 @@ async def _merge_videos_handler(
             entity_id=entity_id,
             output_name=output_name,
             workspace_id=workspace_id,
+            task_id=task_id,
             inputs=inputs,
             width=target_width,
             height=target_height,
@@ -578,6 +827,7 @@ async def _compose_video_timeline_handler(
     burn_subtitles: bool = True,
     subtitle_style: dict[str, Any] | None = None,
     include_audio: bool = True,
+    require_audio: bool = False,
     include_source_audio: bool = False,
     ducking: dict[str, Any] | bool | None = None,
     loudness_normalization: dict[str, Any] | bool | None = None,
@@ -609,13 +859,27 @@ async def _compose_video_timeline_handler(
         from packages.core.services import entity_fs
 
         entity_root = entity_fs.get_entity_root(entity_id)
-        timeline = _load_timeline_json(entity_root, timeline_path, entity_id)
-        clean_rel = _timeline_clean_video_path(timeline, clean_video_path)
-        if not clean_rel:
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
+        timeline = _load_timeline_json(
+            entity_root,
+            timeline_path,
+            entity_id,
+            workspace_base_dir,
+        )
+        clean_reference = _timeline_clean_video_path(timeline, clean_video_path)
+        if not clean_reference:
             return _json_error(
                 "clean_video_path is required when timeline.delivery.clean_picture_master is missing",
                 code="clean_video_missing",
             )
+        clean_rel = _workspace_media_reference(
+            clean_reference,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
         clean_abs = _resolve_entity_file(entity_root, clean_rel)
         _assert_video_path(clean_abs)
 
@@ -623,20 +887,48 @@ async def _compose_video_timeline_handler(
         subtitle_abs = ""
         subtitle_rel = ""
         if burn_subtitles and resolved_subtitle:
-            subtitle_rel = _rel_path_from_reference(resolved_subtitle, entity_id) or resolved_subtitle
+            subtitle_rel = _workspace_media_reference(
+                resolved_subtitle,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
             subtitle_abs = _resolve_entity_file(entity_root, subtitle_rel)
             _assert_subtitle_path(subtitle_abs)
-        resolved_subtitle_style = _timeline_subtitle_style(timeline, subtitle_style)
-
         media_info = await _probe_media(ffprobe, clean_abs)
-        total_duration = float(media_info.get("duration_seconds") or 0.0)
-        audio_tracks = await _resolve_timeline_audio_tracks(
-            ffprobe=ffprobe,
-            entity_root=entity_root,
-            entity_id=entity_id,
-            timeline=timeline,
-            enabled=bool(include_audio),
+        canvas_width, canvas_height = _editor_canvas_size(
+            timeline.get("spec") if isinstance(timeline.get("spec"), dict) else timeline,
+            media_info,
         )
+        resolved_subtitle_style = _compose_subtitle_style(
+            subtitle_path=subtitle_abs,
+            width=canvas_width,
+            height=canvas_height,
+            timeline=timeline,
+            explicit_override=subtitle_style,
+        )
+        clean_video_duration = float(media_info.get("duration_seconds") or 0.0)
+        try:
+            audio_tracks = await _resolve_timeline_audio_tracks(
+                ffprobe=ffprobe,
+                entity_root=entity_root,
+                entity_id=entity_id,
+                timeline=timeline,
+                enabled=bool(include_audio),
+                workspace_base_dir=workspace_base_dir,
+            )
+        except ValueError as exc:
+            if require_audio:
+                return _json_error(
+                    f"No usable timeline audio tracks were found: {exc}",
+                    code="audio_track_missing",
+                )
+            raise
+        if require_audio and not audio_tracks:
+            return _json_error(
+                "No usable timeline audio tracks were found.",
+                code="audio_track_missing",
+            )
+        total_duration = _composition_duration(clean_video_duration, audio_tracks)
         ducking_config = _timeline_ducking_config(timeline, ducking)
         loudness_config = _timeline_loudness_config(timeline, loudness_normalization)
 
@@ -649,6 +941,7 @@ async def _compose_video_timeline_handler(
             entity_id=entity_id,
             output_name=output_name,
             workspace_id=workspace_id,
+            task_id=task_id,
             clean_video_abs=clean_abs,
             subtitle_abs=subtitle_abs,
             subtitle_style=resolved_subtitle_style,
@@ -659,6 +952,7 @@ async def _compose_video_timeline_handler(
             crf=target_crf,
             preset=target_preset,
             total_duration=total_duration,
+            clean_video_duration=clean_video_duration,
         )
 
         audio_payloads = [
@@ -688,13 +982,17 @@ async def _compose_video_timeline_handler(
                 {
                     "source_type": "timeline",
                     "source_id": timeline_path,
-                    "fs_path": _rel_path_from_reference(timeline_path, entity_id) or timeline_path,
+                    "fs_path": _workspace_media_reference(
+                        timeline_path,
+                        entity_id=entity_id,
+                        workspace_base_dir=workspace_base_dir,
+                    ),
                 },
                 {
                     "source_type": "clean_video",
                     "source_id": clean_video_path or clean_rel,
                     "fs_path": _normalize_user_path(clean_rel),
-                    "duration_seconds": round(total_duration, 2),
+                    "duration_seconds": round(clean_video_duration, 2),
                     "has_audio": bool(media_info.get("has_audio")),
                 },
             ],
@@ -784,10 +1082,14 @@ async def _align_subtitles_handler(
     user_id: str = "",
     timeline_path: str = "",
     cues_path: str = "",
+    transcript_path: str = "",
+    audio_path: str = "",
+    require_audio_transcript_match: bool = False,
     output_name: str = "",
     format: str = "srt",
     track_types: list[str] | str | None = None,
     max_chars_per_line: int = 34,
+    max_lines: int = 2,
     style: dict[str, Any] | None = None,
     workspace_id: str | None = None,
     task_id: str | None = None,
@@ -801,17 +1103,53 @@ async def _align_subtitles_handler(
         return _json_error("output_name is required")
     if not (timeline_path or cues_path or "").strip():
         return _json_error("timeline_path or cues_path is required")
+    if (audio_path or "").strip() and not (transcript_path or "").strip():
+        return _json_error(
+            "transcript_path is required when audio_path is supplied so narration can be "
+            "aligned to canonical sentences.",
+            code="subtitle_transcript_required",
+        )
 
     try:
         from packages.core.services import entity_fs
 
         entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
         timeline: dict[str, Any] = {}
         cue_payloads: list[Any] = []
+        timeline_rel = ""
+        cues_rel = ""
+        transcript_rel = ""
+        audio_rel = ""
         if timeline_path:
-            timeline = _load_timeline_json(entity_root, timeline_path, entity_id)
+            timeline_rel = _workspace_media_reference(
+                timeline_path,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+            timeline = _load_timeline_json(
+                entity_root,
+                timeline_path,
+                entity_id,
+                workspace_base_dir,
+            )
         if cues_path:
-            cue_payloads.append(_load_entity_json(entity_root, cues_path, entity_id))
+            cues_rel = _workspace_media_reference(
+                cues_path,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+            cue_payloads.append(
+                _load_entity_json(
+                    entity_root,
+                    cues_path,
+                    entity_id,
+                    workspace_base_dir,
+                )
+            )
 
         ffprobe = shutil.which("ffprobe") or ""
         include_types = _subtitle_track_types(track_types)
@@ -822,16 +1160,230 @@ async def _align_subtitles_handler(
             timeline=timeline,
             cue_payloads=cue_payloads,
             track_types=include_types,
+            workspace_base_dir=workspace_base_dir,
         )
         if not cues:
             return _json_error("No subtitle cues with text and timing were found", code="no_subtitle_cues")
 
+        transcript = ""
+        transcript_matches = None
+        if transcript_path:
+            transcript_rel = _workspace_media_reference(
+                transcript_path,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+            transcript_abs = _resolve_entity_file(entity_root, transcript_rel)
+            transcript = Path(transcript_abs).read_text(encoding="utf-8")
+            transcript_matches = _subtitle_cues_match_transcript(cues, transcript)
+            if not transcript_matches:
+                return _json_error(
+                    "Subtitle cue text must match the canonical narration transcript verbatim.",
+                    code="subtitle_transcript_mismatch",
+                )
+
+        audio_duration = None
+        audio_transcript_matches = None
+        timing_scaled = False
+        alignment_metrics: dict[str, Any] = {
+            "similarity": 1.0 if transcript_matches else None,
+            "coverage": 1.0 if transcript_matches else None,
+            "missing_sentence_indexes": [],
+            "measured_timestamps": False,
+            "transcription_model": None,
+            "sentence_timestamps": [],
+            "scene_coverage": _scene_alignment_coverage(
+                [timeline, *cue_payloads],
+                _canonical_sentences(transcript),
+                cues,
+                list(range(1, len(_canonical_sentences(transcript)) + 1)),
+            ),
+        }
+        if audio_path:
+            if not ffprobe:
+                return _json_error("ffprobe is required to align subtitles to narration audio")
+            audio_rel = _workspace_media_reference(
+                audio_path,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+            audio_abs = _resolve_entity_file(entity_root, audio_rel)
+            _assert_audio_path(audio_abs)
+            audio_info = await _probe_media(ffprobe, audio_abs)
+            audio_duration = float(audio_info.get("duration_seconds") or 0.0)
+            if audio_duration <= 0:
+                return _json_error("Narration audio duration could not be determined")
+            if transcript:
+                audio_transcript_matches = await _audio_prompt_matches_transcript(
+                    entity_id=entity_id,
+                    audio_rel_path=audio_rel,
+                    transcript=transcript,
+                )
+                if audio_transcript_matches is False:
+                    return _json_error(
+                        "Narration audio was generated from text that does not match the canonical transcript.",
+                        code="subtitle_audio_transcript_mismatch",
+                    )
+                if require_audio_transcript_match and audio_transcript_matches is None:
+                    return _json_error(
+                        "Narration audio provenance could not prove that its generation prompt "
+                        "matches the canonical transcript.",
+                        code="subtitle_audio_transcript_unverified",
+                    )
+            if transcript:
+                sentences = _canonical_sentences(transcript)
+                if _subtitle_cues_have_measured_timing(cues):
+                    measured_segments = [
+                        {
+                            "start": cue.start,
+                            "end": cue.end,
+                            "text": cue.text,
+                            "timing_source": cue.timing_source or "existing_measured_cues",
+                        }
+                        for cue in cues
+                    ]
+                    try:
+                        _aligned, semantic_metrics = _align_sentences_to_segments(
+                            sentences,
+                            measured_segments,
+                        )
+                    except SubtitleWordTimestampsRequiredError as exc:
+                        return _json_blocked(
+                            str(exc),
+                            code="subtitle_word_timestamps_required",
+                            transcription_model="existing_measured_cues",
+                        )
+                    measured_sentence_cues = _aligned
+                    transcription_model = "existing_measured_cues"
+                else:
+                    from packages.core.services.voice.whisper import (
+                        WHISPER_MAX_UPLOAD_BYTES,
+                        WhisperTimestampError,
+                        WhisperUploadTooLargeError,
+                    )
+
+                    try:
+                        transcription = await _transcribe_narration_audio(
+                            audio_path=audio_abs,
+                            user_id=user_id,
+                            entity_id=entity_id,
+                            reference_transcript=transcript,
+                            workspace_id=workspace_id,
+                            agent_id=agent_id,
+                            conversation_id=conversation_id,
+                        )
+                    except WhisperUploadTooLargeError as exc:
+                        return _json_blocked(
+                            str(exc),
+                            code="subtitle_audio_too_large",
+                            max_upload_bytes=WHISPER_MAX_UPLOAD_BYTES,
+                        )
+                    except WhisperTimestampError as exc:
+                        return _json_blocked(
+                            str(exc),
+                            code="subtitle_timestamp_capable_stt_required",
+                        )
+                    segments = getattr(transcription, "segments", None)
+                    words = getattr(transcription, "words", None)
+                    transcription_model = str(getattr(transcription, "model", "") or "")
+                    if not isinstance(segments, list) or not segments:
+                        return _json_blocked(
+                            "Measured semantic subtitle alignment requires a timestamp-capable STT "
+                            "route; the configured transcription route returned text without segments.",
+                            code="subtitle_timestamp_capable_stt_required",
+                            transcription_model=transcription_model or None,
+                        )
+                    try:
+                        cues, semantic_metrics = _align_sentences_to_segments(
+                            sentences,
+                            segments,
+                            words=words if isinstance(words, list) else None,
+                        )
+                    except SubtitleWordTimestampsRequiredError as exc:
+                        return _json_blocked(
+                            str(exc),
+                            code="subtitle_word_timestamps_required",
+                            transcription_model=transcription_model or None,
+                        )
+                    measured_sentence_cues = cues
+                scene_coverage = _scene_alignment_coverage(
+                    [timeline, *cue_payloads],
+                    sentences,
+                    measured_sentence_cues,
+                    semantic_metrics["aligned_sentence_indexes"],
+                )
+                alignment_metrics = {
+                    **semantic_metrics,
+                    "measured_timestamps": True,
+                    "transcription_model": transcription_model or None,
+                    "sentence_timestamps": [
+                        {
+                            "sentence_index": sentence_index,
+                            "start": round(cue.start, 3),
+                            "end": round(cue.end, 3),
+                            "timing_source": cue.timing_source,
+                        }
+                        for sentence_index, cue in zip(
+                            semantic_metrics["aligned_sentence_indexes"],
+                            measured_sentence_cues,
+                            strict=True,
+                        )
+                    ],
+                    "scene_coverage": scene_coverage,
+                }
+                if (
+                    semantic_metrics["similarity"] < 0.90
+                    or semantic_metrics["coverage"] < 0.95
+                ):
+                    return _json_blocked(
+                        "Measured narration could not be aligned to at least 95% of the "
+                        "canonical sentences with 0.90 similarity.",
+                        code="subtitle_semantic_alignment_failed",
+                        alignment_metrics=alignment_metrics,
+                    )
+                if scene_coverage["missing_interval_scene_ids"]:
+                    missing_intervals = scene_coverage["missing_interval_scene_ids"]
+                    missing = ", ".join(missing_intervals)
+                    return _json_blocked(
+                        "Measured scene coverage requires a stable start/end interval "
+                        f"for every declared scene. Missing interval for scene(s): {missing}.",
+                        code="subtitle_scene_interval_missing",
+                        missing_interval_scene_ids=missing_intervals,
+                        scene_coverage=scene_coverage,
+                        alignment_metrics=alignment_metrics,
+                    )
+                if scene_coverage["missing_scene_ids"]:
+                    missing = ", ".join(scene_coverage["missing_scene_ids"])
+                    return _json_blocked(
+                        f"Measured narration did not align a sentence to scene(s): {missing}.",
+                        code="subtitle_scene_alignment_incomplete",
+                        missing_scene_ids=scene_coverage["missing_scene_ids"],
+                        scene_coverage=scene_coverage,
+                        alignment_metrics=alignment_metrics,
+                    )
+
+        line_width = int(_clamp_float(max_chars_per_line, 16, 56, 34))
+        line_limit = int(_clamp_float(max_lines, 1, 2, 2))
+        spec = timeline.get("spec") if isinstance(timeline.get("spec"), dict) else timeline
+        canvas_width, canvas_height = _editor_canvas_size(spec, {})
+        resolved_style = _subtitle_style(
+            canvas_width,
+            canvas_height,
+            _timeline_subtitle_style(timeline, style),
+        )
+        resolved_style["max_lines"] = line_limit
+        cues = _fit_subtitle_cues_to_line_limit(
+            cues,
+            max_chars_per_line=line_width,
+            max_lines=line_limit,
+        )
         subtitle_format = str(format or "srt").strip().lower()
         if subtitle_format not in {"srt", "vtt", "ass"}:
             subtitle_format = "srt"
         target = await _build_media_target(
             entity_id=entity_id,
             workspace_id=workspace_id,
+            task_id=task_id,
             output_name=output_name,
             ext=f".{subtitle_format}",
             fallback="subtitles",
@@ -844,8 +1396,10 @@ async def _align_subtitles_handler(
         text = _render_subtitles(
             cues,
             subtitle_format=subtitle_format,
-            max_chars_per_line=int(_clamp_float(max_chars_per_line, 16, 56, 34)),
-            style=style or _timeline_subtitle_style(timeline, None),
+            max_chars_per_line=line_width,
+            style=resolved_style,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
         )
         data = text.encode("utf-8")
         target_abs_path = entity_fs.write_entity_file_atomic(
@@ -872,12 +1426,23 @@ async def _align_subtitles_handler(
             artifact_role="subtitle",
             generation={
                 "operation": "align_subtitles",
-                "timeline_path": _rel_path_from_reference(timeline_path, entity_id) or timeline_path or None,
-                "cues_path": _rel_path_from_reference(cues_path, entity_id) or cues_path or None,
+                "timeline_path": timeline_rel or None,
+                "cues_path": cues_rel or None,
+                "transcript_path": transcript_rel or None,
+                "audio_path": audio_rel or None,
                 "format": subtitle_format,
                 "track_types": sorted(include_types),
                 "cue_count": len(cues),
                 "estimated_cues": sum(1 for cue in cues if cue.estimated),
+                "transcript_matches": transcript_matches,
+                "audio_transcript_matches": audio_transcript_matches,
+                "require_audio_transcript_match": require_audio_transcript_match,
+                "audio_duration_seconds": round(audio_duration, 3) if audio_duration else None,
+                "timing_scaled": timing_scaled,
+                "alignment_metrics": alignment_metrics,
+                "max_chars_per_line": line_width,
+                "max_lines": line_limit,
+                "subtitle_style": resolved_style,
             },
         )
         await _bind_artifact_to_workspace(
@@ -902,6 +1467,15 @@ async def _align_subtitles_handler(
                 "format": subtitle_format,
                 "cue_count": len(cues),
                 "estimated_cues": sum(1 for cue in cues if cue.estimated),
+                "transcript_matches": transcript_matches,
+                "audio_transcript_matches": audio_transcript_matches,
+                "require_audio_transcript_match": require_audio_transcript_match,
+                "audio_duration_seconds": round(audio_duration, 3) if audio_duration else None,
+                "timing_scaled": timing_scaled,
+                "alignment_metrics": alignment_metrics,
+                "max_chars_per_line": line_width,
+                "max_lines": line_limit,
+                "subtitle_style": resolved_style,
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -940,7 +1514,16 @@ async def _normalize_audio_loudness_handler(
         from packages.core.services import entity_fs
 
         entity_root = entity_fs.get_entity_root(entity_id)
-        rel_input = _rel_path_from_reference(input_path, entity_id) or input_path
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        rel_input = _workspace_media_reference(
+            input_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
         input_abs = _resolve_entity_file(entity_root, rel_input)
         _assert_audio_path(input_abs)
         fmt = str(output_format or "wav").strip().lower()
@@ -949,6 +1532,7 @@ async def _normalize_audio_loudness_handler(
         target = await _build_media_target(
             entity_id=entity_id,
             workspace_id=workspace_id,
+            task_id=task_id,
             output_name=output_name,
             ext=f".{fmt}",
             fallback="normalized-audio",
@@ -1036,6 +1620,665 @@ async def _normalize_audio_loudness_handler(
         return _json_error(str(exc), code="normalize_audio_loudness_failed")
 
 
+async def _probe_media_handler(
+    *,
+    entity_id: str = "",
+    input_path: str = "",
+    workspace_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id:
+        return _json_error("entity_id is required")
+    if not str(input_path or "").strip():
+        return _json_error("input_path is required")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return _json_error("ffprobe is required for media inspection", code="ffprobe_missing")
+    try:
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
+        rel_input = _workspace_media_reference(
+            input_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        input_abs = _resolve_entity_file(entity_root, rel_input)
+        report = await _probe_media_report(ffprobe, input_abs)
+        return _json({
+            "status": "completed",
+            "fs_path": _normalize_user_path(rel_input),
+            "report": report,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("probe_media failed")
+        return _json_error(str(exc), code="probe_media_failed")
+
+
+async def _still_to_video_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    input_path: str = "",
+    output_name: str = "",
+    duration_seconds: float = 3.0,
+    resolution: str = "1080p",
+    aspect_ratio: str = "16:9",
+    fps: int = 30,
+    crf: int = 18,
+    preset: str = "veryfast",
+    workspace_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id:
+        return _json_error("entity_id is required")
+    if not str(input_path or "").strip():
+        return _json_error("input_path is required")
+    if not str(output_name or "").strip():
+        return _json_error("output_name is required")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return _json_error("ffmpeg is required to render still scenes", code="ffmpeg_missing")
+
+    try:
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
+        rel_input = _workspace_media_reference(
+            input_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        input_abs = _resolve_entity_file(entity_root, rel_input)
+        _assert_image_path(input_abs)
+
+        duration = _clamp_float(duration_seconds, 0.1, 30.0, 3.0)
+        selected_resolution = str(resolution or "1080p").strip().lower()
+        if selected_resolution not in {"480p", "720p", "1080p"}:
+            selected_resolution = "1080p"
+        selected_aspect_ratio = str(aspect_ratio or "16:9").strip()
+        if selected_aspect_ratio not in {"16:9", "9:16", "1:1", "4:3", "3:4"}:
+            selected_aspect_ratio = "16:9"
+        selected_fps = max(12, min(60, int(fps or 30)))
+        selected_crf = max(14, min(28, int(crf or 18)))
+        selected_preset = str(preset or "veryfast").strip().lower()
+        if selected_preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium"}:
+            selected_preset = "veryfast"
+        width, height = _target_dimensions(selected_resolution, selected_aspect_ratio)
+
+        target = await _build_media_target(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            output_name=output_name,
+            ext=".mp4",
+            fallback="still-scene",
+            default_dir="video",
+        )
+        if not target.abs_dir or not target.abs_path:
+            raise ValueError("Could not resolve still-scene output path")
+        os.makedirs(target.abs_dir, exist_ok=True)
+        video_filter = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1,fps={selected_fps},format=yuv420p"
+        )
+        await _run_process(
+            [
+                ffmpeg,
+                "-y",
+                "-loop",
+                "1",
+                "-i",
+                input_abs,
+                "-t",
+                f"{duration:.3f}",
+                "-vf",
+                video_filter,
+                "-r",
+                str(selected_fps),
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                selected_preset,
+                "-crf",
+                str(selected_crf),
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                target.abs_path,
+            ],
+            timeout_seconds=max(120.0, duration * 8.0 + 30.0),
+        )
+        if not os.path.isfile(target.abs_path) or os.path.getsize(target.abs_path) <= 0:
+            raise RuntimeError("ffmpeg did not produce a still-scene video")
+
+        generation = {
+            "operation": "still_to_video",
+            "input_path": _normalize_user_path(rel_input),
+            "duration_seconds": round(duration, 3),
+            "width": width,
+            "height": height,
+            "fps": selected_fps,
+            "crf": selected_crf,
+            "preset": selected_preset,
+        }
+        document_id = await _register_file_artifact(
+            entity_id=entity_id,
+            user_id=user_id,
+            filename=target.filename,
+            rel_path=target.rel_path,
+            file_size=os.path.getsize(target.abs_path),
+            file_type="mp4",
+            mime_type="video/mp4",
+            workspace_id=workspace_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            tool_name="still_to_video",
+            artifact_role="video",
+            generation=generation,
+        )
+        await _bind_artifact_to_workspace(
+            entity_id=entity_id,
+            document_id=document_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            tool_name="still_to_video",
+        )
+        return _json({
+            "kind": "video",
+            "status": "completed",
+            "document_id": document_id,
+            "name": target.filename,
+            "result_url": f"/api/v1/fs/{entity_id}/{target.rel_path}",
+            "fs_path": target.rel_path,
+            "file_size": os.path.getsize(target.abs_path),
+            "duration_seconds": round(duration, 3),
+            "width": width,
+            "height": height,
+            "fps": selected_fps,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("still_to_video failed")
+        return _json_error(str(exc), code="still_to_video_failed")
+
+
+async def _render_frame_samples_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    input_path: str = "",
+    output_dir: str = "",
+    timestamps: list[float] | None = None,
+    scene_boundaries: list[float] | None = None,
+    interval_seconds: float = 10.0,
+    max_samples: int = 12,
+    workspace_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id:
+        return _json_error("entity_id is required")
+    if not str(input_path or "").strip():
+        return _json_error("input_path is required")
+    if not str(output_dir or "").strip():
+        return _json_error("output_dir is required")
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg:
+        return _json_error("ffmpeg is required to render frame samples", code="ffmpeg_missing")
+    if not ffprobe:
+        return _json_error("ffprobe is required to render frame samples", code="ffprobe_missing")
+
+    completed_frames: list[dict[str, Any]] = []
+    try:
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
+        rel_input = _workspace_media_reference(
+            input_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        input_abs = _resolve_entity_file(entity_root, rel_input)
+        _assert_video_path(input_abs)
+        report = await _probe_media_report(ffprobe, input_abs)
+        if not report.get("has_video"):
+            raise ValueError("Frame sampling requires a video stream")
+        media_duration = float(_probe_number(report.get("duration_seconds")))
+        video_stream = report.get("video_stream")
+        video_duration = float(_probe_number(
+            video_stream.get("duration_seconds")
+            if isinstance(video_stream, dict)
+            else 0
+        ))
+        duration = video_duration if video_duration > 0 else media_duration
+        if duration <= 0:
+            raise ValueError("Frame sampling requires a positive media duration")
+        output_base = _normalize_user_path(output_dir).rstrip("/")
+        sample_times = _frame_sample_times(
+            duration_seconds=duration,
+            timestamps=timestamps,
+            scene_boundaries=scene_boundaries,
+            interval_seconds=interval_seconds,
+            max_samples=max_samples,
+        )
+        for index, timestamp in enumerate(sample_times, start=1):
+            timestamp_ms = int(round(timestamp * 1000))
+            output_name = f"{output_base}/frame-{index:03d}-{timestamp_ms:09d}ms.png"
+            target = await _build_media_target(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                output_name=output_name,
+                ext=".png",
+                fallback=f"frame-{index:03d}",
+                default_dir="qa/frames",
+            )
+            if not target.abs_dir or not target.abs_path:
+                raise ValueError("Could not resolve frame sample output path")
+            os.makedirs(target.abs_dir, exist_ok=True)
+            await _run_process(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-ss",
+                    f"{timestamp:.3f}",
+                    "-i",
+                    input_abs,
+                    "-frames:v",
+                    "1",
+                    "-an",
+                    target.abs_path,
+                ],
+                timeout_seconds=120.0,
+            )
+            if not os.path.isfile(target.abs_path) or os.path.getsize(target.abs_path) <= 0:
+                raise RuntimeError(f"ffmpeg did not produce frame sample {index}")
+            generation = {
+                "operation": "render_frame_samples",
+                "input_path": _normalize_user_path(rel_input),
+                "timestamp_seconds": timestamp,
+                "sample_index": index,
+                "media_duration_seconds": round(duration, 3),
+            }
+            document_id = await _register_file_artifact(
+                entity_id=entity_id,
+                user_id=user_id,
+                filename=target.filename,
+                rel_path=target.rel_path,
+                file_size=os.path.getsize(target.abs_path),
+                file_type="png",
+                mime_type="image/png",
+                workspace_id=workspace_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                tool_name="render_frame_samples",
+                artifact_role="qa_evidence",
+                generation=generation,
+            )
+            await _bind_artifact_to_workspace(
+                entity_id=entity_id,
+                document_id=document_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                tool_name="render_frame_samples",
+            )
+            completed_frames.append({
+                "index": index,
+                "timestamp_seconds": timestamp,
+                "document_id": document_id,
+                "name": target.filename,
+                "fs_path": target.rel_path,
+                "result_url": f"/api/v1/fs/{entity_id}/{target.rel_path}",
+                "file_size": os.path.getsize(target.abs_path),
+            })
+        return _json({
+            "status": "completed",
+            "input_path": _normalize_user_path(rel_input),
+            "duration_seconds": round(duration, 3),
+            "sample_count": len(completed_frames),
+            "frames": completed_frames,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("render_frame_samples failed")
+        return _json({
+            "status": "error",
+            "code": "render_frame_samples_failed",
+            "error": str(exc),
+            "completed_frames": completed_frames,
+        })
+
+
+async def _analyze_audio_handler(
+    *,
+    entity_id: str = "",
+    input_path: str = "",
+    target_lufs_min: float = -20.0,
+    target_lufs_max: float = -14.0,
+    max_true_peak_dbfs: float = -1.0,
+    silence_noise_db: float = -50.0,
+    minimum_silence_seconds: float = 0.5,
+    max_silence_ratio: float = 0.35,
+    workspace_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id:
+        return _json_error("entity_id is required")
+    if not str(input_path or "").strip():
+        return _json_error("input_path is required")
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg:
+        return _json_error("ffmpeg is required for audio analysis", code="ffmpeg_missing")
+    if not ffprobe:
+        return _json_error("ffprobe is required for audio analysis", code="ffprobe_missing")
+
+    try:
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
+        rel_input = _workspace_media_reference(
+            input_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        input_abs = _resolve_entity_file(entity_root, rel_input)
+        report = await _probe_media_report(ffprobe, input_abs)
+        if not report.get("has_audio"):
+            raise ValueError("Media has no audio stream")
+        duration = float(_probe_number(report.get("duration_seconds")))
+        if duration <= 0:
+            raise ValueError("Audio analysis requires a positive media duration")
+
+        lufs_min = _clamp_float(target_lufs_min, -40.0, 0.0, -20.0)
+        lufs_max = _clamp_float(target_lufs_max, -40.0, 0.0, -14.0)
+        if lufs_min > lufs_max:
+            raise ValueError("target_lufs_min must not exceed target_lufs_max")
+        peak_limit = _clamp_float(max_true_peak_dbfs, -12.0, 0.0, -1.0)
+        noise = _clamp_float(silence_noise_db, -80.0, -20.0, -50.0)
+        silence_minimum = _clamp_float(minimum_silence_seconds, 0.1, 10.0, 0.5)
+        silence_ratio_limit = _clamp_float(max_silence_ratio, 0.0, 1.0, 0.35)
+
+        _loudness_stdout, loudness_stderr = await _run_process(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                input_abs,
+                "-map",
+                "0:a:0",
+                "-af",
+                "ebur128=peak=true:framelog=verbose",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout_seconds=max(120.0, duration * 2.0 + 30.0),
+        )
+        _silence_stdout, silence_stderr = await _run_process(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                input_abs,
+                "-map",
+                "0:a:0",
+                "-af",
+                f"silencedetect=noise={noise:.1f}dB:d={silence_minimum:.3f}",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout_seconds=max(120.0, duration * 2.0 + 30.0),
+        )
+        loudness = _parse_ebur128(loudness_stderr)
+        silence = _parse_silence_intervals(silence_stderr, duration_seconds=duration)
+        integrated_lufs = loudness["integrated_lufs"]
+        true_peak = loudness["true_peak_dbfs"]
+        active_seconds = max(0.0, duration - silence["total_silence_seconds"])
+        non_empty = integrated_lufs is not None and active_seconds > 0.05
+        clipping_detected = true_peak is not None and true_peak >= -0.1
+
+        findings: list[dict[str, Any]] = []
+        if integrated_lufs is None:
+            findings.append({"code": "loudness_unavailable"})
+        elif not lufs_min <= integrated_lufs <= lufs_max:
+            findings.append({
+                "code": "integrated_loudness_out_of_range",
+                "actual_lufs": integrated_lufs,
+                "minimum_lufs": lufs_min,
+                "maximum_lufs": lufs_max,
+            })
+        if true_peak is None:
+            findings.append({"code": "true_peak_unavailable"})
+        elif true_peak > peak_limit:
+            findings.append({
+                "code": "true_peak_exceeded",
+                "actual_dbfs": true_peak,
+                "maximum_dbfs": peak_limit,
+            })
+        if clipping_detected:
+            findings.append({"code": "clipping_detected", "actual_dbfs": true_peak})
+        if silence["silence_ratio"] > silence_ratio_limit:
+            findings.append({
+                "code": "silence_ratio_exceeded",
+                "actual_ratio": silence["silence_ratio"],
+                "maximum_ratio": silence_ratio_limit,
+            })
+        if not non_empty:
+            findings.append({"code": "audio_empty"})
+
+        return _json({
+            "status": "completed",
+            "verdict": "pass" if not findings else "fail",
+            "fs_path": _normalize_user_path(rel_input),
+            "duration_seconds": round(duration, 3),
+            "non_empty": non_empty,
+            "integrated_lufs": integrated_lufs,
+            "loudness_range_lu": loudness["loudness_range_lu"],
+            "true_peak_dbfs": true_peak,
+            "clipping_detected": clipping_detected,
+            **silence,
+            "thresholds": {
+                "target_lufs_min": lufs_min,
+                "target_lufs_max": lufs_max,
+                "max_true_peak_dbfs": peak_limit,
+                "max_silence_ratio": silence_ratio_limit,
+            },
+            "findings": findings,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("analyze_audio failed")
+        return _json_error(str(exc), code="analyze_audio_failed")
+
+
+async def _validate_subtitles_handler(
+    *,
+    entity_id: str = "",
+    subtitle_path: str = "",
+    media_path: str = "",
+    media_duration_seconds: float | None = None,
+    max_lines: int = 2,
+    min_margin_v: int = 28,
+    workspace_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id:
+        return _json_error("entity_id is required")
+    if not str(subtitle_path or "").strip():
+        return _json_error("subtitle_path is required")
+
+    try:
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
+        subtitle_rel = _workspace_media_reference(
+            subtitle_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        subtitle_abs = _resolve_entity_file(entity_root, subtitle_rel)
+        _assert_subtitle_path(subtitle_abs)
+        subtitle_format = Path(subtitle_abs).suffix.lower().lstrip(".")
+        parsed = _parse_subtitle_content(
+            Path(subtitle_abs).read_text(encoding="utf-8-sig"),
+            subtitle_format,
+        )
+
+        duration = float(_probe_number(media_duration_seconds))
+        media_rel = ""
+        if duration <= 0:
+            if not str(media_path or "").strip():
+                raise ValueError("media_path or media_duration_seconds is required")
+            ffprobe = shutil.which("ffprobe")
+            if not ffprobe:
+                raise ValueError("ffprobe is required to resolve media duration")
+            media_rel = _workspace_media_reference(
+                media_path,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+            media_abs = _resolve_entity_file(entity_root, media_rel)
+            report = await _probe_media_report(ffprobe, media_abs)
+            duration = float(_probe_number(report.get("duration_seconds")))
+        if duration <= 0:
+            raise ValueError("Subtitle validation requires a positive media duration")
+
+        line_limit = max(1, min(4, int(max_lines or 2)))
+        margin_limit = max(0, min(500, int(min_margin_v or 0)))
+        cues = list(parsed["cues"])
+        findings: list[dict[str, Any]] = []
+        if not cues:
+            findings.append({"code": "no_subtitle_cues"})
+
+        for cue in cues:
+            cue_id = cue["id"]
+            if not str(cue.get("text") or "").strip():
+                findings.append({"code": "blank_cue", "cue_id": cue_id})
+            if float(cue["end"]) <= float(cue["start"]):
+                findings.append({
+                    "code": "non_positive_duration",
+                    "cue_id": cue_id,
+                    "start": cue["start"],
+                    "end": cue["end"],
+                })
+            if float(cue["start"]) < 0 or float(cue["end"]) > duration + 0.001:
+                findings.append({
+                    "code": "cue_outside_media",
+                    "cue_id": cue_id,
+                    "start": cue["start"],
+                    "end": cue["end"],
+                    "media_duration_seconds": round(duration, 3),
+                })
+            if int(cue.get("line_count") or 0) > line_limit:
+                findings.append({
+                    "code": "too_many_lines",
+                    "cue_id": cue_id,
+                    "line_count": cue["line_count"],
+                    "maximum_lines": line_limit,
+                })
+
+        active_cue: dict[str, Any] | None = None
+        for cue in sorted(cues, key=lambda item: (float(item["start"]), float(item["end"]))):
+            if active_cue is not None and float(cue["start"]) < float(active_cue["end"]) - 0.001:
+                findings.append({
+                    "code": "cue_overlap",
+                    "cue_id": cue["id"],
+                    "overlaps_cue_id": active_cue["id"],
+                })
+            if active_cue is None or float(cue["end"]) > float(active_cue["end"]):
+                active_cue = cue
+
+        style_evidence: dict[str, dict[str, Any]] = {}
+        if subtitle_format == "ass":
+            used_styles = sorted({str(cue.get("style") or "Default") for cue in cues})
+            for style_name in used_styles:
+                style = parsed["styles"].get(style_name)
+                if style is None:
+                    findings.append({"code": "ass_style_missing", "style": style_name})
+                    continue
+                alignment = int(style.get("alignment") or 0)
+                margin_v = int(style.get("margin_v") or 0)
+                bottom_safe = alignment == 2 and margin_v >= margin_limit
+                style_evidence[style_name] = {
+                    "font_size": style.get("font_size"),
+                    "outline": style.get("outline"),
+                    "shadow": style.get("shadow"),
+                    "alignment": alignment,
+                    "margin_v": margin_v,
+                    "bottom_safe": bottom_safe,
+                }
+                if not bottom_safe:
+                    findings.append({
+                        "code": "ass_style_not_bottom_safe",
+                        "style": style_name,
+                        "required_alignment": 2,
+                        "minimum_margin_v": margin_limit,
+                    })
+
+        starts = [float(cue["start"]) for cue in cues]
+        ends = [float(cue["end"]) for cue in cues]
+        return _json({
+            "status": "completed",
+            "verdict": "pass" if not findings else "fail",
+            "fs_path": _normalize_user_path(subtitle_rel),
+            "media_path": _normalize_user_path(media_rel) if media_rel else None,
+            "media_duration_seconds": round(duration, 3),
+            "subtitle_format": subtitle_format,
+            "cue_count": len(cues),
+            "maximum_line_count": max(
+                (int(cue.get("line_count") or 0) for cue in cues),
+                default=0,
+            ),
+            "timing_bounds": {
+                "start_seconds": round(min(starts), 3) if starts else None,
+                "end_seconds": round(max(ends), 3) if ends else None,
+            },
+            "play_res_y": parsed["play_res_y"],
+            "style_evidence": style_evidence,
+            "findings": findings,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("validate_subtitles failed")
+        return _json_error(str(exc), code="validate_subtitles_failed")
+
+
 async def _load_media_jobs(entity_id: str, ids: list[str]) -> tuple[list[Any], list[str]]:
     from packages.core.database import async_session
     from packages.core.models.media_job import MediaJob
@@ -1111,6 +2354,8 @@ async def _resolve_video_inputs(
     document_ids: list[str],
     paths: list[str],
     folder_path: str | None,
+    workspace_id: str | None = None,
+    workspace_base_dir: str = "",
 ) -> list[VideoInput]:
     from packages.core.services import entity_fs
 
@@ -1127,7 +2372,14 @@ async def _resolve_video_inputs(
                 doc = await get_document(db, document_id, entity_id)
                 if not doc:
                     raise ValueError(f"Document not found: {document_id}")
-                resolved.append(_video_input_from_document(entity_root, doc))
+                resolved.append(
+                    _video_input_from_document(
+                        entity_root,
+                        doc,
+                        workspace_id=workspace_id,
+                        workspace_base_dir=workspace_base_dir,
+                    )
+                )
 
             if job_ids:
                 result = await db.execute(
@@ -1143,7 +2395,7 @@ async def _resolve_video_inputs(
                         raise ValueError(f"Media job not found: {job_id}")
                     if job.kind != "video":
                         raise ValueError(f"Media job is not a video job: {job_id}")
-                    if job.status != "completed":
+                    if job.status != MediaJobStatus.COMPLETED:
                         raise ValueError(f"Media job is not completed: {job_id} ({job.status})")
                     params = job.params or {}
                     document_id = params.get("result_document_id")
@@ -1151,7 +2403,12 @@ async def _resolve_video_inputs(
                         doc = await get_document(db, str(document_id), entity_id)
                         if not doc:
                             raise ValueError(f"Media job document not found: {job_id}")
-                        item = _video_input_from_document(entity_root, doc)
+                        item = _video_input_from_document(
+                            entity_root,
+                            doc,
+                            workspace_id=workspace_id,
+                            workspace_base_dir=workspace_base_dir,
+                        )
                         resolved.append(
                             VideoInput(
                                 source_type="job",
@@ -1162,7 +2419,11 @@ async def _resolve_video_inputs(
                             )
                         )
                         continue
-                    rel_path = _rel_path_from_reference(job.result_url, entity_id)
+                    rel_path = _workspace_media_reference(
+                        job.result_url,
+                        entity_id=entity_id,
+                        workspace_base_dir=workspace_base_dir,
+                    )
                     if not rel_path:
                         raise ValueError(f"Completed media job has no Knowledge path: {job_id}")
                     abs_path = _resolve_entity_file(entity_root, rel_path)
@@ -1177,7 +2438,11 @@ async def _resolve_video_inputs(
                     )
 
     for path in paths:
-        rel_path = _rel_path_from_reference(path, entity_id) or path
+        rel_path = _workspace_media_reference(
+            path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
         abs_path = _resolve_entity_file(entity_root, rel_path)
         _assert_video_path(abs_path)
         resolved.append(
@@ -1190,7 +2455,11 @@ async def _resolve_video_inputs(
         )
 
     if folder_path:
-        folder_rel_path = _normalize_user_path(folder_path)
+        folder_rel_path = _workspace_media_reference(
+            folder_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
         folder_abs_path = _resolve_entity_dir(entity_root, folder_rel_path)
         for filename in sorted(os.listdir(folder_abs_path)):
             full_path = os.path.join(folder_abs_path, filename)
@@ -1211,12 +2480,79 @@ async def _resolve_video_inputs(
     return _dedupe_inputs(resolved)
 
 
-def _video_input_from_document(entity_root: str, doc: Any) -> VideoInput:
+async def _resolve_ordered_video_clips(
+    *,
+    entity_id: str,
+    clips: list[dict[str, Any]],
+    workspace_id: str | None = None,
+    workspace_base_dir: str = "",
+) -> list[VideoInput]:
+    resolved: list[VideoInput] = []
+    for index, raw_clip in enumerate(clips, start=1):
+        if not isinstance(raw_clip, dict):
+            raise ValueError(f"clips[{index}] must be an object")
+        document_id = str(raw_clip.get("document_id") or "").strip()
+        job_id = str(raw_clip.get("job_id") or "").strip()
+        path = str(raw_clip.get("path") or "").strip()
+        locator_count = sum(bool(value) for value in (document_id, job_id, path))
+        if locator_count != 1:
+            raise ValueError(
+                f"clips[{index}] requires exactly one of document_id, job_id, or path"
+            )
+        items = await _resolve_video_inputs(
+            entity_id=entity_id,
+            job_ids=[job_id] if job_id else [],
+            document_ids=[document_id] if document_id else [],
+            paths=[path] if path else [],
+            folder_path=None,
+            workspace_id=workspace_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        if len(items) != 1:
+            raise ValueError(f"clips[{index}] did not resolve to exactly one video")
+        try:
+            start_seconds = float(raw_clip.get("start_seconds") or 0.0)
+            end_value = raw_clip.get("end_seconds")
+            end_seconds = float(end_value) if end_value is not None else None
+            speed = float(raw_clip.get("speed") or 1.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"clips[{index}] has invalid trim or speed values") from exc
+        if start_seconds < 0:
+            raise ValueError(f"clips[{index}].start_seconds must be non-negative")
+        if end_seconds is not None and end_seconds <= start_seconds:
+            raise ValueError(f"clips[{index}].end_seconds must be greater than start_seconds")
+        if not 0.25 <= speed <= 8.0:
+            raise ValueError(f"clips[{index}].speed must be between 0.25 and 8")
+        resolved.append(
+            replace(
+                items[0],
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                speed=speed,
+                label=str(raw_clip.get("label") or "").strip() or None,
+            )
+        )
+    return resolved
+
+
+def _video_input_from_document(
+    entity_root: str,
+    doc: Any,
+    *,
+    workspace_id: str | None = None,
+    workspace_base_dir: str = "",
+) -> VideoInput:
     if not _is_video_document(doc):
         raise ValueError(f"Document is not a supported video: {getattr(doc, 'id', '')}")
     rel_path = getattr(doc, "fs_path", None)
     if not rel_path:
         raise ValueError(f"Document has no filesystem path: {getattr(doc, 'id', '')}")
+    _assert_document_workspace_scope(
+        doc,
+        rel_path=rel_path,
+        workspace_id=workspace_id,
+        workspace_base_dir=workspace_base_dir,
+    )
     abs_path = _resolve_entity_file(entity_root, rel_path)
     _assert_video_path(abs_path)
     return VideoInput(
@@ -1228,6 +2564,46 @@ def _video_input_from_document(entity_root: str, doc: Any) -> VideoInput:
     )
 
 
+def _assert_document_workspace_scope(
+    doc: Any,
+    *,
+    rel_path: str,
+    workspace_id: str | None,
+    workspace_base_dir: str,
+) -> None:
+    current_workspace = str(workspace_id or "").strip()
+    if not current_workspace:
+        return
+
+    metadata = getattr(doc, "metadata_", None)
+    if not isinstance(metadata, dict):
+        metadata = getattr(doc, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    origin = metadata.get("origin") if isinstance(metadata.get("origin"), dict) else {}
+    origin_workspace = str(origin.get("workspace_id") or "").strip()
+    if origin_workspace and origin_workspace != current_workspace:
+        raise ValueError(
+            f"Document {getattr(doc, 'id', '')} does not belong to Workspace "
+            f"{current_workspace}"
+        )
+
+    normalized_path = _normalize_user_path(rel_path)
+    normalized_base = _normalize_user_path(workspace_base_dir) if workspace_base_dir else ""
+    path_matches = bool(
+        normalized_base
+        and (
+            normalized_path == normalized_base
+            or normalized_path.startswith(f"{normalized_base}/")
+        )
+    )
+    if path_matches or origin_workspace == current_workspace:
+        return
+    raise ValueError(
+        f"Document {getattr(doc, 'id', '')} does not belong to Workspace "
+        f"{current_workspace}"
+    )
+
+
 async def _merge_video_files(
     *,
     ffmpeg: str,
@@ -1235,6 +2611,7 @@ async def _merge_video_files(
     entity_id: str,
     output_name: str,
     workspace_id: str | None,
+    task_id: str | None = None,
     inputs: list[VideoInput],
     width: int,
     height: int,
@@ -1255,6 +2632,7 @@ async def _merge_video_files(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     target = build_generated_media_target(
         prompt=output_name,
@@ -1265,7 +2643,7 @@ async def _merge_video_files(
         ),
         ext=".mp4",
         fallback="merged-video",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, "videos"),
+        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.VIDEOS.value),
         entity_root=entity_root,
     )
     if not target.abs_dir or not target.abs_path:
@@ -1278,8 +2656,13 @@ async def _merge_video_files(
         normalized_paths: list[str] = []
         for index, item in enumerate(inputs, start=1):
             media_info = await _probe_media(ffprobe, item.abs_path)
-            duration = media_info.get("duration_seconds") or 0.0
-            total_duration += duration
+            source_duration = float(media_info.get("duration_seconds") or 0.0)
+            trim_start, trim_end, planned_duration = _resolve_clip_window(
+                source_duration=source_duration,
+                start_seconds=item.start_seconds,
+                end_seconds=item.end_seconds,
+                speed=item.speed,
+            )
             normalized_path = os.path.join(tmp_dir, f"clip-{index:03d}.mp4")
             await _normalize_clip(
                 ffmpeg=ffmpeg,
@@ -1290,10 +2673,18 @@ async def _merge_video_files(
                 fps=fps,
                 crf=crf,
                 preset=preset,
-                duration_seconds=duration,
+                start_seconds=trim_start,
+                source_duration_seconds=trim_end - trim_start,
+                output_duration_seconds=planned_duration,
+                speed=item.speed,
                 has_audio=bool(media_info.get("has_audio")),
                 include_source_audio=include_source_audio,
             )
+            normalized_info = await _probe_media(ffprobe, normalized_path)
+            rendered_duration = float(
+                normalized_info.get("duration_seconds") or planned_duration
+            )
+            total_duration += rendered_duration
             normalized_paths.append(normalized_path)
             input_payloads.append(
                 {
@@ -1301,7 +2692,12 @@ async def _merge_video_files(
                     "source_id": item.source_id,
                     "document_id": item.document_id,
                     "fs_path": item.rel_path,
-                    "duration_seconds": round(duration, 2),
+                    "label": item.label,
+                    "source_duration_seconds": round(source_duration, 3),
+                    "start_seconds": round(trim_start, 3),
+                    "end_seconds": round(trim_end, 3),
+                    "speed": round(item.speed, 3),
+                    "duration_seconds": round(rendered_duration, 3),
                     "has_audio": bool(media_info.get("has_audio")),
                     "source_audio_used": bool(include_source_audio and media_info.get("has_audio")),
                 }
@@ -1342,6 +2738,29 @@ async def _merge_video_files(
     return target.abs_path, target.rel_path, target.filename, input_payloads, total_duration
 
 
+async def _artifact_document_folder_id(
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    rel_path: str,
+) -> str | None:
+    if workspace_id:
+        from packages.core.services.workspace_artifacts import (
+            ensure_workspace_document_folder,
+        )
+
+        return await ensure_workspace_document_folder(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            rel_path=rel_path,
+        )
+    from packages.core.services.knowledge_sync import ensure_folder_path
+
+    rel_dir = str(Path(rel_path).parent).replace("\\", "/")
+    rel_dir = "" if rel_dir == "." else rel_dir
+    return await ensure_folder_path(entity_id, rel_dir)
+
+
 async def _register_merged_video(
     *,
     entity_id: str,
@@ -1365,11 +2784,11 @@ async def _register_merged_video(
     from packages.core.database import async_session
     from packages.core.services.document_metadata import merge_document_metadata
     from packages.core.services.document_service import upsert_document_by_fs_path
-    from packages.core.services.knowledge_sync import ensure_folder_path
-
-    rel_dir = str(Path(rel_path).parent).replace("\\", "/")
-    rel_dir = "" if rel_dir == "." else rel_dir
-    folder_id = await ensure_folder_path(entity_id, rel_dir)
+    folder_id = await _artifact_document_folder_id(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        rel_path=rel_path,
+    )
     async with async_session() as db:
         doc = await upsert_document_by_fs_path(
             db,
@@ -1731,11 +3150,11 @@ async def _register_video_editor_recipe(
     from packages.core.database import async_session
     from packages.core.services.document_metadata import merge_document_metadata
     from packages.core.services.document_service import upsert_document_by_fs_path
-    from packages.core.services.knowledge_sync import ensure_folder_path
-
-    rel_dir = str(Path(rel_path).parent).replace("\\", "/")
-    rel_dir = "" if rel_dir == "." else rel_dir
-    folder_id = await ensure_folder_path(entity_id, rel_dir)
+    folder_id = await _artifact_document_folder_id(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        rel_path=rel_path,
+    )
     async with async_session() as db:
         doc = await upsert_document_by_fs_path(
             db,
@@ -1824,6 +3243,7 @@ async def _build_media_target(
     *,
     entity_id: str,
     workspace_id: str | None,
+    task_id: str | None = None,
     output_name: str,
     ext: str,
     fallback: str,
@@ -1841,6 +3261,7 @@ async def _build_media_target(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     return build_generated_media_target(
         prompt=output_name or fallback,
@@ -1876,11 +3297,11 @@ async def _register_file_artifact(
     from packages.core.database import async_session
     from packages.core.services.document_metadata import merge_document_metadata
     from packages.core.services.document_service import upsert_document_by_fs_path
-    from packages.core.services.knowledge_sync import ensure_folder_path
-
-    rel_dir = str(Path(rel_path).parent).replace("\\", "/")
-    rel_dir = "" if rel_dir == "." else rel_dir
-    folder_id = await ensure_folder_path(entity_id, rel_dir)
+    folder_id = await _artifact_document_folder_id(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        rel_path=rel_path,
+    )
     async with async_session() as db:
         doc = await upsert_document_by_fs_path(
             db,
@@ -1942,8 +3363,17 @@ async def _bind_artifact_to_workspace(
     )
 
 
-def _load_timeline_json(entity_root: str, timeline_path: str, entity_id: str) -> dict[str, Any]:
-    rel_path = _rel_path_from_reference(timeline_path, entity_id) or timeline_path
+def _load_timeline_json(
+    entity_root: str,
+    timeline_path: str,
+    entity_id: str,
+    workspace_base_dir: str = "",
+) -> dict[str, Any]:
+    rel_path = _workspace_media_reference(
+        timeline_path,
+        entity_id=entity_id,
+        workspace_base_dir=workspace_base_dir,
+    )
     abs_path = _resolve_entity_file(entity_root, rel_path)
     if Path(abs_path).suffix.lower() != ".json":
         raise ValueError(f"Timeline must be a JSON file: {rel_path}")
@@ -1954,8 +3384,17 @@ def _load_timeline_json(entity_root: str, timeline_path: str, entity_id: str) ->
     return data
 
 
-def _load_entity_json(entity_root: str, path: str, entity_id: str) -> Any:
-    rel_path = _rel_path_from_reference(path, entity_id) or path
+def _load_entity_json(
+    entity_root: str,
+    path: str,
+    entity_id: str,
+    workspace_base_dir: str = "",
+) -> Any:
+    rel_path = _workspace_media_reference(
+        path,
+        entity_id=entity_id,
+        workspace_base_dir=workspace_base_dir,
+    )
     abs_path = _resolve_entity_file(entity_root, rel_path)
     if Path(abs_path).suffix.lower() != ".json":
         raise ValueError(f"JSON file expected: {rel_path}")
@@ -2006,6 +3445,30 @@ def _timeline_subtitle_style(
     if isinstance(override, dict):
         style.update(override)
     return {str(key): value for key, value in style.items() if value is not None}
+
+
+def _compose_subtitle_style(
+    *,
+    subtitle_path: str,
+    width: int,
+    height: int,
+    timeline: dict[str, Any],
+    explicit_override: dict[str, Any] | None,
+) -> dict[str, Any]:
+    explicit = {
+        str(key): value
+        for key, value in (explicit_override or {}).items()
+        if value is not None
+    }
+    requested = _timeline_subtitle_style(timeline, None)
+    requested.update(explicit)
+    if Path(subtitle_path).suffix.lower() == ".ass":
+        return requested
+    return _subtitle_style(
+        width,
+        height,
+        requested,
+    )
 
 
 def _timeline_ducking_config(
@@ -2069,6 +3532,7 @@ async def _resolve_timeline_audio_tracks(
     entity_id: str,
     timeline: dict[str, Any],
     enabled: bool,
+    workspace_base_dir: str = "",
 ) -> list[TimelineAudioTrack]:
     if not enabled:
         return []
@@ -2089,11 +3553,19 @@ async def _resolve_timeline_audio_tracks(
         raw_path = str(item.get("path") or item.get("fs_path") or "").strip()
         if not raw_path:
             continue
-        rel_path = _rel_path_from_reference(raw_path, entity_id) or raw_path
+        rel_path = _workspace_media_reference(
+            raw_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
         abs_path = _resolve_entity_file(entity_root, rel_path)
         _assert_audio_path(abs_path)
         start = _coerce_required_time(item.get("start"), f"audio_tracks[{index}].start")
         media_info = await _probe_media(ffprobe, abs_path)
+        if not media_info.get("has_audio"):
+            raise ValueError(
+                f"audio_tracks[{index}] source does not contain an audio stream: {rel_path}"
+            )
         source_duration = max(0.01, float(media_info.get("duration_seconds") or 0.01))
         end = _timeline_track_end(item, start, source_duration, index)
         if end <= start:
@@ -2116,6 +3588,14 @@ async def _resolve_timeline_audio_tracks(
             )
         )
     return tracks
+
+
+def _composition_duration(
+    clean_video_duration: float,
+    audio_tracks: list[TimelineAudioTrack],
+) -> float:
+    scheduled_audio_end = max((track.end for track in audio_tracks), default=0.0)
+    return max(0.0, float(clean_video_duration), scheduled_audio_end)
 
 
 def _timeline_audio_track_items(timeline: dict[str, Any]) -> tuple[Any, str]:
@@ -2774,6 +4254,674 @@ def _subtitle_track_types(value: list[str] | str | None) -> set[str]:
     return items or {"dialogue", "narration"}
 
 
+def _canonical_subtitle_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"\s+", "", normalized)
+
+
+def _canonical_sentences(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFC", str(text or "")).replace("\r\n", "\n")
+    return [
+        part.strip()
+        for part in re.split(r"(?<=[.!?。！？])\s*|\n+", normalized)
+        if part.strip()
+    ]
+
+
+def _semantic_alignment_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(
+        character
+        for character in normalized
+        if not character.isspace() and not unicodedata.category(character).startswith("P")
+    )
+
+
+class SubtitleWordTimestampsRequiredError(ValueError):
+    """Raised when a multi-sentence STT segment has no usable word timing."""
+
+
+def _word_units_for_segment(
+    segment: dict[str, Any],
+    words: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    try:
+        segment_start = float(segment["start"])
+        segment_end = float(segment["end"])
+    except (KeyError, TypeError, ValueError):
+        return []
+    units: list[dict[str, Any]] = []
+    for word in words:
+        try:
+            start = float(word["start"])
+            end = float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(word.get("text") or word.get("word") or "").strip()
+        midpoint = start + (end - start) / 2
+        if text and end > start and segment_start <= midpoint <= segment_end:
+            units.append({"start": start, "end": end, "text": text})
+    return sorted(units, key=lambda item: (item["start"], item["end"]))
+
+
+def _split_measured_segment_sentences(
+    sentences: list[str],
+    segments: list[dict[str, Any]],
+    words: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    expanded: list[dict[str, Any]] = []
+    canonical_cursor = 0
+    for segment in segments:
+        text = str(segment.get("text") or "")
+        parts = _canonical_sentences(text)
+        expected_segment = _semantic_alignment_text(text)
+        best_canonical: tuple[float, int] | None = None
+        for sentence_end in range(canonical_cursor, len(sentences)):
+            canonical_text = " ".join(sentences[canonical_cursor : sentence_end + 1])
+            actual_segment = _semantic_alignment_text(canonical_text)
+            score = (
+                SequenceMatcher(None, expected_segment, actual_segment).ratio()
+                if expected_segment and actual_segment
+                else 0.0
+            )
+            if best_canonical is None or score > best_canonical[0]:
+                best_canonical = (score, sentence_end)
+        if best_canonical is not None and best_canonical[0] >= 0.90:
+            sentence_end = best_canonical[1]
+            parts = sentences[canonical_cursor : sentence_end + 1]
+            canonical_cursor = sentence_end + 1
+        if len(parts) <= 1:
+            expanded.append(segment)
+            continue
+        word_units = _word_units_for_segment(segment, words)
+        if not word_units:
+            raise SubtitleWordTimestampsRequiredError(
+                "Measured alignment needs word-level timestamps when one STT segment "
+                "contains multiple canonical sentences."
+            )
+        cursor = 0
+        for part in parts:
+            expected = _semantic_alignment_text(part)
+            best: tuple[float, int] | None = None
+            combined: list[str] = []
+            for end_index in range(cursor, len(word_units)):
+                combined.append(str(word_units[end_index]["text"]))
+                actual = _semantic_alignment_text(" ".join(combined))
+                score = (
+                    SequenceMatcher(None, expected, actual).ratio()
+                    if expected and actual
+                    else 0.0
+                )
+                if best is None or score > best[0]:
+                    best = (score, end_index)
+            if best is None or best[0] < 0.90:
+                raise SubtitleWordTimestampsRequiredError(
+                    "The STT word-level timestamps could not be mapped to every sentence "
+                    "inside a multi-sentence segment."
+                )
+            end_index = best[1]
+            expanded.append(
+                {
+                    **segment,
+                    "start": word_units[cursor]["start"],
+                    "end": word_units[end_index]["end"],
+                    "text": part,
+                    "timing_source": "measured_stt_words",
+                }
+            )
+            cursor = end_index + 1
+    return expanded
+
+
+def _align_sentences_to_segments(
+    sentences: list[str],
+    segments: list[dict[str, Any]],
+    *,
+    words: list[dict[str, Any]] | None = None,
+) -> tuple[list[SubtitleCue], dict[str, Any]]:
+    segments = _split_measured_segment_sentences(sentences, segments, words or [])
+    cues: list[SubtitleCue] = []
+    scores: list[float] = []
+    aligned_sentence_indexes: list[int] = []
+    cursor = 0
+
+    for sentence_index, sentence in enumerate(sentences, start=1):
+        expected = _semantic_alignment_text(sentence)
+        best: tuple[float, int] | None = None
+        combined_parts: list[str] = []
+        for end in range(cursor, len(segments)):
+            combined_parts.append(str(segments[end].get("text") or ""))
+            actual = _semantic_alignment_text(" ".join(combined_parts))
+            score = SequenceMatcher(None, expected, actual).ratio() if expected and actual else 0.0
+            if best is None or score > best[0]:
+                best = (score, end)
+            if score >= 0.90:
+                break
+
+        if best is None or best[0] < 0.90:
+            continue
+
+        end = best[1]
+        try:
+            start_seconds = float(segments[cursor]["start"])
+            end_seconds = float(segments[end]["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end_seconds <= start_seconds:
+            continue
+        timing_sources = {
+            str(item.get("timing_source") or "measured_stt_segments")
+            for item in segments[cursor : end + 1]
+        }
+        timing_source = (
+            next(iter(timing_sources))
+            if len(timing_sources) == 1
+            else "mixed_measured_stt_timestamps"
+        )
+        cues.append(
+            SubtitleCue(
+                index=len(cues) + 1,
+                start=start_seconds,
+                end=end_seconds,
+                text=sentence,
+                cue_type="narration",
+                estimated=False,
+                measured=True,
+                timing_source=timing_source,
+            )
+        )
+        scores.append(best[0])
+        aligned_sentence_indexes.append(sentence_index)
+        cursor = end + 1
+
+    sentence_count = len(sentences)
+    aligned_set = set(aligned_sentence_indexes)
+    missing_sentence_indexes = [
+        index for index in range(1, sentence_count + 1) if index not in aligned_set
+    ]
+    return cues, {
+        "similarity": sum(scores) / sentence_count if sentence_count else 0.0,
+        "coverage": len(cues) / sentence_count if sentence_count else 0.0,
+        "aligned_sentence_indexes": aligned_sentence_indexes,
+        "missing_sentence_indexes": missing_sentence_indexes,
+        "timing_sources": sorted({cue.timing_source for cue in cues}),
+    }
+
+
+def _subtitle_font_size(width: int, height: int) -> int:
+    return max(16, min(56, round(min(width, height) * 14 / 288)))
+
+
+def _subtitle_margin_v(width: int, height: int) -> int:
+    return max(28, min(80, round(min(width, height) / 15)))
+
+
+def _subtitle_outline(width: int, height: int) -> int:
+    return max(1, min(2, round(min(width, height) / 540)))
+
+
+def _subtitle_style(
+    width: int,
+    height: int,
+    override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    style: dict[str, Any] = {
+        "font_size": _subtitle_font_size(width, height),
+        "margin_v": _subtitle_margin_v(width, height),
+        "outline": _subtitle_outline(width, height),
+        "shadow": 0,
+        "alignment": 2,
+        "max_lines": 2,
+    }
+    if isinstance(override, dict):
+        style.update({str(key): value for key, value in override.items() if value is not None})
+    return style
+
+
+def _subtitle_cues_match_transcript(
+    cues: list[SubtitleCue],
+    transcript: str,
+) -> bool:
+    cue_text = "".join(cue.text for cue in cues)
+    return bool(transcript.strip()) and (
+        _canonical_subtitle_text(cue_text) == _canonical_subtitle_text(transcript)
+    )
+
+
+async def _audio_prompt_matches_transcript(
+    *,
+    entity_id: str,
+    audio_rel_path: str,
+    transcript: str,
+) -> bool | None:
+    """Follow normalized-audio provenance to compare its TTS prompt when available."""
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.document import Document
+
+    current_path = _rel_path_from_reference(audio_rel_path, entity_id) or audio_rel_path
+    seen: set[str] = set()
+    async with async_session() as db:
+        for _depth in range(3):
+            current_path = str(current_path or "").strip()
+            if not current_path or current_path in seen:
+                return None
+            seen.add(current_path)
+            document = (
+                await db.execute(
+                    select(Document)
+                    .where(
+                        Document.entity_id == entity_id,
+                        Document.fs_path == current_path,
+                        Document.is_trashed == False,  # noqa: E712
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if document is None:
+                return None
+            generation = (document.metadata_ or {}).get("generation")
+            generation = generation if isinstance(generation, dict) else {}
+            prompt = generation.get("prompt")
+            if isinstance(prompt, str) and prompt.strip():
+                return _canonical_subtitle_text(prompt) == _canonical_subtitle_text(transcript)
+            source_path = generation.get("input_path") or generation.get("source_path")
+            if not isinstance(source_path, str) or not source_path.strip():
+                return None
+            current_path = _rel_path_from_reference(source_path, entity_id) or source_path
+    return None
+
+
+async def _transcribe_narration_audio(
+    *,
+    audio_path: str,
+    user_id: str,
+    entity_id: str,
+    reference_transcript: str = "",
+    workspace_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+) -> Any:
+    from packages.core.ai.runtime import (
+        RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+        runtime_assert_credit_available,
+    )
+    from packages.core.services.model_resolver import (
+        resolve_llm_metadata_for_user,
+        resolve_model_for_user,
+    )
+    from packages.core.services.voice.whisper import (
+        WHISPER_MAX_UPLOAD_BYTES,
+        WhisperUploadTooLargeError,
+        transcribe_blob,
+        whisper_cost_usd,
+    )
+
+    stt_model = await resolve_model_for_user(
+        "stt",
+        user_id=user_id or None,
+        entity_id=entity_id or None,
+    )
+    metadata = await resolve_llm_metadata_for_user(
+        "stt",
+        user_id=user_id or None,
+        entity_id=entity_id or None,
+    )
+    user_key = (metadata or {}).get("llm_api_key")
+    user_base_url = (metadata or {}).get("llm_base_url")
+    path = Path(audio_path)
+    file_size = path.stat().st_size
+    if file_size > WHISPER_MAX_UPLOAD_BYTES:
+        raise WhisperUploadTooLargeError(
+            f"Narration audio is too large: {file_size / 1024 / 1024:.1f} MB exceeds "
+            f"the {WHISPER_MAX_UPLOAD_BYTES // (1024 * 1024)} MB STT upload limit. "
+            "Export a shorter or compressed narration file and retry."
+        )
+    if not user_key:
+        await runtime_assert_credit_available(
+            entity_id,
+            source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+        )
+    transcribe_kwargs: dict[str, Any] = {
+        "mime": _audio_mime_from_path(audio_path),
+        "filename": path.name,
+        "user_api_key": user_key,
+        "resolved_model": stt_model,
+        "require_timestamps": True,
+        "reference_transcript": reference_transcript,
+    }
+    if user_base_url:
+        transcribe_kwargs["user_base_url"] = user_base_url
+    result = await transcribe_blob(
+        path.read_bytes(),
+        **transcribe_kwargs,
+    )
+    if not user_key:
+        try:
+            from packages.core.database import async_session
+            from packages.core.services.usage_service import record_media_usage
+
+            async with async_session() as db:
+                await record_media_usage(
+                    db,
+                    entity_id=entity_id,
+                    kind="whisper",
+                    model=result.model,
+                    cost_usd=whisper_cost_usd(result.duration_seconds, result.model),
+                    units=int(result.duration_seconds),
+                    workspace_id=workspace_id,
+                    user_id=user_id or None,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+                    byok=False,
+                )
+                await db.commit()
+        except Exception:
+            logger.debug("narration STT billing failed (best-effort)", exc_info=True)
+    return result
+
+
+def _sentence_indexes_for_text(text: str, sentences: list[str]) -> list[int]:
+    indexes: list[int] = []
+    cursor = 0
+    for part in _canonical_sentences(text):
+        expected = _semantic_alignment_text(part)
+        best: tuple[float, int] | None = None
+        for index in range(cursor, len(sentences)):
+            score = SequenceMatcher(
+                None,
+                expected,
+                _semantic_alignment_text(sentences[index]),
+            ).ratio()
+            if best is None or score > best[0]:
+                best = (score, index)
+        if best is None or best[0] < 0.90:
+            continue
+        indexes.append(best[1] + 1)
+        cursor = best[1] + 1
+    return indexes
+
+
+def _scene_time_range(item: dict[str, Any]) -> tuple[float | None, float | None]:
+    start = item.get("start", item.get("start_seconds"))
+    end = item.get("end", item.get("end_seconds"))
+    if start is not None or end is not None:
+        return (
+            _coerce_float(start, -1.0) if start is not None else None,
+            _coerce_float(end, -1.0) if end is not None else None,
+        )
+    for key in ("range", "time", "timeline_range"):
+        if item.get(key) is not None:
+            return _parse_timeline_range(item.get(key))
+    return None, None
+
+
+def _scene_sentence_indexes(item: dict[str, Any], sentences: list[str]) -> list[int]:
+    raw_indexes = item.get("sentence_indexes")
+    if isinstance(raw_indexes, list):
+        return sorted(
+            {
+                int(value)
+                for value in raw_indexes
+                if str(value).strip().lstrip("-").isdigit() and 1 <= int(value) <= len(sentences)
+            }
+        )
+
+    raw_range = item.get("sentence_range") or item.get("narration_sentence_range")
+    if isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
+        try:
+            start, end = int(raw_range[0]), int(raw_range[1])
+        except (TypeError, ValueError):
+            start = end = -1
+        if start == 0:
+            start += 1
+            end += 1
+        if 1 <= start <= end <= len(sentences):
+            return list(range(start, end + 1))
+
+    for key in ("narration_text", "narration", "subtitle", "subtitle_text", "text"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return _sentence_indexes_for_text(value, sentences)
+    return []
+
+
+def _scene_alignment_coverage(
+    payloads: list[Any],
+    sentences: list[str],
+    cues: list[SubtitleCue],
+    aligned_sentence_indexes: list[int],
+) -> dict[str, Any]:
+    declared: dict[str, dict[str, Any]] = {}
+    boundary_ranges: dict[str, list[tuple[float, float]]] = {}
+    cue_sentence_indexes: dict[str, set[int]] = {}
+
+    def scene_id_for(item: dict[str, Any]) -> str:
+        return str(item.get("scene_id") or "").strip()
+
+    def item_range(item: dict[str, Any]) -> tuple[float, float] | None:
+        start, end = _scene_time_range(item)
+        if start is None or end is None or start < 0 or end <= start:
+            return None
+        return start, end
+
+    def number_range(start_value: Any, end_value: Any) -> tuple[float, float] | None:
+        if start_value is None or end_value is None:
+            return None
+        start = _coerce_float(start_value, -1.0)
+        end = _coerce_float(end_value, -1.0)
+        if start < 0 or end <= start:
+            return None
+        return start, end
+
+    def declare(item: dict[str, Any]) -> None:
+        scene_id = scene_id_for(item)
+        if not scene_id:
+            return
+        scene = declared.setdefault(
+            scene_id,
+            {"sentence_indexes": set(), "ranges": [], "narration_ranges": []},
+        )
+        scene["sentence_indexes"].update(_scene_sentence_indexes(item, sentences))
+        time_range = item_range(item)
+        if time_range is not None:
+            scene["ranges"].append(time_range)
+
+    def declare_visual_interval(item: dict[str, Any]) -> None:
+        scene_id = scene_id_for(item)
+        if not scene_id:
+            return
+        visual_range = number_range(
+            item.get("visual_start_seconds"),
+            item.get("visual_end_seconds"),
+        )
+        narration_range = number_range(
+            item.get("narration_start_seconds"),
+            item.get("narration_end_seconds"),
+        )
+        scene = declared.setdefault(
+            scene_id,
+            {"sentence_indexes": set(), "ranges": [], "narration_ranges": []},
+        )
+        if visual_range is not None:
+            scene["ranges"].append(visual_range)
+        if narration_range is not None:
+            scene["narration_ranges"].append(narration_range)
+            start, end = narration_range
+            scene["sentence_indexes"].update(
+                sentence_index
+                for sentence_index, cue in zip(
+                    aligned_sentence_indexes,
+                    cues,
+                    strict=False,
+                )
+                if cue.end > start and cue.start < end
+            )
+
+    def collect_boundary(item: dict[str, Any]) -> None:
+        scene_id = scene_id_for(item)
+        time_range = item_range(item)
+        if scene_id and time_range is not None:
+            boundary_ranges.setdefault(scene_id, []).append(time_range)
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        scenes = payload.get("scenes")
+        if isinstance(scenes, list):
+            for item in scenes:
+                if isinstance(item, dict):
+                    declare(item)
+        segments = payload.get("segments")
+        if isinstance(segments, list):
+            for item in segments:
+                if (
+                    isinstance(item, dict)
+                    and scene_id_for(item)
+                    and item_range(item) is not None
+                ):
+                    declare(item)
+        visual_scene_intervals = payload.get("visual_scene_intervals")
+        if isinstance(visual_scene_intervals, list):
+            for item in visual_scene_intervals:
+                if isinstance(item, dict):
+                    declare_visual_interval(item)
+        for key in ("scene_boundaries", "canonical_scene_boundaries"):
+            boundaries = payload.get(key)
+            if isinstance(boundaries, list):
+                for item in boundaries:
+                    if isinstance(item, dict):
+                        collect_boundary(item)
+        for item in _timeline_video_items(payload):
+            collect_boundary(item)
+        for item in _subtitle_items_from_payload(payload):
+            if not isinstance(item, dict):
+                continue
+            scene_id = scene_id_for(item)
+            if scene_id:
+                cue_sentence_indexes.setdefault(scene_id, set()).update(
+                    _sentence_indexes_for_text(_subtitle_text(item), sentences)
+                )
+
+    for scene_id, scene in declared.items():
+        scene["ranges"].extend(boundary_ranges.get(scene_id, []))
+        scene["sentence_indexes"].update(cue_sentence_indexes.get(scene_id, set()))
+
+    aligned_cues = {
+        sentence_index: cue
+        for sentence_index, cue in zip(aligned_sentence_indexes, cues, strict=False)
+    }
+    covered_scene_ids: list[str] = []
+    missing_scene_ids: list[str] = []
+    missing_interval_scene_ids: list[str] = []
+    unmapped_scene_ids: list[str] = []
+    for scene_id, scene in declared.items():
+        if not scene["ranges"]:
+            missing_interval_scene_ids.append(scene_id)
+            missing_scene_ids.append(scene_id)
+            continue
+        if not scene["sentence_indexes"]:
+            unmapped_scene_ids.append(scene_id)
+            missing_scene_ids.append(scene_id)
+            continue
+        alignment_ranges = scene["narration_ranges"] or scene["ranges"]
+        covered = any(
+            sentence_index in aligned_cues
+            and aligned_cues[sentence_index].end > start
+            and aligned_cues[sentence_index].start < end
+            for sentence_index in scene["sentence_indexes"]
+            for start, end in alignment_ranges
+        )
+        (covered_scene_ids if covered else missing_scene_ids).append(scene_id)
+
+    declared_count = len(declared)
+    return {
+        "coverage": len(covered_scene_ids) / declared_count if declared_count else 1.0,
+        "covered_scene_ids": covered_scene_ids,
+        "missing_scene_ids": missing_scene_ids,
+        "missing_interval_scene_ids": missing_interval_scene_ids,
+        "unmapped_scene_ids": unmapped_scene_ids,
+    }
+
+
+def _subtitle_cues_have_measured_timing(cues: list[SubtitleCue]) -> bool:
+    return bool(cues) and all(cue.measured and not cue.estimated for cue in cues)
+
+
+def _scale_subtitle_cues_to_duration(
+    cues: list[SubtitleCue],
+    duration_seconds: float,
+) -> list[SubtitleCue]:
+    if not cues or duration_seconds <= 0:
+        return cues
+    source_end = max(cue.end for cue in cues)
+    if source_end <= 0:
+        return cues
+    scale = duration_seconds / source_end
+    scaled: list[SubtitleCue] = []
+    for index, cue in enumerate(cues):
+        end = duration_seconds if index == len(cues) - 1 else round(cue.end * scale, 3)
+        scaled.append(
+            SubtitleCue(
+                index=cue.index,
+                start=round(cue.start * scale, 3),
+                end=round(end, 3),
+                text=cue.text,
+                cue_type=cue.cue_type,
+                source_path=cue.source_path,
+                estimated=cue.estimated or abs(scale - 1.0) > 0.001,
+                measured=False,
+                timing_source="proportional_duration_scale",
+            )
+        )
+    return scaled
+
+
+def _fit_subtitle_cues_to_line_limit(
+    cues: list[SubtitleCue],
+    *,
+    max_chars_per_line: int,
+    max_lines: int = 2,
+) -> list[SubtitleCue]:
+    """Split long cues while preserving their text order and timing span."""
+    line_width = max(1, int(max_chars_per_line))
+    line_limit = max(1, int(max_lines))
+    fitted: list[SubtitleCue] = []
+
+    for cue in cues:
+        wrapped_lines = _wrap_subtitle_text(cue.text, line_width).splitlines()
+        chunks = [
+            " ".join(wrapped_lines[index:index + line_limit]).strip()
+            for index in range(0, len(wrapped_lines), line_limit)
+        ] or [cue.text]
+        weights = [max(1, len(_canonical_subtitle_text(chunk))) for chunk in chunks]
+        total_weight = sum(weights)
+        cue_duration = max(0.0, cue.end - cue.start)
+        elapsed_weight = 0
+
+        for chunk_index, (chunk, weight) in enumerate(zip(chunks, weights, strict=True)):
+            start = cue.start + cue_duration * elapsed_weight / total_weight
+            elapsed_weight += weight
+            end = (
+                cue.end
+                if chunk_index == len(chunks) - 1
+                else cue.start + cue_duration * elapsed_weight / total_weight
+            )
+            fitted.append(
+                replace(
+                    cue,
+                    index=len(fitted) + 1,
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    text=chunk,
+                )
+            )
+
+    return fitted
+
+
 async def _collect_subtitle_cues(
     *,
     ffprobe: str,
@@ -2782,6 +4930,7 @@ async def _collect_subtitle_cues(
     timeline: dict[str, Any],
     cue_payloads: list[Any],
     track_types: set[str],
+    workspace_base_dir: str = "",
 ) -> list[SubtitleCue]:
     raw_items: list[dict[str, Any]] = []
     raw_items.extend(_subtitle_items_from_payload(timeline))
@@ -2803,9 +4952,21 @@ async def _collect_subtitle_cues(
             ffprobe=ffprobe,
             entity_root=entity_root,
             entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
         )
         if end <= start:
             continue
+        estimated = bool(item.get("estimated", estimated))
+        timing_source = str(
+            item.get("timing_source") or item.get("timestamp_source") or ""
+        ).strip()
+        normalized_timing_source = timing_source.casefold().replace("-", "_")
+        measured = not estimated and (
+            item.get("measured") is True
+            or normalized_timing_source.startswith("measured")
+            or normalized_timing_source
+            in {"stt_segments", "speech_segments", "transcription_segments", "whisper_segments"}
+        )
         cues.append(
             SubtitleCue(
                 index=len(cues) + 1,
@@ -2815,6 +4976,8 @@ async def _collect_subtitle_cues(
                 cue_type=cue_type,
                 source_path=str(item.get("path") or item.get("fs_path") or ""),
                 estimated=estimated,
+                measured=measured,
+                timing_source=timing_source,
             )
         )
     cues.sort(key=lambda cue: (cue.start, cue.end))
@@ -2827,6 +4990,8 @@ async def _collect_subtitle_cues(
             cue_type=cue.cue_type,
             source_path=cue.source_path,
             estimated=cue.estimated,
+            measured=cue.measured,
+            timing_source=cue.timing_source,
         )
         for index, cue in enumerate(cues, start=1)
     ]
@@ -2876,6 +5041,7 @@ async def _subtitle_cue_end(
     ffprobe: str,
     entity_root: str,
     entity_id: str,
+    workspace_base_dir: str = "",
 ) -> tuple[float, bool]:
     if item.get("end") is not None:
         return _coerce_required_time(item.get("end"), "subtitle cue end"), False
@@ -2886,7 +5052,11 @@ async def _subtitle_cue_end(
     if raw_path:
         if not ffprobe:
             raise ValueError("ffprobe is required to derive subtitle end from audio duration")
-        rel_path = _rel_path_from_reference(raw_path, entity_id) or raw_path
+        rel_path = _workspace_media_reference(
+            raw_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
         abs_path = _resolve_entity_file(entity_root, rel_path)
         _assert_audio_path(abs_path)
         media_info = await _probe_media(ffprobe, abs_path)
@@ -2902,7 +5072,15 @@ def _render_subtitles(
     subtitle_format: str,
     max_chars_per_line: int,
     style: dict[str, Any],
+    canvas_width: int = 1920,
+    canvas_height: int = 1080,
 ) -> str:
+    resolved_style = _subtitle_style(canvas_width, canvas_height, style)
+    cues = _fit_subtitle_cues_to_line_limit(
+        cues,
+        max_chars_per_line=max_chars_per_line,
+        max_lines=int(_clamp_float(resolved_style.get("max_lines"), 1, 2, 2)),
+    )
     if subtitle_format == "vtt":
         body = ["WEBVTT", ""]
         for cue in cues:
@@ -2916,7 +5094,13 @@ def _render_subtitles(
             )
         return "\n".join(body)
     if subtitle_format == "ass":
-        return _render_ass_subtitles(cues, max_chars_per_line=max_chars_per_line, style=style)
+        return _render_ass_subtitles(
+            cues,
+            max_chars_per_line=max_chars_per_line,
+            style=resolved_style,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+        )
 
     body = []
     for cue in cues:
@@ -2936,14 +5120,16 @@ def _render_ass_subtitles(
     *,
     max_chars_per_line: int,
     style: dict[str, Any],
+    canvas_width: int = 1920,
+    canvas_height: int = 1080,
 ) -> str:
     force_style = _subtitle_force_style(style)
     style_map = _ass_style_map(force_style)
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 1920",
-        "PlayResY: 1080",
+        f"PlayResX: {canvas_width}",
+        f"PlayResY: {canvas_height}",
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
@@ -2976,14 +5162,24 @@ def _render_ass_subtitles(
 
 
 def _wrap_subtitle_text(text: str, max_chars_per_line: int) -> str:
+    limit = max(1, int(max_chars_per_line))
     words = text.split()
     if not words:
         return ""
     lines: list[str] = []
     current = ""
     for word in words:
+        if len(word) > limit:
+            if current:
+                lines.append(current)
+                current = ""
+            while len(word) > limit:
+                lines.append(word[:limit])
+                word = word[limit:]
+            current = word
+            continue
         candidate = f"{current} {word}".strip()
-        if current and len(candidate) > max_chars_per_line:
+        if current and len(candidate) > limit:
             lines.append(current)
             current = word
         else:
@@ -3104,6 +5300,7 @@ async def _compose_video_file(
     entity_id: str,
     output_name: str,
     workspace_id: str | None,
+    task_id: str | None = None,
     clean_video_abs: str,
     subtitle_abs: str,
     subtitle_style: dict[str, Any],
@@ -3114,6 +5311,7 @@ async def _compose_video_file(
     crf: int,
     preset: str,
     total_duration: float,
+    clean_video_duration: float | None = None,
 ) -> tuple[str, str, str]:
     from packages.core.services import entity_fs
     from packages.core.services.generated_media_naming import (
@@ -3127,6 +5325,7 @@ async def _compose_video_file(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     target = build_generated_media_target(
         prompt=output_name,
@@ -3137,7 +5336,7 @@ async def _compose_video_file(
         ),
         ext=".mp4",
         fallback="composed-video",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, "videos"),
+        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.VIDEOS.value),
         entity_root=entity_root,
     )
     if not target.abs_dir or not target.abs_path:
@@ -3152,9 +5351,16 @@ async def _compose_video_file(
 
     filter_parts: list[str] = []
     video_map = "0:v:0"
+    video_filters: list[str] = []
+    source_duration = total_duration if clean_video_duration is None else clean_video_duration
+    extension_seconds = max(0.0, total_duration - source_duration)
+    if extension_seconds > 0.001:
+        video_filters.append(f"tpad=stop_mode=clone:stop_duration={extension_seconds:.3f}")
     if subtitle_abs:
+        video_filters.append(f"subtitles={_subtitles_filter_value(subtitle_abs, subtitle_style)}")
+    if video_filters:
         video_map = "vout"
-        filter_parts.append(f"[0:v:0]subtitles={_subtitles_filter_value(subtitle_abs, subtitle_style)}[vout]")
+        filter_parts.append(f"[0:v:0]{','.join(video_filters)}[vout]")
 
     audio_labels: list[str] = []
     ducking_intervals = _ducking_intervals(audio_tracks, ducking_config)
@@ -3272,8 +5478,405 @@ async def _probe_media(ffprobe: str, path: str) -> dict[str, Any]:
         duration = float((data.get("format") or {}).get("duration") or 0.0)
     except (TypeError, ValueError):
         duration = 0.0
-    has_audio = any(stream.get("codec_type") == "audio" for stream in data.get("streams") or [])
+    stream_types = {
+        str(stream.get("codec_type") or "")
+        for stream in data.get("streams") or []
+    }
+    has_audio = "audio" in stream_types
+    if duration <= 0 and stream_types.intersection({"video", "audio"}):
+        selector = "v:0" if "video" in stream_types else "a:0"
+        try:
+            packet_stdout, _packet_stderr = await _run_process(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    selector,
+                    "-show_entries",
+                    "packet=pts_time,duration_time",
+                    "-of",
+                    "csv=p=0",
+                    path,
+                ],
+                timeout_seconds=60,
+            )
+            for line in (packet_stdout or "").splitlines():
+                fields = [field.strip() for field in line.split(",")]
+                try:
+                    pts = float(fields[0])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                try:
+                    packet_duration = max(0.0, float(fields[1]))
+                except (IndexError, TypeError, ValueError):
+                    packet_duration = 0.0
+                duration = max(duration, pts + packet_duration)
+        except Exception:
+            logger.debug("Packet timestamp duration probe failed for %s", path, exc_info=True)
     return {"duration_seconds": duration, "has_audio": has_audio}
+
+
+def _probe_number(value: Any, *, integer: bool = False) -> int | float:
+    try:
+        return int(value) if integer else float(value)
+    except (TypeError, ValueError):
+        return 0 if integer else 0.0
+
+
+def _probe_frame_rate(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if "/" not in text:
+        return float(_probe_number(text))
+    numerator, denominator = text.split("/", 1)
+    denominator_value = float(_probe_number(denominator))
+    if denominator_value == 0:
+        return 0.0
+    return float(_probe_number(numerator)) / denominator_value
+
+
+def _frame_sample_times(
+    *,
+    duration_seconds: float,
+    timestamps: list[float] | None,
+    scene_boundaries: list[float] | None,
+    interval_seconds: float,
+    max_samples: int,
+) -> list[float]:
+    duration = max(0.001, float(_probe_number(duration_seconds)))
+    end_margin = min(0.1, duration / 2)
+    end_time = round(max(0.0, duration - end_margin), 3)
+    candidates = {0.0, end_time}
+    for value in [*(timestamps or []), *(scene_boundaries or [])]:
+        number = float(_probe_number(value))
+        if 0 <= number < duration:
+            candidates.add(round(min(number, end_time), 3))
+
+    interval = max(0.25, float(_probe_number(interval_seconds)) or 10.0)
+    cursor = interval
+    while cursor < end_time:
+        candidates.add(round(cursor, 3))
+        cursor += interval
+
+    ordered = sorted(candidates)
+    limit = max(1, min(24, int(max_samples or 12)))
+    if len(ordered) <= limit:
+        return ordered
+    if limit == 1:
+        return [ordered[0]]
+    indexes = {
+        round(position * (len(ordered) - 1) / (limit - 1))
+        for position in range(limit)
+    }
+    thinned = [ordered[index] for index in sorted(indexes)]
+    if len(thinned) < limit:
+        for value in ordered:
+            if value not in thinned:
+                thinned.append(value)
+            if len(thinned) == limit:
+                break
+        thinned.sort()
+    return thinned
+
+
+def _last_ffmpeg_measurement(stderr: str, label: str, unit: str) -> float | None:
+    matches = re.findall(
+        rf"\b{re.escape(label)}:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*{re.escape(unit)}\b",
+        stderr or "",
+        flags=re.IGNORECASE,
+    )
+    for raw in reversed(matches):
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if value not in {float("inf"), float("-inf")}:
+            return value
+    return None
+
+
+def _parse_ebur128(stderr: str) -> dict[str, float | None]:
+    return {
+        "integrated_lufs": _last_ffmpeg_measurement(stderr, "I", "LUFS"),
+        "loudness_range_lu": _last_ffmpeg_measurement(stderr, "LRA", "LU"),
+        "true_peak_dbfs": _last_ffmpeg_measurement(stderr, "Peak", "dBFS"),
+    }
+
+
+def _parse_silence_intervals(
+    stderr: str,
+    *,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    duration = max(0.0, float(_probe_number(duration_seconds)))
+    intervals: list[dict[str, float]] = []
+    active_start: float | None = None
+    for line in (stderr or "").splitlines():
+        start_match = re.search(r"silence_start:\s*(-?\d+(?:\.\d+)?)", line)
+        if start_match:
+            active_start = max(0.0, min(duration, float(start_match.group(1))))
+        end_match = re.search(r"silence_end:\s*(-?\d+(?:\.\d+)?)", line)
+        if end_match and active_start is not None:
+            end = max(active_start, min(duration, float(end_match.group(1))))
+            intervals.append({
+                "start": round(active_start, 3),
+                "end": round(end, 3),
+                "duration_seconds": round(end - active_start, 3),
+            })
+            active_start = None
+    if active_start is not None and duration > active_start:
+        intervals.append({
+            "start": round(active_start, 3),
+            "end": round(duration, 3),
+            "duration_seconds": round(duration - active_start, 3),
+        })
+    total = round(sum(item["duration_seconds"] for item in intervals), 3)
+    leading = intervals[0]["duration_seconds"] if intervals and intervals[0]["start"] == 0 else 0.0
+    trailing = (
+        intervals[-1]["duration_seconds"]
+        if intervals and abs(intervals[-1]["end"] - duration) <= 0.001
+        else 0.0
+    )
+    return {
+        "intervals": intervals,
+        "total_silence_seconds": total,
+        "leading_silence_seconds": round(leading, 3),
+        "trailing_silence_seconds": round(trailing, 3),
+        "silence_ratio": round(min(1.0, total / duration), 4) if duration > 0 else 0.0,
+    }
+
+
+def _parse_subtitle_timestamp(value: str) -> float:
+    token = str(value or "").strip().split()[0].replace(",", ".")
+    parts = token.split(":")
+    if len(parts) not in {2, 3}:
+        raise ValueError(f"Invalid subtitle timestamp: {value}")
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+        else:
+            hours = 0
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid subtitle timestamp: {value}") from exc
+    if hours < 0 or minutes < 0 or minutes >= 60 or seconds < 0 or seconds >= 60:
+        raise ValueError(f"Invalid subtitle timestamp: {value}")
+    return round(hours * 3600 + minutes * 60 + seconds, 3)
+
+
+def _normalize_subtitle_text(value: str, *, ass: bool = False) -> tuple[str, int]:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    if ass:
+        text = text.replace(r"\N", "\n").replace(r"\n", "\n").replace(r"\h", " ")
+        text = re.sub(r"\{[^}]*\}", "", text)
+    else:
+        text = re.sub(r"<[^>]*>", "", text)
+    visible_lines = [" ".join(line.split()) for line in text.split("\n")]
+    normalized_lines = [line for line in visible_lines if line]
+    return "\n".join(normalized_lines), len(normalized_lines)
+
+
+def _parse_block_subtitles(content: str, subtitle_format: str) -> dict[str, Any]:
+    cues: list[dict[str, Any]] = []
+    normalized = str(content or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    for block in re.split(r"\n[ \t]*\n", normalized):
+        lines = block.strip("\n").split("\n")
+        timing_index = next((index for index, line in enumerate(lines) if "-->" in line), None)
+        if timing_index is None:
+            continue
+        timing = lines[timing_index].split("-->", 1)
+        start = _parse_subtitle_timestamp(timing[0])
+        end = _parse_subtitle_timestamp(timing[1])
+        raw_id = lines[timing_index - 1].strip() if timing_index > 0 else ""
+        cue_id = raw_id or str(len(cues) + 1)
+        text, line_count = _normalize_subtitle_text("\n".join(lines[timing_index + 1:]))
+        cues.append({
+            "id": cue_id,
+            "start": start,
+            "end": end,
+            "text": text,
+            "line_count": line_count,
+        })
+    return {
+        "format": subtitle_format,
+        "cues": cues,
+        "styles": {},
+        "play_res_y": None,
+    }
+
+
+def _parse_ass_subtitles(content: str) -> dict[str, Any]:
+    section = ""
+    style_fields: list[str] = []
+    event_fields: list[str] = []
+    styles: dict[str, dict[str, Any]] = {}
+    cues: list[dict[str, Any]] = []
+    play_res_y: int | None = None
+
+    for raw_line in str(content or "").lstrip("\ufeff").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        key, separator, raw_value = line.partition(":")
+        if not separator:
+            continue
+        key_lower = key.strip().lower()
+        value = raw_value.lstrip()
+        if section == "script info" and key_lower == "playresy":
+            play_res_y = int(_probe_number(value, integer=True)) or None
+            continue
+        if section in {"v4+ styles", "v4 styles"}:
+            if key_lower == "format":
+                style_fields = [field.strip().lower() for field in value.split(",")]
+                continue
+            if key_lower == "style" and style_fields:
+                values = [item.strip() for item in value.split(",", len(style_fields) - 1)]
+                if len(values) != len(style_fields):
+                    continue
+                style = dict(zip(style_fields, values, strict=True))
+                name = str(style.get("name") or "").strip()
+                if name:
+                    font_size = _probe_number(style.get("fontsize"))
+                    outline = _probe_number(style.get("outline"))
+                    shadow = _probe_number(style.get("shadow"))
+                    styles[name] = {
+                        "font_size": font_size if font_size > 0 else None,
+                        "outline": outline if style.get("outline") is not None else None,
+                        "shadow": shadow if style.get("shadow") is not None else None,
+                        "alignment": int(_probe_number(style.get("alignment"), integer=True)),
+                        "margin_v": int(_probe_number(style.get("marginv"), integer=True)),
+                    }
+                continue
+        if section != "events":
+            continue
+        if key_lower == "format":
+            event_fields = [field.strip().lower() for field in value.split(",")]
+            continue
+        if key_lower != "dialogue" or not event_fields:
+            continue
+        values = [item.strip() for item in value.split(",", len(event_fields) - 1)]
+        if len(values) != len(event_fields):
+            continue
+        event = dict(zip(event_fields, values, strict=True))
+        if not event.get("start") or not event.get("end"):
+            continue
+        text, line_count = _normalize_subtitle_text(event.get("text", ""), ass=True)
+        cues.append({
+            "id": str(len(cues) + 1),
+            "start": _parse_subtitle_timestamp(event["start"]),
+            "end": _parse_subtitle_timestamp(event["end"]),
+            "text": text,
+            "line_count": line_count,
+            "style": str(event.get("style") or "Default").strip() or "Default",
+        })
+    return {
+        "format": "ass",
+        "cues": cues,
+        "styles": styles,
+        "play_res_y": play_res_y,
+    }
+
+
+def _parse_subtitle_content(content: str, subtitle_format: str) -> dict[str, Any]:
+    selected_format = str(subtitle_format or "").strip().lower().lstrip(".")
+    if selected_format in {"srt", "vtt"}:
+        return _parse_block_subtitles(content, selected_format)
+    if selected_format == "ass":
+        return _parse_ass_subtitles(content)
+    raise ValueError(f"Unsupported subtitle format: {subtitle_format}")
+
+
+async def _probe_media_report(ffprobe: str, path: str) -> dict[str, Any]:
+    stdout, _stderr = await _run_process(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration,format_name,bit_rate,size",
+            "-show_entries",
+            (
+                "stream=index,codec_type,codec_name,width,height,pix_fmt,r_frame_rate,"
+                "avg_frame_rate,display_aspect_ratio,sample_rate,channels,channel_layout,duration"
+            ),
+            "-of",
+            "json",
+            path,
+        ],
+        timeout_seconds=60,
+    )
+    try:
+        data = json.loads(stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ffprobe returned invalid JSON for {path}") from exc
+    streams = [item for item in (data.get("streams") or []) if isinstance(item, dict)]
+    media_streams = [
+        item for item in streams if str(item.get("codec_type") or "") in {"video", "audio"}
+    ]
+    if not media_streams:
+        raise RuntimeError(f"ffprobe found no audio or video streams in {path}")
+
+    format_info = data.get("format") if isinstance(data.get("format"), dict) else {}
+    duration = float(_probe_number(format_info.get("duration")))
+    if duration <= 0:
+        duration = max(
+            (float(_probe_number(stream.get("duration"))) for stream in media_streams),
+            default=0.0,
+        )
+    video = next((item for item in media_streams if item.get("codec_type") == "video"), None)
+    audio = next((item for item in media_streams if item.get("codec_type") == "audio"), None)
+    video_report = None
+    if video is not None:
+        video_report = {
+            "index": int(_probe_number(video.get("index"), integer=True)),
+            "codec": str(video.get("codec_name") or ""),
+            "width": int(_probe_number(video.get("width"), integer=True)),
+            "height": int(_probe_number(video.get("height"), integer=True)),
+            "pixel_format": str(video.get("pix_fmt") or ""),
+            "frame_rate": _probe_frame_rate(video.get("r_frame_rate")),
+            "average_frame_rate": _probe_frame_rate(video.get("avg_frame_rate")),
+            "display_aspect_ratio": str(video.get("display_aspect_ratio") or ""),
+            "duration_seconds": float(_probe_number(video.get("duration"))),
+        }
+    audio_report = None
+    if audio is not None:
+        audio_report = {
+            "index": int(_probe_number(audio.get("index"), integer=True)),
+            "codec": str(audio.get("codec_name") or ""),
+            "sample_rate": int(_probe_number(audio.get("sample_rate"), integer=True)),
+            "channels": int(_probe_number(audio.get("channels"), integer=True)),
+            "channel_layout": str(audio.get("channel_layout") or ""),
+            "duration_seconds": float(_probe_number(audio.get("duration"))),
+        }
+    return {
+        "decodable": True,
+        "duration_seconds": duration,
+        "format_names": [
+            name for name in str(format_info.get("format_name") or "").split(",") if name
+        ],
+        "bit_rate": int(_probe_number(format_info.get("bit_rate"), integer=True)),
+        "size_bytes": int(_probe_number(format_info.get("size"), integer=True)),
+        "has_video": video is not None,
+        "has_audio": audio is not None,
+        "video_stream": video_report,
+        "audio_stream": audio_report,
+        "streams": [
+            {
+                "index": int(_probe_number(stream.get("index"), integer=True)),
+                "codec_type": str(stream.get("codec_type") or ""),
+                "codec": str(stream.get("codec_name") or ""),
+            }
+            for stream in media_streams
+        ],
+    }
 
 
 async def _normalize_clip(
@@ -3286,18 +5889,35 @@ async def _normalize_clip(
     fps: int,
     crf: int,
     preset: str,
-    duration_seconds: float,
-    has_audio: bool,
-    include_source_audio: bool,
+    duration_seconds: float | None = None,
+    start_seconds: float = 0.0,
+    source_duration_seconds: float | None = None,
+    output_duration_seconds: float | None = None,
+    speed: float = 1.0,
+    has_audio: bool = False,
+    include_source_audio: bool = False,
 ) -> None:
+    source_span = max(
+        0.1,
+        float(source_duration_seconds if source_duration_seconds is not None else duration_seconds or 0.1),
+    )
+    output_span = max(
+        0.1,
+        float(output_duration_seconds if output_duration_seconds is not None else source_span / speed),
+    )
+    speed_filter = f",setpts=PTS/{speed:.6f}" if abs(speed - 1.0) > 0.000001 else ""
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-        f"setsar=1,fps={fps},format=yuv420p"
+        f"setsar=1{speed_filter},fps={fps},format=yuv420p"
     )
     base = [
         ffmpeg,
         "-y",
+        "-ss",
+        f"{start_seconds:.3f}",
+        "-t",
+        f"{source_span:.3f}",
         "-i",
         input_path,
     ]
@@ -3318,6 +5938,8 @@ async def _normalize_clip(
             str(crf),
             "-c:a",
             "aac",
+            "-filter:a",
+            _atempo_filter(speed),
             "-ar",
             "48000",
             "-ac",
@@ -3326,7 +5948,7 @@ async def _normalize_clip(
             output_path,
         ]
     else:
-        silent_duration = max(0.1, duration_seconds or 0.1)
+        silent_duration = output_span
         args = [
             *base,
             "-f",
@@ -3356,7 +5978,46 @@ async def _normalize_clip(
             "-shortest",
             output_path,
         ]
-    await _run_process(args, timeout_seconds=max(120.0, duration_seconds * 8.0 + 60.0))
+    await _run_process(
+        args,
+        timeout_seconds=max(
+            120.0,
+            max(source_span, output_span) * 8.0 + 60.0,
+        ),
+    )
+
+
+def _resolve_clip_window(
+    *,
+    source_duration: float,
+    start_seconds: float,
+    end_seconds: float | None,
+    speed: float,
+) -> tuple[float, float, float]:
+    if source_duration <= 0:
+        raise ValueError("Video source has no measurable duration")
+    if not 0.25 <= speed <= 8.0:
+        raise ValueError("Clip speed must be between 0.25 and 8")
+    start = max(0.0, float(start_seconds or 0.0))
+    if start >= source_duration:
+        raise ValueError("Clip starts after the source ends")
+    end = source_duration if end_seconds is None else min(float(end_seconds), source_duration)
+    if end <= start:
+        raise ValueError("Clip end must be greater than its start")
+    return start, end, (end - start) / speed
+
+
+def _atempo_filter(speed: float) -> str:
+    remaining = float(speed)
+    factors: list[float] = []
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
 async def _run_process(args: list[str], *, timeout_seconds: float) -> tuple[str, str]:
@@ -3491,6 +6152,42 @@ def _rel_path_from_reference(value: str | None, entity_id: str) -> str:
     if path.startswith(alt_marker):
         return _normalize_user_path(unquote(path[len(alt_marker):]))
     return ""
+
+
+def _workspace_media_reference(
+    value: str | None,
+    *,
+    entity_id: str,
+    workspace_base_dir: str = "",
+) -> str:
+    """Resolve a media input reference inside its Workspace storage root."""
+    from packages.core.services.generated_media_naming import scope_workspace_artifact_path
+
+    rel_path = _rel_path_from_reference(value, entity_id) or str(value or "").strip()
+    if not rel_path:
+        return ""
+    if workspace_base_dir:
+        rel_path = scope_workspace_artifact_path(rel_path, workspace_base_dir)
+    return _normalize_user_path(rel_path)
+
+
+async def _workspace_media_base_dir(
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    task_id: str | None = None,
+) -> str:
+    if not str(workspace_id or "").strip():
+        return ""
+    from packages.core.services.generated_media_naming import (
+        resolve_workspace_artifact_base_dir,
+    )
+
+    return await resolve_workspace_artifact_base_dir(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
 
 
 def _normalize_user_path(path: str) -> str:
@@ -3683,6 +6380,10 @@ def _json_error(message: str, *, code: str = "invalid_request") -> str:
     return _json({"status": "error", "code": code, "error": message})
 
 
+def _json_blocked(message: str, *, code: str, **details: Any) -> str:
+    return _json({"status": "blocked", "code": code, "error": message, **details})
+
+
 def get_tools():
     return [
         (WAIT_MEDIA_JOBS_SCHEMA, _wait_media_jobs_handler),
@@ -3690,4 +6391,9 @@ def get_tools():
         (ALIGN_SUBTITLES_SCHEMA, _align_subtitles_handler),
         (NORMALIZE_AUDIO_LOUDNESS_SCHEMA, _normalize_audio_loudness_handler),
         (COMPOSE_VIDEO_TIMELINE_SCHEMA, _compose_video_timeline_handler),
+        (PROBE_MEDIA_SCHEMA, _probe_media_handler),
+        (RENDER_FRAME_SAMPLES_SCHEMA, _render_frame_samples_handler),
+        (ANALYZE_AUDIO_SCHEMA, _analyze_audio_handler),
+        (VALIDATE_SUBTITLES_SCHEMA, _validate_subtitles_handler),
+        (STILL_TO_VIDEO_SCHEMA, _still_to_video_handler),
     ]

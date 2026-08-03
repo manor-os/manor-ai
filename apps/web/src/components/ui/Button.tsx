@@ -10,6 +10,7 @@ interface ButtonProps {
   className?: string;
   style?: React.CSSProperties;
   type?: "button" | "submit";
+  form?: string;
   title?: string;
   ariaLabel?: string;
 }
@@ -38,6 +39,7 @@ export default function Button({
   className = "",
   style,
   type = "button",
+  form,
   title,
   ariaLabel,
 }: ButtonProps) {
@@ -47,6 +49,7 @@ export default function Button({
   return (
     <button
       type={type}
+      form={form}
       className={`${base} ${className}`}
       style={{
         ...(size !== "lg" ? sizeStyles[size] : {}),

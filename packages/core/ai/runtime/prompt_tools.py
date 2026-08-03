@@ -54,7 +54,7 @@ def runtime_populate_tools_for_prompt_context(
     bound_tool_names: set[str] | None,
     is_master: bool,
     mcp_allowed_names: set[str] | None,
-    legacy_tool_profile: str | None,
+    tool_profile: str | None,
 ) -> tuple[list[dict], set[str]]:
     """Resolve turn-scoped tools and attach them to a prompt context."""
     from packages.core.ai.runtime.tool_registry import runtime_tool_schemas_for_agent
@@ -66,7 +66,7 @@ def runtime_populate_tools_for_prompt_context(
         bound_tool_names=bound_tool_names,
         is_master=is_master,
         mcp_allowed_names=mcp_allowed_names,
-        legacy_tool_profile=legacy_tool_profile,
+        tool_profile=tool_profile,
     )
     try:
         surface = ChatSurface(str(getattr(ctx, "runtime_surface", "") or ""))

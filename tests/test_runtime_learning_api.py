@@ -230,6 +230,107 @@ async def test_agent_runtime_learning_can_be_disabled(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_agent_runtime_learning_endpoints_show_only_that_agent(client: AsyncClient):
+    _, headers = await _register(client, username="agentlearnview")
+    workspace_resp = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Visible Learning WS"},
+    )
+    assert workspace_resp.status_code == 201
+    workspace_id = workspace_resp.json()["id"]
+
+    agent_resp = await client.post(
+        "/api/v1/agents",
+        headers=headers,
+        json={"name": "Learning Viewer Agent"},
+    )
+    assert agent_resp.status_code == 201
+    agent_id = agent_resp.json()["id"]
+
+    other_agent_resp = await client.post(
+        "/api/v1/agents",
+        headers=headers,
+        json={"name": "Other Learning Agent"},
+    )
+    assert other_agent_resp.status_code == 201
+    other_agent_id = other_agent_resp.json()["id"]
+
+    import packages.core.database as db_module
+    from packages.core.models.user import User
+    from packages.core.services.runtime_learning import record_chat_run_evidence
+
+    async with db_module.async_session() as db:
+        user = (
+            await db.execute(select(User).where(User.email == "agentlearnview@test.com"))
+        ).scalar_one()
+        evidence, candidates = await record_chat_run_evidence(
+            db,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            conversation_id="conv_agent_learning",
+            message_id="msg_agent_learning",
+            trace_id="trace_agent_learning",
+            user_message="以后请始终先给出简短结论，再展示细节。",
+            assistant_content="明白，我会先给出结论。",
+            tool_calls_made=["generate_file"],
+            usage={"total_tokens": 24},
+            rounds=1,
+            stop_reason="completed",
+        )
+        assert evidence is not None
+        assert candidates
+
+        other_evidence, other_candidates = await record_chat_run_evidence(
+            db,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            workspace_id=workspace_id,
+            agent_id=other_agent_id,
+            conversation_id="conv_other_learning",
+            message_id="msg_other_learning",
+            trace_id="trace_other_learning",
+            user_message="以后使用另一套输出格式。",
+            assistant_content="收到。",
+            tool_calls_made=[],
+            rounds=1,
+            stop_reason="completed",
+        )
+        assert other_evidence is not None
+        assert other_candidates
+        await db.commit()
+
+    evidence_resp = await client.get(
+        f"/api/v1/agents/{agent_id}/runtime/evidence",
+        headers=headers,
+    )
+    assert evidence_resp.status_code == 200
+    evidence_rows = evidence_resp.json()
+    assert evidence_rows
+    assert all(row["agent_id"] == agent_id for row in evidence_rows)
+    assert evidence_rows[0]["metrics"]["total_tokens"] == 24
+
+    candidates_resp = await client.get(
+        f"/api/v1/agents/{agent_id}/learning-candidates?status=",
+        headers=headers,
+    )
+    assert candidates_resp.status_code == 200
+    candidate_rows = candidates_resp.json()
+    assert candidate_rows
+    assert all(row["agent_id"] == agent_id for row in candidate_rows)
+    assert any(row["candidate_type"] == "memory" for row in candidate_rows)
+
+    _, outsider_headers = await _register(client, username="agentlearnoutsider")
+    outsider_resp = await client.get(
+        f"/api/v1/agents/{agent_id}/learning-candidates",
+        headers=outsider_headers,
+    )
+    assert outsider_resp.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_workspace_runtime_learning_endpoints(client: AsyncClient, tmp_path, monkeypatch):
     from packages.core.config import get_settings
 

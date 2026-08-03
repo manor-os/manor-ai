@@ -34,7 +34,7 @@ def test_exec_subagent_only_forwards_supported_loop_kwargs(monkeypatch):
         system_prompt="sys",
         runtime_envelope=None,
         tools=[],
-        legacy_runtime_profile="profile",
+        tool_profile="profile",
         allowed_tool_names=set(),
         model="model-x",
         llm_metadata=None,

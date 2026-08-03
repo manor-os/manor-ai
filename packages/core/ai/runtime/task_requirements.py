@@ -27,6 +27,7 @@ STRATEGIST_TASK_CAPABILITY_IDS = (
     "file.write",
     "sandbox.execute",
     "automation.manage",
+    "workflow.manage",
     "manor.composite",
 )
 

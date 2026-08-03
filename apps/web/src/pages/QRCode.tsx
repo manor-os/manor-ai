@@ -45,7 +45,7 @@ export default function QRCode() {
   }, [text]);
 
   return (
-    <div className="max-w-3xl mx-auto animate-fade-in">
+    <div className="max-w-3xl animate-fade-in">
       <PageHeader
         title={t("page.qr.title")}
         subtitle={t("page.qr.subtitle")}

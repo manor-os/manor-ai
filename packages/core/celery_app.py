@@ -7,6 +7,12 @@ import os
 from celery import Celery
 from celery.schedules import crontab
 from celery.signals import worker_process_init, worker_process_shutdown
+from kombu import Queue
+
+from packages.core.queues import CeleryQueue, route_task
+from packages.core.services.step_deadline import (
+    CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS,
+)
 
 # Broker and result backend from environment
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/2")
@@ -30,9 +36,42 @@ celery_app.conf.update(
     # Reliability
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    # ``task_acks_late`` only means "ack when the task finishes" — it is the
+    # BROKER that decides how long it waits for that ack before handing the
+    # message to somebody else. Redis has no server-side ack, so kombu emulates
+    # one with ``visibility_timeout``, whose default is ONE HOUR: without this
+    # setting every step still running at the 60-minute mark was re-delivered
+    # to a second worker while the first was still executing it. The value is
+    # derived from the step-deadline ceiling so the ordering
+    # "visibility timeout > celery hard limit > step deadline" cannot silently
+    # invert — see packages/core/services/step_deadline.py.
+    broker_transport_options={
+        "visibility_timeout": CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS,
+    },
+    # The result backend speaks the same Redis dialect and applies the same
+    # default; keep them aligned so a long task's bookkeeping isn't reaped early.
+    result_backend_transport_options={
+        "visibility_timeout": CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS,
+    },
     # Worker
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=100,
+    # Queues — work is separated from the control plane so concurrent long
+    # steps can no longer starve internal_worker_tick / cleanup_expired_leases /
+    # scheduler.tick. Every task's queue comes from the explicit registry in
+    # packages/core/queues.py (a dotted-name lookup, never a prefix match); the
+    # default queue keeps its historical name so a worker started without -Q
+    # still consumes the whole control plane.
+    # ``routing_key`` is pinned to the queue name on purpose: the Redis
+    # transport resolves a direct-exchange message to the list named by the
+    # routing key, and celery's default routing key is "celery" — leaving it
+    # implicit would silently deliver every work task back into the control
+    # plane's list.
+    task_queues=tuple(
+        Queue(queue.value, routing_key=queue.value) for queue in CeleryQueue
+    ),
+    task_default_queue=CeleryQueue.CONTROL.value,
+    task_routes=(route_task,),
     # Timezone
     timezone="UTC",
     enable_utc=True,
@@ -47,6 +86,7 @@ celery_app.conf.include = [
     "packages.core.tasks.scheduler_tasks",
     "packages.core.tasks.oauth_refresh",
     "packages.core.tasks.channel_tasks",
+    "packages.core.tasks.metrics_tasks",
     "packages.core.tasks.ops_tasks",
     "packages.core.tasks.deletion_tasks",
     "packages.core.tasks.maintenance_tasks",
@@ -62,6 +102,20 @@ celery_app.conf.beat_schedule = {
     "daily-health-briefing": {
         "task": "monitor.daily_health_briefing",
         "schedule": crontab(hour=8, minute=0),
+    },
+    "media-reference-cleanup": {
+        # Provider input snapshots (uploads/media-references/<job id>/), not
+        # deliverables. Daily sweep, 30-day retention by default.
+        "task": "media.cleanup_media_references",
+        "schedule": crontab(hour=4, minute=30),
+    },
+    "entity-chat-extraction-sweep": {
+        # Entity-level (workspace-less) chats have no per-workspace
+        # extraction job; this sweep gives the main assistant chat the
+        # same memory pipeline. Bookmark-guarded, so quiet entities cost
+        # one indexed query per pass.
+        "task": "memory.entity_chat_extraction_sweep",
+        "schedule": 6 * 3600.0,  # every 6h, matching workspace extraction
     },
     "heartbeat-check": {
         "task": "monitor.heartbeat_check",
@@ -127,12 +181,34 @@ celery_app.conf.beat_schedule = {
         "task": "monitor.workspace_readiness_check",
         "schedule": 600.0,  # every 10 minutes
     },
+    "experiment-guardrail-tick": {
+        # M13: stop running experiments on consecutive cohort failures /
+        # max_runs / expiry, remove their overlay, auto-evaluate. Pure DB
+        # arithmetic — cheap no-op when no experiment is running.
+        "task": "experiments.guardrail_tick",
+        "schedule": 300.0,  # every 5 minutes
+    },
     "budget-monthly-reset": {
         # Daily — first-of-month catches the calendar rollover, runs
         # on other days are cheap no-ops. Pairs with billing-cycle-check
         # above (different scope: per-workspace caps vs entity AI budgets).
         "task": "packages.core.tasks.ai_tasks.budget_monthly_reset",
         "schedule": crontab(hour=0, minute=5),
+    },
+    "metrics-daily-rollup": {
+        # Runs 15 minutes after midnight UTC so the prior day's data is
+        # fully written (no in-flight requests still landing rows dated
+        # "yesterday" at the stroke of midnight).
+        "task": "metrics.daily_rollup",
+        "schedule": crontab(hour=0, minute=15),
+    },
+    "metrics-http-flush": {
+        # Snapshot-sync the Redis HTTP traffic counters into
+        # http_request_hourly (reads the last few hour buckets;
+        # absolute-set upsert, so re-runs converge instead of
+        # double-counting).
+        "task": "metrics.http_flush",
+        "schedule": 300.0,  # every 5 minutes
     },
     "embedding-sweep-pending": {
         # Picks up documents stuck at 'pending' (task dispatch lost).
@@ -221,6 +297,7 @@ def _init_otel(**_kwargs: object) -> None:
         asyncio.run(sync_openrouter_pricing_cache(timeout_s=10.0))
     except Exception:
         pass
+
 
 
 @worker_process_shutdown.connect

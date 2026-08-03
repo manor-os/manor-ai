@@ -17,7 +17,7 @@ RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
         "_dependency_artifact_urls_from_context",
         "_manual_skill_selected_from_context",
         "_manual_skill_slugs_from_context",
-        "_legacy_tool_profile_from_context",
+        "_tool_profile_from_context",
         "_runtime_envelope_from_context",
         "_allowed_tool_names_from_context",
         "_llm_metadata_from_context",
@@ -25,6 +25,11 @@ RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
         "workspace_id",
         "conversation_id",
         "task_id",
+        "_workflow_project_id_from_context",
+        "_workflow_action_grant_id_from_context",
+        "_workflow_scene_id_from_context",
+        "_workflow_batch_capture_from_context",
+        "_approved_plan_version_from_context",
     }
 )
 
@@ -68,7 +73,7 @@ class RuntimeToolCallContext:
     dependency_artifact_urls: frozenset[str] = frozenset()
     manual_skill_selected: bool = False
     manual_skill_slugs: frozenset[str] = frozenset()
-    legacy_tool_profile: str | None = None
+    tool_profile: str | None = None
     runtime_envelope: Any | None = None
     allowed_tool_names: frozenset[str] | None = None
     llm_metadata: dict[str, Any] | None = None
@@ -76,6 +81,11 @@ class RuntimeToolCallContext:
     workspace_id: str | None = None
     conversation_id: str | None = None
     task_id: str | None = None
+    workflow_project_id: str | None = None
+    workflow_action_grant_id: str | None = None
+    workflow_scene_id: str | None = None
+    workflow_batch_capture: str | None = None
+    approved_plan_version: str | None = None
 
 
 def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeToolCallContext:
@@ -88,7 +98,7 @@ def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeTool
         dependency_artifact_urls=frozenset(_url_set(kwargs.get("_dependency_artifact_urls_from_context"))),
         manual_skill_selected=runtime_manual_skill_selected_from_context(kwargs),
         manual_skill_slugs=frozenset(runtime_manual_skill_slugs_from_context(kwargs)),
-        legacy_tool_profile=str(kwargs.get("_legacy_tool_profile_from_context") or "") or None,
+        tool_profile=str(kwargs.get("_tool_profile_from_context") or "") or None,
         runtime_envelope=kwargs.get("_runtime_envelope_from_context"),
         allowed_tool_names=frozenset(allowed) if allowed is not None else None,
         llm_metadata=(
@@ -100,6 +110,17 @@ def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeTool
         workspace_id=str(kwargs.get("workspace_id") or "") or None,
         conversation_id=str(kwargs.get("conversation_id") or "") or None,
         task_id=str(kwargs.get("task_id") or "") or None,
+        workflow_project_id=str(kwargs.get("_workflow_project_id_from_context") or "") or None,
+        workflow_action_grant_id=(
+            str(kwargs.get("_workflow_action_grant_id_from_context") or "") or None
+        ),
+        workflow_scene_id=str(kwargs.get("_workflow_scene_id_from_context") or "") or None,
+        workflow_batch_capture=(
+            str(kwargs.get("_workflow_batch_capture_from_context") or "") or None
+        ),
+        approved_plan_version=(
+            str(kwargs.get("_approved_plan_version_from_context") or "") or None
+        ),
     )
 
 
@@ -140,7 +161,7 @@ def runtime_injected_tool_context_args(
     dependency_artifact_urls: Iterable[str] | None = None,
     manual_skill_selected: bool = False,
     manual_skill_slugs: Iterable[str] | None = None,
-    legacy_tool_profile: str | None = None,
+    tool_profile: str | None = None,
     runtime_envelope: Any | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     llm_metadata: dict[str, Any] | None = None,
@@ -155,7 +176,7 @@ def runtime_injected_tool_context_args(
         "_active_user_message_from_context": active_user_message,
         "_manual_skill_selected_from_context": manual_skill_selected,
         "_manual_skill_slugs_from_context": list(manual_skill_slugs or []),
-        "_legacy_tool_profile_from_context": legacy_tool_profile,
+        "_tool_profile_from_context": tool_profile,
     }
     from packages.core.ai.runtime.artifacts import (
         runtime_current_artifact_urls,

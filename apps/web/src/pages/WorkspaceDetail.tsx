@@ -1,9 +1,17 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { Link, useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   api,
+  type AutomationHealthEntry,
   type GovernancePolicy,
+  type HumanBlockingEntry,
+  type HumanContributionDigest,
+  type HumanDecisionDigest,
+  type HumanParticipantDigest,
+  type HumanQueueCommitment,
+  type StrategyProposalItem,
+  type StrategyReviewListEntry,
   type WorkerRegisterResponse,
   type WorkspaceBudgetUpdate,
   type WorkspaceEvaluationSnapshot,
@@ -12,6 +20,8 @@ import { useToastStore } from "../stores/toast";
 import type { AgentLearningCandidate, RuntimeEvidence, Workspace, WorkspaceStaff, WorkspaceActivity } from "../lib/types";
 import { canManageWorkspace } from "../lib/permissions";
 import { useAuthStore } from "../stores/auth";
+import { useConfigStore } from "../stores/config";
+import { openAgentEditModal } from "../stores/agentEditModal";
 import { formatDate, relativeTime } from "../lib/format";
 import PageHeader from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
@@ -20,6 +30,7 @@ import Chip from "../components/ui/Chip";
 import GlassCard from "../components/ui/GlassCard";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
+import CelebrationFirework from "../components/ui/CelebrationFirework";
 import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import Button from "../components/ui/Button";
@@ -30,8 +41,16 @@ import Toggle from "../components/ui/Toggle";
 import UserAvatar from "../components/ui/UserAvatar";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import { PeoplePicker, type StaffOption } from "../components/permissions";
-import { IconInfo, IconDocument } from "../components/icons";
+import {
+  IconChat,
+  IconCopy,
+  IconDocument,
+  IconDownload,
+  IconInfo,
+  IconShare,
+} from "../components/icons";
 import WorkspaceGoalGraph from "../components/ui/WorkspaceGoalGraph";
+import WorkspaceWorkflows from "../components/workflows/WorkspaceWorkflows";
 import ScheduledJobs from "./ScheduledJobs";
 import ExportBlueprintModal from "../components/blueprints/ExportBlueprintModal";
 import { SUPPORTED_LOCALES, t } from "../lib/i18n";
@@ -74,6 +93,27 @@ const SECTION_TITLE: React.CSSProperties = {
   marginBottom: 16,
 };
 
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const el = document.createElement("textarea");
+      el.value = text;
+      el.style.position = "fixed";
+      el.style.opacity = "0";
+      document.body.appendChild(el);
+      el.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(el);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
 const CHANNEL_LANGUAGE_OPTIONS = SUPPORTED_LOCALES.map((locale) => ({
   value: locale.code,
   label: locale.name,
@@ -103,10 +143,7 @@ const TABLE_CELL: React.CSSProperties = {
   borderBottom: "1px solid #fafaf9",
 };
 
-type WorkspaceAgentSource =
-  | "hosted"
-  | "https"
-  | "custom";
+type WorkspaceAgentSource = "hosted" | "https" | "custom";
 
 type WorkspaceAgentForm = {
   source: WorkspaceAgentSource;
@@ -162,7 +199,7 @@ const KPI_CARD: React.CSSProperties = {
   padding: "20px 24px",
 };
 
-type Tab = "overview" | "staff" | "agents" | "capabilities" | "channels" | "documents" | "rules" | "goals" | "automations" | "learning" | "activity" | "settings";
+type Tab = "overview" | "staff" | "agents" | "capabilities" | "channels" | "documents" | "rules" | "goals" | "workflows" | "automations" | "learning" | "activity" | "settings";
 type PrimaryTab = "overview" | "configure" | "activity" | "settings";
 
 type EvaluationDimensionKey =
@@ -185,6 +222,7 @@ function _isWorkspaceDetailTab(value: string | null): value is Tab {
     "documents",
     "rules",
     "goals",
+    "workflows",
     "automations",
     "learning",
     "activity",
@@ -207,6 +245,7 @@ const SETUP_TABS: Tab[] = [
   "documents",
   "rules",
   "goals",
+  "workflows",
   "automations",
   "learning",
 ];
@@ -244,6 +283,31 @@ function _humanize(key: string | null | undefined): string {
     .split(/\s+/)
     .map((w) => (w.length > 0 ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w))
     .join(" ");
+}
+
+/** Settings → Approval automation: the Strategist proposal kinds, in the
+ *  order the M8 catalog lists them. Rows the server sends for an unknown
+ *  kind are simply not grouped (the catalog is the source of truth). */
+const APPROVAL_MATRIX_GROUPS = [
+  "task",
+  "automation_change",
+  "workflow_change",
+  "goal_change",
+  "experiment",
+] as const;
+
+function approvalGroupLabel(kind: string): string {
+  const key = `page.workspace_detail.approval_group.${kind}`;
+  const label = t(key);
+  return label === key ? _humanize(kind) : label;
+}
+
+/** Localised row label, falling back to the server's English catalog label
+ *  so a new action_key is never rendered as a raw i18n key. */
+function approvalActionLabel(row: { action_key: string; label: string }): string {
+  const key = `page.workspace_detail.approval_action.${row.action_key}`;
+  const label = t(key);
+  return label === key ? row.label : label;
 }
 
 function _friendlyCodeLabel(value: string | null | undefined): string {
@@ -481,28 +545,6 @@ function _activityEventLabel(eventType: string): string {
   return _humanize(normalized.replace(/\./g, " "));
 }
 
-function WorkspaceWelcomeBurst() {
-  const trails = ["1", "2", "3"];
-  const pieces = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
-  return (
-    <div className="workspace-welcome-burst" aria-hidden="true">
-      <span className="workspace-welcome-burst__core" />
-      {trails.map((trail) => (
-        <span
-          key={trail}
-          className={`workspace-welcome-burst__trail workspace-welcome-burst__trail--${trail}`}
-        />
-      ))}
-      {pieces.map((piece) => (
-        <span
-          key={piece}
-          className={`workspace-welcome-burst__piece workspace-welcome-burst__piece--${piece}`}
-        />
-      ))}
-    </div>
-  );
-}
-
 function _activityDecisionLabel(choice: any): string {
   const normalized = String(choice || "").trim().toLowerCase();
   if (["approve", "approved", "approve_all", "approve_selected", "yes", "accept", "confirm"].includes(normalized)) {
@@ -661,6 +703,24 @@ function _taskStatusChipVariant(status: string): "teal" | "orange" | "blue" | "g
     case "error":
     case "cancelled":
       return "red";
+    case "proposed":
+      return "purple";
+    default:
+      return "slate";
+  }
+}
+
+function _strategyStatusChipVariant(status: string): "teal" | "orange" | "blue" | "green" | "red" | "slate" | "purple" {
+  switch (String(status || "").toLowerCase()) {
+    case "succeeded":
+    case "approved":
+      return "green";
+    case "failed":
+    case "rejected":
+      return "red";
+    case "running":
+    case "executing":
+      return "blue";
     case "proposed":
       return "purple";
     default:
@@ -918,6 +978,7 @@ const SETUP_TAB_ITEMS: { key: Tab; label: string }[] = [
   { key: "documents", label: t("nav.knowledge") },
   { key: "rules", label: t("page.workspace_detail.rules") },
   { key: "goals", label: t("nav.goals") },
+  { key: "workflows", label: t("nav.flows") },
   { key: "automations", label: t("page.scheduled_jobs.automations") },
   { key: "learning", label: t("page.workspace_detail.learning") },
 ];
@@ -1272,16 +1333,27 @@ export default function WorkspaceDetail() {
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
   const privateApiEnabled = !authLoading && Boolean(authToken);
-  const [tab, setTab] = useState<Tab>(
-    requestedTab === "chat" ? "overview" : _normalizeWorkspaceDetailTab(requestedTab),
-  );
+  const configLoaded = useConfigStore((s) => s.loaded);
+  const flowsAvailable = useConfigStore((s) => s.flows_available);
+  const [tab, setTab] = useState<Tab>(() => {
+    const initial = requestedTab === "chat" ? "overview" : _normalizeWorkspaceDetailTab(requestedTab);
+    return initial === "workflows" && !flowsAvailable ? "overview" : initial;
+  });
   const [lastSetupTab, setLastSetupTab] = useState<Tab>(() => {
     const initialTab = _normalizeWorkspaceDetailTab(requestedTab);
-    return _isSetupTab(initialTab) ? initialTab : "agents";
+    return _isSetupTab(initialTab) && (initialTab !== "workflows" || flowsAvailable) ? initialTab : "agents";
   });
   const shouldShowWorkspaceWelcome = searchParams.get("created") === "1" || searchParams.get("welcome") === "1";
   const [showWorkspaceWelcome, setShowWorkspaceWelcome] = useState(shouldShowWorkspaceWelcome);
 
+  useEffect(() => {
+    useConfigStore.getState().load();
+  }, []);
+
+  const setupTabItems = useMemo(
+    () => SETUP_TAB_ITEMS.filter((item) => flowsAvailable || item.key !== "workflows"),
+    [flowsAvailable],
+  );
 
   const commitTab = useCallback((nextTab: Tab, options?: { replace?: boolean }) => {
     setTab(nextTab);
@@ -1302,8 +1374,13 @@ export default function WorkspaceDetail() {
       navigate(`/chat?workspace=${encodeURIComponent(workspaceId)}`, { replace: true });
       return;
     }
-    const nextTab = _normalizeWorkspaceDetailTab(requestedTab);
+    if (requestedTab === "workflows" && !configLoaded) return;
+    const normalizedTab = _normalizeWorkspaceDetailTab(requestedTab);
+    const nextTab = normalizedTab === "workflows" && !flowsAvailable ? "overview" : normalizedTab;
     setTab(nextTab);
+    if (normalizedTab === "workflows" && !flowsAvailable) {
+      setLastSetupTab((current) => current === "workflows" ? "agents" : current);
+    }
     if (_isSetupTab(nextTab)) setLastSetupTab(nextTab);
     if (requestedTab && requestedTab !== nextTab) {
       const nextParams = new URLSearchParams(searchParams);
@@ -1314,7 +1391,7 @@ export default function WorkspaceDetail() {
       }
       setSearchParams(nextParams, { replace: true });
     }
-  }, [workspaceId, requestedTab, searchParams, setSearchParams, navigate]);
+  }, [workspaceId, requestedTab, searchParams, setSearchParams, navigate, configLoaded, flowsAvailable]);
 
   useEffect(() => {
     if (shouldShowWorkspaceWelcome) setShowWorkspaceWelcome(true);
@@ -1371,7 +1448,7 @@ export default function WorkspaceDetail() {
   const [agentForm, setAgentForm] = useState<WorkspaceAgentForm>(DEFAULT_AGENT_FORM);
   const [agentConnectionResult, setAgentConnectionResult] = useState<AgentConnectionResult>(null);
   const [confirmUnmapAgent, setConfirmUnmapAgent] = useState<string | null>(null);
-  let visibleAgentSourceOptions = AGENT_SOURCE_OPTIONS;
+  const visibleAgentSourceOptions = AGENT_SOURCE_OPTIONS;
 
   const [showChannelModal, setShowChannelModal] = useState(false);
   const [editingChannel, setEditingChannel] = useState<any | null>(null);
@@ -1437,6 +1514,7 @@ export default function WorkspaceDetail() {
     staleTime: 30_000,
   });
   const canManageWs = canManageWorkspace(currentUser, staffList || []);
+  const [showBlueprintUpgrade, setShowBlueprintUpgrade] = useState(false);
 
   // Pool of staff members in the entity that can be picked for assignment.
   // Only fetched when the assign modal is open to avoid a hot query on tab load.
@@ -1509,6 +1587,12 @@ export default function WorkspaceDetail() {
     enabled: !!workspaceId && tab === "rules",
   });
 
+  const { data: approvalMatrix } = useQuery({
+    queryKey: ["workspace-approval-matrix", workspaceId],
+    queryFn: () => api.workspaces.governance.approvalMatrix(workspaceId!),
+    enabled: !!workspaceId && tab === "settings",
+  });
+
   const { data: goals, isLoading: goalsLoading } = useQuery({
     queryKey: ["workspace-goals", workspaceId],
     queryFn: () => api.goals.list({ workspace_id: workspaceId!, limit: 50 }),
@@ -1531,6 +1615,38 @@ export default function WorkspaceDetail() {
     queryKey: ["workspace-runtime-evidence", workspaceId],
     queryFn: () => api.workspaces.runtimeEvidence(workspaceId!, { limit: 30 }),
     enabled: !!workspaceId && tab === "learning",
+  });
+
+  /* ---- M14 observability (Strategy + Automation health) ---- */
+
+  const [expandedReviewId, setExpandedReviewId] = useState<string | null>(null);
+  const [strategyWhyItemId, setStrategyWhyItemId] = useState<string | null>(null);
+
+  const { data: strategyReviews } = useQuery({
+    queryKey: ["workspace-strategy-reviews", workspaceId],
+    queryFn: () => api.workspaces.observability.strategyReviews(workspaceId!, 10),
+    enabled: !!workspaceId && tab === "learning",
+  });
+
+  const { data: strategyReviewDetail, isLoading: strategyDetailLoading } = useQuery({
+    queryKey: ["workspace-strategy-review-detail", workspaceId, expandedReviewId],
+    queryFn: () => api.workspaces.observability.strategyReviewDetail(workspaceId!, expandedReviewId!),
+    enabled: !!workspaceId && !!expandedReviewId,
+  });
+
+  const { data: automationHealth } = useQuery({
+    queryKey: ["workspace-automation-health", workspaceId],
+    queryFn: () => api.workspaces.observability.automationHealth(workspaceId!),
+    enabled: !!workspaceId && tab === "automations",
+  });
+
+  // M14 Human Participation — lives in the Activity tab: it is the
+  // "what happened / what is still waiting on a person" surface, and the
+  // decisions + contributions it lists are activity facts.
+  const { data: humanParticipation } = useQuery({
+    queryKey: ["workspace-human-participation", workspaceId],
+    queryFn: () => api.workspaces.humanParticipation(workspaceId!),
+    enabled: !!workspaceId && tab === "activity",
   });
 
   const { data: workspaceEvaluation, isLoading: evaluationLoading } = useQuery({
@@ -1615,7 +1731,6 @@ export default function WorkspaceDetail() {
       if (data.source === "https" && !data.https_url.trim()) {
         throw new Error("Enter the HTTPS agent endpoint.");
       }
-
       const services = ((operatingModel?.services as any[]) || []);
       const service = services.find((svc: any) => (svc.service_key || svc.key) === serviceKey) || {};
       const serviceName = service.name || _humanize(serviceKey) || "Workspace Agent";
@@ -1654,7 +1769,7 @@ export default function WorkspaceDetail() {
       const runtimeConnection =
         data.source === "https"
           ? { source: "https", endpoint_url: data.https_url.trim() }
-            : { source: "manor_hosted" };
+          : { source: "manor_hosted" };
 
       const created = await api.agents.create({
         name: agentName,
@@ -1665,7 +1780,7 @@ export default function WorkspaceDetail() {
           serviceKey,
           data.source === "https"
             ? "https-agent"
-              : "workspace-agent",
+            : "workspace-agent",
         ],
         config: {
           runtime_connection: runtimeConnection,
@@ -1678,7 +1793,6 @@ export default function WorkspaceDetail() {
         agent_id: created.id,
         custom_prompt: customPrompt,
       });
-
 
       if (data.source === "https") {
         const endpoint = data.https_url.trim();
@@ -2099,6 +2213,29 @@ export default function WorkspaceDetail() {
     onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_save_guardrails"), err.message),
   });
 
+  const revokeStandingGrant = useMutation({
+    mutationFn: ({ kind, value }: { kind: "action" | "capability"; value: string }) =>
+      api.workspaces.governance.revokeStandingGrant(workspaceId!, kind, value),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["workspace-standing-grants", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-approval-matrix", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-governance", workspaceId] });
+      toast.success(t("page.workspace_detail.standing_grant_revoked"));
+    },
+    onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_revoke_standing_grant"), err.message),
+  });
+
+  const setApprovalMatrixRow = useMutation({
+    mutationFn: ({ actionKey, autoApproved }: { actionKey: string; autoApproved: boolean }) =>
+      api.workspaces.governance.setApprovalMatrix(workspaceId!, actionKey, autoApproved),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["workspace-approval-matrix", workspaceId], data);
+      queryClient.invalidateQueries({ queryKey: ["workspace-standing-grants", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-governance", workspaceId] });
+    },
+    onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_save_approval_automation"), err.message),
+  });
+
   const togglePause = useMutation({
     mutationFn: () => ws?.status === "active"
       ? api.workspaces.pause(workspaceId!)
@@ -2454,6 +2591,58 @@ export default function WorkspaceDetail() {
           </div>
         )}
 
+        {ws.blueprint_update?.status === "update_available" && (
+          <GlassCard hoverable={false}>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+              <div style={{
+                width: 28, height: 28, borderRadius: 9, flexShrink: 0,
+                background: "#eaf1ef", color: "#3f6f68",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 19V5M5 12l7-7 7 7" />
+                </svg>
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: "#292524", marginBottom: 4 }}>
+                  {t("page.workspaces.blueprint_update_title")}
+                </div>
+                <p style={{ fontSize: 12.5, color: "#57534e", lineHeight: 1.6, margin: 0 }}>
+                  {t("page.workspaces.blueprint_update_body")
+                    .replace("{slug}", ws.blueprint_update.blueprint_slug || "—")
+                    .replace("{date}", formatDate(ws.blueprint_update.installed_at || "") || "—")}
+                </p>
+                {(ws.blueprint_update.changed?.length ?? 0) > 0 && (
+                  <p style={{ fontSize: 12.5, color: "#57534e", lineHeight: 1.6, margin: "6px 0 0" }}>
+                    {t("page.workspaces.blueprint_update_changed").replace(
+                      "{sections}",
+                      (ws.blueprint_update.changed || [])
+                        .map((section) => t(`page.workspaces.blueprint_section_${section}`) || section)
+                        .join("、"),
+                    )}
+                  </p>
+                )}
+                {canManageWs && (
+                  <div style={{ marginTop: 10 }}>
+                    <Button size="sm" onClick={() => setShowBlueprintUpgrade(true)}>
+                      {t("page.workspaces.blueprint_update_review")}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </GlassCard>
+        )}
+        {showBlueprintUpgrade && (
+          <BlueprintUpgradeDialog
+            open
+            onClose={() => setShowBlueprintUpgrade(false)}
+            workspaceId={ws.id}
+            workspaceName={ws.name}
+          />
+        )}
+
         {renderWorkspaceEvaluationCard({ compact: true })}
 
         {/* Cover image */}
@@ -2666,7 +2855,7 @@ export default function WorkspaceDetail() {
           return (
             <GlassCard hoverable={false} className="workspace-overview-card workspace-overview-setup-card">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <div className="workspace-overview-setup-title" style={{ ...SECTION_TITLE, color: "#936027" }}>
+                <div className="workspace-overview-setup-title" style={{ ...SECTION_TITLE, color: "var(--text-default)" }}>
                   {t("page.workspace_detail.needs_setup")} {flagged.length} {t("page.apps.integration")}{flagged.length === 1 ? "" : "s"}
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
@@ -2695,7 +2884,7 @@ export default function WorkspaceDetail() {
                   </Button>
                 </div>
               </div>
-              <p className="workspace-overview-setup-copy" style={{ fontSize: 12, color: "#76502c", margin: "0 0 12px", lineHeight: 1.5 }}>
+              <p className="workspace-overview-setup-copy" style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
                 {t("page.workspace_detail.these_integrations_were_referenced_when_the_work")}
               </p>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 240px), 1fr))", gap: 10 }}>
@@ -2712,29 +2901,34 @@ export default function WorkspaceDetail() {
                     <div className="workspace-overview-setup-item" key={i} style={{
                       padding: "10px 12px",
                       borderRadius: 10,
-                      background: "rgba(243, 236, 214, 0.4)",
-                      border: "1px solid rgba(207, 155, 68, 0.3)",
+                      background: "var(--surface-muted)",
+                      border: "1px solid var(--border-subtle)",
                     }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "space-between" }}>
-                        <span className="workspace-overview-setup-item-title" style={{ fontSize: 13, fontWeight: 700, color: "#1c1917" }}>
+                        <span className="workspace-overview-setup-item-title" style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>
                           {String(f.provider || "").replace(/[_\-]+/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase())}
                         </span>
                         <div style={{ display: "flex", gap: 4 }}>
-                          <Chip variant={isChannelSetup ? "blue" : "slate"} size="sm">
+                          <Chip variant="slate" size="sm">
                             {isChannelSetup ? t("page.workspace_detail.channel") : t("page.workspace_detail.capability")}
                           </Chip>
-                          {f.required && <Chip variant="red" size="sm">{t("page.login.required")}</Chip>}
+                          {f.setup_kind === "browser_extension" && (
+                            <Chip variant="slate" size="sm">
+                              {t("page.integrations.local_browser_setup_required")}
+                            </Chip>
+                          )}
+                          {f.required && <Chip variant="slate" size="sm">{t("page.login.required")}</Chip>}
                         </div>
                       </div>
                       {f.purpose && (
-                        <div className="workspace-overview-setup-item-copy" style={{ fontSize: 11, color: "#76502c", marginTop: 4, lineHeight: 1.4 }}>
+                        <div className="workspace-overview-setup-item-copy" style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.4 }}>
                           {f.purpose}
                         </div>
                       )}
                       {Array.isArray(f.linked_service_keys) && f.linked_service_keys.length > 0 && (
                         <div className="workspace-overview-setup-chip-row" style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
                           {f.linked_service_keys.map((sk: string) => (
-                            <Chip key={sk} variant="orange" size="sm">
+                            <Chip key={sk} variant="slate" size="sm">
                               {_serviceLabelFromKey(sk, (operatingModel?.services as any[]) || [])}
                             </Chip>
                           ))}
@@ -2754,12 +2948,12 @@ export default function WorkspaceDetail() {
           const activeGoals = Array.isArray(goalsData) ? _dedupeGoals(goalsData).filter((g: any) => g.status === "active") : [];
           if (activeGoals.length === 0) return null;
           const paceColors: Record<string, { bg: string; fg: string }> = {
-            on_track: { bg: "#e4efe8", fg: "#3d7351" },
-            ahead: { bg: "#e3e9f1", fg: "#3f57a0" },
-            achieved: { bg: "#dceae3", fg: "#065f46" },
-            behind: { bg: "#f3ecd6", fg: "#76502c" },
-            at_risk: { bg: "#f1dddb", fg: "#c14a44" },
-            unknown: { bg: "#f5f5f4", fg: "#78716c" },
+            on_track: { bg: "var(--surface-muted)", fg: "var(--text-default)" },
+            ahead: { bg: "var(--surface-muted)", fg: "var(--text-default)" },
+            achieved: { bg: "var(--accent-soft)", fg: "var(--accent)" },
+            behind: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
+            at_risk: { bg: "var(--surface-muted)", fg: "var(--text-strong)" },
+            unknown: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
           };
           return (
             <GlassCard hoverable={false} className="workspace-overview-card workspace-overview-goals-progress">
@@ -2778,22 +2972,22 @@ export default function WorkspaceDetail() {
                     <div className="workspace-overview-goal-row" key={g.id} style={{
                       display: "flex", alignItems: "center", gap: 12,
                       padding: "10px 12px", borderRadius: 12,
-                      background: "rgba(250,250,249,0.6)", border: "1px solid rgba(28,25,23,0.06)",
+                      background: "var(--glass-card)", border: "1px solid var(--border-subtle)",
                     }}>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div className="workspace-overview-goal-title" style={{ fontSize: 13, fontWeight: 700, color: "#1c1917", marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <div className="workspace-overview-goal-title" style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)", marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {g.title}
                         </div>
-                        <div className="workspace-overview-goal-track" style={{ height: 4, borderRadius: 2, background: "#e7e5e4", overflow: "hidden" }}>
+                        <div className="workspace-overview-goal-track" style={{ height: 4, borderRadius: 2, background: "var(--surface-muted)", overflow: "hidden" }}>
                           <div className="workspace-overview-goal-fill" style={{
                             height: "100%", borderRadius: 2,
-                            background: pace === "at_risk" ? "#d65f59" : pace === "behind" ? "#cf9b44" : "#5f928a",
+                            background: pace === "at_risk" ? "var(--text-strong)" : pace === "behind" ? "var(--text-muted)" : "var(--accent)",
                             width: `${pct}%`, transition: "width 0.5s",
                           }} />
                         </div>
                       </div>
                       <div style={{ textAlign: "right", flexShrink: 0 }}>
-                        <div className="workspace-overview-goal-percent" style={{ fontSize: 14, fontWeight: 800, color: "#1c1917" }}>{Math.round(pct)}%</div>
+                        <div className="workspace-overview-goal-percent" style={{ fontSize: 14, fontWeight: 800, color: "var(--text-strong)" }}>{Math.round(pct)}%</div>
                         <span className="workspace-overview-goal-status" style={{
                           fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
                           background: pc.bg, color: pc.fg,
@@ -2865,18 +3059,62 @@ export default function WorkspaceDetail() {
       { value: "editor", label: "Editor" },
       { value: "contributor", label: "Contributor" },
       { value: "viewer", label: "Viewer" },
-      { value: "external_client", label: "External client" },
     ];
+    const workspaceUrl = `${window.location.origin}/workspaces/${workspaceId || workspace?.id || ""}`;
+    const workspaceChatUrl = `${window.location.origin}/chat?workspace=${encodeURIComponent(workspaceId || workspace?.id || "")}`;
+    const closeShareModal = () => {
+      setShowWorkspaceShareModal(false);
+      setPickedStaff(null);
+    };
+    const shareActionStyle: React.CSSProperties = {
+      width: "100%",
+      minHeight: 74,
+      borderRadius: 14,
+      border: "1px solid var(--border-subtle)",
+      background: "var(--surface-panel)",
+      padding: "12px 14px",
+      display: "grid",
+      gridTemplateColumns: "34px minmax(0, 1fr)",
+      gap: 12,
+      alignItems: "center",
+      textAlign: "left",
+      cursor: "pointer",
+      color: "var(--text-default)",
+    };
+    const shareIconStyle: React.CSSProperties = {
+      width: 34,
+      height: 34,
+      borderRadius: 10,
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      background: "var(--surface-muted)",
+      color: "var(--text-muted)",
+    };
+    const shareAction = (
+      title: string,
+      body: string,
+      icon: React.ReactNode,
+      onClick: () => void,
+    ) => (
+      <button type="button" style={shareActionStyle} onClick={onClick}>
+        <span style={shareIconStyle}>{icon}</span>
+        <span style={{ minWidth: 0 }}>
+          <span style={{ display: "block", fontSize: 13, fontWeight: 800, color: "var(--text-strong)" }}>{title}</span>
+          <span style={{ display: "block", fontSize: 12, color: "var(--text-muted)", lineHeight: 1.35, marginTop: 3 }}>{body}</span>
+        </span>
+      </button>
+    );
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <GlassCard hoverable={false}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
             <div style={{ minWidth: 240, flex: 1 }}>
               <div style={SECTION_TITLE}>Workspace access</div>
-              <div style={{ fontSize: 16, fontWeight: 800, color: "#1c1917", marginTop: 6 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-strong)", marginTop: 6 }}>
                 {accessCopy.title}
               </div>
-              <p style={{ margin: "6px 0 0", color: "#78716c", fontSize: 13, lineHeight: 1.5 }}>
+              <p style={{ margin: "6px 0 0", color: "var(--text-muted)", fontSize: 13, lineHeight: 1.5 }}>
                 {accessCopy.body}
               </p>
             </div>
@@ -2969,10 +3207,65 @@ export default function WorkspaceDetail() {
           }
         >
           <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
+              gap: 10,
+              padding: 12,
+              borderRadius: 18,
+              background: "var(--surface-muted)",
+              border: "1px solid var(--border-subtle)",
+            }}>
+              {shareAction(
+                "Copy workspace link",
+                "Send people to this workspace. Access still follows the rules below.",
+                <IconCopy size={16} />,
+                async () => {
+                  const ok = await copyTextToClipboard(workspaceUrl);
+                  if (ok) toast.success("Workspace link copied");
+                  else toast.error("Could not copy link");
+                },
+              )}
+              {shareAction(
+                "Open workspace chat",
+                "Jump to the shared operating room conversation.",
+                <IconChat size={16} />,
+                () => {
+                  closeShareModal();
+                  navigate(`/chat?workspace=${encodeURIComponent(workspaceId || workspace?.id || "")}`);
+                },
+              )}
+              {shareAction(
+                "Export blueprint",
+                "Package this workspace setup so another team can install it.",
+                <IconDownload size={16} />,
+                () => {
+                  closeShareModal();
+                  setExportOpen(true);
+                },
+              )}
+              <div style={{
+                gridColumn: "1 / -1",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                minWidth: 0,
+                color: "var(--text-muted)",
+                fontSize: 11,
+                fontWeight: 700,
+                padding: "0 2px",
+              }}>
+                <IconShare size={13} />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {workspaceChatUrl}
+                </span>
+              </div>
+            </div>
+
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               <div>
                 <div style={LABEL}>Add people</div>
-                <div style={{ fontSize: 12, color: "#78716c", lineHeight: 1.45 }}>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.45 }}>
                   Pick teammates or agents from this organization. They will be added to this workspace only.
                 </div>
               </div>
@@ -3026,18 +3319,18 @@ export default function WorkspaceDetail() {
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-end", marginBottom: 8 }}>
                 <div>
                   <div style={LABEL}>People with access</div>
-                  <div style={{ fontSize: 12, color: "#78716c" }}>
+                  <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
                     These people can open this workspace even when general access is restricted.
                   </div>
                 </div>
-                <span style={{ fontSize: 11, fontWeight: 700, color: "#a8a29e" }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)" }}>
                   {items.length} {items.length === 1 ? "member" : "members"}
                 </span>
               </div>
 
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                 {items.length === 0 ? (
-                  <div style={{ fontSize: 12, color: "#a8a29e", padding: "12px 4px", borderTop: "1px solid rgba(28,25,23,0.06)" }}>
+                  <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "12px 4px" }}>
                     No invited members yet.
                   </div>
                 ) : items.map((s: WorkspaceStaff) => {
@@ -3060,11 +3353,11 @@ export default function WorkspaceDetail() {
                     >
                       <UserAvatar name={displayName} avatarUrl={matched?.avatar_url} size={32} />
                       <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: "#292524", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-default)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {displayName}
                           {expired && <span style={{ color: "#a23e38", marginLeft: 6, fontSize: 10, fontWeight: 500 }}>expired</span>}
                         </div>
-                        <div style={{ fontSize: 11, color: "#78716c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <div style={{ fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {email}
                           {s.expires_at && !expired && ` · Expires ${new Date(s.expires_at).toLocaleDateString()}`}
                         </div>
@@ -3091,7 +3384,7 @@ export default function WorkspaceDetail() {
                           borderRadius: 6,
                           border: "none",
                           background: "transparent",
-                          color: "#a8a29e",
+                          color: "var(--text-faint)",
                           cursor: !s.staff_id || removeStaff.isPending ? "not-allowed" : "pointer",
                           display: "flex",
                           alignItems: "center",
@@ -3112,7 +3405,7 @@ export default function WorkspaceDetail() {
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 8 }}>
                 <div>
                   <div style={LABEL}>General access</div>
-                  <div style={{ fontSize: 12, color: "#78716c" }}>
+                  <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
                     Controls whether this workspace can be discovered by the whole organization.
                   </div>
                 </div>
@@ -3130,8 +3423,8 @@ export default function WorkspaceDetail() {
                         textAlign: "left",
                         width: "100%",
                         borderRadius: 12,
-                        border: selected ? "1px solid rgba(79,125,117,0.36)" : "1px solid rgba(28,25,23,0.08)",
-                        background: selected ? "rgba(79,125,117,0.08)" : "#fff",
+                        border: selected ? "1px solid var(--border-subtle)" : "1px solid var(--border-subtle)",
+                        background: selected ? "var(--surface-muted)" : "var(--surface-panel)",
                         padding: "12px 14px",
                         cursor: updateWorkspace.isPending ? "wait" : "pointer",
                         display: "grid",
@@ -3145,16 +3438,16 @@ export default function WorkspaceDetail() {
                           width: 18,
                           height: 18,
                           borderRadius: 999,
-                          border: selected ? "5px solid #4f7d75" : "1px solid #d6d3d1",
-                          background: "#fff",
+                          border: selected ? "5px solid var(--text-default)" : "1px solid var(--border-subtle)",
+                          background: "var(--surface-panel)",
                           marginTop: 1,
                         }}
                       />
                       <span>
-                        <span style={{ display: "block", fontSize: 13, fontWeight: 700, color: "#292524" }}>
+                        <span style={{ display: "block", fontSize: 13, fontWeight: 700, color: "var(--text-default)" }}>
                           {opt.title}
                         </span>
-                        <span style={{ display: "block", fontSize: 12, color: "#78716c", lineHeight: 1.45, marginTop: 3 }}>
+                        <span style={{ display: "block", fontSize: 12, color: "var(--text-muted)", lineHeight: 1.45, marginTop: 3 }}>
                           {opt.body}
                         </span>
                       </span>
@@ -3235,7 +3528,6 @@ export default function WorkspaceDetail() {
                   { value: "editor", label: t("page.workspace_detail.role.editor") },
                   { value: "contributor", label: t("page.workspace_detail.role.contributor") },
                   { value: "viewer", label: t("page.workspace_detail.role.viewer") },
-                  { value: "external_client", label: t("page.workspace_detail.role.external_client") },
                 ]}
               />
               <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 4 }}>
@@ -3300,7 +3592,6 @@ export default function WorkspaceDetail() {
       (agentForm.source === "hosted" && !agentForm.agent_id) ||
       (agentForm.source === "https" && !agentForm.https_url.trim()) ||
       mapAgent.isPending;
-
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -3394,12 +3685,7 @@ export default function WorkspaceDetail() {
                 {items.map((m: any, i: number) => {
                   const matched = (entityAgents || []).find((a: any) => a.id === m.agent_id);
                   const runtimeSource = String(matched?.config?.runtime_connection?.source || "manor_hosted");
-                  const sourceLabel =
-                    runtimeSource === "cli"
-                      ? "CLI"
-                      : runtimeSource === "https"
-                        ? "HTTPS"
-                        : "Manor Hosted";
+                  const sourceLabel = runtimeSource === "https" ? "HTTPS" : "Manor Hosted";
                   const promptText = String(m.custom_prompt || "").trim();
                   return (
                   <tr key={m.service_key || i}>
@@ -3408,7 +3694,7 @@ export default function WorkspaceDetail() {
                     </td>
                     <td style={TABLE_CELL}>{matched ? _agentLabel(matched) : (m.agent_id || "--")}</td>
                     <td style={TABLE_CELL}>
-                      <StatusBadge type={runtimeSource === "manor_hosted" ? "success" : "info"}>
+                      <StatusBadge type={runtimeSource === "https" ? "info" : "success"}>
                         {sourceLabel}
                       </StatusBadge>
                     </td>
@@ -3442,7 +3728,7 @@ export default function WorkspaceDetail() {
                           <Button
                             variant="outline"
                             size="sm"
-                            onClick={() => navigate(`/agents?edit=${matched.id}`)}
+                            onClick={() => openAgentEditModal(matched.id)}
                           >
                             {t("page.workspace_detail.edit_agent")}
                           </Button>
@@ -3493,17 +3779,15 @@ export default function WorkspaceDetail() {
                   <div style={{ fontSize: 13, fontWeight: 800, color: "#57534e" }}>
                     {agentConnectionResult.agentName} is connected to this workspace.
                   </div>
-                    <>
-                      <div style={{ fontSize: 12, color: "#57534e", marginTop: 6 }}>
-                        Use this connection secret in the HTTPS agent once. Manor only stores its hash.
-                      </div>
-                      <pre style={{ margin: "10px 0 0", padding: 12, borderRadius: 10, background: "#fff", color: "#44403c", whiteSpace: "pre-wrap", wordBreak: "break-all", fontSize: 12 }}>
-                        {agentConnectionResult.registration.worker_secret}
-                      </pre>
-                      <div style={{ fontSize: 11, color: "#78716c" }}>
-                        Endpoint: {agentConnectionResult.endpoint}
-                      </div>
-                    </>
+                  <div style={{ fontSize: 12, color: "#57534e", marginTop: 6 }}>
+                    Use this connection secret in the HTTPS agent once. Manor only stores its hash.
+                  </div>
+                  <pre style={{ margin: "10px 0 0", padding: 12, borderRadius: 10, background: "#fff", color: "#44403c", whiteSpace: "pre-wrap", wordBreak: "break-all", fontSize: 12 }}>
+                    {agentConnectionResult.registration.worker_secret}
+                  </pre>
+                  <div style={{ fontSize: 11, color: "#78716c" }}>
+                    Endpoint: {agentConnectionResult.endpoint}
+                  </div>
                 </div>
               </div>
             ) : null}
@@ -3584,12 +3868,14 @@ export default function WorkspaceDetail() {
                   onChange={(e) => setAgentForm({ ...agentForm, agent_name: e.target.value })}
                   placeholder="Example: Leasing Follow-up Agent"
                 />
-                <Input
-                  label={agentForm.source === "https" ? "HTTPS connection name" : "CLI connector name"}
-                  value={agentForm.runtime_display_name}
-                  onChange={(e) => setAgentForm({ ...agentForm, runtime_display_name: e.target.value })}
-                  placeholder={agentForm.source === "https" ? "Example: Hermes endpoint" : "Example: Leasing MacBook"}
-                />
+                {agentForm.source === "https" && (
+                  <Input
+                    label="HTTPS connection name"
+                    value={agentForm.runtime_display_name}
+                    onChange={(e) => setAgentForm({ ...agentForm, runtime_display_name: e.target.value })}
+                    placeholder="Example: Hermes endpoint"
+                  />
+                )}
               </div>
             )}
 
@@ -3729,10 +4015,10 @@ export default function WorkspaceDetail() {
               <GlassCard hoverable={false}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                   <div>
-                    <div style={{ fontSize: 13, fontWeight: 800, color: "#936027", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: "var(--text-default)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
                       {t("page.workspace_detail.workspace_wide_integrations_needed")}
                     </div>
-                    <p style={{ margin: "6px 0 0", fontSize: 12, color: "#76502c" }}>
+                    <p style={{ margin: "6px 0 0", fontSize: 12, color: "var(--text-muted)" }}>
                       {t("page.workspace_detail.these_are_capability_integrations_referenced_by")}
                     </p>
                   </div>
@@ -3742,7 +4028,7 @@ export default function WorkspaceDetail() {
                 </div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
                   {workspaceMissing.map((flag: any, idx: number) => (
-                    <Chip key={`${flag.provider || "integration"}-${idx}`} variant="orange" size="sm">
+                    <Chip key={`${flag.provider || "integration"}-${idx}`} variant="slate" size="sm">
                       {String(flag.provider || "integration").replace(/[_\-]+/g, " ")}
                     </Chip>
                   ))}
@@ -3768,12 +4054,12 @@ export default function WorkspaceDetail() {
                   <GlassCard key={svc.agent_subscription_id || serviceKey || idx} hoverable={false}>
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", marginBottom: 12 }}>
                       <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 15, fontWeight: 800, color: "#1c1917", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {_serviceLabel(service || { service_key: serviceKey })}
                         </div>
                       </div>
                       {agent ? (
-                        <Button variant="outline" size="sm" onClick={() => navigate(`/agents?edit=${agent.id}`)}>
+                        <Button variant="outline" size="sm" onClick={() => openAgentEditModal(agent.id)}>
                           {t("page.workspace_detail.edit_agent")}
                         </Button>
                       ) : (
@@ -3790,22 +4076,22 @@ export default function WorkspaceDetail() {
                           size={24}
                           shape="rounded"
                         />
-                        <span style={{ fontSize: 13, fontWeight: 700, color: "#44403c" }}>{agent.name}</span>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-default)" }}>{agent.name}</span>
                       </div>
                     )}
 
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 8, marginBottom: 14 }}>
-                      <div style={{ padding: "8px 10px", borderRadius: 10, background: "#fafaf9", border: "1px solid rgba(28,25,23,0.06)" }}>
+                      <div style={{ padding: "8px 10px", borderRadius: 10, background: "var(--surface-muted)", border: "1px solid var(--border-subtle)" }}>
                         <div style={LABEL}>{t("page.workspace_detail.tools")}</div>
-                        <div style={{ fontSize: 16, fontWeight: 800, color: "#1c1917" }}>{tools.length + inheritedToolCount}</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-strong)" }}>{tools.length + inheritedToolCount}</div>
                       </div>
-                      <div style={{ padding: "8px 10px", borderRadius: 10, background: "#fafaf9", border: "1px solid rgba(28,25,23,0.06)" }}>
+                      <div style={{ padding: "8px 10px", borderRadius: 10, background: "var(--surface-muted)", border: "1px solid var(--border-subtle)" }}>
                         <div style={LABEL}>{t("nav.skills")}</div>
-                        <div style={{ fontSize: 16, fontWeight: 800, color: "#1c1917" }}>{skills.length}</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-strong)" }}>{skills.length}</div>
                       </div>
-                      <div style={{ padding: "8px 10px", borderRadius: 10, background: "#fafaf9", border: "1px solid rgba(28,25,23,0.06)" }}>
+                      <div style={{ padding: "8px 10px", borderRadius: 10, background: "var(--surface-muted)", border: "1px solid var(--border-subtle)" }}>
                         <div style={LABEL}>{t("nav.integrations")}</div>
-                        <div style={{ fontSize: 16, fontWeight: 800, color: "#1c1917" }}>{integrations.length}</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-strong)" }}>{integrations.length}</div>
                       </div>
                     </div>
 
@@ -3816,7 +4102,7 @@ export default function WorkspaceDetail() {
                           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                             {alwaysTools.length > 0 && (
                               <div>
-                                <div style={{ fontSize: 11, color: "#78716c", fontWeight: 800, marginBottom: 5 }}>
+                                <div style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 800, marginBottom: 5 }}>
                                   {t("page.workspace_detail.always_loaded")}
                                 </div>
                                 {renderSmallList(alwaysTools, t("page.workspace_detail.no_runtime_tools"), (tool) => _friendlyCodeLabel(String(tool)))}
@@ -3824,7 +4110,7 @@ export default function WorkspaceDetail() {
                             )}
                             {contextualTools.length > 0 && (
                               <div>
-                                <div style={{ fontSize: 11, color: "#78716c", fontWeight: 800, marginBottom: 5 }}>
+                                <div style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 800, marginBottom: 5 }}>
                                   {t("page.workspace_detail.contextual_tools")}
                                 </div>
                                 {renderSmallList(contextualTools, t("page.workspace_detail.no_contextual_tools"), (tool) => _friendlyCodeLabel(String(tool)))}
@@ -4190,33 +4476,33 @@ export default function WorkspaceDetail() {
                     <Chip variant={ch.source_scope === "shared" ? "slate" : "teal"} size="sm">
                       {sourceScope}
                     </Chip>
-                    {isWebchat && <Chip variant="blue" size="sm">{t("page.workspace_detail.public")}</Chip>}
+                    {isWebchat && <Chip variant="slate" size="sm">{t("page.workspace_detail.public")}</Chip>}
                   </div>
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    <p style={{ margin: 0, minHeight: 38, color: "#44403c", fontSize: 13, lineHeight: 1.45, fontWeight: 600 }}>
+                    <p style={{ margin: 0, minHeight: 38, color: "var(--text-muted)", fontSize: 13, lineHeight: 1.45, fontWeight: 600 }}>
                       {cfg.purpose || t("page.workspace_detail.channel_default_purpose")}
                     </p>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       <span style={{
                         display: "inline-flex", alignItems: "center", minHeight: 24, padding: "3px 9px",
-                        borderRadius: 999, background: "#fafaf9", border: "1px solid rgba(28,25,23,0.06)",
-                        color: "#57534e", fontSize: 11, fontWeight: 700,
+                        borderRadius: 999, background: "var(--surface-muted)", border: "1px solid var(--border-subtle)",
+                        color: "var(--text-muted)", fontSize: 11, fontWeight: 700,
                       }}>
                         {channelKind}
                       </span>
                       <span style={{
                         display: "inline-flex", alignItems: "center", minHeight: 24, padding: "3px 9px",
-                        borderRadius: 999, background: isWebchat ? "#f3f6fa" : "#f5f5f4",
-                        border: `1px solid ${isWebchat ? "#bfdbfe" : "#efedea"}`,
-                        color: isWebchat ? "#3f57a0" : "#436b65", fontSize: 11, fontWeight: 700,
+                        borderRadius: 999, background: "var(--surface-muted)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-muted)", fontSize: 11, fontWeight: 700,
                       }}>
                         {accessLabel}
                       </span>
                       <span style={{
                         display: "inline-flex", alignItems: "center", minHeight: 24, padding: "3px 9px",
-                        borderRadius: 999, background: "#f9f4ec", border: "1px solid #ecdac2",
-                        color: "#7c4a2e", fontSize: 11, fontWeight: 700,
+                        borderRadius: 999, background: "var(--surface-muted)", border: "1px solid var(--border-subtle)",
+                        color: "var(--text-muted)", fontSize: 11, fontWeight: 700,
                       }}>
                         {t("settings.language")}: {_channelLanguageLabel(channelLanguage)}
                       </span>
@@ -5256,24 +5542,24 @@ export default function WorkspaceDetail() {
       if (enforcement === "blocked" || enforcement === "deny" || enforcement === "never_allow") {
         return {
           label: copy.patternNeverAllow,
-          bg: "rgba(241,221,219,0.62)",
-          border: "rgba(209,139,134,0.4)",
-          color: "#883a35",
+          bg: "var(--surface-muted)",
+          border: "var(--border-subtle)",
+          color: "var(--text-strong)",
         };
       }
       if (enforcement === "required_context" || enforcement === "context_required") {
         return {
           label: copy.patternRequiresContext,
-          bg: "rgba(227,233,241,0.62)",
-          border: "rgba(138,169,209,0.34)",
-          color: "#3f57a0",
+          bg: "var(--surface-muted)",
+          border: "var(--border-subtle)",
+          color: "var(--text-muted)",
         };
       }
       return {
         label: copy.patternNeedsApproval,
-        bg: "rgba(249,244,236,0.8)",
-        border: "rgba(251,146,60,0.38)",
-        color: "#7c4a2e",
+        bg: "var(--surface-muted)",
+        border: "var(--border-subtle)",
+        color: "var(--text-muted)",
       };
     };
 
@@ -5529,14 +5815,14 @@ export default function WorkspaceDetail() {
     };
 
     const paceColors: Record<string, { bg: string; fg: string }> = {
-      on_track: { bg: "#e4efe8", fg: "#3d7351" },
-      ahead: { bg: "#e3e9f1", fg: "#3f57a0" },
-      achieved: { bg: "#dceae3", fg: "#065f46" },
-      behind: { bg: "#f3ecd6", fg: "#76502c" },
-      at_risk: { bg: "#f1dddb", fg: "#c14a44" },
-      tracking: { bg: "#e0f2f1", fg: "#436b65" },
-      paused: { bg: "#f5f5f4", fg: "#78716c" },
-      unknown: { bg: "#f5f5f4", fg: "#78716c" },
+      on_track: { bg: "var(--surface-muted)", fg: "var(--text-default)" },
+      ahead: { bg: "var(--surface-muted)", fg: "var(--text-default)" },
+      achieved: { bg: "var(--accent-soft)", fg: "var(--accent)" },
+      behind: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
+      at_risk: { bg: "var(--surface-muted)", fg: "var(--text-strong)" },
+      tracking: { bg: "var(--accent-soft)", fg: "var(--accent)" },
+      paused: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
+      unknown: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
     };
 
     const computeProgress = (g: any) => {
@@ -5549,7 +5835,7 @@ export default function WorkspaceDetail() {
           <GlassCard hoverable={false}>
             <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 16 }}>
               <div style={SECTION_TITLE}>{t("page.workspace_detail.goal_execution_canvas")}</div>
-              <div style={{ fontSize: 12, color: "#78716c", lineHeight: 1.55, maxWidth: 760 }}>
+              <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.55, maxWidth: 760 }}>
                 {t("page.workspace_detail.goal_execution_canvas_desc")}
               </div>
             </div>
@@ -5562,7 +5848,7 @@ export default function WorkspaceDetail() {
         </div>
 
         {goalsLoading ? (
-          <div style={{ textAlign: "center", padding: 32, color: "#a8a29e", fontSize: 13 }}>{t("page.workspace_detail.loading_goals")}</div>
+          <div style={{ textAlign: "center", padding: 32, color: "var(--text-faint)", fontSize: 13 }}>{t("page.workspace_detail.loading_goals")}</div>
         ) : goalsList.length === 0 ? (
           <EmptyState
             title={t("page.workspace_detail.no_goals_yet")}
@@ -5611,23 +5897,23 @@ export default function WorkspaceDetail() {
                       </div>
 
                       {g.description && !isEditing && (
-                        <div style={{ fontSize: 12, color: "#78716c", lineHeight: 1.4, marginBottom: 6 }}>
+                        <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.4, marginBottom: 6 }}>
                           {g.description}
                         </div>
                       )}
 
                       {/* Progress bar + values */}
                       <div style={{ marginBottom: 6 }}>
-                        <div style={{ height: 5, borderRadius: 3, background: "#e7e5e4", overflow: "hidden" }}>
+                        <div style={{ height: 5, borderRadius: 3, background: "var(--surface-muted)", overflow: "hidden" }}>
                           <div style={{
                             height: "100%", borderRadius: 3,
-                            background: pace === "at_risk" ? "#d65f59" : pace === "behind" ? "#cf9b44" : pace === "achieved" ? "#4f9c84" : "#5f928a",
+                            background: pace === "at_risk" ? "var(--text-strong)" : pace === "behind" ? "var(--text-muted)" : "var(--accent)",
                             width: `${progress}%`, transition: "width 0.5s",
                           }} />
                         </div>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#a8a29e", marginTop: 3 }}>
-                          <span>{t("page.workspace_detail.current")} <strong style={{ color: "#1c1917" }}>{hasCurrentValue ? current.toLocaleString() : t("page.workspace_detail.not_measured_yet")}</strong></span>
-                          <span>{t("page.workspace_detail.target")} <strong style={{ color: "#1c1917" }}>{target.toLocaleString()}</strong></span>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--text-faint)", marginTop: 3 }}>
+                          <span>{t("page.workspace_detail.current")} <strong style={{ color: "var(--text-strong)" }}>{hasCurrentValue ? current.toLocaleString() : t("page.workspace_detail.not_measured_yet")}</strong></span>
+                          <span>{t("page.workspace_detail.target")} <strong style={{ color: "var(--text-strong)" }}>{target.toLocaleString()}</strong></span>
                         </div>
                       </div>
 
@@ -5719,10 +6005,202 @@ export default function WorkspaceDetail() {
     );
   }
 
+  /* M14 Human Participation view. Privacy boundary (M9.6 / invariant 8):
+     the API never returns a per-person latency or efficiency metric and
+     this card must never derive one — counts and declared facts only. */
+  function renderHumanParticipationCard() {
+    const queue: HumanQueueCommitment[] = humanParticipation?.queue || [];
+    const blocking: HumanBlockingEntry[] = humanParticipation?.blocking || [];
+    const participants: HumanParticipantDigest[] = humanParticipation?.participants || [];
+    const decisions: HumanDecisionDigest[] = humanParticipation?.decisions || [];
+    const contributions: HumanContributionDigest[] = humanParticipation?.recent_contributions || [];
+    const blockedByCommitment = new Map(blocking.map((b) => [b.commitment_id, b]));
+    const hasAnything =
+      queue.length > 0 || participants.length > 0 || decisions.length > 0 || contributions.length > 0;
+
+    const subTitle = (label: string) => (
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+        {label}
+      </div>
+    );
+
+    return (
+      <GlassCard hoverable={false}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div>
+            <div style={SECTION_TITLE}>{t("page.workspace_detail.human_participation")}</div>
+            <div style={{ fontSize: 13, color: "#78716c", lineHeight: 1.6, maxWidth: 760 }}>
+              {t("page.workspace_detail.human_participation_desc")}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <Chip variant={queue.length ? "orange" : "green"} size="sm">
+              {t("page.workspace_detail.human_waiting_count").replace("{count}", String(queue.length))}
+            </Chip>
+            {blocking.length > 0 && (
+              <Chip variant="red" size="sm">
+                {t("page.workspace_detail.human_blocking_count").replace("{count}", String(blocking.length))}
+              </Chip>
+            )}
+          </div>
+        </div>
+
+        {!hasAnything ? (
+          <div style={{ marginTop: 14 }}>
+            <EmptyState
+              title={t("page.workspace_detail.no_human_participation")}
+              description={t("page.workspace_detail.no_human_participation_desc")}
+            />
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 14 }}>
+            {/* Waiting for a human */}
+            {queue.length > 0 && (
+              <div>
+                {subTitle(t("page.workspace_detail.human_waiting_for_input"))}
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {queue.map((c) => {
+                    const blocked = blockedByCommitment.get(c.id);
+                    return (
+                      <div key={c.id} style={{ borderRadius: 14, padding: 12, background: "rgba(250,250,249,0.72)" }}>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                          {c.blocking && (
+                            <Chip variant="red" size="sm">{t("page.workspace_detail.human_blocking")}</Chip>
+                          )}
+                          <Chip variant="slate" size="sm">{_activityStatusLabel(c.request_kind)}</Chip>
+                          {c.role_required && (
+                            <Chip variant="blue" size="sm">{_activityStatusLabel(c.role_required)}</Chip>
+                          )}
+                          <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>
+                            {c.source_kind}:{c.source_id}
+                          </span>
+                          {c.expected_by && (
+                            <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>
+                              {t("page.workspace_detail.human_expected_by").replace("{when}", relativeTime(c.expected_by))}
+                            </span>
+                          )}
+                        </div>
+                        {c.expected_input && (
+                          <div style={{ fontSize: 12, color: "#57534e", lineHeight: 1.55, marginTop: 6 }}>
+                            {formatUserFacingText(c.expected_input)}
+                          </div>
+                        )}
+                        {blocked && blocked.blocked.length > 0 && (
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 6 }}>
+                            <span style={{ fontSize: 11, color: "#78716c" }}>
+                              {t("page.workspace_detail.human_blocks")}
+                            </span>
+                            {blocked.blocked.map((b) => (
+                              <span key={`${c.id}-${b.id}`} style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                                {b.title ? (
+                                  <Link to={`/tasks/${encodeURIComponent(b.id)}`} style={{ fontSize: 12, fontWeight: 650, color: "#44403c", textDecoration: "none" }}>
+                                    {formatUserFacingText(b.title)}
+                                  </Link>
+                                ) : (
+                                  <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>{b.id}</span>
+                                )}
+                                {b.status && (
+                                  <Chip variant={_taskStatusChipVariant(b.status)} size="sm">{_activityStatusLabel(b.status)}</Chip>
+                                )}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Participants — declared facts + open-work count. No timings. */}
+            {participants.length > 0 && (
+              <div>
+                {subTitle(t("page.workspace_detail.human_participants"))}
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {participants.map((p) => (
+                    <div key={p.user_id} style={{ borderRadius: 14, padding: "10px 12px", background: "rgba(250,250,249,0.72)", minWidth: 200 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: "#44403c" }}>
+                        {p.display_name || p.user_id}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 6 }}>
+                        {p.roles.map((role, i) => (
+                          <Chip key={`${p.user_id}-role-${i}`} variant="slate" size="sm">{_activityStatusLabel(String(role))}</Chip>
+                        ))}
+                        {p.declared_capabilities.map((cap, i) => (
+                          <Chip key={`${p.user_id}-cap-${i}`} variant="blue" size="sm">{_activityStatusLabel(String(cap))}</Chip>
+                        ))}
+                        {p.availability.out_of_office ? (
+                          <Chip variant="orange" size="sm">{t("page.workspace_detail.human_out_of_office")}</Chip>
+                        ) : (
+                          p.availability.timezone && (
+                            <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>{p.availability.timezone}</span>
+                          )
+                        )}
+                        <Chip variant={p.open_commitments_count ? "orange" : "green"} size="sm">
+                          {t("page.workspace_detail.human_open_requests").replace("{count}", String(p.open_commitments_count))}
+                        </Chip>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Recent decisions */}
+            {decisions.length > 0 && (
+              <div>
+                {subTitle(t("page.workspace_detail.human_recent_decisions"))}
+                <div style={{ display: "flex", flexDirection: "column" }}>
+                  {decisions.map((d) => (
+                    <div key={`${d.item_id}-${d.decision}`} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "7px 0", borderBottom: "1px solid rgba(28,25,23,0.06)" }}>
+                      <Chip variant={d.decision === "approved" ? "green" : "red"} size="sm">{_activityStatusLabel(d.decision)}</Chip>
+                      {d.kind && <Chip variant="slate" size="sm">{_activityStatusLabel(d.kind)}</Chip>}
+                      {d.reason_code && <Chip variant="orange" size="sm">{_activityStatusLabel(d.reason_code)}</Chip>}
+                      <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>{d.item_id}</span>
+                      {d.decided_at && (
+                        <span className="mono" style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>{relativeTime(d.decided_at)}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Recent contributions — field names only, never values. */}
+            {contributions.length > 0 && (
+              <div>
+                {subTitle(t("page.workspace_detail.human_recent_contributions"))}
+                <div style={{ display: "flex", flexDirection: "column" }}>
+                  {contributions.map((c, i) => (
+                    <div key={`${c.target_kind}-${c.target_id}-${i}`} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "7px 0", borderBottom: "1px solid rgba(28,25,23,0.06)" }}>
+                      <Chip variant="slate" size="sm">{_activityStatusLabel(c.kind)}</Chip>
+                      <span style={{ fontSize: 12, color: "#57534e" }}>{_activityStatusLabel(c.target_kind)}</span>
+                      <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>{c.target_id}</span>
+                      {c.fields_changed.length > 0 && (
+                        <span className="mono" style={{ fontSize: 11, color: "#78716c" }}>
+                          {t("page.workspace_detail.human_fields_changed").replace("{fields}", c.fields_changed.join(", "))}
+                        </span>
+                      )}
+                      {c.created_at && (
+                        <span className="mono" style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>{relativeTime(c.created_at)}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </GlassCard>
+    );
+  }
+
   function renderActivity() {
     const items = activityFeed || [];
     return (
       <div className="workspace-activity-feed" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        {renderHumanParticipationCard()}
         <div className="workspace-activity-feed-title" style={SECTION_TITLE}>{t("page.workspace_detail.activity_feed")}</div>
         {items.length === 0 ? (
           <EmptyState title={t("page.workspace_detail.no_activity")} description={t("page.workspace_detail.no_activity_recorded_for_this_workspace_yet")} />
@@ -5852,6 +6330,266 @@ export default function WorkspaceDetail() {
     );
   }
 
+  function renderStrategySection() {
+    const reviews: StrategyReviewListEntry[] = strategyReviews?.reviews || [];
+    const detail = expandedReviewId ? strategyReviewDetail : undefined;
+    const coverageGaps: string[] = Array.isArray(detail?.review?.briefing?.coverage_gaps)
+      ? detail!.review.briefing!.coverage_gaps
+      : [];
+    const itemCountLabel = (c: { kind: string; status: string; count: number }) =>
+      `${c.count} ${_activityStatusLabel(c.kind)} · ${_activityStatusLabel(c.status)}`;
+
+    return (
+      <GlassCard hoverable={false}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div>
+            <div style={SECTION_TITLE}>{t("page.workspace_detail.strategy")}</div>
+            <div style={{ fontSize: 13, color: "#78716c", lineHeight: 1.6, maxWidth: 760 }}>
+              {t("page.workspace_detail.strategy_desc")}
+            </div>
+          </div>
+          <Chip variant="slate" size="sm">
+            {t("page.workspace_detail.strategy_review_count").replace("{count}", String(reviews.length))}
+          </Chip>
+        </div>
+        {reviews.length === 0 ? (
+          <div style={{ marginTop: 14 }}>
+            <EmptyState
+              title={t("page.workspace_detail.no_strategy_reviews")}
+              description={t("page.workspace_detail.no_strategy_reviews_desc")}
+            />
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14 }}>
+            {reviews.map((review) => {
+              const expanded = expandedReviewId === review.id;
+              const totalReports = review.reports.complete + review.reports.partial + review.reports.failed;
+              return (
+                <div key={review.id} style={{ borderRadius: 16, padding: 14, background: "rgba(250,250,249,0.72)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                      <Chip variant={_strategyStatusChipVariant(review.status)} size="sm">{_activityStatusLabel(review.status)}</Chip>
+                      <Chip variant="slate" size="sm">{_activityStatusLabel(review.trigger_kind)}</Chip>
+                      {totalReports > 0 && (
+                        <Chip variant={review.reports.failed > 0 ? "red" : "slate"} size="sm">
+                          {t("page.workspace_detail.strategy_reports_label")
+                            .replace("{complete}", String(review.reports.complete))
+                            .replace("{total}", String(totalReports))}
+                        </Chip>
+                      )}
+                      {review.item_counts.map((c, i) => (
+                        <Chip key={`${review.id}-count-${i}`} variant={_strategyStatusChipVariant(c.status)} size="sm">
+                          {itemCountLabel(c)}
+                        </Chip>
+                      ))}
+                      {review.status === "skipped" && review.skip_reason && (
+                        <span style={{ fontSize: 11, color: "#a8a29e" }}>
+                          {t("page.workspace_detail.strategy_skipped_reason").replace("{reason}", _activityStatusLabel(review.skip_reason))}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                      <span className="mono" style={{ fontSize: 11, color: "#a8a29e", whiteSpace: "nowrap" }}>
+                        {relativeTime(review.created_at || "")}
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => {
+                          setStrategyWhyItemId(null);
+                          setExpandedReviewId(expanded ? null : review.id);
+                        }}
+                      >
+                        {expanded
+                          ? t("page.workspace_detail.strategy_hide_details")
+                          : t("page.workspace_detail.strategy_view_details")}
+                      </Button>
+                    </div>
+                  </div>
+
+                  {expanded && (
+                    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid rgba(28,25,23,0.06)" }}>
+                      {strategyDetailLoading || !detail ? (
+                        <div style={{ display: "grid", placeItems: "center", padding: 16 }}>
+                          <LoadingSpinner />
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                          {coverageGaps.length > 0 && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                                {t("page.workspace_detail.coverage_gaps")}
+                              </div>
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                {coverageGaps.map((gap, i) => (
+                                  <Chip key={`${review.id}-gap-${i}`} variant="red" size="sm">{gap}</Chip>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                              {t("page.workspace_detail.proposal_items")}
+                            </div>
+                            {!detail.proposal || detail.proposal.items.length === 0 ? (
+                              <div style={{ fontSize: 12, color: "#a8a29e" }}>{t("page.workspace_detail.strategy_no_items")}</div>
+                            ) : (
+                              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                                {detail.proposal.items.map((item: StrategyProposalItem) => {
+                                  const reasonCode = item.decision?.reason_code;
+                                  const basisReports = item.basis?.report_refs || [];
+                                  const basisEvidence = item.basis?.evidence_refs || [];
+                                  const hasBasis = basisReports.length > 0 || basisEvidence.length > 0;
+                                  const whyOpen = strategyWhyItemId === item.id;
+                                  return (
+                                    <div key={item.id} style={{ padding: "8px 0", borderBottom: "1px solid rgba(28,25,23,0.06)" }}>
+                                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                                          <Chip variant="slate" size="sm">{_activityStatusLabel(item.kind)}</Chip>
+                                          <Chip variant={_strategyStatusChipVariant(item.status)} size="sm">{_activityStatusLabel(item.status)}</Chip>
+                                          {reasonCode && <Chip variant="orange" size="sm">{_activityStatusLabel(reasonCode)}</Chip>}
+                                          <span style={{ fontSize: 13, fontWeight: 650, color: "#44403c" }}>
+                                            {formatUserFacingText(String(item.payload?.title || item.item_key))}
+                                          </span>
+                                        </div>
+                                        {hasBasis && (
+                                          <Button
+                                            size="sm"
+                                            variant="ghost"
+                                            onClick={() => setStrategyWhyItemId(whyOpen ? null : item.id)}
+                                          >
+                                            {t("page.workspace_detail.strategy_why")}
+                                          </Button>
+                                        )}
+                                      </div>
+                                      {whyOpen && hasBasis && (
+                                        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                                          {basisReports.length > 0 && (
+                                            <div style={{ fontSize: 11, color: "#78716c" }}>
+                                              {t("page.workspace_detail.strategy_basis_reports")}:{" "}
+                                              <span className="mono">{basisReports.join(", ")}</span>
+                                            </div>
+                                          )}
+                                          {basisEvidence.length > 0 && (
+                                            <div style={{ fontSize: 11, color: "#78716c" }}>
+                                              {t("page.workspace_detail.strategy_basis_evidence")}:{" "}
+                                              <span className="mono">{basisEvidence.join(", ")}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {detail.proposal?.notes && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                                {t("page.workspace_detail.strategist_notes")}
+                              </div>
+                              <div style={{ fontSize: 12, color: "#78716c", lineHeight: 1.55, whiteSpace: "pre-wrap" }}>
+                                {detail.proposal.notes}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </GlassCard>
+    );
+  }
+
+  function renderAutomationHealthCard() {
+    const automations: AutomationHealthEntry[] = automationHealth?.automations || [];
+    const scheduleLabel = (a: AutomationHealthEntry) => {
+      if (a.schedule.cron_expr) return a.schedule.cron_expr;
+      if (a.schedule.every_seconds) {
+        const s = a.schedule.every_seconds;
+        return s % 3600 === 0 ? `every ${s / 3600}h` : s % 60 === 0 ? `every ${s / 60}m` : `every ${s}s`;
+      }
+      if (a.schedule.run_at) return a.schedule.run_at;
+      return _activityStatusLabel(a.schedule.kind || "");
+    };
+
+    return (
+      <GlassCard hoverable={false}>
+        <div style={SECTION_TITLE}>{t("page.workspace_detail.automation_health")}</div>
+        <div style={{ fontSize: 13, color: "#78716c", lineHeight: 1.6, maxWidth: 760, marginBottom: 12 }}>
+          {t("page.workspace_detail.automation_health_desc")}
+        </div>
+        {automations.length === 0 ? (
+          <EmptyState
+            title={t("page.workspace_detail.no_automation_health")}
+            description={t("page.workspace_detail.no_automation_health_desc")}
+          />
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            {automations.map((a) => (
+              <div key={a.id} style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap", padding: "10px 0", borderBottom: "1px solid rgba(28,25,23,0.06)" }}>
+                <div style={{ minWidth: 220 }}>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: "#44403c" }}>{a.name}</span>
+                    <Chip variant="slate" size="sm">{_activityStatusLabel(a.kind)}</Chip>
+                    {a.active_experiment && (
+                      <Chip variant="purple" size="sm">
+                        {t("page.workspace_detail.experiment_active").replace("{status}", _activityStatusLabel(a.active_experiment.status || ""))}
+                      </Chip>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
+                    <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>{scheduleLabel(a)}</span>
+                    <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>
+                      {t("page.workspace_detail.automation_revision").replace("{revision}", String(a.revision))}
+                    </span>
+                    {a.last_run_at && (
+                      <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>{relativeTime(a.last_run_at)}</span>
+                    )}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                  <Chip variant="slate" size="sm">
+                    {t("page.workspace_detail.runs_dispatched").replace("{count}", String(a.runs_30d.dispatched))}
+                  </Chip>
+                  <Chip variant="green" size="sm">
+                    {t("page.workspace_detail.runs_completed").replace("{count}", String(a.runs_30d.completed))}
+                  </Chip>
+                  {a.runs_30d.failed > 0 && (
+                    <Chip variant="red" size="sm">
+                      {t("page.workspace_detail.runs_failed").replace("{count}", String(a.runs_30d.failed))}
+                    </Chip>
+                  )}
+                  {a.runs_30d.missed > 0 && (
+                    <Chip variant="red" size="sm">
+                      {t("page.workspace_detail.runs_missed").replace("{count}", String(a.runs_30d.missed))}
+                    </Chip>
+                  )}
+                  {a.consecutive_errors > 0 && (
+                    <Chip variant="red" size="sm">
+                      {t("page.workspace_detail.failure_streak").replace("{count}", String(a.consecutive_errors))}
+                    </Chip>
+                  )}
+                  {a.last_status && (
+                    <Chip variant={_taskStatusChipVariant(a.last_status)} size="sm">{_activityStatusLabel(a.last_status)}</Chip>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </GlassCard>
+    );
+  }
+
   function renderLearning() {
     const candidates: AgentLearningCandidate[] = learningCandidates || [];
     const evidence: RuntimeEvidence[] = runtimeEvidence || [];
@@ -5903,6 +6641,8 @@ export default function WorkspaceDetail() {
         </GlassCard>
 
         {renderWorkspaceEvaluationCard()}
+
+        {renderStrategySection()}
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: 16 }}>
           <GlassCard hoverable={false}>
@@ -6336,7 +7076,7 @@ export default function WorkspaceDetail() {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))", gap: 10 }}>
                 <div style={{ padding: "10px 12px", borderRadius: 12, background: "rgba(250,250,249,0.7)", border: "1px solid rgba(28,25,23,0.06)" }}>
                   <div style={LABEL}>{t("page.workspace_detail.spent_this_month")}</div>
-                  <div style={{ fontSize: 18, fontWeight: 800, color: "#1c1917" }}>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: "var(--text-strong)" }}>
                     {_formatCredits(budgetStatus.monthly_spent_credits)}
                   </div>
                 </div>
@@ -6359,16 +7099,16 @@ export default function WorkspaceDetail() {
               </div>
               {budgetStatus.monthly_budget_credits != null && (
                 <div style={{ marginTop: 10 }}>
-                  <div style={{ height: 6, borderRadius: 999, background: "#e7e5e4", overflow: "hidden" }}>
+                  <div style={{ height: 6, borderRadius: 999, background: "var(--surface-muted)", overflow: "hidden" }}>
                     <div
                       style={{
                         height: "100%",
                         width: `${Math.min(100, Math.round((budgetStatus.pct_used ?? 0) * 100))}%`,
-                        background: (budgetStatus.pct_used ?? 0) >= 1 ? "#c14a44" : (budgetStatus.pct_used ?? 0) >= 0.8 ? "#cf9b44" : "#436b65",
+                        background: (budgetStatus.pct_used ?? 0) >= 1 ? "var(--editor-danger-text)" : (budgetStatus.pct_used ?? 0) >= 0.8 ? "var(--text-muted)" : "var(--accent)",
                       }}
                     />
                   </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 11, color: "#a8a29e" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 11, color: "var(--text-faint)" }}>
                     <span>{Math.round((budgetStatus.pct_used ?? 0) * 100)}%</span>
                     <span>{t("page.workspace_detail.resets_in_days", { days: budgetStatus.days_until_month_end })}</span>
                   </div>
@@ -6479,6 +7219,135 @@ export default function WorkspaceDetail() {
               {t("page.workspace_detail.send_step_to_human_input_when_retries_are_exhaus")}
             </label>
           </div>
+        </GlassCard>
+
+        {/* ── Approval automation (standing grants) ── */}
+        <GlassCard hoverable={false}>
+          <div style={SECTION_TITLE}>{t("page.workspace_detail.approval_automation")}</div>
+          <p style={{ fontSize: 12, color: "#78716c", marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
+            {t("page.workspace_detail.approval_automation_desc")}
+          </p>
+          {(() => {
+            const rows = approvalMatrix?.rows || [];
+            const otherGrants = approvalMatrix?.other_grants || [];
+            const groups = APPROVAL_MATRIX_GROUPS
+              .map((kind) => ({ kind, rows: rows.filter((row) => row.kind === kind) }))
+              .filter((group) => group.rows.length > 0);
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                {groups.map((group) => (
+                  <div key={group.kind} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <div style={{
+                      fontSize: 11,
+                      fontWeight: 800,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.06em",
+                      color: "#a8a29e",
+                      marginBottom: 4,
+                    }}>
+                      {approvalGroupLabel(group.kind)}
+                    </div>
+                    {group.rows.map((row) => (
+                      <div
+                        key={row.action_key}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          padding: "8px 0",
+                          borderTop: "1px solid rgba(28,25,23,0.06)",
+                        }}
+                      >
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                            <span style={{ fontSize: 13, fontWeight: 600, color: "#1c1917" }}>
+                              {approvalActionLabel(row)}
+                            </span>
+                            {row.risk_level === "high" && (
+                              <Chip size="sm" variant="red">{t("page.workspace_detail.approval_high_risk")}</Chip>
+                            )}
+                          </div>
+                          <code className="mono" style={{ fontSize: 10, color: "#a8a29e" }}>{row.action_key}</code>
+                        </div>
+                        <span style={{ fontSize: 11, color: "#78716c", whiteSpace: "nowrap" }}>
+                          {row.auto_approved
+                            ? t("page.workspace_detail.approval_auto")
+                            : t("page.workspace_detail.approval_human")}
+                        </span>
+                        <Toggle
+                          size="sm"
+                          checked={row.auto_approved}
+                          disabled={!canManageWs || setApprovalMatrixRow.isPending}
+                          onChange={() => setApprovalMatrixRow.mutate({
+                            actionKey: row.action_key,
+                            autoApproved: !row.auto_approved,
+                          })}
+                          aria-label={`${approvalActionLabel(row)} — ${row.action_key}`}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                ))}
+
+                {otherGrants.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{
+                      fontSize: 11,
+                      fontWeight: 800,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.06em",
+                      color: "#a8a29e",
+                    }}>
+                      {t("page.workspace_detail.other_standing_grants")}
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                      {otherGrants.map((grant) => (
+                        <span
+                          key={`${grant.kind}:${grant.value}`}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            padding: "6px 10px",
+                            borderRadius: 999,
+                            background: "rgba(245,245,244,0.9)",
+                            fontSize: 12,
+                            fontWeight: 700,
+                            color: "#44403c",
+                          }}
+                        >
+                          {_friendlyCodeLabel(grant.value)}
+                          <span style={{ fontSize: 10, fontWeight: 800, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                            {grant.kind === "action"
+                              ? t("page.workspace_detail.standing_grant_action")
+                              : t("page.workspace_detail.standing_grant_capability")}
+                          </span>
+                          {canManageWs && (
+                            <button
+                              type="button"
+                              onClick={() => revokeStandingGrant.mutate({ kind: grant.kind, value: grant.value })}
+                              disabled={revokeStandingGrant.isPending}
+                              style={{ border: "none", background: "transparent", color: "#78716c", cursor: "pointer", fontWeight: 900 }}
+                              title={t("page.workspace_detail.revoke_standing_grant")}
+                              aria-label={`${t("page.workspace_detail.revoke_standing_grant")}: ${grant.value}`}
+                            >
+                              ×
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {groups.length === 0 && otherGrants.length === 0 && (
+                  <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>
+                    {t("page.workspace_detail.no_standing_grants")}
+                  </p>
+                )}
+              </div>
+            );
+          })()}
         </GlassCard>
 
         {/* ── Notification policy ── */}
@@ -6678,7 +7547,13 @@ export default function WorkspaceDetail() {
     documents: renderDocuments,
     rules: renderRules,
     goals: renderGoals,
-    automations: () => <ScheduledJobs workspaceId={workspaceId!} />,
+    workflows: () => flowsAvailable ? <WorkspaceWorkflows workspaceId={workspaceId!} canManage={canManageWs} /> : null,
+    automations: () => (
+      <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+        {renderAutomationHealthCard()}
+        <ScheduledJobs workspaceId={workspaceId!} workflowsEnabled={flowsAvailable} />
+      </div>
+    ),
     learning: renderLearning,
     activity: renderActivity,
     settings: renderSettings,
@@ -6690,7 +7565,7 @@ export default function WorkspaceDetail() {
       {/* Header */}
       <PageHeader
         title={ws.name}
-        subtitle={
+        meta={
           <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <StatusBadge type={ws.status === "active" ? "active" : "inactive"} dot pulse={ws.status === "active"}>
               {ws.status}
@@ -6752,7 +7627,7 @@ export default function WorkspaceDetail() {
         }
       >
         <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
-          <WorkspaceWelcomeBurst />
+          <CelebrationFirework />
           <div style={{ minWidth: 0 }}>
             <p style={{ margin: "0 0 8px", fontSize: 14, lineHeight: 1.65, color: "var(--text-strong)" }}>
               {t("page.workspace_detail.welcome_description")}
@@ -6852,7 +7727,7 @@ export default function WorkspaceDetail() {
               </div>
             </div>
             <TabSwitcher
-              tabs={SETUP_TAB_ITEMS}
+              tabs={setupTabItems}
               value={tab}
               onChange={handleTabChange}
               size="sm"

@@ -41,8 +41,15 @@ export function isExternalDomMutationError(err: unknown): boolean {
     typeof DOMException !== "undefined" &&
     err instanceof DOMException &&
     err.name === "NotFoundError";
+  const genericDomNotFound =
+    msg.includes("notfounderror") &&
+    (
+      msg.includes("object can not be found") ||
+      msg.includes("object cannot be found") ||
+      msg.includes("object could not be found")
+    );
 
-  return (nodeApiMismatch && childMismatch) || (notFoundDomException && childMismatch);
+  return (nodeApiMismatch && childMismatch) || (notFoundDomException && childMismatch) || genericDomNotFound;
 }
 
 export function isRecoverableUiRuntimeError(err: unknown): boolean {

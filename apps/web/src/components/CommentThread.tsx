@@ -314,13 +314,13 @@ export default function CommentThread({
             disabled={createComment.isPending}
           />
           <div className="comment-thread-composer-actions">
-          <button
-            onClick={submit}
-            disabled={!text.trim() || createComment.isPending}
-            className="comment-thread-button comment-thread-button--primary"
-          >
-            {t("component.comment_thread.post")}
-          </button>
+            <button
+              onClick={submit}
+              disabled={!text.trim() || createComment.isPending}
+              className="comment-thread-button comment-thread-button--primary"
+            >
+              {t("component.comment_thread.post")}
+            </button>
           </div>
         </div>
       ) : (

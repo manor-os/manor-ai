@@ -4,16 +4,19 @@
  * Shows the latest 3 tools by default; older tools are collapsed behind
  * a "Show N more" button. Each tool result can be expanded/collapsed.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   normalizeToolResult,
   WRAPPER_TOOLS,
+  type SubAgentEvent,
   type ToolCall,
 } from "../../lib/chatStream";
 import { resolveDisplayMediaUrl } from "../../lib/api";
 import { t } from "../../lib/i18n";
+import { matchSubAgentRuns } from "../../lib/subAgentDisplay";
 import { formatUserFacingLabel, formatUserFacingStructuredText } from "../../lib/taskDisplay";
 import { parseMcpToolName, processSurfaceSummary, runtimeToolBadge } from "../../lib/toolRuntimeSurface";
+import AgentLoopStep from "./AgentLoopStep";
 import VideoCard from "./VideoCard";
 
 const AI_EDIT_TOOL_LABELS: Record<string, string> = {
@@ -87,6 +90,8 @@ interface ToolCallListProps {
   /** Workspace chat: collapse the whole list to one quiet line of friendly
    *  tool names — no arguments, results, or expanders. */
   minimal?: boolean;
+  /** Delegated Agent runs rendered in place of their workspace_agent step. */
+  subAgentRuns?: SubAgentEvent[];
 }
 
 function parseToolResult(result?: unknown): Record<string, any> | null {
@@ -378,7 +383,12 @@ function normalizedToolName(name?: string) {
 
 
 export default function ToolCallList(props: ToolCallListProps) {
-  const { tools, keyPrefix, variant = "class" } = props;
+  const {
+    tools,
+    keyPrefix,
+    variant = "class",
+    subAgentRuns = [],
+  } = props;
   const shouldCompactCompleted = props.compactCompleted ?? true;
   const [expandedResults, setExpandedResults] = useState<
     Record<string, boolean>
@@ -386,6 +396,10 @@ export default function ToolCallList(props: ToolCallListProps) {
   const displayTools = (() => {
     return tools;
   })();
+  const subAgentRunByTool = useMemo(
+    () => matchSubAgentRuns(displayTools, subAgentRuns),
+    [displayTools, subAgentRuns],
+  );
 
   const hasError = displayTools.some((tc) => tc.status === "error");
   const hasRunning = displayTools.some(
@@ -407,7 +421,7 @@ export default function ToolCallList(props: ToolCallListProps) {
 
   if (displayTools.length === 0) return null;
 
-  if (props.minimal) {
+  if (props.minimal && subAgentRunByTool.size === 0) {
     const names = Array.from(
       new Set(displayTools.map((tc) => `${runtimeToolBadge(tc.name).compactLabel}: ${displayToolName(tc)}`)),
     ).filter(Boolean);
@@ -438,7 +452,10 @@ export default function ToolCallList(props: ToolCallListProps) {
       ? "Process completed with issues"
       : "Process completed";
   const durationLabel = durationSeconds > 0 ? ` · ${durationSeconds.toFixed(1)}s` : "";
-  const surfaceSummary = processSurfaceSummary(displayTools.map((tool) => tool.name));
+  const surfaceSummary =
+    subAgentRunByTool.size > 0
+      ? ""
+      : processSurfaceSummary(displayTools.map((tool) => tool.name));
   const surfaceLabel = surfaceSummary ? ` · ${surfaceSummary}` : "";
   const processLabel = `${processTitle} · ${displayTools.length} step${displayTools.length === 1 ? "" : "s"}${surfaceLabel}${durationLabel}`;
 
@@ -503,6 +520,7 @@ export default function ToolCallList(props: ToolCallListProps) {
         >
           {displayTools.map((tc, j) => {
             const key = `${keyPrefix}-${j}`;
+            const subAgentRun = subAgentRunByTool.get(j);
             const resultText = normalizeToolResult(tc.result);
             const displayResultText = resultText ? formatUserFacingStructuredText(resultText) : "";
             const status = tc.status || (resultText ? "success" : "pending");
@@ -511,6 +529,10 @@ export default function ToolCallList(props: ToolCallListProps) {
             const inputDetail = displayToolInput(tc);
             const progress = wrapperProgressText(tc, status);
             const badge = runtimeToolBadge(tc.name);
+
+            if (subAgentRun) {
+              return <AgentLoopStep key={key} run={subAgentRun} />;
+            }
 
 
             if (useInline) {

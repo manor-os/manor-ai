@@ -116,6 +116,12 @@ DEFAULT_RUNTIME_PROMPT_SECTIONS: tuple[RuntimePromptSectionSpec, ...] = (
         "Generic runtime tool use contract.",
     ),
     RuntimePromptSectionSpec(
+        "artifact_reference_guidance",
+        ("full",),
+        "tools",
+        "A produced file must be cited by the address the tool returned.",
+    ),
+    RuntimePromptSectionSpec(
         "file_approval_guidance",
         ("full",),
         "approval",
@@ -377,6 +383,18 @@ def tool_usage_guidance(ctx: Any) -> str | None:
     )
 
 
+def artifact_reference_guidance(ctx: Any) -> str | None:
+    from packages.core.ai.runtime.prompt_guidance import (
+        runtime_artifact_reference_guidance,
+    )
+
+    return runtime_artifact_reference_guidance(
+        envelope=getattr(ctx, "runtime_envelope", None),
+        tool_names=_context_tool_names(ctx),
+        has_tools=bool(getattr(ctx, "tools", None)),
+    )
+
+
 def file_approval_guidance(ctx: Any) -> str | None:
     from packages.core.ai.runtime.approval_messages import runtime_file_approval_guidance
 
@@ -392,6 +410,7 @@ async def agent_memories(ctx: Any) -> str | None:
         entity_id=getattr(ctx, "entity_id", None),
         agent_id=getattr(ctx, "agent_id", None),
         user_id=getattr(ctx, "user_id", None),
+        active_user_message=getattr(ctx, "active_user_message", None),
     )
 
 
@@ -411,17 +430,15 @@ async def available_skills_section(ctx: Any) -> str | None:
             runtime_available_skills_omission_section,
         )
 
-        omitted = runtime_available_skills_omission_section(
-            active_user_message=getattr(ctx, "active_user_message", None),
-            manual_skill_selected=bool(getattr(ctx, "manual_skill_selected", False)),
-        )
-        if omitted:
-            return omitted
-
         if runtime_skill_descriptors:
             skills = runtime_skill_descriptors
         elif getattr(ctx, "runtime_envelope", None) is not None:
-            return None
+            return runtime_available_skills_omission_section(
+                active_user_message=getattr(ctx, "active_user_message", None),
+                manual_skill_selected=bool(
+                    getattr(ctx, "manual_skill_selected", False)
+                ),
+            )
         elif getattr(ctx, "agent_id", None):
             from packages.core.services.skill_service import list_skills_for_agent
             skills = await list_skills_for_agent(
@@ -470,6 +487,7 @@ def runtime_prompt_section_renderers() -> dict[str, RuntimePromptSectionFn]:
         "workspace_in_flight_task_update_guidance": workspace_in_flight_task_update_guidance,
         "available_skills_section": available_skills_section,
         "tool_usage_guidance": tool_usage_guidance,
+        "artifact_reference_guidance": artifact_reference_guidance,
         "file_approval_guidance": file_approval_guidance,
         "agent_memories": agent_memories,
         "runtime_context": runtime_context,

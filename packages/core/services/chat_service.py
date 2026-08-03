@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncGenerator
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,14 +36,19 @@ from packages.core.ai.runtime.output_policy import (
 )
 from packages.core.ai.runtime.streams import (
     RuntimeToolStreamSink,
+    runtime_record_sub_agent_event_for_chat,
     runtime_record_tool_end_for_chat,
     runtime_record_tool_start_for_chat,
     runtime_should_flush_stream_text,
     runtime_tool_arguments_for_chat as tool_arguments_for_chat,
+    runtime_tool_call_error,
+    runtime_tool_call_outcome,
+    runtime_tool_path_memory_outcome,
     runtime_tool_result_for_chat as tool_result_for_chat,
     runtime_tool_status_for_chat as tool_status_for_chat,
     runtime_tool_stream_sink_var,
 )
+from packages.core.ai.runtime.provider_approvals import ProviderApprovalCollector
 from packages.core.services.conversation_messages import (
     add_message,
     resolve_author_subscription_id,
@@ -55,6 +61,7 @@ from packages.core.services.assistant_blocks import (
     assistant_blocks_stream_payload,
 )
 from packages.core.services.chat_artifacts import chat_attachments_from_tool_results
+from packages.core.services.chat_approvals import register_chat_provider_approval
 from packages.core.services.hitl_requests import (
     hitl_requests_from_data,
     workspace_operation_pending_action_from_data,
@@ -144,6 +151,51 @@ _DETACHED_CHAT_TURNS: "set[asyncio.Task]" = set()
 def _detach_chat_turn(task: "asyncio.Task") -> None:
     _DETACHED_CHAT_TURNS.add(task)
     task.add_done_callback(_DETACHED_CHAT_TURNS.discard)
+
+
+# Intent->tool-path memory (tool discovery v2, spec §A3) fire-and-forget
+# recording tasks. Mirrors _DETACHED_CHAT_TURNS above: a bare
+# asyncio.create_task() with no strong reference held elsewhere can be
+# garbage-collected mid-DB-write (the task object itself is the only
+# thing keeping the coroutine alive once this function returns).
+_RECORDING_TASKS: "set[asyncio.Task]" = set()
+
+
+def _schedule_tool_path_recording(
+    *,
+    tool_name: str,
+    result: str,
+    entity_id: str | None,
+    user_id: str | None,
+    message: "str | list[dict]",
+    ctx: Any,
+) -> None:
+    """Fire-and-forget intent-path recording for one finished tool call.
+
+    Classifies the raw result via runtime_tool_path_memory_outcome rather
+    than the UI-facing tool_status_for_chat status string: approval-gate
+    outcomes (waiting_human/rejected/blocked/cancelled/canceled) and raw
+    __hitl__ interrupt payloads are skipped entirely — spec §A3 explicitly
+    excludes approval denials/cancellations/availability blocks from
+    failure recording ("those say nothing about whether the path fits the
+    task"), and a HITL interrupt is not a terminal outcome yet (recording
+    it as a success would be premature, and double-counts once the human
+    actually resolves it).
+    """
+    outcome = runtime_tool_path_memory_outcome(result)
+    if outcome is None:
+        return
+    from packages.core.ai.agentic_loop import _maybe_record_tool_path
+    task = asyncio.create_task(_maybe_record_tool_path(
+        tool_name=tool_name,
+        success=(outcome == "success"),
+        entity_id=entity_id,
+        user_id=user_id,
+        user_message=runtime_message_text_for_intent(message),
+        hinted_tool_names=getattr(ctx, "hinted_tool_names", None),
+    ))
+    _RECORDING_TASKS.add(task)
+    task.add_done_callback(_RECORDING_TASKS.discard)
 
 
 async def stream_chat_response(
@@ -246,6 +298,8 @@ async def stream_chat_response(
         tools_started = [False]  # a tool/skill has begun executing this turn
         last_tool_args: dict[str, dict] = {}  # name -> args for current round
         tool_results: list[dict] = []  # [{name, result}] for DB storage
+        sub_agent_events: list[dict] = []
+        provider_approvals = ProviderApprovalCollector()
         assistant_blocks = AssistantBlocksBuilder()
         text_buffer = [""]
         pending_post_tool_text = [""]
@@ -299,6 +353,7 @@ async def stream_chat_response(
                 return
             name = str(tool_call.get("name") or "tool")
             args = tool_call.get("arguments")
+            provider_approvals.capture_recorded_tool_call(tool_call)
             if event_type == "tool_start":
                 runtime_record_tool_start_for_chat(tool_results, name, args)
                 flush_text_buffer()
@@ -317,6 +372,9 @@ async def stream_chat_response(
                     status=tool_call.get("status"),
                     duration_ms=tool_call.get("duration_ms"),
                 )
+                persisted_result = tool_call.get("raw_result")
+                if isinstance(persisted_result, str) and persisted_result:
+                    _attach_raw_tool_result(tool_results, name, persisted_result)
                 assistant_blocks.end_tool(
                     name,
                     arguments=args,
@@ -327,9 +385,13 @@ async def stream_chat_response(
                 )
             data.update(assistant_blocks_stream_payload(assistant_blocks))
 
+        def record_sub_agent_event(event: dict) -> None:
+            runtime_record_sub_agent_event_for_chat(sub_agent_events, event)
+
         tool_stream_token = runtime_tool_stream_sink_var.set(RuntimeToolStreamSink(
             event_queue=event_queue,
             record_tool_event=record_nested_tool_event,
+            record_sub_agent_event=record_sub_agent_event,
             format_event=scoped_sse,
             format_tool_arguments=tool_arguments_for_chat,
             format_tool_result=tool_result_for_chat,
@@ -539,6 +601,7 @@ async def stream_chat_response(
                     meta={
                         "stream_status": "streaming",
                         "stream_checkpoint": True,
+                        "sub_agent_events": sub_agent_events,
                         **assistant_blocks.meta(),
                     },
                 )
@@ -601,6 +664,7 @@ async def stream_chat_response(
 
         def on_tool_end(name: str, result: str, duration_ms: float = 0, args: dict | None = None) -> None:
             nonlocal hitl_data
+            provider_approvals.capture(name, args, result)
             if result.strip().startswith('{"__hitl__":'):
                 try:
                     hitl_data = json.loads(result)
@@ -641,13 +705,29 @@ async def stream_chat_response(
                     "duration_ms": int(duration_ms),
                 },
             })))
+            # ``tool_call_logs`` is only useful for failure analysis if the
+            # row records the real outcome — without these two the column
+            # default made every persisted row say success=True.
+            tool_error = runtime_tool_call_error(result)
             trace.log_tool_exec(
                 round_num=round_counter[0],
                 duration_ms=duration_ms,
                 tool_name=name,
                 result_length=len(result),
                 result_preview=preview,
+                success=tool_error is None,
+                error=tool_error,
                 tool_args=tool_args,
+                outcome=runtime_tool_call_outcome(name, result),
+            )
+            # Intent->tool-path memory (tool discovery v2, spec §A3):
+            # fire-and-forget, never delays the tool result. Classifies
+            # the raw result (approval-gate / HITL outcomes are excluded,
+            # not just the UI-facing status) and holds a strong task
+            # reference so it can't be GC'd mid-write.
+            _schedule_tool_path_recording(
+                tool_name=name, result=result, entity_id=entity_id,
+                user_id=user_id, message=message, ctx=ctx,
             )
 
         def on_llm_call(round_num: int, duration_ms: float, usage: dict, tool_calls: list, finish_reason: str) -> None:
@@ -668,6 +748,7 @@ async def stream_chat_response(
         manual_skill_slugs = runtime_manual_skill_ids_from_refs(manual_skill_refs)
 
         async def _run_loop():
+            nonlocal hitl_data
             # Suppress auto-billing — chat handles it via record_chat_llm_usage after the loop
             _billing_handle = runtime_set_suppressed_billing_context(
                 entity_id=entity_id or "",
@@ -691,9 +772,11 @@ async def stream_chat_response(
                     active_user_message=runtime_message_text_for_intent(message),
                     manual_skill_selected=bool(manual_skill_refs),
                     manual_skill_slugs=manual_skill_slugs,
-                    legacy_tool_profile=ctx.legacy_runtime_profile,
+                    tool_profile=ctx.tool_profile,
                     allowed_tool_names=ctx.allowed_tool_names,
                     model=resolved_model,
+                    temperature=getattr(ctx, "temperature", None),
+                    max_tokens=getattr(ctx, "max_tokens", None),
                     initial_messages=initial_messages or None,
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
@@ -708,6 +791,23 @@ async def stream_chat_response(
                 # inside the task so it persists even if the SSE client
                 # disconnects before the generator resumes.
                 if result:
+                    if (
+                        hitl_data is None
+                        and persist_messages
+                        and conversation_id
+                        and (provider_request := provider_approvals.pending_request())
+                    ):
+                        from packages.core.database import async_session as _approval_session_factory
+
+                        async with _approval_session_factory() as approval_db:
+                            hitl_data = await register_chat_provider_approval(
+                                approval_db,
+                                conversation_id=conversation_id,
+                                entity_id=entity_id,
+                                user_id=user_id,
+                                request=provider_request,
+                            )
+                            await approval_db.commit()
                     streamed_fallback_content = streamed_text_content[0].strip()
                     # Some providers stream visible text but return an empty
                     # final assistant message. Persist the streamed content so
@@ -780,6 +880,8 @@ async def stream_chat_response(
                             hitl_requests = hitl_requests_from_data(hitl_data)
                             if hitl_requests:
                                 assistant_meta["hitl_requests"] = hitl_requests
+                            if sub_agent_events:
+                                assistant_meta["sub_agent_events"] = sub_agent_events
                             if attachments:
                                 assistant_meta["attachments"] = attachments
                             saved_id = await save_or_update_assistant_stream_message(
@@ -825,6 +927,7 @@ async def stream_chat_response(
                                 usage=result.usage or {},
                                 duration_ms=elapsed_ms,
                                 fallback_model=resolved_model,
+                                rounds=result.rounds,
                             )
                             queued_learning_ids = (
                                 await record_chat_runtime_learning(
@@ -1121,6 +1224,8 @@ async def run_chat_message(
         _round_counter = [0]
         _last_tool_args: dict[str, dict] = {}
         _tool_results: list[dict] = []
+        sub_agent_events: list[dict] = []
+        provider_approvals = ProviderApprovalCollector()
         hitl_data: dict | None = None
 
         def _record_nested_tool_event(event_type: str, data: dict) -> None:
@@ -1129,6 +1234,7 @@ async def run_chat_message(
                 return
             name = str(tool_call.get("name") or "tool")
             args = tool_call.get("arguments")
+            provider_approvals.capture_recorded_tool_call(tool_call)
             if event_type == "tool_start":
                 runtime_record_tool_start_for_chat(_tool_results, name, args)
             elif event_type == "tool_end":
@@ -1140,9 +1246,16 @@ async def run_chat_message(
                     status=tool_call.get("status"),
                     duration_ms=tool_call.get("duration_ms"),
                 )
+                persisted_result = tool_call.get("raw_result")
+                if isinstance(persisted_result, str) and persisted_result:
+                    _attach_raw_tool_result(_tool_results, name, persisted_result)
+
+        def _record_sub_agent_event(event: dict) -> None:
+            runtime_record_sub_agent_event_for_chat(sub_agent_events, event)
 
         _tool_stream_token = runtime_tool_stream_sink_var.set(RuntimeToolStreamSink(
             record_tool_event=_record_nested_tool_event,
+            record_sub_agent_event=_record_sub_agent_event,
             format_tool_arguments=tool_arguments_for_chat,
             format_tool_result=tool_result_for_chat,
             resolve_tool_status=tool_status_for_chat,
@@ -1170,6 +1283,7 @@ async def run_chat_message(
 
         def _on_tool_end(name: str, result: str, duration_ms: float = 0, args: dict | None = None) -> None:
             nonlocal hitl_data
+            provider_approvals.capture(name, args, result)
             if result.strip().startswith('{"__hitl__":'):
                 try:
                     hitl_data = json.loads(result)
@@ -1188,22 +1302,29 @@ async def run_chat_message(
                 duration_ms=duration_ms,
             )
             _attach_raw_tool_result(_tool_results, name, result)
+            # See the identical comment in stream_chat_response's on_tool_end.
+            tool_error = runtime_tool_call_error(result)
             trace.log_tool_exec(
                 round_num=_round_counter[0],
                 duration_ms=duration_ms,
                 tool_name=name,
                 result_length=len(result),
                 result_preview=preview,
+                success=tool_error is None,
+                error=tool_error,
                 tool_args=tool_args,
+                outcome=runtime_tool_call_outcome(name, result),
+            )
+            # Intent->tool-path memory (tool discovery v2, spec §A3): see
+            # the identical comment in stream_chat_response's on_tool_end.
+            _schedule_tool_path_recording(
+                tool_name=name, result=result, entity_id=entity_id,
+                user_id=user_id, message=message, ctx=ctx,
             )
 
-        # Resolve model via the shared resolver — honours the entity's
-        # Primary AI picker just like the streaming path does.
-        from packages.core.services.model_resolver import resolve_model_for_user
-        _resolved_model = await resolve_model_for_user(
-            "primary",
-            user_id=user_id, entity_id=entity_id, db=db,
-        )
+        # The context already applies the Agent override before tenant and
+        # platform defaults, matching the streaming path.
+        _resolved_model = resolve_model_from_context(ctx)
 
         # Suppress auto-billing — chat handles it via record_chat_llm_usage
         _billing_handle = runtime_set_suppressed_billing_context(
@@ -1229,9 +1350,11 @@ async def run_chat_message(
             active_user_message=runtime_message_text_for_intent(message),
             manual_skill_selected=bool(manual_skill_refs),
             manual_skill_slugs=manual_skill_slugs,
-            legacy_tool_profile=ctx.legacy_runtime_profile,
+            tool_profile=ctx.tool_profile,
             allowed_tool_names=ctx.allowed_tool_names,
             model=_resolved_model,
+            temperature=getattr(ctx, "temperature", None),
+            max_tokens=getattr(ctx, "max_tokens", None),
             initial_messages=initial_messages if initial_messages else None,
             on_tool_start=_on_tool_start,
             on_tool_end=_on_tool_end,
@@ -1255,6 +1378,7 @@ async def run_chat_message(
             usage=result.usage or {},
             duration_ms=elapsed_ms,
             fallback_model=_resolved_model,
+            rounds=result.rounds,
         )
     except Exception as exc:
         trace.log_error(str(exc), phase="run_chat_message")
@@ -1271,6 +1395,20 @@ async def run_chat_message(
         result.content = runtime_sanitize_assistant_content_after_loop(
             result.content or "",
             result.tool_calls_made,
+        )
+
+    if (
+        hitl_data is None
+        and db
+        and conversation_id
+        and (provider_request := provider_approvals.pending_request())
+    ):
+        hitl_data = await register_chat_provider_approval(
+            db,
+            conversation_id=conversation_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            request=provider_request,
         )
 
     # Save assistant message to DB
@@ -1296,6 +1434,8 @@ async def run_chat_message(
             hitl_requests = hitl_requests_from_data(hitl_data)
             if hitl_requests:
                 assistant_meta["hitl_requests"] = hitl_requests
+            if sub_agent_events:
+                assistant_meta["sub_agent_events"] = sub_agent_events
             if attachments:
                 assistant_meta["attachments"] = attachments
             assistant_blocks = AssistantBlocksBuilder()

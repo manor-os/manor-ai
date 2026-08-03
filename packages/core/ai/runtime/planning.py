@@ -112,7 +112,6 @@ RUNTIME_PLAN_JSON_HINT = {
             "capability_id": "<runtime capability id, only if kind=action and known>",
             "params": {"prompt": "<required for llm/subagent steps>"},
             "depends_on": ["<earlier step key>"],
-            "expected_output_schema": {"type": "object"},
             "risk_level": "low|medium|high",
             "description": "Human-readable one-liner (<=120 chars).",
         }
@@ -229,14 +228,24 @@ def runtime_planner_system_prompt(
         "  * action steps MUST choose capability_id first, then provider+action_key from that capability's actions\n"
         "  * action steps SHOULD include capability_id whenever the capability catalog shows one\n"
         "  * llm/subagent steps MUST put the natural-language work request in params.prompt\n"
+        "  * Every llm/subagent step automatically returns the standard StepResult "
+        "envelope: {status, summary, outputs{text, files, data}, progress{done, total, unit}, "
+        "failure{reason, blockers, retryable}, next_steps}. Do NOT author "
+        "expected_output_schema for llm/subagent steps — the envelope is the contract. "
+        "Describe the desired CONTENT in the step's params.prompt prose instead.\n"
+        "  * Do NOT require platform receipts (tweet ids, urns, post URLs, "
+        "published_at timestamps) from llm/subagent step outputs — the runtime "
+        "captures those as execution evidence.\n"
+        "  * Reference upstream llm/subagent results via "
+        "steps.<key>.result.outputs.text / .outputs.files / .outputs.data / .status.\n"
         "  * If the task deliverable is a user-visible artifact (file, image, PDF, "
         "document, deck, spreadsheet, video, export, attachment, or domain-specific file), "
         "do not satisfy it with a plain text-only LLM step. Use a subagent step whose "
-        "prompt explicitly instructs the agent to call an available file/media tool such as `generate_file`, "
-        "and set output_shape to the canonical shape the step produces — one of: "
+        "prompt explicitly instructs the agent to call an available file/media tool such as `generate_file`. "
+        "When a step's whole purpose is producing files/documents you may still set "
+        "output_shape explicitly to a specialized canonical shape — one of: "
         "ArtifactResult, TextResult, DocumentResult, ListResult, PublishResult, CountResult, EmptyResult. "
-        "Do not invent output field names; the shape owns them (e.g. ArtifactResult provides files[].fs_path). "
-        "A legacy expected_output_schema is still accepted but output_shape is preferred.\n"
+        "Do not invent output field names; the shape owns them (e.g. ArtifactResult provides files[].fs_path).\n"
         "  * For workspace tasks, do not ask the user where to save generated files. "
         "Runtime file/media tools are automatically scoped to the current workspace's "
         "artifact folder. Only skip saving when the task explicitly asks for text-only "
@@ -245,8 +254,24 @@ def runtime_planner_system_prompt(
         "always-allow, and deny rules are inherited from workspace governance "
         "policy. Use a human step only when the task genuinely needs missing "
         "input or a user decision to proceed.\n"
+        "  * When a step waits on an external system (rendering, batch jobs, "
+        "third-party async APIs), do NOT emit one long-running step that blocks "
+        "until the job finishes. Emit submit → sleep → poll: an action/subagent "
+        "step that STARTS the job and returns its job id, a `sleep` step, then a "
+        "poll step that re-checks status and depends on the sleep (add another "
+        "sleep+poll pair for longer waits). `sleep` steps consume no worker "
+        "capacity while waiting.\n"
+        "  * If a step genuinely needs one long uninterrupted run, declare its "
+        "budget explicitly as params.max_runtime_seconds instead of relying on "
+        "the default.\n"
         "  * human steps should only involve assigned staff above\n"
-        "  * document references must use workspace documents above\n\n"
+        "  * document references must use workspace documents above\n"
+        "  * If a `USER CONSTRAINTS` block is present, it is the user's own "
+        "binding wording (including prohibitions like 'save only the table, do "
+        "not write an essay'). Copy each relevant constraint VERBATIM into the "
+        "`params.prompt` of every llm/subagent step it applies to, and never "
+        "produce a step that violates one. These override your default output "
+        "preferences.\n\n"
         "Reference earlier step output in params with "
         '"${{ steps.<step_key>.result.<path> }}".\n\n'
         "Replanning:\n"
@@ -254,9 +279,24 @@ def runtime_planner_system_prompt(
         "`succeeded_steps` (each with a result summary) and one or a few "
         "`failed_steps`: produce a MINIMAL plan — redo only the failed "
         "step(s); do NOT regenerate steps that already succeeded, reuse their "
-        "outputs by referencing the prior result. Regenerate the whole plan "
+        "outputs. Regenerate the whole plan "
         "only when the failure is structural (the original DAG itself was "
-        "wrong, not just one step's output).\n\n"
+        "wrong, not just one step's output).\n"
+        "  * Every step listed in `succeeded_steps` HAS ALREADY RUN in a "
+        "prior plan and its output still exists — including a step marked "
+        "`no_output: true`, which ran and simply returned no payload. Do not "
+        "put a step in the new plan that re-creates work already listed "
+        "there. Consume the existing output instead: copy the literal "
+        "`artifacts[].fs_path` / `artifacts[].url` / `document_id` / "
+        "`fs_path` / `result_summary` values from `_replan_context` directly "
+        "into the params of the steps that need them.\n"
+        "  * `${{ steps.<key>.result... }}` refs resolve ONLY within the plan "
+        "you are emitting now; they CANNOT reach a previous plan's step. "
+        "Referencing a `succeeded_steps` key that way fails at dispatch — "
+        "inline the literal value instead.\n"
+        "  * Re-run an already-succeeded step only when its recorded output "
+        "is genuinely unusable for the new approach, and say why in that "
+        "step's `description`.\n\n"
         "Use submit_plan tool to submit the final plan as JSON.\n"
         f"Plan JSON shape:\n{schema_hint}\n"
     )
@@ -307,6 +347,17 @@ def runtime_planner_task_prompt(task: Any) -> str:
     parts = [f"# Task to plan\nTitle: {title}"]
     if description:
         parts.append(f"Description: {description}")
+    # Lift the user's verbatim task constraints OUT of the opaque Details JSON
+    # into a prominent binding block, so the planner carries them into steps
+    # instead of paraphrasing them away.
+    from packages.core.plans.task_constraints import (
+        extract_binding_constraints,
+        render_constraints_block,
+    )
+
+    constraints_block = render_constraints_block(extract_binding_constraints(details))
+    if constraints_block:
+        parts.append(constraints_block)
     predecessor_outputs = runtime_planner_predecessor_outputs(
         details.get("dep_outputs") if isinstance(details, dict) else None
     )
@@ -569,7 +620,73 @@ def runtime_planner_tool_message(content: str, *, tool_call_id: str | None = Non
     return payload
 
 
-RUNTIME_PLAN_SUPERVISOR_VERDICTS = ("completed", "needs_replan", "needs_human", "failed")
+from packages.core.constants.execution import ExecutionStepStatus
+from packages.core.constants.supervisor import (
+    MAX_EVIDENCE_CHARS,
+    MODEL_CHOOSABLE_VERDICTS,
+    SupervisorDecision,
+    SupervisorDecisionSource,
+    SupervisorVerdict,
+)
+
+# The verdict vocabulary is the enum in packages/core/constants/supervisor.py;
+# this tuple is the model-facing subset, kept for prompt/tests that iterate it.
+RUNTIME_PLAN_SUPERVISOR_VERDICTS = tuple(
+    verdict.value for verdict in (
+        SupervisorVerdict.COMPLETED,
+        SupervisorVerdict.RETRY_STEP,
+        SupervisorVerdict.NEEDS_REPLAN,
+        SupervisorVerdict.NEEDS_HUMAN,
+        SupervisorVerdict.FAILED,
+    )
+)
+
+
+#: Per-step ceilings for the supervisor's view. The supervisor reviews one
+#: task a handful of times across its whole execution, so input size is the
+#: wrong thing to economise: a starved context produces a wrong verdict,
+#: and a wrong verdict throws away the whole plan's spend. (The previous view gave it 150 characters of result
+#: and nothing else — accurate judgement was impossible by construction.)
+#: These exist only against pathological inputs — a step result carrying
+#: megabytes of text — never as a working constraint.
+SUPERVISOR_INSTRUCTION_CHARS = 4000
+SUPERVISOR_RESULT_CHARS = 4000
+SUPERVISOR_ERROR_CHARS = 1000
+SUPERVISOR_MAX_STEPS = 50
+SUPERVISOR_MAX_ARTIFACTS = 10
+
+
+def _render_supervisor_step(index: int, info: dict[str, Any]) -> str:
+    """One step, as the supervisor sees it: what it was asked to do, what
+    it reported, and what it verifiably produced."""
+    key = str(info.get("key") or f"step_{index}")
+    kind = str(info.get("kind") or "step")
+    owner = str(info.get("owner") or "").strip()
+    status = str(info.get("status") or "unknown")
+    attempts = info.get("attempts")
+    header = f"{index}. {key} ({kind}{', ' + owner if owner else ''}) — {status}"
+    if isinstance(attempts, int) and attempts > 1:
+        header += f" after {attempts} attempts"
+
+    lines = [header]
+    instruction = str(info.get("instruction") or "").strip()
+    if instruction:
+        lines.append(f"   asked to: {instruction[:SUPERVISOR_INSTRUCTION_CHARS]}")
+    result = str(info.get("result") or "").strip()
+    if result:
+        lines.append(f"   reported: {result[:SUPERVISOR_RESULT_CHARS]}")
+    error = str(info.get("error") or "").strip()
+    if error:
+        lines.append(f"   error: {error[:SUPERVISOR_ERROR_CHARS]}")
+    artifacts = [str(a) for a in (info.get("artifacts") or []) if str(a).strip()]
+    if status == ExecutionStepStatus.DONE:
+        if artifacts:
+            lines.append(
+                "   artifacts: " + "; ".join(artifacts[:SUPERVISOR_MAX_ARTIFACTS])
+            )
+        else:
+            lines.append("   artifacts: (none recorded)")
+    return "\n".join(lines)
 
 
 def runtime_plan_supervisor_prompt(
@@ -579,26 +696,124 @@ def runtime_plan_supervisor_prompt(
     done_count: int,
     failed_count: int,
     skipped_count: int,
-    step_lines: Iterable[str],
+    steps: Iterable[dict[str, Any]],
+    retryable_step_keys: Iterable[str] = (),
+    plan_rationale: str = "",
+    is_replan: bool = False,
+    prior_attempts: Iterable[dict[str, Any]] = (),
+    prior_reviews: Iterable[dict[str, Any]] = (),
 ) -> str:
-    """Build the Runtime-owned supervisor prompt for executed plans."""
+    """Build the Runtime-owned supervisor prompt for executed plans.
+
+    The supervisor's scope is ONE task, across its whole execution: earlier
+    plans for the same task and the supervisor's own earlier reviews are
+    part of the picture, so a verdict never repeats what was already tried
+    and found wanting.
+    """
+
+    retryable = [str(key) for key in retryable_step_keys if str(key).strip()]
+    retryable_text = ", ".join(retryable) if retryable else "(none — do not use retry_step)"
+    step_list = list(steps)
+    rendered_steps = [
+        _render_supervisor_step(i + 1, info)
+        for i, info in enumerate(step_list[:SUPERVISOR_MAX_STEPS])
+    ]
+    if len(step_list) > SUPERVISOR_MAX_STEPS:
+        rendered_steps.append(f"(+{len(step_list) - SUPERVISOR_MAX_STEPS} more steps omitted)")
+    plan_context = ""
+    if plan_rationale.strip():
+        plan_context += f"Planner rationale: {plan_rationale.strip()[:2000]}\n"
+    if is_replan:
+        plan_context += (
+            "This plan is already a REPLAN of an earlier failed attempt — "
+            "weigh that before asking for another one.\n"
+        )
+
+    history = ""
+    attempt_list = list(prior_attempts)
+    if attempt_list:
+        lines = []
+        for i, attempt in enumerate(attempt_list[-5:], 1):
+            steps_text = ", ".join(
+                f"{s.get('key')}({s.get('status')}"
+                + (f": {str(s.get('error'))[:120]}" if s.get("error") else "")
+                + ")"
+                for s in (attempt.get("steps") or [])[:8]
+            )
+            lines.append(
+                f"{i}. plan {attempt.get('status')}"
+                + (f" — steps: {steps_text}" if steps_text else "")
+            )
+        history += "Earlier attempts on this task:\n" + "\n".join(lines) + "\n"
+    review_list = list(prior_reviews)
+    if review_list:
+        lines = []
+        for i, review in enumerate(review_list[-5:], 1):
+            entry = f"{i}. {review.get('verdict')}"
+            if review.get("step_key"):
+                entry += f" (step {review.get('step_key')})"
+            evidence = str(review.get("evidence") or "").strip()
+            if evidence:
+                entry += f' — "{evidence[:300]}"'
+            lines.append(entry)
+        history += "Your earlier reviews of this task:\n" + "\n".join(lines) + "\n"
 
     return (
-        f"You are a task supervisor. A plan just finished executing.\n\n"
+        "You are the supervisor for one task. You oversee its whole "
+        "execution: each time one of its plans finishes you review the "
+        "results, and your verdict either continues the work (retry_step, "
+        "needs_replan, needs_human) or closes the task (completed, failed).\n\n"
         f"Task: {task_title}\n"
         f"Description: {task_description}\n\n"
-        f"Plan result: {done_count} steps done, {failed_count} failed, "
-        f"{skipped_count} skipped\n\n"
-        f"Steps:\n" + "\n".join(step_lines) + "\n\n"
-        "Before the parent task status is changed, decide whether the "
-        "task objective was actually achieved by these outputs. Do not "
-        "mark completed only because every execution step is marked done.\n\n"
+        f"Latest plan result: {done_count} steps done, {failed_count} failed, "
+        f"{skipped_count} skipped\n"
+        + plan_context + history + "\n"
+        f"Steps:\n" + "\n".join(rendered_steps) + "\n\n"
+        "Judge whether the TASK'S OWN deliverable was produced and delivered "
+        "— judge the task itself, not the subject it reports on.\n\n"
+        "Rules:\n"
+        "- The deliverable is what THIS task was asked to produce or do: a "
+        "report, email, post, file, message, or action. If that deliverable "
+        "was produced and any send / publish / save / execute step succeeded, "
+        "the task is COMPLETED — even when its content reports blockers, zero "
+        "progress, or says the user should decide or act on OTHER work. A "
+        "status report that correctly states 'these items are blocked or need "
+        "your decision' is a SUCCESSFUL report, not a failed task.\n"
+        "- Do not require the underlying problem to be solved, and do not "
+        "re-judge work the task was only asked to summarize or notify about.\n"
+        "- Weigh what was already tried: if an earlier review retried a step "
+        "or asked for a replan and the outcome is unchanged, do not ask for "
+        "the same thing again — decide the task instead (needs_human or "
+        "failed).\n"
+        "- Each step's 'artifacts' line lists the delivery receipts the system "
+        "actually recorded (file paths, document ids, URLs). When a step was "
+        "asked to save, send, or publish something and its artifacts line says "
+        "(none recorded), do not take the step's own prose as proof of "
+        "delivery.\n"
+        "- Reserve needs_replan for when the deliverable was NOT actually "
+        "produced (steps ran but the output is empty, a placeholder, or "
+        "clearly wrong) and a fresh plan could produce it. Reserve needs_human "
+        "for when THIS task cannot be finished without user-supplied input, "
+        "access, or approval — not merely because its output recommends "
+        "follow-up.\n\n"
         "Choose ONE verdict:\n"
-        "- completed - the task goal was achieved and any required deliverable exists\n"
-        "- needs_replan - the system should try a different plan without asking the user\n"
-        "- needs_human - missing input, access, approval, source material, or user decision is required\n"
+        "- completed - the task's deliverable was produced and delivered "
+        "(default when nothing failed and a concrete output exists)\n"
+        "- retry_step - exactly one step's output is empty, malformed, or hit "
+        "a transient error, and simply running THAT step again could produce "
+        "it. Only allowed for a step listed under Retryable steps; prefer it "
+        "over needs_replan when one bad step is the whole problem.\n"
+        "- needs_replan - the deliverable is missing, empty, or wrong and a "
+        "different plan could produce it\n"
+        "- needs_human - this task needs user input, access, or approval to finish\n"
         "- failed - the task cannot be completed or is permanently invalid\n\n"
-        "Respond with ONLY the verdict word, nothing else."
+        f"Retryable steps: {retryable_text}\n\n"
+        "Respond with ONLY a single-line JSON object:\n"
+        '{"verdict": "<verdict>", "step": "<step_key if retry_step, else null>", '
+        '"evidence": "<one short sentence citing the specific step result that '
+        "justifies this verdict>\"}\n"
+        "evidence must reference what the steps actually produced, not restate "
+        "the verdict."
     )
 
 
@@ -609,7 +824,12 @@ def runtime_plan_supervisor_messages(
     done_count: int,
     failed_count: int,
     skipped_count: int,
-    step_lines: Iterable[str],
+    steps: Iterable[dict[str, Any]],
+    retryable_step_keys: Iterable[str] = (),
+    plan_rationale: str = "",
+    is_replan: bool = False,
+    prior_attempts: Iterable[dict[str, Any]] = (),
+    prior_reviews: Iterable[dict[str, Any]] = (),
 ) -> list[dict[str, str]]:
     """Build Runtime one-shot messages for plan supervisor verdicts."""
 
@@ -621,7 +841,12 @@ def runtime_plan_supervisor_messages(
             done_count=done_count,
             failed_count=failed_count,
             skipped_count=skipped_count,
-            step_lines=step_lines,
+            steps=steps,
+            retryable_step_keys=retryable_step_keys,
+            plan_rationale=plan_rationale,
+            is_replan=is_replan,
+            prior_attempts=prior_attempts,
+            prior_reviews=prior_reviews,
         ),
     }]
 
@@ -633,9 +858,14 @@ async def runtime_execute_plan_supervisor_completion(
     done_count: int,
     failed_count: int,
     skipped_count: int,
-    step_lines: Iterable[str],
+    steps: Iterable[dict[str, Any]],
     entity_id: str | None,
     workspace_id: str | None = None,
+    retryable_step_keys: Iterable[str] = (),
+    plan_rationale: str = "",
+    is_replan: bool = False,
+    prior_attempts: Iterable[dict[str, Any]] = (),
+    prior_reviews: Iterable[dict[str, Any]] = (),
 ) -> RuntimeTextCompletionResult:
     """Execute the Plan supervisor verdict call with Runtime-owned defaults."""
 
@@ -646,32 +876,91 @@ async def runtime_execute_plan_supervisor_completion(
             done_count=done_count,
             failed_count=failed_count,
             skipped_count=skipped_count,
-            step_lines=step_lines,
+            steps=steps,
+            retryable_step_keys=retryable_step_keys,
+            plan_rationale=plan_rationale,
+            is_replan=is_replan,
+            prior_attempts=prior_attempts,
+            prior_reviews=prior_reviews,
         ),
         entity_id=entity_id,
         source=RUNTIME_PLAN_SUPERVISOR_SOURCE,
         workspace_id=workspace_id,
         temperature=0.1,
-        max_tokens=20,
+        # The output is a verdict plus its explanation; one call per task,
+        # so the ceiling only guards against runaway generation — it is not
+        # a length the model is expected to reach. (The original budget of
+        # 20 tokens fit exactly the bare word this design replaces.)
+        max_tokens=2000,
     )
 
 
-def runtime_parse_plan_supervisor_verdict(raw: str | None) -> str:
-    """Parse a Runtime plan supervisor verdict from plain text or JSON."""
+def runtime_parse_plan_supervisor_decision(
+    raw: str | None,
+    *,
+    retryable_step_keys: Iterable[str] = (),
+) -> SupervisorDecision | None:
+    """Parse the supervisor's reply into a validated SupervisorDecision.
 
+    Accepts the requested one-line JSON, and tolerates a bare verdict word
+    (the previous contract) with empty evidence. Everything the model names
+    is validated, never trusted: an unknown verdict is None, and a
+    retry_step naming a step that is not actually retryable downgrades to
+    needs_replan with the invalid reference recorded — the model offers,
+    the code decides (the same rule the StepResult envelope follows for
+    IDs).
+    """
     text = (raw or "").strip()
     if not text:
-        return ""
+        return None
+
+    step_raw: str | None = None
+    evidence = ""
+    verdict_text = text
+    # Models sometimes fence the JSON; strip a ```...``` wrapper first.
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+        verdict_text = text
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
-            text = str(parsed.get("verdict") or parsed.get("status") or "").strip()
+            verdict_text = str(parsed.get("verdict") or parsed.get("status") or "").strip()
+            raw_step = parsed.get("step") or parsed.get("step_key")
+            step_raw = str(raw_step).strip() if raw_step not in (None, "", "null") else None
+            evidence = str(parsed.get("evidence") or parsed.get("reason") or "").strip()
     except Exception:
         pass
-    verdict = text.lower().split()[0].strip("`'\".,:;")
-    if verdict in RUNTIME_PLAN_SUPERVISOR_VERDICTS:
-        return verdict
-    return ""
+
+    word = verdict_text.lower().split()[0].strip("`'\".,:;") if verdict_text else ""
+    try:
+        verdict = SupervisorVerdict(word)
+    except ValueError:
+        return None
+    if verdict not in MODEL_CHOOSABLE_VERDICTS:
+        return None
+
+    evidence = evidence[:MAX_EVIDENCE_CHARS]
+    if verdict is SupervisorVerdict.RETRY_STEP:
+        valid_keys = {str(key) for key in retryable_step_keys}
+        if not step_raw or step_raw not in valid_keys:
+            return SupervisorDecision(
+                verdict=SupervisorVerdict.NEEDS_REPLAN,
+                evidence=(
+                    f"{evidence} — " if evidence else ""
+                ) + f"the supervisor asked to retry {step_raw or 'an unnamed step'}, which is not a retryable step",
+                source=SupervisorDecisionSource.MODEL,
+            )
+        return SupervisorDecision(
+            verdict=verdict,
+            evidence=evidence,
+            source=SupervisorDecisionSource.MODEL,
+            step_key=step_raw,
+        )
+    return SupervisorDecision(
+        verdict=verdict, evidence=evidence, source=SupervisorDecisionSource.MODEL,
+    )
 
 
 async def runtime_execute_planner_chat_turn(

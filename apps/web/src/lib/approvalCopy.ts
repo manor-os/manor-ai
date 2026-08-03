@@ -7,7 +7,78 @@ type ApprovalCopyInput = {
   content?: unknown;
   argsPreview?: unknown;
   operation?: unknown;
+  /** `pending_action.hitl_type` — "input" | "review" | "authorize" |
+   *  "choice" | "error". Absent on cards posted before the type shipped. */
+  hitlType?: string;
+  /** `pending_action.payload` — the typed copy that answers what / why /
+   *  what-to-do. Absent on those same older cards. */
+  payload?: unknown;
 };
+
+/** The three things every typed card must be able to say. Built from the
+ *  request's own payload; `null` when the card carries no payload at all,
+ *  which is the signal to fall back to prompt-based copy.
+ *
+ *  This exists because the prompt-based path could not say them. The
+ *  dispatcher's synthesized reason ("Step requires operator approval before
+ *  dispatching 'x'.") answers only "what", and answers it in internal terms —
+ *  so the UI rewrote it to one fixed sentence, and the real failure underneath
+ *  ("your local worker is offline") was destroyed on the way to the screen. */
+export type StructuredApprovalCopy = {
+  /** The one-line answer to "what is this". */
+  headline: string;
+  /** Supporting "why", when the payload carries one distinct from headline. */
+  detail: string | null;
+  /** The call to action — what the user should go do. */
+  actionToTake: string | null;
+  /** In-app route for the call to action (e.g. "/integrations"). */
+  actionLink: string | null;
+};
+
+function payloadText(payload: Record<string, any>, key: string): string {
+  const value = payload[key];
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+/**
+ * Render copy from a typed HITL payload. Returns null when there is nothing
+ * structured to render — callers then keep their existing prompt-based
+ * behavior, so cards posted before the type system still look exactly as
+ * they did.
+ *
+ * The headline is the type's own "what": `what_happened` for `error`,
+ * `question` for `input`/`choice`, `action_description` for `authorize`.
+ * `review` has no headline field of its own, so its `why` leads.
+ */
+export function structuredApprovalCopy(
+  payload?: unknown,
+): StructuredApprovalCopy | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const record = payload as Record<string, any>;
+  const why = payloadText(record, "why");
+  const headline =
+    payloadText(record, "what_happened")
+    || payloadText(record, "question")
+    || payloadText(record, "action_description")
+    || why;
+  if (!headline) return null;
+  const actionToTake = payloadText(record, "action_to_take");
+  const rawLink = record.action_link;
+  const actionLink =
+    typeof rawLink === "string" && rawLink.trim() ? rawLink.trim() : null;
+  return {
+    headline,
+    detail: why && why !== headline ? why : null,
+    actionToTake: actionToTake || null,
+    actionLink,
+  };
+}
+
+/** True when this card is a failure report rather than a request for
+ *  permission. An error card must never offer "Approve". */
+export function isErrorHitlCard(hitlType?: string | null): boolean {
+  return String(hitlType || "").toLowerCase() === "error";
+}
 
 const ACTION_LABELS: Record<string, string> = {
   create_document: "Create file",
@@ -79,6 +150,11 @@ export function friendlyApprovalToolLabel(tool?: string): string {
 }
 
 export function friendlyApprovalDescription(input: ApprovalCopyInput): string {
+  // A typed payload knows what this card is about; the prompt only guesses.
+  // When one is present it wins outright — no rewrite pass runs over it, so
+  // nothing it says can be swallowed.
+  const structured = structuredApprovalCopy(input.payload);
+  if (structured) return structured.headline;
   const prompt = cleanPrompt(input.prompt);
   const rewritten = rewriteInternalPrompt(prompt);
   const paths = normalizePaths(input.paths);
@@ -138,12 +214,51 @@ function describeStepAction(
   return friendlyDispatchVerb(String(tool || ""));
 }
 
+// The approval gate's fully-synthesized reasons. These sentences contain
+// nothing but internal identifiers, so replacing them wholesale loses nothing.
+// Anything that merely CONTAINS the dispatch phrasing is not one of these:
+// the extra words are real content — the worker's actual failure, a policy
+// rule's description — and get local redaction instead. Replacing those
+// wholesale is exactly how "Manor could not reach the browser on your
+// computer" became "This step needs your approval before it runs", fifteen
+// times, for one operator whose local worker daemon was simply not running.
+const DISPATCH_PROMPT_TEMPLATES: RegExp[] = [
+  /^step(\s+['"`][\w.\-]+['"`])?\s+requires operator approval before dispatching\s+['"`]?[\w.\-]+['"`]?\.?$/i,
+  /^high[\s-]?risk step needs one-time operator approval before dispatching\s+['"`]?[\w.\-]+['"`]?\.?$/i,
+  /^step\s+['"`][\w.\-]+['"`]\s+is high[\s-]?risk and needs one-time operator approval before dispatching\s+['"`]?[\w.\-]+['"`]?\.?$/i,
+];
+
+/** Swap internal identifiers for human words IN PLACE, leaving every other
+ *  word of the sentence intact. */
+function redactInternalIdentifiers(prompt: string): string {
+  const toolMatch = prompt.match(/dispatching\s+['"`]?([\w.\-]+)['"`]?/i);
+  const stepMatch = prompt.match(/\bstep\s+['"`]([\w.\-]+)['"`]/i);
+  let out = prompt;
+  if (stepMatch) {
+    const described = describeStepAction(stepMatch[1], toolMatch?.[1]);
+    out = out.replace(
+      stepMatch[0],
+      described ? `The step to ${described}` : "This step",
+    );
+  }
+  if (toolMatch) {
+    const verb = friendlyDispatchVerb(toolMatch[1]);
+    out = out.replace(
+      toolMatch[0],
+      `dispatching ${verb || friendlyApprovalActionLabel(toolMatch[1]).toLowerCase()}`,
+    );
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
 function rewriteInternalPrompt(prompt: string): string | null {
   if (!prompt) return null;
   for (const [pattern, replacement] of PROMPT_REWRITES) {
     if (pattern.test(prompt)) return replacement;
   }
   if (/\bapproval\s+before\s+dispatching\b/i.test(prompt)) {
+    const isPureTemplate = DISPATCH_PROMPT_TEMPLATES.some((re) => re.test(prompt));
+    if (!isPureTemplate) return redactInternalIdentifiers(prompt) || null;
     const stepMatch = prompt.match(/step\s+['"`]?([\w.\-]+)['"`]?/i);
     const toolMatch = prompt.match(/dispatching\s+['"`]?([\w.\-]+)['"`]?/i);
     const action = describeStepAction(stepMatch?.[1], toolMatch?.[1]);

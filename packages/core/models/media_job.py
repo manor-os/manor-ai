@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 from sqlalchemy import DateTime, Index, Integer, String, Text, func
@@ -9,6 +10,32 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin, generate_ulid
+
+
+class MediaJobStatus(str, Enum):
+    """Lifecycle of an async media generation job.
+
+    Consumers compare against these members rather than string literals —
+    an artifact collector that guessed at the word for "finished" would
+    either miss real deliverables or promote a pending job's empty path.
+    """
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        return [member.value for member in cls]
+
+    @classmethod
+    def terminal(cls) -> frozenset[str]:
+        return frozenset({cls.COMPLETED.value, cls.FAILED.value})
+
+    @classmethod
+    def is_completed(cls, value: object) -> bool:
+        return str(value or "").strip().lower() == cls.COMPLETED.value
 
 
 class MediaJob(Base, TimestampMixin):

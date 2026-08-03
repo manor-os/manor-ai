@@ -358,6 +358,42 @@ def load_skill_extra_files(
     return results
 
 
+def delete_skill_paths(
+    entity_id: str,
+    skill_id: str,
+    rels: list[str],
+    *,
+    skill_dir: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> int:
+    """Best-effort removal of specific bundle files (relative paths).
+
+    Used when an edit removes files from a bundle — the objects must leave
+    MinIO too, or the next load resurrects them. Core files (SKILL.md,
+    config.json, credentials.json) are never removed this way.
+    """
+    if not entity_id or not skill_id or not rels:
+        return 0
+    client, bucket = _get_client()
+    if client is None:
+        return 0
+
+    d = skill_dir or compute_skill_dir(skill_id, config=config)
+    protected = {"SKILL.md", "config.json", "credentials.json"}
+    removed = 0
+    for rel in rels:
+        safe = str(rel).replace("\\", "/").strip().lstrip("/")
+        if not safe or ".." in safe or safe in protected:
+            continue
+        try:
+            client.remove_object(bucket, _key(entity_id, d, safe))
+            removed += 1
+        except Exception as exc:
+            logger.debug("[skill_file_storage] delete path failed entity=%s dir=%s rel=%s: %s",
+                         entity_id, d, safe, exc)
+    return removed
+
+
 def delete_skill_files(
     entity_id: str,
     skill_id: str,

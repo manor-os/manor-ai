@@ -1,13 +1,14 @@
 """Model gateway facade.
 
 This module is the business-facing boundary for model routing. Provider
-registry data, official platform credentials, OpenRouter fallback, and route
-pricing source are exposed here so callers do not reach into lower-level
+registry data, official platform credentials, managed gateway failover, and
+route pricing source are exposed here so callers do not reach into lower-level
 storage modules directly.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,8 +27,13 @@ from packages.core.services.model_provider_handlers import (  # noqa: F401 — r
     provider_from_base_url,
     resolve_provider_base_url,
 )
+from packages.core.services.model_provider_adapters import (  # noqa: F401 — re-exported
+    adapt_native_chat_completion_payload,
+)
 from packages.core.services import platform_model_provider_keys as provider_key_service
 from packages.core.services.platform_model_provider_keys import OfficialProviderCredential
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,8 @@ class ModelGatewayRoute:
     def pricing_source(self) -> str:
         if self.is_byok:
             return "byok"
+        if self.provider == "vercel" or "ai-gateway.vercel.sh" in self.base_url.lower():
+            return "vercel"
         if self.provider == "openrouter" or "openrouter.ai" in self.base_url.lower():
             return "openrouter"
         return self.source or "official"
@@ -67,6 +75,8 @@ def route_pricing_source(route: ModelGatewayRoute, base_url: str | None = None) 
     )
     if route.source == "byok":
         return route_provider, "byok"
+    if route_provider == "vercel" or "ai-gateway.vercel.sh" in url.lower():
+        return "vercel", "vercel"
     if route_provider == "openrouter" or "openrouter.ai" in url.lower():
         return "openrouter", "openrouter"
     return route_provider, (route.source or "official")
@@ -75,44 +85,48 @@ def route_pricing_source(route: ModelGatewayRoute, base_url: str | None = None) 
 async def resolve_official_model_route(
     model_id: str,
     *,
-    reason: str = "llm.chat.official_provider_key",
+    reason: str | None = None,
+    vercel_reason: str = "llm.chat.vercel_gateway_key",
     openrouter_reason: str = "llm.chat.openrouter_fallback_key",
+    gateway_provider: str | None = None,
 ) -> ModelGatewayRoute | None:
     """Resolve official platform routing for a catalog model.
 
-    Native official provider tokens win. If no native token exists, OpenRouter
-    remains the broad fallback so catalog models keep working during rollout.
+    Manor official calls prefer Vercel AI Gateway and fall back to OpenRouter.
+    ``gateway_provider`` narrows resolution to one gateway for runtime failover.
+    User BYOK is resolved by the caller before this platform route is queried.
     """
 
-    model_provider = provider_for_model_id(model_id)
-    if not model_provider:
+    if not provider_for_model_id(model_id):
         return None
 
-    credential = await provider_key_service.resolve_official_provider_credential(
-        model_provider,
-        reason=reason,
-    )
-    if credential and credential.api_key:
-        return ModelGatewayRoute(
-            api_key=credential.api_key,
-            base_url=credential.base_url,
-            provider=model_provider,
-            source=credential.source,
-            source_detail=credential.source_detail,
-        )
-
-    if model_provider != "openrouter":
-        fallback = await provider_key_service.resolve_official_provider_credential(
-            "openrouter",
-            reason=openrouter_reason,
-        )
-        if fallback and fallback.api_key:
+    gateway_chain = (gateway_provider,) if gateway_provider else ("vercel", "openrouter")
+    reasons = {
+        "vercel": reason or vercel_reason,
+        "openrouter": openrouter_reason,
+    }
+    for provider in gateway_chain:
+        if provider not in reasons:
+            continue
+        try:
+            credential = await provider_key_service.resolve_official_provider_credential(
+                provider,
+                reason=reasons[provider],
+            )
+        except Exception:
+            logger.warning(
+                "Official %s credential lookup failed; trying the next managed gateway.",
+                provider,
+                exc_info=True,
+            )
+            continue
+        if credential and credential.api_key:
             return ModelGatewayRoute(
-                api_key=fallback.api_key,
-                base_url=fallback.base_url,
-                provider="openrouter",
-                source=fallback.source,
-                source_detail=fallback.source_detail,
+                api_key=credential.api_key,
+                base_url=credential.base_url,
+                provider=provider,
+                source=credential.source,
+                source_detail=credential.source_detail,
             )
 
     return None

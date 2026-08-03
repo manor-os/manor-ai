@@ -12,7 +12,7 @@ Usage:
         tools=ctx.tools,
         entity_id=ctx.entity_id,
         agent_id=ctx.agent_id,
-        legacy_tool_profile=ctx.legacy_runtime_profile,
+        tool_profile=ctx.tool_profile,
         allowed_tool_names=ctx.allowed_tool_names,
         model=ctx.model,
         ...
@@ -47,6 +47,8 @@ class AgentExecutionContext:
     tool_names: list[str] = field(default_factory=list)
     allowed_tool_names: set[str] = field(default_factory=set)
     model: str = ""
+    temperature: float | None = None
+    max_tokens: int | None = None
     initial_messages: list[dict] = field(default_factory=list)
     entity_id: str = ""
     user_id: Optional[str] = None
@@ -55,7 +57,7 @@ class AgentExecutionContext:
     workspace_id: Optional[str] = None
     task_id: Optional[str] = None
     runtime_profile: Optional[str] = None
-    legacy_runtime_profile: Optional[str] = None
+    tool_profile: Optional[str] = None
     runtime_surface: str | None = None
     runtime_envelope: RuntimeEnvelope | None = None
     llm_metadata: Optional[dict] = None
@@ -70,6 +72,7 @@ async def build_agent_context(
     agent_id: Optional[str] = None,
     workspace_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    task_id: Optional[str] = None,
     active_user_message: Optional[str] = None,
     model_role: str = "primary",
     mode: str = "full",
@@ -84,6 +87,9 @@ async def build_agent_context(
         agent_id: Which agent to use. None = master agent.
         workspace_id: Optional workspace scope (loads workspace context).
         conversation_id: Optional conversation (loads history).
+        task_id: Task this run belongs to. Callers that execute a plan step
+            outside a conversation MUST pass it — it is what makes the run's
+            RuntimeEventLog rows joinable to the task that produced them.
         active_user_message: Latest task/message text for skill routing hints.
         model_role: Model tier — "primary", "worker", "image", etc.
         mode: Prompt detail — "full" (chat), "minimal" (quick), "task" (execution).
@@ -134,6 +140,7 @@ async def build_agent_context(
         agent_id=agent_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
+        task_id=task_id,
         is_master=is_master,
         runtime_surface=runtime_surface,
     )
@@ -141,7 +148,7 @@ async def build_agent_context(
     ctx.task_id = runtime.task_id
     surface = runtime_surface if isinstance(runtime_surface, ChatSurface) else ChatSurface(str(runtime_surface))
     ctx.runtime_profile = runtime_profile_name_for_surface(surface)
-    ctx.legacy_runtime_profile = runtime.legacy_tool_profile
+    ctx.tool_profile = runtime.tool_profile
     ctx.runtime_surface = surface.value
 
     # ── Resolve system prompt + tools ──
@@ -166,7 +173,7 @@ async def build_agent_context(
         assembled = await runtime_assemble_prompt_for_turn(
             db,
             request=runtime_request,
-            legacy_runtime_profile=runtime.legacy_tool_profile,
+            tool_profile=runtime.tool_profile,
             agent_id=agent_id,
             bound_tool_names=runtime.bound_tool_names,
             is_master=runtime.is_master,
@@ -187,6 +194,19 @@ async def build_agent_context(
             ctx.agent_name = "Manor AI"
         else:
             ctx.agent_name = getattr(chat_ctx.agent, "name", None) or "Agent"
+            from packages.core.services.agent_runtime_config import (
+                agent_runtime_config_for,
+            )
+            agent_config = agent_runtime_config_for(chat_ctx.agent)
+            if agent_config.model:
+                ctx.model = agent_config.model
+                if ctx.llm_metadata:
+                    ctx.llm_metadata = {
+                        **ctx.llm_metadata,
+                        "_resolved_model": ctx.model,
+                    }
+            ctx.temperature = agent_config.temperature
+            ctx.max_tokens = agent_config.max_tokens
     except Exception:
         logger.warning("build_agent_context: prompt/tool resolution failed", exc_info=True)
         ctx.system_prompt = (
@@ -214,7 +234,7 @@ async def build_agent_context(
                 bound_tool_names=runtime.bound_tool_names,
                 is_master=runtime.is_master,
                 mcp_allowed_names=runtime.mcp_allowed_names,
-                legacy_runtime_profile=runtime.legacy_tool_profile,
+                tool_profile=runtime.tool_profile,
             )
             ctx.tools = surface_result.tool_schemas
             ctx.tool_names = [

@@ -141,10 +141,128 @@ async def extract_chat_insights(
     }
 
 
+async def extract_entity_chat_insights(
+    db: AsyncSession,
+    entity_id: str,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """One extraction pass over an entity's workspace-less chats. Caller commits.
+
+    The workspace extractor never sees the main assistant chat
+    (``Conversation.workspace_id IS NULL``), so preferences typed there
+    never reached long-term memory. Insights are persisted as per-user
+    agent memories (``agent_memories`` rows with ``workspace_id`` null),
+    which the chat prompt reads back via ``get_context_memories``.
+    """
+    from packages.core.models.user import Entity
+    from packages.core.services.memory_service import add_memory
+
+    now = now or datetime.now(timezone.utc)
+
+    entity = (await db.execute(
+        select(Entity).where(Entity.id == entity_id)
+    )).scalar_one_or_none()
+    if entity is None:
+        return {"entity_id": entity_id, "skipped": True, "reason": "not_found"}
+
+    settings = dict(entity.settings or {})
+    bookmark = _parse_bookmark(
+        settings.get(LAST_EXTRACT_KEY),
+        default=now - timedelta(hours=LOOKBACK_HOURS),
+    )
+
+    conv_rows = (await db.execute(
+        select(Conversation.id, Conversation.user_id).where(
+            Conversation.entity_id == entity_id,
+            Conversation.workspace_id.is_(None),
+        )
+    )).all()
+    conv_user_by_id = {row[0]: row[1] for row in conv_rows}
+    if not conv_user_by_id:
+        return {"entity_id": entity_id, "messages": 0, "extracted": 0}
+
+    rows = list((await db.execute(
+        select(Message).where(
+            Message.conversation_id.in_(list(conv_user_by_id)),
+            Message.author_kind == "user",
+            Message.created_at > bookmark,
+        ).order_by(desc(Message.created_at)).limit(MAX_MESSAGES_PER_PASS)
+    )).scalars().all())
+    messages = [
+        m for m in rows
+        if m.content and len(m.content.strip()) >= MIN_MESSAGE_CHARS
+    ]
+    messages.sort(key=lambda m: m.created_at)
+
+    def _save_bookmark(ts: datetime) -> None:
+        settings[LAST_EXTRACT_KEY] = ts.isoformat()
+        entity.settings = settings
+
+    if not messages:
+        _save_bookmark(now)
+        await db.flush()
+        return {"entity_id": entity_id, "messages": 0, "extracted": 0}
+
+    user_by_message_id = {
+        m.id: conv_user_by_id.get(m.conversation_id) for m in messages
+    }
+    fallback_user_id = next(
+        (uid for uid in user_by_message_id.values() if uid), None
+    )
+
+    payload = runtime_chat_insight_payload(messages)
+    extractions = await _call_llm(
+        payload, entity_id=entity_id, workspace_id=None,
+    )
+
+    written = 0
+    skipped_invalid = 0
+    for entry in extractions:
+        if not _is_valid_entry(entry):
+            skipped_invalid += 1
+            continue
+        source_msg_id = str(entry.get("source_message_id") or "")
+        user_id = user_by_message_id.get(source_msg_id) or fallback_user_id
+        await add_memory(
+            db,
+            entity_id,
+            f"{entry['title'].strip()}: {entry['body'].strip()}",
+            memory_type=_ENTITY_MEMORY_TYPE_BY_SCOPE.get(entry["scope"], "fact"),
+            user_id=user_id,
+            importance=int(entry.get("importance") or 5),
+            source=f"chat_extract:{source_msg_id or 'unknown'}",
+            metadata={
+                "confidence": float(entry["confidence"]),
+                "tags": list(entry.get("tags") or []) + ["auto", "from_chat"],
+            },
+        )
+        written += 1
+
+    _save_bookmark(max(m.created_at for m in messages))
+    await db.flush()
+
+    return {
+        "entity_id": entity_id,
+        "messages": len(messages),
+        "extracted": written,
+        "skipped_invalid": skipped_invalid,
+    }
+
+
+# Map the extractor taxonomy onto the per-agent memory taxonomy
+# ('fact' | 'preference' | 'context' | 'instruction').
+_ENTITY_MEMORY_TYPE_BY_SCOPE = {
+    "guidance": "instruction",
+    "preference": "preference",
+    "decision": "context",
+    "fact": "fact",
+}
+
+
 # ── Internals ─────────────────────────────────────────────────────────
 
-def _read_bookmark(workspace: Workspace, *, default: datetime) -> datetime:
-    raw = (workspace.settings or {}).get(LAST_EXTRACT_KEY)
+def _parse_bookmark(raw: Any, *, default: datetime) -> datetime:
     if not raw:
         return default
     try:
@@ -154,6 +272,12 @@ def _read_bookmark(workspace: Workspace, *, default: datetime) -> datetime:
         return ts
     except (ValueError, TypeError):
         return default
+
+
+def _read_bookmark(workspace: Workspace, *, default: datetime) -> datetime:
+    return _parse_bookmark(
+        (workspace.settings or {}).get(LAST_EXTRACT_KEY), default=default
+    )
 
 
 def _write_bookmark(workspace: Workspace, ts: datetime) -> None:
@@ -201,7 +325,7 @@ async def _call_llm(
     payload: str,
     *,
     entity_id: str,
-    workspace_id: str,
+    workspace_id: str | None,
 ) -> list[dict[str, Any]]:
     """Single LLM call asking for the extracted entries.
 

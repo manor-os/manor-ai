@@ -1,6 +1,7 @@
 """Workspace endpoints — CRUD, operating model, agent mappings, activity, setup."""
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -9,6 +10,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, delete as sa_delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskStatus
+from packages.core.constants.execution import (
+    ExecutionStepStatus,
+)
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.models.workspace import Workspace, WorkspaceStaff
@@ -29,6 +34,7 @@ from packages.core.services.workspace_runtime import (
 from packages.core.services.workspace_access import (
     ensure_workspace_owner_membership,
     filter_workspaces_for_user,
+    get_active_workspace_membership,
     settings_with_default_workspace_access,
     user_can_read_workspace,
 )
@@ -39,6 +45,8 @@ from packages.core.services.provider_keys import (
 )
 from packages.core.services.tool_cache_version import bump_tool_cache_version
 from apps.api.deps import get_current_user, require_plan
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["workspaces"])
 
@@ -64,6 +72,7 @@ class WorkspaceResponse(BaseModel):
     id: str
     entity_id: str
     name: str
+    artifact_folder_id: str | None = None
     description: str | None = None
     category: str | None = None
     address: str | None = None
@@ -79,6 +88,9 @@ class WorkspaceResponse(BaseModel):
     created_by_name: str | None = None
     created_by_email: str | None = None
     created_by_avatar_url: str | None = None
+    #: Whether the blueprint this workspace was installed from has changed
+    #: since. Detection only — applying an update is a deliberate act.
+    blueprint_update: dict | None = None
     # Extended fields
     longitude: float | None = None
     latitude: float | None = None
@@ -145,9 +157,8 @@ class StaffAssignRequest(BaseModel):
     staff_id: str
     role: str | None = None
     # Permission-v1: workspace-level role (owner / editor / contributor /
-    # viewer / external_client) + optional expiry. Backward compat: legacy
-    # callers that didn't send these get permanent assignment with no
-    # role enum validation.
+    # viewer) + optional expiry. Backward compat: legacy callers that didn't
+    # send these get permanent assignment with no role enum validation.
     expires_at: datetime | None = None
     user_id: str | None = None
 
@@ -382,16 +393,96 @@ async def _workspace_creator_summaries(
     return result
 
 
-def _to_response(ws, *, creator: User | dict[str, Any] | None = None) -> WorkspaceResponse:
+async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tuple]:
+    """Map each workspace to the blueprint payload it would upgrade toward.
+
+    Two sources, because there are two ways in. A built-in blueprint lives in
+    the config directory and is found by slug. A marketplace blueprint lives
+    in workspace_blueprints, and the install recorded its id — resolving those
+    by slug alone would find nothing, which is how "update available" would
+    have stayed silent for every marketplace install while quietly reporting
+    "unknown".
+
+    One query for all of them: this feeds the workspace list.
+    """
+    from packages.core.blueprints.freshness import (
+        BLUEPRINT_ID_KEY,
+        installed_blueprint_record,
+    )
+
+    payloads: dict[str, tuple] = {}
+    wanted_ids: dict[str, list[str]] = {}
+
+    for ws in workspaces:
+        settings = ws.settings if isinstance(getattr(ws, "settings", None), dict) else {}
+        blueprint_id = str(
+            installed_blueprint_record(settings).get(BLUEPRINT_ID_KEY) or ""
+        ).strip()
+        if blueprint_id:
+            wanted_ids.setdefault(blueprint_id, []).append(ws.id)
+
+    if wanted_ids:
+        try:
+            from packages.core.models.blueprint import WorkspaceBlueprint
+
+            rows = (await db.execute(
+                select(WorkspaceBlueprint).where(
+                    WorkspaceBlueprint.id.in_(list(wanted_ids)),
+                )
+            )).scalars().all()
+            for row in rows:
+                payload = row.payload if isinstance(row.payload, dict) else None
+                if not payload:
+                    continue
+                for workspace_id in wanted_ids.get(row.id, []):
+                    payloads[workspace_id] = (payload, row.content_version)
+        except Exception:
+            logger.warning("blueprint freshness: payload lookup failed", exc_info=True)
+
+    return payloads
+
+
+def _blueprint_update_for(ws, resolved: tuple | None = None) -> dict[str, Any] | None:
+    """Whether this workspace's blueprint has moved on without it.
+
+    Best-effort: a workspace page must render whether or not the blueprint it
+    names can still be read.
+    """
+    from packages.core.blueprints.freshness import (
+        BLUEPRINT_ID_KEY,
+        BlueprintFreshness,
+        blueprint_update_summary,
+        installed_blueprint_record,
+    )
+
+    settings = ws.settings if isinstance(getattr(ws, "settings", None), dict) else {}
+    if not installed_blueprint_record(settings).get(BLUEPRINT_ID_KEY):
+        return None
+
+    payload, current_version = resolved if resolved else (None, None)
+    summary = blueprint_update_summary(settings, payload, current_version=current_version)
+    if summary.get("status") == BlueprintFreshness.NOT_FROM_BLUEPRINT.value:
+        return None
+    return summary
+
+
+def _to_response(
+    ws,
+    *,
+    creator: User | dict[str, Any] | None = None,
+    blueprint_payload: tuple | None = None,
+) -> WorkspaceResponse:
     creator_summary = _coerce_user_summary(creator)
     return WorkspaceResponse(
         id=ws.id, entity_id=ws.entity_id, name=ws.name,
+        artifact_folder_id=getattr(ws, "artifact_folder_id", None),
         description=ws.description, category=ws.category,
         address=ws.address, kind=ws.kind,
         operating_context=ws.operating_context,
         primary_work=ws.primary_work,
         operating_model=ws.operating_model or {},
         settings=ws.settings or {}, status=ws.status,
+        blueprint_update=_blueprint_update_for(ws, blueprint_payload),
         created_at=ws.created_at, updated_at=getattr(ws, "updated_at", None),
         created_by_user_id=(creator_summary or {}).get("id"),
         created_by_name=(creator_summary or {}).get("name"),
@@ -430,21 +521,17 @@ async def _require_workspace_read(db: AsyncSession, workspace_id: str, user: Use
 async def _workspace_role_of(
     db: AsyncSession, workspace_id: str, user_id: str | None
 ) -> str | None:
-    """Return the caller's active membership role in this workspace, or None."""
-    if not user_id:
-        return None
-    row = (
-        await db.execute(
-            select(WorkspaceStaff)
-            .where(
-                WorkspaceStaff.workspace_id == workspace_id,
-                WorkspaceStaff.user_id == user_id,
-                WorkspaceStaff.status == "active",
-            )
-            .limit(1)
-        )
-    ).scalars().first()
-    return row.role if row else None
+    """Return the caller's active, non-expired membership role, or None.
+
+    Delegates to :func:`get_active_workspace_membership` so the *manage* path
+    honors ``expires_at`` exactly like the *read* path does — otherwise a
+    time-boxed workspace-``owner`` grant would keep management rights after its
+    read access has lapsed.
+    """
+    membership = await get_active_workspace_membership(
+        db, workspace_id=workspace_id, user_id=user_id
+    )
+    return membership.role if membership else None
 
 
 async def _require_workspace_manage(db: AsyncSession, workspace_id: str, user: User):
@@ -607,11 +694,36 @@ async def list_my_workspaces(
             "proposal_actions": 0,
             "failed_actions": 0,
             "hitl_tasks": 0,
+            "open_approval_requests": 0,
         }
         for wid in ws_ids
     }
 
     if ws_ids:
+        # Unified approval store: open requests per workspace — the truth the
+        # cards/badge derive from, exposed directly so the UI can render an
+        # approvals count that stale or duplicate cards cannot inflate.
+        # SAVEPOINT so a missing hitl_requests table (mid-rollout, replica
+        # behind on migrations) degrades to count=0 WITHOUT aborting the outer
+        # transaction — a bare try/except would poison every later query in
+        # this request and 500 the whole sidebar endpoint.
+        # NOTE: the response key stays ``open_approval_requests`` — it is a
+        # published API field name, and renaming it would break clients.
+        try:
+            from packages.core.governance.approvals import (
+                count_open_requests_by_workspace,
+            )
+
+            async with db.begin_nested():
+                counts = await count_open_requests_by_workspace(
+                    db, workspace_ids=ws_ids,
+                )
+            for wid, cnt in counts.items():
+                if wid in stats_map:
+                    stats_map[wid]["open_approval_requests"] = cnt
+        except Exception:
+            pass  # hitl_requests table may not exist yet mid-rollout
+
         # Task counts
         task_rows = (await db.execute(
             select(Task.workspace_id, Task.status, func.count().label("cnt"))
@@ -661,38 +773,45 @@ async def list_my_workspaces(
         chat_hitl_step_ids: dict[str, set[str]] = {}
         chat_hitl_task_ids: dict[str, set[str]] = {}
         try:
-            pending_rows = (await db.execute(
-                select(Conversation.workspace_id, Message.pending_action)
-                .join(Message, Message.conversation_id == Conversation.id)
-                .where(
-                    Conversation.workspace_id.in_(ws_ids),
-                    Conversation.entity_id == user.entity_id,
-                    Message.pending_action.isnot(None),
-                    Message.pending_action["kind"].as_string().isnot(None),
-                    Message.resolved_at.is_(None),
-                )
-            )).all()
+            # SAVEPOINT for the same reason as the approval-requests block
+            # above: a bare try/except around a failing query leaves the outer
+            # transaction aborted, so every later query in this request fails
+            # too and the whole sidebar 500s instead of losing one stat.
+            async with db.begin_nested():
+                pending_rows = (await db.execute(
+                    select(Conversation.workspace_id, Message.pending_action)
+                    .join(Message, Message.conversation_id == Conversation.id)
+                    .where(
+                        Conversation.workspace_id.in_(ws_ids),
+                        Conversation.entity_id == user.entity_id,
+                        Message.pending_action.isnot(None),
+                        Message.pending_action["kind"].as_string().isnot(None),
+                        Message.resolved_at.is_(None),
+                    )
+                )).all()
             for r in pending_rows:
                 action = r.pending_action or {}
                 action_kind = action.get("kind")
-                if action_kind in {
-                    "human_input",
-                    "governance_approval",
-                    "workspace_operation_review",
-                    "needs_input",
-                    "needs_confirmation",
-                }:
+                # `approve_proposals` and `retry_strategist_review` get their
+                # own buckets so the UI can style them differently. EVERY other
+                # kind counts as a plain chat action — including ones added
+                # after this code was written. An `elif` chain that silently
+                # dropped unknown kinds made `external_message_approval`
+                # (approve a post/tweet) and `needs_login` invisible to the
+                # badge while the chat rendered them as actionable cards.
+                if action_kind == "approve_proposals":
+                    stats_map[r.workspace_id]["proposal_actions"] += 1
+                elif action_kind == "retry_strategist_review":
+                    stats_map[r.workspace_id]["failed_actions"] += 1
+                else:
                     stats_map[r.workspace_id]["chat_pending_actions"] += 1
                     if action.get("step_id"):
                         chat_hitl_step_ids.setdefault(r.workspace_id, set()).add(action["step_id"])
                     if action.get("task_id"):
                         chat_hitl_task_ids.setdefault(r.workspace_id, set()).add(action["task_id"])
-                elif action_kind == "approve_proposals":
-                    stats_map[r.workspace_id]["proposal_actions"] += 1
-                elif action_kind == "retry_strategist_review":
-                    stats_map[r.workspace_id]["failed_actions"] += 1
         except Exception:
-            pass  # Message model may not have these columns yet
+            # Degrading to 0 hides every badge in the sidebar, so say why.
+            logger.warning("workspace chat pending-action stats failed", exc_info=True)
 
         hitl_task_ids: dict[str, set[str]] = {}
         waiting_step_ids: dict[str, set[str]] = {}
@@ -703,7 +822,7 @@ async def list_my_workspaces(
             .where(
                 Task.workspace_id.in_(ws_ids),
                 Task.entity_id == user.entity_id,
-                Task.status == "waiting_on_customer",
+                Task.status == TaskStatus.WAITING_ON_CUSTOMER,
             )
         )).all()
         for r in waiting_task_rows:
@@ -716,7 +835,7 @@ async def list_my_workspaces(
                 ExecutionPlan.workspace_id.in_(ws_ids),
                 ExecutionPlan.entity_id == user.entity_id,
                 ExecutionStep.entity_id == user.entity_id,
-                ExecutionStep.step_status == "waiting_human",
+                ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
                 ExecutionPlan.task_id.isnot(None),
             )
         )).all()
@@ -741,9 +860,14 @@ async def list_my_workspaces(
             )
 
     creator_map = await _workspace_creator_summaries(db, workspaces)
+    blueprint_payloads = await _blueprint_payloads_for(db, workspaces)
     result = []
     for ws in workspaces:
-        resp = _to_response(ws, creator=creator_map.get(ws.id))
+        resp = _to_response(
+            ws,
+            creator=creator_map.get(ws.id),
+            blueprint_payload=blueprint_payloads.get(ws.id),
+        )
         data = resp.model_dump() if hasattr(resp, "model_dump") else resp.__dict__.copy()
         data["stats"] = stats_map.get(ws.id, {})
         result.append(data)
@@ -832,7 +956,11 @@ async def list_trash(
         raise HTTPException(403, "Only owner/admin can view workspace trash")
     rows = await list_trashed_workspaces(db, user.entity_id)
     creator_map = await _workspace_creator_summaries(db, rows)
-    return [_to_response(ws, creator=creator_map.get(ws.id)) for ws in rows]
+    payloads = await _blueprint_payloads_for(db, rows)
+    return [
+        _to_response(ws, creator=creator_map.get(ws.id), blueprint_payload=payloads.get(ws.id))
+        for ws in rows
+    ]
 
 
 @router.get("/trash/grace-days")
@@ -850,7 +978,11 @@ async def get_one_workspace(
 ):
     ws = await _require_workspace_read(db, workspace_id, user)
     creator_map = await _workspace_creator_summaries(db, [ws])
-    return _to_response(ws, creator=creator_map.get(ws.id))
+    return _to_response(
+        ws,
+        creator=creator_map.get(ws.id),
+        blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+    )
 
 
 @router.put("/{workspace_id}", response_model=WorkspaceResponse)
@@ -902,7 +1034,11 @@ async def update_one_workspace(
         )
     _invalidate_workspace_context(workspace_id)
     creator_map = await _workspace_creator_summaries(db, [ws])
-    return _to_response(ws, creator=creator_map.get(ws.id))
+    return _to_response(
+        ws,
+        creator=creator_map.get(ws.id),
+        blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+    )
 
 
 @router.delete("/{workspace_id}", status_code=204)
@@ -961,7 +1097,11 @@ async def restore_one_workspace(
     invalidate_gate_cache(user.entity_id)
     _invalidate_workspace_context(workspace_id)
     creator_map = await _workspace_creator_summaries(db, [ws])
-    return _to_response(ws, creator=creator_map.get(ws.id))
+    return _to_response(
+        ws,
+        creator=creator_map.get(ws.id),
+        blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+    )
 
 
 # ── Pause / Resume ──────────────────────────────────────────────────────────
@@ -974,6 +1114,13 @@ async def pause_workspace(
 ):
     """Pause a workspace — stops strategist, dispatcher, and heartbeat."""
     ws = await _require_workspace_manage(db, workspace_id, user)
+    if ws.status == "paused":
+        return {"status": "paused", "workspace_id": workspace_id}
+    if ws.status != "active":
+        raise HTTPException(
+            409,
+            f"Workspace status is {ws.status!r}; only an active workspace can be paused",
+        )
     ws.status = "paused"
     await _apply_workspace_operation_patches(
         db,
@@ -994,6 +1141,13 @@ async def resume_workspace(
 ):
     """Resume a paused workspace — re-enables strategist and heartbeat."""
     ws = await _require_workspace_manage(db, workspace_id, user)
+    if ws.status == "active":
+        return {"status": "active", "workspace_id": workspace_id}
+    if ws.status != "paused":
+        raise HTTPException(
+            409,
+            f"Workspace status is {ws.status!r}; only a paused workspace can be resumed",
+        )
     ws.status = "active"
     await _apply_workspace_operation_patches(
         db,
@@ -1918,7 +2072,7 @@ async def list_workspace_staff(
 # Workspace-role enum from RFC §5.2. Empty / None / legacy values are
 # accepted for backwards compatibility but new code should send one of
 # these.
-_WORKSPACE_ROLES = {"owner", "editor", "contributor", "viewer", "external_client"}
+_WORKSPACE_ROLES = {"owner", "editor", "contributor", "viewer"}
 
 
 @router.post("/{workspace_id}/staff", response_model=StaffResponse, status_code=201)
@@ -1940,6 +2094,21 @@ async def assign_staff(
     )).scalar_one_or_none()
     if not staff:
         raise HTTPException(404, "Staff member not found")
+    # A supplied user_id must belong to this entity — otherwise a foreign or
+    # mismatched user_id would be written onto the membership row (a data-
+    # integrity footgun for the membership lookups keyed on user_id).
+    if req.user_id is not None:
+        from packages.core.models.user import User as _User
+
+        member = (await db.execute(
+            select(_User.id).where(
+                _User.id == req.user_id,
+                _User.entity_id == user.entity_id,
+                _User.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if not member:
+            raise HTTPException(400, "user_id does not belong to this entity")
     # Permission-v1 user-scoped assignments should use the canonical
     # workspace role enum. Legacy staff-scoped assignments historically used
     # business labels like "reviewer" / "lead"; keep those working.
@@ -2055,7 +2224,12 @@ async def enable_heartbeat(
     db: AsyncSession = Depends(get_db),
 ):
     """Enable heartbeat for a workspace."""
-    await _require_workspace_manage(db, workspace_id, user)
+    ws = await _require_workspace_manage(db, workspace_id, user)
+    if ws.status != "active":
+        raise HTTPException(
+            409,
+            f"Workspace status is {ws.status!r}; complete setup before enabling heartbeat",
+        )
     await _apply_workspace_operation_patches(
         db,
         workspace_id=workspace_id,
@@ -3502,3 +3676,66 @@ async def update_workspace_budget(
     status = await get_budget_status(db, workspace_id)
     await db.commit()
     return BudgetStatusResponse(**status.__dict__)
+
+
+# ── Blueprint upgrade ────────────────────────────────────────────────
+# Three endpoints, because the three acts carry different risk: reading the
+# plan is safe, applying overwrites content, reverting undoes exactly what
+# the last apply overwrote. The operator confirms between the first and the
+# second — nothing upgrades on its own.
+
+
+async def _blueprint_payload_for(db: AsyncSession, ws) -> dict | None:
+    """The payload this workspace would upgrade toward — built-in or
+    marketplace, resolved the same way the list does."""
+    resolved = (await _blueprint_payloads_for(db, [ws])).get(ws.id)
+    return resolved[0] if resolved else None
+
+
+@router.get("/{workspace_id}/blueprint/upgrade")
+async def preview_blueprint_upgrade(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """What an upgrade would change. Reads only — this is what gets confirmed."""
+    ws = await _require_workspace_read(db, workspace_id, user)
+    from packages.core.blueprints.upgrade import plan
+
+    return await plan(db, workspace=ws, payload=await _blueprint_payload_for(db, ws))
+
+
+@router.post("/{workspace_id}/blueprint/upgrade")
+async def apply_blueprint_upgrade(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Apply the update. Items the workspace edited are left alone, and the
+    previous values are kept so this can be undone."""
+    ws = await _require_workspace_manage(db, workspace_id, user)
+    from packages.core.blueprints.upgrade import apply
+
+    resolved = (await _blueprint_payloads_for(db, [ws])).get(ws.id)
+    payload, current_version = resolved if resolved else (None, None)
+    result = await apply(
+        db, workspace=ws, payload=payload,
+        by_user_id=user.id, current_version=current_version,
+    )
+    await db.commit()
+    return result
+
+
+@router.post("/{workspace_id}/blueprint/revert")
+async def revert_blueprint_upgrade(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Put back what the most recent upgrade overwrote."""
+    ws = await _require_workspace_manage(db, workspace_id, user)
+    from packages.core.blueprints.upgrade import revert
+
+    result = await revert(db, workspace=ws, by_user_id=user.id)
+    await db.commit()
+    return result

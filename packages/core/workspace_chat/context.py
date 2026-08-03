@@ -8,6 +8,11 @@ Cache: in-memory dict with 5-min TTL. Invalidated on task/goal/proposal
 changes so the chat stays fresh without re-querying on every message.
 """
 from __future__ import annotations
+from packages.core.constants.task import TaskStatus
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
 
 import logging
 import time
@@ -175,7 +180,7 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
             .where(
                 Task.entity_id == entity_id,
                 Task.workspace_id == workspace_id,
-                Task.status.in_(["in_progress", "pending", "waiting_on_customer"]),
+                Task.status.in_((TaskStatus.IN_PROGRESS, TaskStatus.PENDING, TaskStatus.WAITING_ON_CUSTOMER,)),
             )
             .order_by(Task.created_at.desc())
             .limit(5)
@@ -332,6 +337,7 @@ async def workspace_search(
     limit: int = 10,
     external_client: bool = False,
     public_agent_client: bool = False,
+    user_id: str | None = None,
 ) -> str:
     """Search workspace data by category. Returns formatted text for the LLM."""
     q = (query or "").strip().lower()
@@ -348,6 +354,20 @@ async def workspace_search(
     )).scalar_one_or_none()
     if not ws_exists:
         return "Workspace not found."
+
+    # Defense in depth: for an internal (non-external-client) caller with a
+    # known user, verify the user may actually read this workspace. The chat
+    # entrypoints already gate on this today, but any future caller that binds
+    # an unverified workspace_id would otherwise leak all of its tasks/goals/
+    # agents/activity. External/public clients keep their own client_visible
+    # filtering below and never carry a Manor user_id.
+    if user_id and not external_client and not public_agent_client:
+        from packages.core.services.workspace_access import user_can_read_workspace_id
+
+        if not await user_can_read_workspace_id(
+            db, workspace_id=workspace_id, entity_id=entity_id, user_id=user_id,
+        ):
+            return "Workspace not found."
 
     results: list[str] = []
 
@@ -374,7 +394,9 @@ async def workspace_search(
         results.append(await _search_agents(db, workspace_id, entity_id, q, limit))
 
     if cat in ("knowledge", "all"):
-        results.append(await _search_knowledge(db, workspace_id, entity_id, q, limit))
+        results.append(await _search_knowledge(
+            db, workspace_id, entity_id, q, limit, user_id=user_id,
+        ))
 
     if cat in ("artifacts", "files", "generated_files", "all"):
         results.append(await _search_artifacts(db, workspace_id, entity_id, q, limit))
@@ -510,12 +532,14 @@ async def _search_knowledge(
     *,
     client_visible_only: bool = False,
     public_agent_visible_only: bool = False,
+    user_id: str | None = None,
 ) -> str:
     from packages.core.models.document import DocumentGroup, Document, DocumentGroupMember
     from packages.core.models.workspace import Workspace
     from packages.core.services.document_access import (
         document_is_client_visible,
         document_is_public_agent_visible,
+        user_can_read_document,
     )
     ws = (await db.execute(select(Workspace).where(
         Workspace.id == ws_id,
@@ -617,6 +641,17 @@ async def _search_knowledge(
                     )
                 )
             ]
+        elif user_id:
+            # Internal caller with a known user: never surface a document
+            # (name or fs_path) the user cannot read in the Knowledge Base.
+            filtered = []
+            for doc in docs:
+                if await user_can_read_document(
+                    db, doc, entity_id=entity_id,
+                    user_id=user_id, workspace_id=ws_id, actor_type="agent",
+                ):
+                    filtered.append(doc)
+            docs = filtered
         if q and not group_matches and not docs:
             continue
         line = f"- **{g.name}** ({doc_count} docs)"
@@ -704,7 +739,7 @@ async def _search_plans(db: AsyncSession, ws_id: str, entity_id: str, q: str, li
         select(ExecutionPlan).where(
             ExecutionPlan.entity_id == entity_id,
             ExecutionPlan.workspace_id == ws_id,
-            ExecutionPlan.status.in_(["running", "completed", "failed"]),
+            ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.FAILED,)),
         ).order_by(ExecutionPlan.created_at.desc()).limit(limit)
     )).scalars().all()
     if not plans:
@@ -715,8 +750,8 @@ async def _search_plans(db: AsyncSession, ws_id: str, entity_id: str, q: str, li
             select(ExecutionStep.step_key, ExecutionStep.step_status)
             .where(ExecutionStep.plan_id == p.id)
         )).all()
-        done = sum(1 for s in steps if s.step_status == "done")
-        failed = sum(1 for s in steps if s.step_status == "failed")
+        done = sum(1 for s in steps if s.step_status == ExecutionStepStatus.DONE)
+        failed = sum(1 for s in steps if s.step_status == ExecutionStepStatus.FAILED)
         task_ref = f" task_id={p.task_id}" if p.task_id else ""
         lines.append(f"- Plan {p.id[:8]}… [{p.status}]{task_ref} — {done}/{len(steps)} done, {failed} failed")
     return "\n".join(lines) if len(lines) > 1 else ""

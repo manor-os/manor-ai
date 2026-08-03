@@ -1,4 +1,5 @@
 import Modal from "./Modal";
+import Button from "./Button";
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -9,6 +10,10 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
+  loading?: boolean;
+  closeOnConfirm?: boolean;
+  error?: string;
+  restoreFocusFallback?: () => void;
 }
 
 export default function ConfirmDialog({
@@ -20,28 +25,45 @@ export default function ConfirmDialog({
   confirmLabel = "Confirm",
   cancelLabel = "Cancel",
   danger = false,
+  loading = false,
+  closeOnConfirm = true,
+  error,
+  restoreFocusFallback,
 }: ConfirmDialogProps) {
+  const closeIfIdle = () => {
+    if (!loading) onClose();
+  };
+
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={closeIfIdle}
       title={title}
+      restoreFocusFallback={restoreFocusFallback}
       footer={
         <>
-          <button className="btn-manor-outline" onClick={onClose}>
+          <Button variant="outline" onClick={closeIfIdle} disabled={loading}>
             {cancelLabel}
-          </button>
-          <button
-            className={danger ? "btn-manor-danger" : "btn-manor"}
-            onClick={() => { onConfirm(); onClose(); }}
-            style={danger ? { background: "#c14a44", color: "#fff" } : undefined}
+          </Button>
+          <Button
+            variant={danger ? "danger" : "primary"}
+            loading={loading}
+            onClick={() => {
+              onConfirm();
+              if (closeOnConfirm) onClose();
+            }}
           >
             {confirmLabel}
-          </button>
+          </Button>
         </>
       }
     >
-      <p style={{ color: "#57534e", fontSize: "14px", lineHeight: 1.6 }}>{message}</p>
+      <p className="confirm-dialog-message">{message}</p>
+      {error && (
+        <p className="confirm-dialog-error" role="alert">
+          {error}
+        </p>
+      )}
     </Modal>
   );
 }

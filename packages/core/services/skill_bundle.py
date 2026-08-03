@@ -147,6 +147,11 @@ def assemble_skill_bundle(
             config["scripts"] = scripts
         if extra_files:
             config["extra_files"] = extra_files
+        # Same contract as the GitHub installer: the UI reads these paths to
+        # show the bundle's file list without loading contents.
+        config["extra_file_paths"] = sorted(
+            [f"scripts/{name}" for name in scripts] + list(extra_files)
+        )
         return list(SANDBOX_SKILL_TOOLS), config
 
     tools = spec.get("tools")

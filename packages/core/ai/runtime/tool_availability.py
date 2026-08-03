@@ -42,6 +42,7 @@ async def runtime_annotate_tool_availability(
 
     provider_status: dict[str, dict] = {}
     provider_metadata: dict[str, dict] = {}
+    provider_account_options: dict[str, list[dict]] = {}
 
     async with async_session() as db:
         providers = sorted({
@@ -81,6 +82,19 @@ async def runtime_annotate_tool_availability(
             metadata = provider_metadata.get(provider, {})
             if provider not in provider_status:
                 try:
+                    from packages.core.services.integration_account_service import (
+                        list_runtime_integration_accounts,
+                    )
+
+                    accounts = await list_runtime_integration_accounts(
+                        db,
+                        user_id=user_id or "",
+                        entity_id=entity_id,
+                        provider=provider,
+                    )
+                    provider_account_options[provider] = [
+                        account.public_option() for account in accounts
+                    ]
                     decision = await can_use_integration(
                         db,
                         user_id=user_id or "",
@@ -92,6 +106,7 @@ async def runtime_annotate_tool_availability(
                         "available": decision.allowed,
                         "reason": decision.reason,
                         "scope": decision.scope,
+                        "account_id": decision.account_id,
                     }
                 except Exception:
                     provider_status[provider] = {
@@ -99,12 +114,17 @@ async def runtime_annotate_tool_availability(
                         "reason": "availability check failed",
                         "scope": "none",
                     }
+                    provider_account_options[provider] = []
             runtime_apply_mcp_availability(
                 match,
                 provider=provider,
                 metadata=metadata,
                 status=provider_status[provider],
             )
+            account_options = provider_account_options.get(provider, [])
+            if account_options:
+                match["account_options"] = account_options
+                match["default_account_id"] = provider_status[provider].get("account_id")
 
     return runtime_sort_available_matches(matches)
 

@@ -157,7 +157,7 @@ async def test_sync_file_to_knowledge_preserves_code_type_and_folder(
 
 
 @pytest.mark.asyncio
-async def test_reconcile_entity_filesystem_syncs_real_paths_and_trashes_missing(
+async def test_reconcile_entity_filesystem_syncs_real_paths_and_marks_missing_without_trashing(
     client: AsyncClient,
     db_session,
     monkeypatch,
@@ -198,14 +198,16 @@ async def test_reconcile_entity_filesystem_syncs_real_paths_and_trashes_missing(
 
     assert result.scanned_files == 1
     assert result.synced_files == 1
-    assert result.trashed_missing_documents == 1
+    assert result.missing_documents == 1
+    assert result.trashed_missing_documents == 0
 
     async with db_module.async_session() as db:
         stale = await db.get(Document, stale_id)
         assert stale is not None
-        assert stale.is_trashed is True
-        assert stale.vector_status == "failed"
+        assert stale.is_trashed is False
+        assert stale.vector_status == "ready"
         assert stale.metadata_["file_integrity"]["status"] == "missing"
+        assert stale.metadata_["file_integrity"]["recoverable"] is True
 
         synced = (
             await db.execute(

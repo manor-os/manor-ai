@@ -10,6 +10,8 @@ REDACTED = "<redacted>"
 _SENSITIVE_KEYS = {
     "api_key",
     "apikey",
+    "x_api_key",
+    "xapikey",
     "llm_api_key",
     "_resolved_api_key",
     "new_api_key",
@@ -17,10 +19,12 @@ _SENSITIVE_KEYS = {
     "refresh_token",
     "id_token",
     "auth_token",
+    "api_token",
     "bearer_token",
     "secret_token",
     "token",
     "authorization",
+    "proxy_authorization",
     "auth_header",
     "client_secret",
     "oauth_client_secret",
@@ -30,6 +34,10 @@ _SENSITIVE_KEYS = {
     "secret_key",
     "secret",
     "private_key",
+    "cookie",
+    "cookies",
+    "set_cookie",
+    "session_cookie",
     "key_hash",
     "password",
     "password_hash",
@@ -43,7 +51,42 @@ _SENSITIVE_KEYS = {
 
 _SECRET_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
+        re.compile(
+            r"(?is)-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----.*?"
+            r"-----END (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
+        ),
+        REDACTED,
+    ),
+    (
+        re.compile(
+            r"(?i)(proxy[-_]authorization\s*[:=]\s*)"
+            r"(?:(?:bearer|basic|token)\s+)?([^\s,;]+)"
+        ),
+        r"\1" + REDACTED,
+    ),
+    (
         re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([A-Za-z0-9._~+/=-]{8,})"),
+        r"\1" + REDACTED,
+    ),
+    (
+        re.compile(
+            r"(?i)(authorization\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?([^\s,;]+)"
+        ),
+        r"\1" + REDACTED,
+    ),
+    (
+        re.compile(r"(?i)(x[-_]?api[-_]?key\s*[:=]\s*)([^\s,;]+)"),
+        r"\1" + REDACTED,
+    ),
+    (
+        re.compile(
+            r"""(?i)(['"]?(?:password|client_secret)['"]?\s*[:=]\s*['"]?)"""
+            r"""([^'"\s,}&;]+)"""
+        ),
+        r"\1" + REDACTED,
+    ),
+    (
+        re.compile(r"(?i)((?:set[-_])?cookie\s*[:=]\s*)([^\r\n]+)"),
         r"\1" + REDACTED,
     ),
     (
@@ -105,7 +148,7 @@ def sanitize_sensitive_payload(
 ) -> Any:
     """Recursively redact credential-shaped fields while preserving structure."""
     if _depth > max_depth:
-        return value
+        return replacement
     if isinstance(value, str):
         return redact_sensitive_text(value, replacement=replacement)
     if isinstance(value, bytes):

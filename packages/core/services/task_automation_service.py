@@ -8,6 +8,7 @@ from typing import Optional
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskLogType, TaskStatus
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import (
     Task, TaskSlaPolicy, TaskEscalationRule, TaskChecklist,
@@ -61,7 +62,7 @@ async def check_sla_deadlines(db: AsyncSession, entity_id: str | None = None) ->
         is_breached = False
 
         # Response breach: still pending after response_seconds
-        if task.status == "pending" and now > response_deadline:
+        if task.status == TaskStatus.PENDING and now > response_deadline:
             is_breached = True
 
         # Resolution breach: not completed after resolution_seconds
@@ -162,10 +163,12 @@ async def escalate_task(db: AsyncSession, task_id: str, entity_id: str) -> bool:
     await db.flush()
 
     # Log
+    from packages.core.constants.task_actors import TaskActor
     from packages.core.services.task_service import add_task_log
     await add_task_log(
-        db, task_id, "escalation",
+        db, task_id, TaskLogType.ESCALATION,
         f"Escalated to level {next_level} — action: {action}",
+        actor=TaskActor.SYSTEM,
         created_by="system",
     )
 
@@ -247,10 +250,12 @@ async def auto_reassign_task(db: AsyncSession, task_id: str, entity_id: str) -> 
     task.assignee_id = best.id
     await db.flush()
 
+    from packages.core.constants.task_actors import TaskActor
     from packages.core.services.task_service import add_task_log
     await add_task_log(
-        db, task_id, "reassign",
+        db, task_id, TaskLogType.REASSIGN,
         f"Auto-reassigned from {old_assignee or 'unassigned'} to {best.id} ({best.name})",
+        actor=TaskActor.SYSTEM,
         created_by="system",
     )
 

@@ -20,6 +20,80 @@ from typing import Any
 
 logger = logging.getLogger("manor.chat")
 
+CHAT_TOOL_CALL_SOURCE = "chat"
+"""``tool_call_logs.source`` for rows written from a chat turn."""
+
+_TOOL_ARG_PREVIEW_CHARS = 200
+
+
+def safe_tool_args(tool_args: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drop internal context kwargs and truncate large values for storage."""
+    if not tool_args:
+        return None
+    safe: dict[str, Any] = {}
+    for key, value in tool_args.items():
+        if str(key).startswith("_"):
+            continue  # skip internal context keys
+        rendered = str(value)
+        safe[key] = (
+            rendered[:_TOOL_ARG_PREVIEW_CHARS]
+            if len(rendered) > _TOOL_ARG_PREVIEW_CHARS
+            else value
+        )
+    return safe
+
+
+def schedule_tool_call_log(
+    *,
+    entity_id: str,
+    tool_name: str,
+    source: str,
+    round_num: int,
+    duration_ms: int,
+    result_chars: int,
+    success: bool,
+    error: str | None,
+    workspace_id: str | None = None,
+    agent_id: str | None = None,
+    user_id: str | None = None,
+    conversation_id: str | None = None,
+    tool_args: dict[str, Any] | None = None,
+    outcome: str = "success",
+) -> None:
+    """Append one row to ``tool_call_logs``, fire-and-forget.
+
+    The single writer for the table, shared by the chat trace and the
+    InternalWorker's subagent steps — the worker path used to pass no
+    ``on_tool_end`` at all, so a plan step's tool calls produced zero rows.
+    Best-effort by construction: it must never slow or fail its caller.
+    """
+    snap = {
+        "entity_id": entity_id,
+        "workspace_id": workspace_id,
+        "agent_id": agent_id,
+        "user_id": user_id,
+        "conversation_id": conversation_id,
+        "tool_name": tool_name,
+        "round_num": round_num,
+        "duration_ms": duration_ms,
+        "result_chars": result_chars,
+        "success": success,
+        "error": error,
+        "tool_args": tool_args,
+        "source": source,
+        "outcome": outcome,
+    }
+
+    async def _write():
+        from packages.core.database import async_session
+        from packages.core.services.usage_service import record_tool_call
+        async with async_session() as db:
+            await record_tool_call(db, **snap)
+            await db.commit()
+
+    from packages.core.ai.llm_client import fire_and_forget
+    fire_and_forget(_write, label="tool_call_log persist")
+
 
 @dataclass
 class ChatTrace:
@@ -160,6 +234,7 @@ class ChatTrace:
         success: bool = True,
         error: str | None = None,
         tool_args: dict[str, Any] | None = None,
+        outcome: str = "success",
     ) -> None:
         self.tool_calls_made.append(tool_name)
         level = logging.INFO if success else logging.WARNING
@@ -168,14 +243,8 @@ class ChatTrace:
         if tool_name == "invoke_skill" and tool_args:
             extra["skill_name"] = tool_args.get("skill", "")
         # Include args (truncate large values for readability)
-        safe_args: dict[str, Any] | None = None
-        if tool_args:
-            safe_args = {}
-            for k, v in tool_args.items():
-                if k.startswith("_"):
-                    continue  # skip internal context keys
-                sv = str(v)
-                safe_args[k] = sv[:200] if len(sv) > 200 else v
+        safe_args = safe_tool_args(tool_args)
+        if safe_args is not None:
             extra["tool_args"] = safe_args
         logger.log(
             level,
@@ -197,7 +266,12 @@ class ChatTrace:
         # Fire-and-forget DB persist — same fields, append-only row in
         # ``tool_call_logs``. Best-effort; never blocks the chat loop.
         if self.entity_id:
-            self._schedule_tool_call_record(
+            schedule_tool_call_log(
+                entity_id=self.entity_id,
+                workspace_id=self.workspace_id,
+                agent_id=self.agent_id,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
                 tool_name=tool_name,
                 round_num=round_num,
                 duration_ms=int(duration_ms),
@@ -205,46 +279,9 @@ class ChatTrace:
                 success=success,
                 error=error,
                 tool_args=safe_args,
+                source=CHAT_TOOL_CALL_SOURCE,
+                outcome=outcome,
             )
-
-    def _schedule_tool_call_record(
-        self,
-        *,
-        tool_name: str,
-        round_num: int,
-        duration_ms: int,
-        result_chars: int,
-        success: bool,
-        error: str | None,
-        tool_args: dict[str, Any] | None,
-    ) -> None:
-        """Persist a tool-execution row to ``tool_call_logs``. Best-effort
-        + fire-and-forget so it can't slow the chat loop."""
-        snap = {
-            "entity_id": self.entity_id,
-            "workspace_id": self.workspace_id,
-            "agent_id": self.agent_id,
-            "user_id": self.user_id,
-            "conversation_id": self.conversation_id,
-            "tool_name": tool_name,
-            "round_num": round_num,
-            "duration_ms": duration_ms,
-            "result_chars": result_chars,
-            "success": success,
-            "error": error,
-            "tool_args": tool_args,
-            "source": "chat",
-        }
-
-        async def _write():
-            from packages.core.database import async_session
-            from packages.core.services.usage_service import record_tool_call
-            async with async_session() as db:
-                await record_tool_call(db, **snap)
-                await db.commit()
-
-        from packages.core.ai.llm_client import fire_and_forget
-        fire_and_forget(_write, label="tool_call_log persist")
 
     def log_complete(self, *, result: Any = None) -> None:
         elapsed_ms = (time.time() - self.started_at) * 1000

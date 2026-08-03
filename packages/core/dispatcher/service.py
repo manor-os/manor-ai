@@ -42,10 +42,25 @@ from typing import Any, Optional
 from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskLogType
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+    WorkLeaseStatus,
+    WorkerStatus,
+)
+from packages.core.ai.pending_action import (
+    KIND_HUMAN_INPUT,
+    LEASE_HITL_CLOSEABLE_KINDS,
+)
 from packages.core.ai.runtime import (
     runtime_capability_id_for_action_key,
     runtime_planner_action_binding_for,
     runtime_planner_action_specs_from_tools_cached,
+)
+from packages.core.contracts.envelope import (
+    envelope_indicates_failure,
+    is_step_result_envelope_schema,
 )
 from packages.core.dispatcher.output_coercion import coerce_step_output_for_schema
 from packages.core.dispatcher.validation import (
@@ -91,12 +106,22 @@ def _counts_towards_worker_quarantine(error: dict | None) -> bool:
     permissions, not logged in, or Chrome inspection disabled. Those should
     fail the step and surface to the UI, but they should not quarantine the
     whole local worker.
+
+    Recognized transient failures are excluded for the same reason, and for
+    a sharper one: they are now retried up to six times in a row, and five
+    consecutive failures quarantine a non-internal worker. Counting them
+    would let one offline local worker take the whole queue down.
     """
     if not isinstance(error, dict):
         return True
     err_type = str(error.get("type") or "")
     err_code = str(error.get("code") or "")
     if err_type == "LocalDiagnosticFailed" or err_code == "local_diagnostic_failed":
+        return False
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    hint = classify_execution_error(error)
+    if hint is not None and hint.is_transient:
         return False
     return True
 
@@ -130,37 +155,6 @@ def _plan_source(plan: ExecutionPlan) -> str:
             if source:
                 return str(source)
     return ""
-
-
-def _has_governance_approval_once(step: ExecutionStep) -> bool:
-    params = dict(step.params or {})
-    approval = params.get("_governance_approval")
-    if not isinstance(approval, dict):
-        return False
-    if approval.get("status") != "approved" or approval.get("consumed_at"):
-        return False
-    return _governance_approval_matches_step(step, approval)
-
-
-def _consume_governance_approval_once(step: ExecutionStep) -> bool:
-    params = dict(step.params or {})
-    approval = params.get("_governance_approval")
-    if not isinstance(approval, dict):
-        return False
-    if approval.get("status") != "approved" or approval.get("consumed_at"):
-        return False
-    if not _governance_approval_matches_step(step, approval):
-        return False
-    approval = {
-        **approval,
-        "consumed_at": datetime.now(timezone.utc).isoformat(),
-        "consumed_for_step_id": step.id,
-    }
-    params["_governance_approval"] = approval
-    step.params = params
-    step.error = None
-    step.human_input_prompt = None
-    return True
 
 
 def _step_runtime_capability_id(step: ExecutionStep) -> str | None:
@@ -316,19 +310,6 @@ def _worker_supported_capability_ids(capabilities: dict[str, Any]) -> set[str] |
     return {str(value).strip() for value in raw if str(value or "").strip()}
 
 
-def _governance_approval_matches_step(step: ExecutionStep, approval: dict[str, Any]) -> bool:
-    approved_step_id = str(approval.get("step_id") or "")
-    if approved_step_id and approved_step_id != str(getattr(step, "id", "") or ""):
-        return False
-    approved_action = str(approval.get("action_key") or "")
-    approved_capability = str(approval.get("capability_id") or "")
-    if approved_action and approved_action != str(getattr(step, "action_key", None) or ""):
-        return False
-    if approved_capability and approved_capability != str(_step_runtime_capability_id(step) or ""):
-        return False
-    return bool(approved_step_id or approved_action or approved_capability)
-
-
 def _step_intrinsic_approval_reason(step: ExecutionStep, capability_id: str | None) -> tuple[str, str] | None:
     """Return (matched_rule, reason) when the step itself requires HITL."""
     if getattr(step, "requires_approval", False):
@@ -405,7 +386,7 @@ class Dispatcher:
         plan_id: Optional[str],
         _sp: Any = None,
     ) -> list[tuple[WorkLease, ExecutionStep]]:
-        if worker.status != "active":
+        if worker.status != WorkerStatus.ACTIVE:
             return []
 
         capabilities = worker.capabilities or {}
@@ -447,19 +428,19 @@ class Dispatcher:
             select(ExecutionStep, ExecutionPlan)
             .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
             .where(
-                ExecutionStep.step_status == "pending",
+                ExecutionStep.step_status == ExecutionStepStatus.PENDING,
                 ExecutionStep.entity_id == worker.entity_id,
                 ExecutionStep.kind.in_(supported_kinds),
                 ExecutionStep.risk_level.in_(allowed_risk_levels),
                 ExecutionStep.attempt_count < ExecutionStep.max_attempts,
-                ExecutionPlan.status.in_(("draft", "running")),
+                ExecutionPlan.status.in_((ExecutionPlanStatus.DRAFT, ExecutionPlanStatus.RUNNING,)),
                 # No active lease for this step (the partial unique index
                 # is the hard guarantee; this filter is the soft one
                 # that lets the DB skip already-leased rows fast).
                 ~exists().where(
                     and_(
                         WorkLease.step_id == ExecutionStep.id,
-                        WorkLease.status == "active",
+                        WorkLease.status == WorkLeaseStatus.ACTIVE,
                     )
                 ),
             )
@@ -519,7 +500,7 @@ class Dispatcher:
             if not step_retry_ready(step, now=now):
                 continue
             if step.attempt_count >= step.max_attempts:
-                step.step_status = "failed"
+                step.step_status = ExecutionStepStatus.FAILED.value
                 step.error = {
                     "type": "RetryPolicyExhausted",
                     "message": "attempt_count reached max_attempts before checkout",
@@ -563,134 +544,185 @@ class Dispatcher:
                 if not step_capability_id or step_capability_id not in supported_capabilities:
                     continue
 
-            # ── Step-level approval gate ──
-            # Planner can mark a specific step as approval-gated, and high-risk
-            # steps keep the same safety posture without blocking the whole plan
-            # at creation time. Approval is one-use and scoped to this step.
-            if not _has_governance_approval_once(step):
-                intrinsic_approval = _step_intrinsic_approval_reason(
-                    step,
-                    step_capability_id,
+            # ── Unified approval gate ──
+            # One decision for BOTH the intrinsic step-approval check and the
+            # governance policy: resolve_approval() answers allow / deny /
+            # needs-human against the single HitlRequest store. A grant made
+            # in any surface satisfies this gate (no more per-plane loops), a
+            # re-trip reuses one card (dedup), and hard blocks (deny / risk
+            # ceiling / budget cap) stay hard — they cannot be approved past.
+            #
+            # NOTE: this deliberately evaluates policy BEFORE the intrinsic
+            # high-risk/requires_approval prompt, closing a prior hole where a
+            # high-risk step could be offered an approvable HITL card even when
+            # a never_allow / risk-ceiling / budget rule should hard-deny it.
+            #
+            granted_approval_request = None
+            from packages.core.budget import (
+                get_workspace_spent_credits_per_kind,
+            )
+            from packages.core.constants.approvals import (
+                ApprovalOriginKind,
+                HitlType,
+            )
+            from packages.core.governance.approvals import (
+                ApprovalOrigin,
+                ApprovalSubject,
+                resolve_approval,
+            )
+            from packages.core.governance.error_signatures import (
+                classify_execution_error,
+            )
+            from packages.core.governance.service import post_hitl_card
+
+            spent_credits_per_kind = (
+                await get_workspace_spent_credits_per_kind(db, step.workspace_id)
+                if step.workspace_id else None
+            )
+
+            # A step that already ran and failed is NOT a fresh "may I?" —
+            # the operator said yes once and the work still didn't happen.
+            # Re-asking the same authorize question is exactly the 15-approval
+            # loop from the incident. When the real failure survived (Task 3),
+            # mint an ERROR card carrying what broke and what to do about it.
+            _hitl_type = HitlType.AUTHORIZE.value
+            _payload: dict = {}
+            _prior = step.last_execution_error
+            if step.attempt_count and isinstance(_prior, dict) and _prior:
+                _hint = classify_execution_error(_prior)
+                _raw = str(_prior.get("message") or "").strip()
+                _hitl_type = HitlType.ERROR.value
+                _payload = {
+                    "what_happened": (
+                        _hint.what_happened if _hint
+                        else (_raw or "The step failed.")
+                    ),
+                    # Required by HITL_REQUIRED_PAYLOAD_FIELDS and must be
+                    # non-empty, so an error reported with no message still
+                    # yields a card the record layer will accept.
+                    "why": _raw or "The worker reported no failure detail.",
+                    "action_to_take": (
+                        _hint.action_to_take if _hint
+                        else "Review the step output, then retry or cancel."
+                    ),
+                    "action_link": _hint.action_link if _hint else None,
+                    "is_transient": bool(_hint and _hint.is_transient),
+                }
+            decision = await resolve_approval(
+                db,
+                subject=ApprovalSubject(
+                    entity_id=step.entity_id,
+                    workspace_id=step.workspace_id,
+                    action_key=step.action_key,
+                    capability_id=step_capability_id,
+                    risk_level=step.risk_level or "low",
+                    kind=step.kind,
+                    requires_approval=bool(
+                        getattr(step, "requires_approval", False)
+                    ),
+                ),
+                origin=ApprovalOrigin(
+                    kind=ApprovalOriginKind.STEP.value,
+                    step_id=step.id,
+                    plan_id=step.plan_id,
+                    task_id=plan.task_id,
+                ),
+                spent_credits=spent_credits_per_kind,
+                hitl_type=_hitl_type,
+                payload=_payload,
+            )
+            if decision.outcome == "needs_human":
+                request_id = decision.request.id if decision.request else None
+                # The card renders what the ROW says, not what this pass
+                # recomputed. They agree on a fresh mint (the row was minted
+                # from _hitl_type/_payload just above), and when an open
+                # request is REUSED the row is the only truth — resolve_approval
+                # ignores the incoming type in that case, so re-deriving here
+                # would put a type on screen that the record never held.
+                card_hitl_type = (
+                    decision.request.hitl_type if decision.request else _hitl_type
                 )
-                # A workspace that EXPLICITLY auto-approves this capability/action
-                # overrides the capability-level intrinsic requires_approval — the
-                # operator opted in. Fall through to the governance policy gate
-                # below, which re-confirms allow and still enforces deny / risk /
-                # budget. (Without this, file.write & other required_approval
-                # capabilities pause even when the workspace policy grants them,
-                # because this intrinsic gate runs before the policy gate.)
-                if intrinsic_approval is not None and step.workspace_id:
-                    from packages.core.governance.service import (
-                        workspace_policy_auto_approves,
-                    )
-                    if await workspace_policy_auto_approves(
-                        db,
+                card_payload = (
+                    decision.request.payload if decision.request else _payload
+                ) or {}
+                # Preserve the two historical error types: an intrinsic
+                # step-approval trigger ("step.*") vs a governance policy
+                # pause. The blueprint report keys its paused/denied counts
+                # off these, and the dispatcher tests assert them.
+                approval_error_type = (
+                    "StepApprovalRequired"
+                    if (decision.matched_rule or "").startswith("step.")
+                    else "GovernancePolicyHITL"
+                )
+                if step.workspace_id:
+                    step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
+                    step.human_input_prompt = decision.reason
+                    step.current_lease_id = None
+                    step.error = {
+                        "type": approval_error_type,
+                        "message": decision.reason,
+                        "matched_rule": decision.matched_rule,
+                        "capability_id": step_capability_id,
+                        "approval_request_id": request_id,
+                    }
+                    await post_hitl_card(
+                        entity_id=step.entity_id,
                         workspace_id=step.workspace_id,
+                        plan_id=step.plan_id,
+                        step_id=step.id,
+                        step_key=step.step_key,
+                        kind=step.kind,
                         action_key=step.action_key,
                         capability_id=step_capability_id,
-                    ):
-                        intrinsic_approval = None
-                if intrinsic_approval is not None:
-                    matched_rule, reason = intrinsic_approval
-                    if step.workspace_id:
-                        from packages.core.governance.service import post_hitl_card
-
-                        step.step_status = "waiting_human"
-                        step.human_input_prompt = reason
-                        step.current_lease_id = None
-                        step.error = {
-                            "type": "StepApprovalRequired",
-                            "message": reason,
-                            "matched_rule": matched_rule,
-                            "capability_id": step_capability_id,
-                        }
-                        await post_hitl_card(
-                            entity_id=step.entity_id,
-                            workspace_id=step.workspace_id,
-                            plan_id=step.plan_id,
-                            step_id=step.id,
-                            step_key=step.step_key,
-                            kind=step.kind,
-                            action_key=step.action_key,
-                            capability_id=step_capability_id,
-                            matched_rule=matched_rule,
-                            reason=reason,
-                        )
-                    else:
-                        step.step_status = "failed"
-                        step.error = {
-                            "type": "StepApprovalUnavailable",
-                            "message": reason,
-                            "matched_rule": matched_rule,
-                            "capability_id": step_capability_id,
-                        }
-                        step.finished_at = now
-                    logger.info(
-                        "dispatcher: step %s requires approval (%s) — %s",
-                        step.step_key, matched_rule, reason,
+                        matched_rule=decision.matched_rule,
+                        reason=decision.reason,
+                        approval_request_id=request_id,
+                        hitl_type=card_hitl_type,
+                        payload=card_payload,
+                        # What the card deep-links to. plan.task_id is the
+                        # same value the request's origin carries, so card
+                        # and record point at one place.
+                        task_id=plan.task_id,
+                        # Same transaction as the request + the step's
+                        # waiting_human transition: card, request, and pause
+                        # commit (or roll back) atomically — a crash cannot
+                        # strand a card pointing at a never-committed request.
+                        db=db,
                     )
-                    continue
-
-            # ── Governance policy gate ──
-            # Hard-deny → step.failed with policy reason; HITL-required →
-            # waiting_human + structured workspace-chat pending_action.
-            # A user approval writes a one-use bypass into step.params; the
-            # dispatcher consumes it immediately before lease creation.
-            if not _has_governance_approval_once(step):
-                from packages.core.budget import get_workspace_spent_credits_per_kind
-                from packages.core.governance import check_step_policy
-                from packages.core.governance.service import post_hitl_card
-                spent_credits_per_kind = (
-                    await get_workspace_spent_credits_per_kind(db, step.workspace_id)
-                    if step.workspace_id else None
+                else:
+                    # No workspace to render an approval card in — fail
+                    # closed rather than dispatch an unapproved step.
+                    step.step_status = ExecutionStepStatus.FAILED.value
+                    step.error = {
+                        "type": "StepApprovalUnavailable",
+                        "message": decision.reason,
+                        "matched_rule": decision.matched_rule,
+                        "capability_id": step_capability_id,
+                    }
+                    step.finished_at = now
+                logger.info(
+                    "dispatcher: step %s needs approval (%s) — %s",
+                    step.step_key, decision.matched_rule, decision.reason,
                 )
-                decision = await check_step_policy(
-                    db,
-                    workspace_id=step.workspace_id,
-                    kind=step.kind,
-                    action_key=step.action_key,
-                    risk_level=step.risk_level or "low",
-                    capability_id=step_capability_id,
-                    spent_credits_per_kind=spent_credits_per_kind,
-                    task_id=plan.task_id,
+                continue
+            if decision.outcome == "deny":
+                step.step_status = ExecutionStepStatus.FAILED.value
+                step.error = {
+                    "type": "GovernancePolicy",
+                    "message": decision.reason,
+                    "matched_rule": decision.matched_rule,
+                    "capability_id": step_capability_id,
+                }
+                step.finished_at = now
+                logger.info(
+                    "dispatcher: step %s blocked by policy (%s) — %s",
+                    step.step_key, decision.matched_rule, decision.reason,
                 )
-                if not decision.allowed:
-                    if decision.pause_for_hitl and step.workspace_id:
-                        step.step_status = "waiting_human"
-                        step.human_input_prompt = decision.reason
-                        step.current_lease_id = None
-                        step.error = {
-                            "type": "GovernancePolicyHITL",
-                            "message": decision.reason,
-                            "matched_rule": decision.matched_rule,
-                            "capability_id": step_capability_id,
-                        }
-                        await post_hitl_card(
-                            entity_id=step.entity_id,
-                            workspace_id=step.workspace_id,
-                            plan_id=step.plan_id,
-                            step_id=step.id,
-                            step_key=step.step_key,
-                            kind=step.kind,
-                            action_key=step.action_key,
-                            capability_id=step_capability_id,
-                            matched_rule=decision.matched_rule,
-                            reason=decision.reason,
-                        )
-                    else:
-                        step.step_status = "failed"
-                        step.error = {
-                            "type": "GovernancePolicy",
-                            "message": decision.reason,
-                            "matched_rule": decision.matched_rule,
-                            "capability_id": step_capability_id,
-                        }
-                        step.finished_at = datetime.now(timezone.utc)
-                    logger.info(
-                        "dispatcher: step %s blocked by policy (%s) — %s",
-                        step.step_key, decision.matched_rule, decision.reason,
-                    )
-                    continue
+                continue
+            # allow → fall through to subscription gating + lease. If the
+            # allow rests on a one-time operator grant, carry the request
+            # so it is consumed only when the lease actually goes out.
+            granted_approval_request = decision.request
 
             # Subscription gating — for kinds that need an owner.
             if step.kind in ("llm", "action", "subagent", "code"):
@@ -709,7 +741,7 @@ class Dispatcher:
                             action_key=step.action_key,
                         )
                         if not allowed_action:
-                            step.step_status = "failed"
+                            step.step_status = ExecutionStepStatus.FAILED.value
                             step.error = action_error or {
                                 "type": "ActionBindingDenied",
                                 "message": "agent action binding denied",
@@ -726,7 +758,7 @@ class Dispatcher:
             # the step skipped instead of leasing.
             dep_status = await _check_dependency_status(db, step)
             if dep_status == "blocked_by_failure":
-                step.step_status = "skipped"
+                step.step_status = ExecutionStepStatus.SKIPPED.value
                 step.finished_at = now
                 continue
             if dep_status == "waiting":
@@ -741,7 +773,7 @@ class Dispatcher:
                     prior_results = await _collect_done_step_results(db, step)
                     step.params = resolve_refs(step.params or {}, prior_results)
                 except PlanReferenceError as exc:
-                    step.step_status = "failed"
+                    step.step_status = ExecutionStepStatus.FAILED.value
                     step.error = {
                         "type": "ReferenceError",
                         "message": str(exc),
@@ -755,7 +787,7 @@ class Dispatcher:
             try:
                 validate_step_input(step, step.params or {})
             except SchemaError as exc:
-                step.step_status = "failed"
+                step.step_status = ExecutionStepStatus.FAILED.value
                 step.error = {
                     "type": "InputSchemaError",
                     "message": str(exc),
@@ -764,7 +796,12 @@ class Dispatcher:
                 step.finished_at = now
                 continue
 
-            _consume_governance_approval_once(step)
+            if granted_approval_request is not None:
+                from packages.core.governance.approvals import consume_approval
+
+                await consume_approval(db, granted_approval_request)
+                step.error = None
+                step.human_input_prompt = None
 
             lease = WorkLease(
                 id=generate_ulid(),
@@ -775,16 +812,24 @@ class Dispatcher:
                 worker_id=worker.id,
                 subscription_id=step.resolved_subscription_id,
                 lease_until=now + self._lease_ttl,
-                status="active",
+                status=WorkLeaseStatus.ACTIVE.value,
             )
             db.add(lease)
 
             # Step state transition.
-            step.step_status = "running"
+            step.step_status = ExecutionStepStatus.RUNNING.value
             step.current_lease_id = lease.id
             step.attempt_count = (step.attempt_count or 0) + 1
             if step.started_at is None:
                 step.started_at = now
+
+            # Explicit runtime budget for this attempt. Resolved at dispatch
+            # time from the same step/plan/workspace layering the retry policy
+            # uses; the worker re-resolves it onto its work item and enforces
+            # it in-process (see packages/core/services/step_deadline.py).
+            from packages.core.services.step_deadline import resolve_step_deadline
+
+            step_deadline = await resolve_step_deadline(db, step, plan=plan)
 
             # Activity log for audit.
             db.add(
@@ -797,6 +842,8 @@ class Dispatcher:
                         "kind": step.kind,
                         "capability_id": _step_runtime_capability_id(step),
                         "plan_id": step.plan_id,
+                        "max_runtime_seconds": step_deadline.max_runtime_seconds,
+                        "max_runtime_source": step_deadline.source,
                     },
                 )
             )
@@ -892,8 +939,39 @@ class Dispatcher:
                         },
                     )
 
+        # ── StepResult envelope: status IS the control signal ──
+        # For envelope-shaped steps (llm/subagent) the envelope's `status` is
+        # the success/failure contract — `build_step_result_envelope` never
+        # infers "succeeded", so a step that produced no content lands on
+        # "failed" and must not be recorded as done. Without this the step
+        # renders as Done holding an empty result, dependents run on that empty
+        # input, and the retry budget is never touched. "partial" stays a
+        # success: partial output is usable output. The gate is the SCHEMA, so
+        # a custom/action schema carrying `status` as ordinary payload data
+        # (e.g. a provider receipt) is unaffected.
+        if is_step_result_envelope_schema(step.expected_output_schema) and envelope_indicates_failure(result):
+            lease.result = result
+            if cost:
+                lease.cost = cost
+            error: dict[str, Any] = {
+                "type": "StepResultFailed",
+                "message": str(result.get("summary") or "step reported a failed StepResult"),
+            }
+            failure = result.get("failure")
+            if isinstance(failure, dict) and failure:
+                error["failure"] = failure
+            logger.warning(
+                "[dispatcher] step %s returned a failed StepResult envelope: %s",
+                step.step_key, error["message"],
+            )
+            failed_lease = await self.fail_lease(db, lease_id, error=error)
+            # Keep the envelope on the step too — the operator needs to see
+            # what actually came back, not just the derived error.
+            step.result = result
+            return failed_lease
+
         # Lease side
-        lease.status = "completed"
+        lease.status = WorkLeaseStatus.COMPLETED.value
         lease.result = result
         if cost:
             lease.cost = cost
@@ -902,7 +980,7 @@ class Dispatcher:
 
         # Step side — mirror the result so PlanExecutor can pick it
         # up without joining work_leases on every cycle.
-        step.step_status = "done"
+        step.step_status = ExecutionStepStatus.DONE.value
         step.result = result if isinstance(result, dict) else ({"value": result} if result is not None else None)
         step.finished_at = now
         if cost:
@@ -975,11 +1053,10 @@ class Dispatcher:
                 log_meta_extra["worker_metadata"] = metadata
         await _safe_task_log(
             step,
-            "step_completed",
+            TaskLogType.STEP_COMPLETED,
             log_content,
             metadata=_step_log_meta(step, lease, **log_meta_extra),
         )
-        await _safe_signal_workflow_done(step, result)
         return lease
 
     async def fail_lease(
@@ -1000,8 +1077,11 @@ class Dispatcher:
         step = await self._get_step(db, lease.step_id)
         now = datetime.now(timezone.utc)
 
+        from packages.core.governance.error_signatures import classify_execution_error
         from packages.core.services.retry_policy import (
+            advance_transient_retry,
             apply_retry_policy_to_step,
+            apply_transient_backoff,
             error_with_retry_policy,
             human_prompt_for_exhausted_step,
             resolve_retry_policy_for_step,
@@ -1018,22 +1098,67 @@ class Dispatcher:
             attempt_count=step.attempt_count,
         )
 
-        lease.status = "failed"
+        # ── Transient failure: back off, don't bill it, don't re-ask ──
+        # Nothing Manor asked for actually ran, so this attempt bought
+        # nothing and the operator's grant was never really spent.
+        _hint = classify_execution_error(error)
+        transient_streak = (
+            advance_transient_retry(step.last_execution_error, now=now)
+            if _hint is not None and _hint.is_transient
+            else None
+        )
+        if transient_streak is not None and transient_streak.exhausted:
+            # Budget spent. Record the final streak so the escalation is
+            # legible, then fall through to the ordinary failure path —
+            # which puts the step back in front of the gate, where it now
+            # gets an actionable `error` card instead of another
+            # "needs approval".
+            stored_error["transient_retry"] = transient_streak.as_marker()
+            transient_streak = None
+        if transient_streak is not None:
+            stored_error, next_retry_at = apply_transient_backoff(
+                stored_error, streak=transient_streak, now=now,
+            )
+            # Overrides an explicit will_retry=False on purpose: "transient"
+            # means the failure is expected to clear once the user fixes
+            # something external, which is the opposite of terminal. Safe
+            # only because the streak is bounded.
+            retry = True
+            # The attempt never executed — give the budget back.
+            step.attempt_count = max(0, (step.attempt_count or 0) - 1)
+            from packages.core.governance.approvals import (
+                restore_consumed_grant_for_step,
+            )
+
+            await restore_consumed_grant_for_step(
+                db,
+                entity_id=step.entity_id,
+                step_id=step.id,
+                reason="transient_failure_retry",
+            )
+
+        lease.status = WorkLeaseStatus.FAILED.value
         lease.error = stored_error
         lease.credential_leases = []
 
+        # Keep the REAL failure where the approval gate cannot overwrite it.
+        # `error` gets clobbered on every re-gate (it means "why is this
+        # currently blocked"); this field means "why did it actually fail",
+        # which is what the card must tell the user.
+        step.last_execution_error = stored_error
+
         if retry:
-            step.step_status = "pending"  # back in the queue
+            step.step_status = ExecutionStepStatus.PENDING.value  # back in the queue
             step.error = stored_error  # surface the most recent error
             step.current_lease_id = None
         elif retry_policy.auto_human_on_exhausted:
-            step.step_status = "waiting_human"
+            step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
             step.error = stored_error
             step.human_input_prompt = human_prompt_for_exhausted_step(step, stored_error, retry_policy)
             step.finished_at = None
             step.current_lease_id = None
         else:
-            step.step_status = "failed"
+            step.step_status = ExecutionStepStatus.FAILED.value
             step.error = stored_error
             step.finished_at = now
             step.current_lease_id = None
@@ -1048,6 +1173,12 @@ class Dispatcher:
                     "capability_id": _step_runtime_capability_id(step),
                     "will_retry": retry,
                     "error_type": stored_error.get("type"),
+                    # Present only on a backed-off transient retry — this is
+                    # the audit trail for both the refunded attempt and the
+                    # restored operator grant.
+                    "transient_retry": (
+                        transient_streak.as_marker() if transient_streak else None
+                    ),
                 },
             )
         )
@@ -1103,19 +1234,13 @@ class Dispatcher:
                     "reason": "retry_policy_exhausted",
                 },
             )
-        # Only signal Temporal on TERMINAL failure — retries stay
-        # invisible to the workflow (the next worker pickup is just
-        # another attempt at the same step from the workflow's POV).
-        if not retry and step.step_status == "failed":
-            await _safe_signal_workflow_failed(step, stored_error)
-
         # Quarantine workers that fail repeatedly — keeps a buggy
         # external worker from holding the queue hostage.
         worker = (await db.execute(select(Worker).where(Worker.id == lease.worker_id))).scalar_one_or_none()
         if worker is not None and _counts_towards_worker_quarantine(stored_error):
             worker.consecutive_failures = (worker.consecutive_failures or 0) + 1
             if worker.kind != "internal" and worker.consecutive_failures >= 5:
-                worker.status = "quarantined"
+                worker.status = WorkerStatus.QUARANTINED.value
                 db.add(
                     WorkerActivityLog(
                         worker_id=worker.id,
@@ -1173,11 +1298,87 @@ class Dispatcher:
         """
         lease = await self._get_active_lease(db, lease_id)
         step = await self._get_step(db, lease.step_id)
+        plan_task_id = (await db.execute(
+            select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id)
+        )).scalar_one_or_none()
 
-        lease.status = "needs_human"
+        # ── Mint FIRST, mutate after ───────────────────────────────────────
+        # Order is load-bearing, not stylistic. ``mint_approval_request`` can
+        # lose a race on the dedup index, and its recovery path calls
+        # db.rollback() — which would discard anything already written in this
+        # transaction. Writing lease.status / step.step_status / the activity
+        # log before the mint would let that rollback silently undo the pause
+        # while this method goes on to post a card announcing it, leaving an
+        # ACTIVE lease behind a card that says it is paused. Path B (the step
+        # gate) is mint-first for the same reason; keep this one aligned.
+        #
+        # The race is not reachable from the test fixtures: the partial unique
+        # index that raises IntegrityError lives only in the migration, not in
+        # the model's __table_args__ (deliberately — see
+        # models/hitl_request.py), so create_all() builds a schema that
+        # cannot produce it. This ordering is the whole defense; do not reorder
+        # on the grounds that no test fails.
+        #
+        # No policy evaluation here: the human is being asked for information,
+        # not permission — that decision belongs to resolve_approval.
+        pending_kind = str((pending_action or {}).get("kind") or KIND_HUMAN_INPUT.value)
+        # Bound on every path: the notifier call below reads it outside the
+        # branches that assign it.
+        approval_request = None
+        # Only mint what the chat endpoint can close. A kind outside this set
+        # (e.g. workspace_operation_review, which internal.py can raise through
+        # this same path) has no resolve branch that decides its request, so a
+        # row minted for it would sit PENDING forever: its step stays
+        # waiting_human → its plan never finalizes → resolve_origin_requests,
+        # whose only production caller is that terminal path, never runs.
+        # Phase 2 brings these kinds in by giving their branches a verdict.
+        if step.workspace_id and pending_kind in LEASE_HITL_CLOSEABLE_KINDS:
+            from packages.core.constants.approvals import (
+                LEASE_KIND_HITL_TYPES,
+                ApprovalOriginKind,
+                HitlType,
+            )
+            from packages.core.governance.approvals import (
+                ApprovalOrigin,
+                ApprovalSubject,
+                mint_approval_request,
+            )
+
+            approval_request = await mint_approval_request(
+                db,
+                subject=ApprovalSubject(
+                    entity_id=step.entity_id,
+                    workspace_id=step.workspace_id,
+                    action_key=step.action_key,
+                    capability_id=_step_runtime_capability_id(step),
+                    risk_level=step.risk_level or "medium",
+                    kind=step.kind,
+                ),
+                origin=ApprovalOrigin(
+                    kind=ApprovalOriginKind.LEASE.value,
+                    lease_id=lease.id,
+                    step_id=step.id,
+                    plan_id=step.plan_id,
+                    task_id=plan_task_id,
+                    context={"pending_kind": pending_kind},
+                ),
+                reason=prompt,
+                matched_rule=f"lease.{pending_kind}",
+                # Say what this pause actually is. The record layer's default
+                # is "authorize", which for a CAPTCHA wall or a missing field
+                # is simply false — and false in the direction that made every
+                # read surface count it as governance friction. The comment
+                # above ("the human is being asked for information, not
+                # permission") is now written into the row.
+                hitl_type=LEASE_KIND_HITL_TYPES.get(
+                    pending_kind, HitlType.AUTHORIZE.value,
+                ),
+            )
+
+        lease.status = WorkLeaseStatus.NEEDS_HUMAN.value
         lease.credential_leases = []  # release while waiting
 
-        step.step_status = "waiting_human"
+        step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
         step.human_input_prompt = prompt
         step.current_lease_id = None
 
@@ -1194,10 +1395,16 @@ class Dispatcher:
             )
         )
         await db.flush()
+
+        # The notifier is the single writer of ``approval_request_id`` onto the
+        # card — including the fallback card it builds itself when the caller
+        # passed no pending_action (apps/api/routers/workers.py never does).
+        # Injecting it into ``pending_action`` here would miss that branch.
         await _safe_chat_step_needs_human(
             step,
             prompt=prompt,
             pending_action=pending_action,
+            approval_request_id=approval_request.id if approval_request else None,
         )
         await _safe_task_log(
             step,
@@ -1246,7 +1453,7 @@ class Dispatcher:
                 await db.execute(
                     select(WorkLease)
                     .where(
-                        WorkLease.status == "active",
+                        WorkLease.status == WorkLeaseStatus.ACTIVE,
                         WorkLease.lease_until < now,
                     )
                     .with_for_update(skip_locked=True)
@@ -1257,7 +1464,7 @@ class Dispatcher:
         )
 
         for lease in rows:
-            lease.status = "expired"
+            lease.status = WorkLeaseStatus.EXPIRED.value
             lease.credential_leases = []
 
             step = await self._get_step(db, lease.step_id)
@@ -1280,17 +1487,23 @@ class Dispatcher:
                 attempt_count=step.attempt_count,
             )
 
+            # Same reasoning as fail_lease: a lease that expired without a
+            # report IS a real execution failure (the worker died / never came
+            # back), and the step goes straight back in front of the approval
+            # gate — which would otherwise be the last thing the user hears.
+            step.last_execution_error = expired_error
+
             if step.attempt_count < step.max_attempts:
-                step.step_status = "pending"
+                step.step_status = ExecutionStepStatus.PENDING.value
                 step.error = expired_error
                 step.current_lease_id = None
             elif retry_policy.auto_human_on_exhausted:
-                step.step_status = "waiting_human"
+                step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
                 step.error = expired_error
                 step.human_input_prompt = human_prompt_for_exhausted_step(step, expired_error, retry_policy)
                 step.current_lease_id = None
             else:
-                step.step_status = "failed"
+                step.step_status = ExecutionStepStatus.FAILED.value
                 step.error = {"type": "lease_expired", "message": "all attempts expired", **expired_error}
                 step.finished_at = now
                 step.current_lease_id = None
@@ -1321,7 +1534,7 @@ class Dispatcher:
         lease = (await db.execute(select(WorkLease).where(WorkLease.id == lease_id))).scalar_one_or_none()
         if lease is None:
             raise DispatchError(f"lease {lease_id} not found")
-        if lease.status != "active":
+        if lease.status != WorkLeaseStatus.ACTIVE:
             raise LeaseNotActive(f"lease {lease_id} is {lease.status!r}, not active")
         return lease
 
@@ -1358,7 +1571,7 @@ async def _collect_done_step_results(
             await db.execute(
                 select(ExecutionStep.step_key, ExecutionStep.result).where(
                     ExecutionStep.plan_id == step.plan_id,
-                    ExecutionStep.step_status == "done",
+                    ExecutionStep.step_status == ExecutionStepStatus.DONE,
                     ExecutionStep.result.is_not(None),
                 )
             )
@@ -1493,6 +1706,12 @@ def _step_log_meta(
         "lease_until": _iso_or_none(lease.lease_until if lease else None),
         "error_type": err.get("type") if isinstance(err, dict) else None,
         "error_message": err.get("message") if isinstance(err, dict) else None,
+        # Runtime-budget diagnostics, promoted next to the retry diagnostics so
+        # a StepDeadlineExceeded is readable on the Task detail page without
+        # opening the raw error blob.
+        "max_runtime_seconds": err.get("max_runtime_seconds") if isinstance(err, dict) else None,
+        "elapsed_seconds": err.get("elapsed_seconds") if isinstance(err, dict) else None,
+        "max_runtime_source": err.get("max_runtime_source") if isinstance(err, dict) else None,
         "error": err or None,
     }
     meta.update(extra)
@@ -1521,8 +1740,16 @@ async def _enrich_step_log_author_meta(db: AsyncSession, step: ExecutionStep, me
                 )
             ).scalar_one_or_none()
             if sub:
+                from packages.core.constants.agents import (
+                    agent_display_name_from_service_key,
+                )
+
                 meta.setdefault("agent_id", sub.agent_id)
-                meta["agent_name"] = sub.name or sub.service_key or step.service_key
+                # A nameless subscription is still a specific agent; its key
+                # is the only identity available, but a raw key is not a name.
+                meta["agent_name"] = sub.name or agent_display_name_from_service_key(
+                    sub.service_key or step.service_key
+                )
         except Exception:
             logger.debug("dispatcher: failed to enrich task log author from subscription", exc_info=True)
 
@@ -1539,6 +1766,8 @@ async def _safe_task_log(step: ExecutionStep, log_type: str, content: str, metad
     """Write a TaskLog entry for plan step events. Best-effort."""
     try:
         from packages.core.database import async_session as _session
+        from packages.core.constants.agents import MANOR_AGENT_NAME
+        from packages.core.constants.task_actors import TaskActor
         from packages.core.services.task_service import add_task_log
         from packages.core.models.execution import ExecutionPlan
 
@@ -1548,8 +1777,17 @@ async def _safe_task_log(step: ExecutionStep, log_type: str, content: str, metad
             ).scalar_one_or_none()
             if plan:
                 enriched_metadata = await _enrich_step_log_author_meta(db, step, metadata)
-                created_by = enriched_metadata.get("agent_name") or enriched_metadata.get("agent_id") or "system"
-                await add_task_log(db, plan, log_type, content, created_by=created_by, metadata=enriched_metadata)
+                created_by = enriched_metadata.get("agent_name") or enriched_metadata.get("agent_id")
+                # A step with no resolvable agent ran under the master agent,
+                # not under "system" — the dispatcher is the scheduler, but
+                # something did the work.
+                actor = TaskActor.AGENT if created_by else TaskActor.MANOR
+                await add_task_log(
+                    db, plan, log_type, content,
+                    actor=actor,
+                    created_by=created_by or MANOR_AGENT_NAME,
+                    metadata=enriched_metadata,
+                )
                 await db.commit()
     except Exception:
         logger.warning("dispatcher: task log write failed for step %s", step.id, exc_info=True)
@@ -1671,6 +1909,7 @@ async def _safe_chat_step_needs_human(
     *,
     prompt: str,
     pending_action: Optional[dict] = None,
+    approval_request_id: Optional[str] = None,
 ) -> None:
     if not step.workspace_id:
         return
@@ -1686,38 +1925,7 @@ async def _safe_chat_step_needs_human(
             prompt=prompt,
             subscription_id=step.resolved_subscription_id,
             pending_action=pending_action,
+            approval_request_id=approval_request_id,
         )
     except Exception:
         logger.warning("dispatcher: chat notify (needs_human) failed", exc_info=True)
-
-
-# ── Workflow signaling (M3.8 — Temporal opt-in) ──────────────────────
-# These no-op when TEMPORAL_ENABLED=false, so the legacy Celery path
-# is unaffected. When enabled, the Dispatcher pushes step lifecycle
-# updates to the per-plan workflow which is awaiting them via
-# wait_condition. Imports are deferred to keep temporalio out of the
-# import graph for non-Temporal deployments.
-
-
-async def _safe_signal_workflow_done(
-    step: ExecutionStep,
-    result: Optional[dict],
-) -> None:
-    try:
-        from packages.core.temporal_app import signal_step_completed
-
-        await signal_step_completed(step.plan_id, step.step_key, result)
-    except Exception:
-        logger.debug("dispatcher: workflow signal (done) skipped", exc_info=True)
-
-
-async def _safe_signal_workflow_failed(
-    step: ExecutionStep,
-    error: dict,
-) -> None:
-    try:
-        from packages.core.temporal_app import signal_step_failed
-
-        await signal_step_failed(step.plan_id, step.step_key, error)
-    except Exception:
-        logger.debug("dispatcher: workflow signal (failed) skipped", exc_info=True)

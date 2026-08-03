@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Creator"
+  short_description: "Create, improve, and evaluate reusable Manor Skills"
+  default_prompt: "Create or improve a Manor Skill from my workflow, then validate it with representative examples."

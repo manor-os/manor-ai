@@ -551,7 +551,13 @@ async def test_internal_worker_heartbeats_during_long_lease(client, monkeypatch)
 
     async def slow_handler(_snapshot: dict) -> dict:
         snapshots.append(dict(_snapshot))
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(2):
+            while True:
+                async with dbmod.async_session() as db:
+                    lease = await db.get(WorkLease, lease_id)
+                    if lease is not None and lease.heartbeat_count > 0:
+                        break
+                await asyncio.sleep(0.01)
         return {"result": {"text": "done"}, "cost": {"usd": 0}}
 
     monkeypatch.setattr(internal, "LEASE_HEARTBEAT_INTERVAL_SECONDS", 0.01)

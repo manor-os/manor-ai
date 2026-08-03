@@ -9,6 +9,7 @@ interface InputProps {
   className?: string;
   autoFocus?: boolean;
   onFocus?: (e: React.FocusEvent<HTMLInputElement>) => void;
+  ariaLabel?: string;
 }
 
 export default function Input({
@@ -22,6 +23,7 @@ export default function Input({
   className = "",
   autoFocus = false,
   onFocus,
+  ariaLabel,
 }: InputProps) {
   return (
     <div className={className}>
@@ -38,6 +40,7 @@ export default function Input({
         disabled={disabled}
         autoFocus={autoFocus}
         onFocus={onFocus}
+        aria-label={ariaLabel}
         className="manor-input"
         style={error ? { background: "var(--surface-panel)", boxShadow: "0 0 0 3px rgba(214,95,89,0.22)" } : undefined}
       />

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from datetime import datetime, timezone
 
@@ -712,7 +711,7 @@ async def get_my_models(
 
 
 class UpdateModelsRequest(BaseModel):
-    models: dict  # {"primary": "anthropic/claude-sonnet-4.6", "worker": "openai/gpt-4o-mini", ...}
+    models: dict  # {"primary": "anthropic/claude-sonnet-4.6", "worker": "openai/gpt-4", ...}
 
 
 @router.put("/me/models")
@@ -874,6 +873,15 @@ class LlmBaseUrlRequest(BaseModel):
     role: str | None = None
 
 
+class CatalogModelSettingsRequest(BaseModel):
+    role: str
+    model: str
+    api_key: str | None = None
+    use_saved_api_key: bool = False
+    clear_api_key: bool = False
+    base_url: str = ""
+
+
 class CustomModelRequest(BaseModel):
     role: str
     model: str
@@ -945,14 +953,20 @@ def _resolve_custom_model_key(req: CustomModelRequest, settings: dict | None, ro
 
 async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str | None) -> tuple[str | None, int | None]:
     from packages.core.services.model_resolver import (
+        adapt_llm_chat_payload_for_provider,
         detect_llm_provider_from_key,
+        llm_provider_from_base_url,
         normalize_llm_model_for_provider,
         resolve_llm_provider_base_url,
     )
 
     started = time.perf_counter()
     resolved_base = resolve_llm_provider_base_url(model, api_key, base_url).rstrip("/")
-    provider = detect_llm_provider_from_key(api_key) or _catalog_model_provider(model)
+    provider = (
+        llm_provider_from_base_url(resolved_base)
+        or _catalog_model_provider(model)
+        or detect_llm_provider_from_key(api_key)
+    )
     provider_model = normalize_llm_model_for_provider(model, resolved_base)
 
     if role in {"primary", "worker"}:
@@ -972,6 +986,12 @@ async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str
                 "messages": [{"role": "user", "content": "ping"}],
             }
             url = f"{resolved_base}/chat/completions"
+            adapt_llm_chat_payload_for_provider(
+                payload,
+                model=model,
+                base_url=resolved_base,
+                purpose="probe",
+            )
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code >= 400:
@@ -1016,6 +1036,12 @@ async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str
                     }],
                     "tool_choice": "auto",
                 }
+                adapt_llm_chat_payload_for_provider(
+                    tool_payload,
+                    model=model,
+                    base_url=resolved_base,
+                    purpose="probe",
+                )
             tool_resp = await client.post(url, json=tool_payload, headers=headers)
             if tool_resp.status_code >= 400:
                 detail = tool_resp.text[:500]
@@ -1070,6 +1096,41 @@ def _mask_key(raw: str) -> str:
     return raw[:4] + "****" + raw[-4:] if len(raw) > 8 else ("****" if raw else "")
 
 
+async def _probe_media_role_key(role: str, api_key: str, model: str, base_url: str) -> None:
+    """Live-test a media BYOK key on save where the provider makes it cheap.
+
+    Atlas Cloud exposes an OpenAI-compatible, free model listing — a bad key
+    fails here instead of on the user's first (paid) generation. Providers
+    without a free auth probe (Volcengine task API, Kling JWT) keep the
+    validate-on-first-use behavior.
+    """
+    provider = _catalog_model_provider(model)
+    if role != "video" or provider != "atlascloud":
+        return
+    base = (base_url or "https://api.atlascloud.ai").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{base}/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not reach Atlas Cloud to verify this API key: {exc}",
+        )
+    if resp.status_code in (401, 403):
+        raise HTTPException(
+            status_code=400,
+            detail="Atlas Cloud rejected this API key. Copy a valid key from the Atlas Cloud dashboard.",
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Atlas Cloud key check failed ({resp.status_code}): {resp.text[:300]}",
+        )
+
+
 def _validate_role_api_key_for_model(role: str, api_key: str, model: str) -> None:
     """Validate that a user BYOK key can call the selected catalog model."""
     from packages.core.services.model_resolver import (
@@ -1110,23 +1171,23 @@ def _validate_role_api_key_for_model(role: str, api_key: str, model: str) -> Non
         )
 
     if role == "video":
-        if model_provider in {"bytedance", "kwaivgi"} and provider not in {"anthropic", "google", "groq"}:
+        if model_provider in {"bytedance", "kwaivgi", "atlascloud"} and provider not in {"anthropic", "google", "groq"}:
             return
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Video model {model} requires a native Seedance/Kling key for the "
-                "selected video model."
+                f"Video model {model} requires a native Seedance/Kling/Atlas Cloud key "
+                "for the selected video model."
             ),
         )
 
     if role == "stt":
-        if model_provider == "openai" and provider == "openai":
+        if model_provider in {"openai", "groq"} and provider == model_provider:
             return
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Speech-to-text model {model} requires a matching native OpenAI key. "
+                f"Speech-to-text model {model} requires a matching native OpenAI or Groq key. "
             ),
         )
 
@@ -1176,6 +1237,130 @@ def _validate_role_base_url_for_model(role: str, base_url: str, model: str) -> N
                 "native provider endpoint."
             ),
         )
+
+
+@router.put("/me/models/catalog")
+async def save_catalog_model_settings(
+    req: CatalogModelSettingsRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Atomically save a catalog model with its matching BYOK route."""
+    from packages.core.services.audit_service import log_action
+    from packages.core.services.model_resolver import sanitize_llm_api_key
+    from packages.core.services.model_settings import (
+        effective_catalog,
+        get_model_settings_cached,
+    )
+
+    role = _validate_model_role(req.role)
+    model = str(req.model or "").strip()
+    if not role or not model:
+        raise HTTPException(status_code=400, detail="Role and model are required.")
+    catalog = effective_catalog(await get_model_settings_cached(db))
+    catalog_ids = {
+        str(item.get("id"))
+        for item in catalog.get(role, [])
+        if item.get("id")
+    }
+    if model not in catalog_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {model} is not available for role: {role}",
+        )
+    if req.clear_api_key and (str(req.api_key or "").strip() or req.use_saved_api_key):
+        raise HTTPException(
+            status_code=400,
+            detail="clear_api_key cannot be combined with an API key.",
+        )
+
+    entity = await _require_entity_byok_manager(db, user)
+    settings = dict(entity.settings or {})
+    effective_settings = (
+        await _effective_entity_settings(db, entity)
+        if req.use_saved_api_key
+        else settings
+    )
+    role_keys = dict(settings.get("llm_api_keys") or {})
+    role_urls = dict(settings.get("llm_base_urls") or {})
+    key = sanitize_llm_api_key(str(req.api_key or ""), f"{role}.api_key")
+    if not req.clear_api_key:
+        if not key and req.use_saved_api_key:
+            key = _stored_role_api_key(effective_settings, role)
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="A matching native provider API key is required.",
+            )
+        _validate_role_api_key_for_model(role, key, model)
+        await _probe_media_role_key(role, key, model, str(req.base_url or "").strip())
+
+    base_url = str(req.base_url or "").strip().rstrip("/")
+    if base_url and not req.clear_api_key:
+        _validate_role_base_url_for_model(role, base_url, model)
+
+    existing_models = dict(settings.get("models") or {})
+    changed: dict = {}
+    if existing_models.get(role) != model:
+        changed["model"] = {"old": existing_models.get(role), "new": model}
+    existing_models[role] = model
+    settings["models"] = existing_models
+
+    if req.clear_api_key:
+        if role in role_keys:
+            changed["api_key"] = "cleared"
+        role_keys.pop(role, None)
+        role_urls.pop(role, None)
+    else:
+        if role_keys.get(role) != key:
+            changed["api_key"] = "updated"
+        role_keys[role] = key
+        old_base_url = str(role_urls.get(role) or "")
+        if base_url:
+            role_urls[role] = base_url
+        else:
+            role_urls.pop(role, None)
+        if old_base_url != str(role_urls.get(role) or ""):
+            changed["base_url"] = {
+                "old": old_base_url,
+                "new": role_urls.get(role, ""),
+            }
+    settings["llm_api_keys"] = role_keys
+    settings["llm_base_urls"] = role_urls
+    if role == "primary":
+        if req.clear_api_key:
+            settings.pop("llm_api_key", None)
+            settings.pop("llm_base_url", None)
+        else:
+            settings["llm_api_key"] = key
+            if base_url:
+                settings["llm_base_url"] = base_url
+            else:
+                settings.pop("llm_base_url", None)
+
+    entity.settings = settings
+    if changed:
+        await log_action(
+            db,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            action="entity.models.catalog_update",
+            resource_type="entity",
+            resource_id=entity.id,
+            details={
+                "role": role,
+                "changes": changed,
+                "user_agent": request.headers.get("user-agent", "")[:300],
+            },
+            ip_address=request.client.host if request.client else None,
+        )
+    await db.flush()
+    return {
+        "detail": "Catalog model settings saved",
+        "models": settings["models"],
+        "masked": _mask_key(key),
+    }
 
 
 @router.post("/me/models/test")
@@ -1685,6 +1870,8 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         entity_id=user.entity_id,
         role=user.role,
     )
+
+
 
 
 # ── User Management Schemas ──

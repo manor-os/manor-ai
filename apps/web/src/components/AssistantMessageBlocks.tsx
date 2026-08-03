@@ -1,11 +1,20 @@
 import ChatMarkdown from "./ChatMarkdown";
 import { useEffect, useMemo, useState } from "react";
-import type { AssistantBlock, AssistantProcessStep, ToolCall } from "../lib/chatStream";
+import type { CSSProperties } from "react";
+import type {
+  AssistantBlock,
+  AssistantProcessStep,
+  SubAgentEvent,
+  ToolCall,
+} from "../lib/chatStream";
 import { normalizeToolResult } from "../lib/chatStream";
 import { shouldExpandAssistantProcessBlock } from "../lib/assistantProcessFlow";
+import { stripEditorLiveEditBlocks } from "../lib/editorLiveChat";
 import { t } from "../lib/i18n";
+import { matchSubAgentRuns } from "../lib/subAgentDisplay";
 import { formatUserFacingStructuredText } from "../lib/taskDisplay";
 import { processSurfaceSummary, runtimeToolBadge } from "../lib/toolRuntimeSurface";
+import AgentLoopStep from "./ui/AgentLoopStep";
 
 function processStepToToolCall(step: AssistantProcessStep): ToolCall {
   const status =
@@ -37,6 +46,66 @@ function formatDuration(ms?: number) {
   return `${minutes}m ${seconds}s`;
 }
 
+const COLLAPSIBLE_FINAL_MAX_CHARS = 900;
+const COLLAPSIBLE_FINAL_MAX_LINES = 12;
+
+function CollapsibleFinalMarkdown({
+  content,
+  isUser,
+  streaming,
+  returnTo,
+  enabled,
+}: {
+  content: string;
+  isUser: boolean;
+  streaming: boolean;
+  returnTo?: string;
+  enabled: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const shouldCollapse =
+    enabled &&
+    !streaming &&
+    (content.length > COLLAPSIBLE_FINAL_MAX_CHARS ||
+      content.split(/\r?\n/).length > COLLAPSIBLE_FINAL_MAX_LINES);
+
+  if (!shouldCollapse) {
+    return (
+      <ChatMarkdown
+        content={content}
+        isUser={isUser}
+        streaming={streaming}
+        returnTo={returnTo}
+      />
+    );
+  }
+
+  return (
+    <div className="workspace-markdown-expandable">
+      <div
+        className={`workspace-markdown-clamp${expanded ? "" : " workspace-markdown-clamp--collapsed"}`}
+        style={
+          expanded
+            ? undefined
+            : ({ "--workspace-markdown-clamp-height": "260px" } as CSSProperties)
+        }
+      >
+        <ChatMarkdown content={content} isUser={isUser} returnTo={returnTo} />
+        {!expanded && (
+          <button
+            type="button"
+            className="workspace-markdown-expand-button"
+            onClick={() => setExpanded(true)}
+            aria-label={t("chat.show_more")}
+          >
+            <span aria-hidden="true">...</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function normalizeStepStatus(status?: string) {
   if (status === "running" || status === "pending") return "running";
   if (status === "error") return "error";
@@ -57,7 +126,22 @@ function processVerb(step: AssistantProcessStep) {
   const result = parsePreviewObject(step.result_preview);
   const genericTarget = stepTarget(step, args, display);
   if (name === "manor") {
+    const manorParams =
+      args?.params && typeof args.params === "object" && !Array.isArray(args.params)
+        ? args.params
+        : null;
     const action = String(args?.action || "").toLowerCase();
+    const manorQuery = String(
+      args?.query ||
+        args?.q ||
+        args?.search ||
+        args?.keyword ||
+        manorParams?.query ||
+        manorParams?.q ||
+        manorParams?.search ||
+        manorParams?.keyword ||
+        "",
+    ).trim();
     if (action === "list_tasks") {
       return t("component.assistant_process.tool.manor.list_tasks");
     }
@@ -76,6 +160,14 @@ function processVerb(step: AssistantProcessStep) {
       return t("component.assistant_process.tool.manor.list_documents", {
         target: step.summary || t("component.assistant_message_blocks.knowledge_base"),
         ...(count ? { count } : {}),
+      });
+    }
+    if (action === "search_documents") {
+      return t("component.assistant_process.tool.manor.search_documents", {
+        target:
+          manorQuery ||
+          step.summary ||
+          t("component.assistant_message_blocks.knowledge_base"),
       });
     }
     if (action.includes("search")) {
@@ -102,7 +194,21 @@ function processVerb(step: AssistantProcessStep) {
   if (name === "get_skill_details") {
     return t("component.assistant_process.tool.discovery.skill_details", { target: genericTarget || "skill" });
   }
-  if (name === "rag" || name === "search_documents" || name === "search_tasks") {
+  if (name === "rag") {
+    const displayKey =
+      result?.content_evidence_available === false
+        ? "component.assistant_process.tool.knowledge.rag_no_content"
+        : "component.assistant_process.tool.knowledge.rag";
+    return t(displayKey, {
+      target: genericTarget || "knowledge",
+    });
+  }
+  if (name === "search_documents") {
+    return t("component.assistant_process.tool.knowledge.document_search", {
+      target: genericTarget || "documents",
+    });
+  }
+  if (name === "search_tasks") {
     return t("component.assistant_process.tool.workspace.search", { target: genericTarget || "workspace" });
   }
   if (name.startsWith("workspace_")) {
@@ -568,6 +674,36 @@ function RuntimeSurfaceBadge({
   );
 }
 
+function stripInternalProtocolText(value?: string | null) {
+  if (!value) return value || "";
+  return stripEditorLiveEditBlocks(value);
+}
+
+function sanitizeAssistantBlocks(blocks?: AssistantBlock[] | null): AssistantBlock[] {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.map((block) => {
+    if (block.type === "text") {
+      return {
+        ...block,
+        text: stripInternalProtocolText(block.text),
+      };
+    }
+    return {
+      ...block,
+      title: stripInternalProtocolText(block.title),
+      note: stripInternalProtocolText(block.note),
+      steps: (block.steps || []).map((step) => ({
+        ...step,
+        display_name: stripInternalProtocolText(step.display_name),
+        summary: stripInternalProtocolText(step.summary),
+        assistant_text: stripInternalProtocolText(step.assistant_text),
+        arguments_preview: stripInternalProtocolText(step.arguments_preview),
+        result_preview: stripInternalProtocolText(step.result_preview),
+      })),
+    };
+  });
+}
+
 function AssistantProcessBlock({
   block,
   openingText,
@@ -575,6 +711,7 @@ function AssistantProcessBlock({
   minimal = false,
   hasFinalOutput = false,
   returnTo,
+  subAgentRuns = [],
 }: {
   block: Extract<AssistantBlock, { type: "process" }>;
   openingText: string;
@@ -582,6 +719,7 @@ function AssistantProcessBlock({
   minimal?: boolean;
   hasFinalOutput?: boolean;
   returnTo?: string;
+  subAgentRuns?: SubAgentEvent[];
 }) {
   const steps = block.steps || [];
   const hasRunning = steps.some((step) => normalizeStepStatus(step.status) === "running");
@@ -597,8 +735,15 @@ function AssistantProcessBlock({
   const autoExpand = shouldExpandAssistantProcessBlock(block, minimal);
   const [expanded, setExpanded] = useState(autoExpand);
   const tools = useMemo(() => steps.map(processStepToToolCall), [steps]);
+  const subAgentRunByStep = useMemo(
+    () => matchSubAgentRuns(steps, subAgentRuns),
+    [steps, subAgentRuns],
+  );
   const duration = formatDuration(block.duration_ms);
-  const surfaceSummary = processSurfaceSummary(steps.map((step) => step.name));
+  const surfaceSummary =
+    subAgentRunByStep.size > 0
+      ? ""
+      : processSurfaceSummary(steps.map((step) => step.name));
   const title = hasRunning
     ? t("component.assistant_message_blocks.processing")
     : hasError
@@ -642,9 +787,19 @@ function AssistantProcessBlock({
           )}
           {tools.map((tool, index) => {
             const step = steps[index];
+            const subAgentRun = subAgentRunByStep.get(index);
             const status = normalizeStepStatus(step.status);
             const stepDuration = formatDuration(step.duration_ms);
             const badge = runtimeToolBadge(step.name);
+
+            if (subAgentRun) {
+              return (
+                <AgentLoopStep
+                  key={step.id || index}
+                  run={subAgentRun}
+                />
+              );
+            }
 
             // Minimal (workspace chat): just the verb + status, never the
             // arguments / result / thinking — no AI "running code" surfaces.
@@ -706,13 +861,15 @@ function AssistantProcessBlock({
 }
 
 export default function AssistantMessageBlocks({
-  blocks,
-  content,
+  blocks: rawBlocks,
+  content: rawContent,
   keyPrefix,
   isUser = false,
   streaming = false,
   minimal = false,
+  collapseLongFinal = false,
   returnTo,
+  subAgentRuns = [],
 }: {
   blocks?: AssistantBlock[] | null;
   content?: string | null;
@@ -720,10 +877,16 @@ export default function AssistantMessageBlocks({
   isUser?: boolean;
   streaming?: boolean;
   returnTo?: string;
+  subAgentRuns?: SubAgentEvent[];
   /** Workspace chat: hide tool/step technical detail (args, results,
    *  thinking) — show only the agent's final text + a quiet step summary. */
   minimal?: boolean;
+  /** Collapse long final answers on compact surfaces such as Workspace Chat. */
+  collapseLongFinal?: boolean;
 }) {
+  const blocks = useMemo(() => sanitizeAssistantBlocks(rawBlocks), [rawBlocks]);
+  const content = isUser ? rawContent : stripInternalProtocolText(rawContent);
+
   if (!Array.isArray(blocks) || blocks.length === 0) return null;
 
   const firstProcessIndex = blocks.findIndex((block) => block.type === "process");
@@ -833,12 +996,13 @@ export default function AssistantMessageBlocks({
           if (block.phase !== "final") return null;
           if (shouldSuppressFinalText(block.text)) return null;
           return (
-            <ChatMarkdown
+            <CollapsibleFinalMarkdown
               key={block.id || `${keyPrefix}-text-${index}`}
               content={isUser ? block.text : formatUserFacingStructuredText(block.text)}
               isUser={isUser}
               streaming={streaming && index === blocks.length - 1}
               returnTo={returnTo}
+              enabled={collapseLongFinal}
             />
           );
         }
@@ -851,43 +1015,48 @@ export default function AssistantMessageBlocks({
             minimal={minimal}
             hasFinalOutput={hasFinalOutput}
             returnTo={returnTo}
+            subAgentRuns={subAgentRuns}
           />
         );
       })}
       {recoveredFinalText && (
-        <ChatMarkdown
+        <CollapsibleFinalMarkdown
           key={`${keyPrefix}-recovered-final`}
           content={isUser ? recoveredFinalText : formatUserFacingStructuredText(recoveredFinalText)}
           isUser={isUser}
           streaming={false}
           returnTo={returnTo}
+          enabled={collapseLongFinal}
         />
       )}
       {liveFinalText && (
-        <ChatMarkdown
+        <CollapsibleFinalMarkdown
           key={`${keyPrefix}-live-final`}
           content={isUser ? liveFinalText : formatUserFacingStructuredText(liveFinalText)}
           isUser={isUser}
           streaming={streaming}
           returnTo={returnTo}
+          enabled={collapseLongFinal}
         />
       )}
       {shouldUseAuthoritativeContent && !liveFinalText && (
-        <ChatMarkdown
+        <CollapsibleFinalMarkdown
           key={`${keyPrefix}-authoritative-final`}
           content={isUser ? authoritativeContent : formatUserFacingStructuredText(authoritativeContent)}
           isUser={isUser}
           streaming={streaming}
           returnTo={returnTo}
+          enabled={collapseLongFinal}
         />
       )}
       {fallbackFinalText && (
-        <ChatMarkdown
+        <CollapsibleFinalMarkdown
           key={`${keyPrefix}-fallback-final`}
           content={isUser ? fallbackFinalText : formatUserFacingStructuredText(fallbackFinalText)}
           isUser={isUser}
           streaming={false}
           returnTo={returnTo}
+          enabled={collapseLongFinal}
         />
       )}
     </>

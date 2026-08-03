@@ -33,6 +33,7 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Channel, Document, DocumentGroup, DocumentGroupMember, VectorStatus
@@ -403,7 +404,7 @@ async def create_sandbox_workspace(
             {"type": "channel_config", "id": channel_config_id},
         ],
         pending_action={
-            "kind": "external_message_approval",
+            "kind": PendingActionKind.EXTERNAL_MESSAGE_APPROVAL.value,
             "action_key": "social_post.publish",
             "channel_config_id": channel_config_id,
             "channel_type": "twitter_x",
@@ -455,6 +456,10 @@ async def create_sandbox_workspace(
     ))
 
     await db.flush()
+    from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+    workspace = await db.get(Workspace, workspace_id)
+    if workspace is not None:
+        await ensure_workspace_artifact_folder(db, workspace)
 
     return {
         "workspace_id": workspace_id,
@@ -1235,7 +1240,7 @@ async def _create_leasing_sandbox_workspace(
             {"type": "channel_config", "id": webchat_cc_id},
         ],
         pending_action={
-            "kind": "external_message_approval",
+            "kind": PendingActionKind.EXTERNAL_MESSAGE_APPROVAL.value,
             "action_key": "external_message.send",
             "channel_config_id": webchat_cc_id,
             "channel_type": "webchat",
@@ -1374,6 +1379,10 @@ async def _create_leasing_sandbox_workspace(
         ))
 
     await db.flush()
+    from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+    workspace = await db.get(Workspace, workspace_id)
+    if workspace is not None:
+        await ensure_workspace_artifact_folder(db, workspace)
 
     primary_agent_id, primary_sub_id = subscriptions["lead_intake"]
     return {

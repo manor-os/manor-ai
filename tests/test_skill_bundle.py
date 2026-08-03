@@ -50,6 +50,26 @@ def test_references_are_namespaced_and_trigger_bundle():
     }
 
 
+def test_bundle_sets_extra_file_paths():
+    # Same contract as the GitHub installer — the UI reads these paths to show
+    # the bundle's file list without loading contents.
+    spec = {
+        "scripts": {"b.py": "1", "a.py": "2"},
+        "references": {"guide.md": "# G"},
+    }
+    _, config = assemble_skill_bundle(spec, _BASE)
+    assert config["extra_file_paths"] == [
+        "references/guide.md",
+        "scripts/a.py",
+        "scripts/b.py",
+    ]
+
+
+def test_plain_skill_has_no_extra_file_paths():
+    _, config = assemble_skill_bundle({"tools": ["bash"]}, _BASE)
+    assert "extra_file_paths" not in config
+
+
 def test_scripts_path_is_basename_only():
     spec = {"scripts": {"sub/dir/run.py": "x = 1"}}
     _, config = assemble_skill_bundle(spec, _BASE)

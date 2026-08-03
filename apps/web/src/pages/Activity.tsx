@@ -55,7 +55,7 @@ export default function Activity() {
   const items: any[] = data ?? [];
 
   return (
-    <div style={{ height: "100%", overflowY: "auto", padding: "clamp(16px, 5vw, 24px)", maxWidth: 720, margin: "0 auto" }}>
+    <div style={{ height: "100%", overflowY: "auto", padding: 0, maxWidth: 720 }}>
       <PageHeader
         title={t("nav.activity")}
         subtitle={t("page.activity.subtitle")}

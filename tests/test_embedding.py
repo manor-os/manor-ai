@@ -52,11 +52,24 @@ async def db_session():
         await conn.run_sync(Base.metadata.drop_all)
         if has_vector:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await conn.run_sync(Base.metadata.create_all)
         if has_vector:
             await conn.execute(
                 text(f"ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding vector({EMBEDDING_DIMENSIONS})")
             )
+            await conn.execute(
+                text(
+                    "ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS "
+                    f"embedding vector({EMBEDDING_DIMENSIONS})"
+                )
+            )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_document_chunks_content_trgm "
+                "ON document_chunks USING GIN (content gin_trgm_ops)"
+            )
+        )
 
     async with session_factory() as session:
         yield session, has_vector
@@ -268,7 +281,6 @@ async def test_index_document_reads_xlsx_extracted_text_beyond_500_rows(db_sessi
     await session.flush()
 
     captured_inputs: list[str] = []
-    mock_resp = _mock_embedding_response()
 
     with patch.dict(os.environ, {"EMBEDDING_API_KEY": "test-key"}):
         with patch("packages.core.services.embedding_service.httpx.AsyncClient") as mock_cls:
@@ -278,9 +290,13 @@ async def test_index_document_reads_xlsx_extracted_text_beyond_500_rows(db_sessi
                 value = (json or {}).get("input")
                 if isinstance(value, list):
                     captured_inputs.extend(value)
+                    # A real provider returns one embedding per input; a fixed
+                    # single-item response would under-count once this document
+                    # spans more than one retrieval chunk.
+                    return _mock_embedding_response([FAKE_EMBEDDING] * len(value))
                 elif isinstance(value, str):
                     captured_inputs.append(value)
-                return mock_resp
+                return _mock_embedding_response()
 
             mock_client.post.side_effect = _post
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -359,7 +375,6 @@ async def test_index_document_reads_docx_and_pptx_extracted_text(db_session, tmp
     await session.flush()
 
     captured_inputs: list[str] = []
-    mock_resp = _mock_embedding_response()
 
     with patch.dict(os.environ, {"EMBEDDING_API_KEY": "test-key"}):
         with patch("packages.core.services.embedding_service.httpx.AsyncClient") as mock_cls:
@@ -369,9 +384,10 @@ async def test_index_document_reads_docx_and_pptx_extracted_text(db_session, tmp
                 value = (json or {}).get("input")
                 if isinstance(value, list):
                     captured_inputs.extend(value)
+                    return _mock_embedding_response([FAKE_EMBEDDING] * len(value))
                 elif isinstance(value, str):
                     captured_inputs.append(value)
-                return mock_resp
+                return _mock_embedding_response()
 
             mock_client.post.side_effect = _post
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)

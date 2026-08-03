@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import async_session
 from packages.core.services.hitl_options import approval_options
 
@@ -86,7 +87,7 @@ async def maybe_hold_external_reply_for_approval(
                 message_kind="hitl_prompt",
                 author_kind="system",
                 pending_action={
-                    "kind": "external_message_approval",
+                    "kind": PendingActionKind.EXTERNAL_MESSAGE_APPROVAL.value,
                     "channel_type": channel_type,
                     "channel_config_id": channel_config_id,
                     "channel_conversation_id": conversation_id,

@@ -41,15 +41,21 @@ async def runtime_execute_task_agent_chat(
     tools: list[dict[str, Any]],
     system_prompt: str,
     metadata: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> ChatMessage:
     """Run one scheduled-task agent chat call through the Runtime LLM gateway."""
 
-    return await engine.chat(
-        messages,
-        tools=tools,
-        system_prompt=system_prompt,
-        metadata=metadata,
-    )
+    call_kwargs: dict[str, Any] = {
+        "tools": tools,
+        "system_prompt": system_prompt,
+        "metadata": metadata,
+    }
+    if temperature is not None:
+        call_kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        call_kwargs["max_tokens"] = max_tokens
+    return await engine.chat(messages, **call_kwargs)
 
 
 async def runtime_execute_task_supervisor_chat(
@@ -81,6 +87,8 @@ async def runtime_execute_task_final_chat(
     messages: list[ChatMessage],
     system_prompt: str,
     metadata: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> ChatMessage:
     """Run the scheduled-task final no-tools chat call."""
 
@@ -88,7 +96,15 @@ async def runtime_execute_task_final_chat(
         messages,
         tools=None,
         system_prompt=system_prompt,
-        temperature=RUNTIME_TASK_FINAL_TEMPERATURE,
-        max_tokens=RUNTIME_TASK_FINAL_MAX_TOKENS,
+        temperature=(
+            RUNTIME_TASK_FINAL_TEMPERATURE
+            if temperature is None
+            else temperature
+        ),
+        max_tokens=(
+            RUNTIME_TASK_FINAL_MAX_TOKENS
+            if max_tokens is None
+            else max_tokens
+        ),
         metadata=metadata,
     )

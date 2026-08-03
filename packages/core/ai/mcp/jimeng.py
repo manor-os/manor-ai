@@ -31,9 +31,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import httpx
+
+from packages.core.contracts.artifacts import build_knowledge_artifacts, build_mcp_text_result
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +154,7 @@ async def call_tool(
 
     try:
         result = await handler(arguments, bearer_token)
-        return _content(result)
+        return result if isinstance(result, dict) else _content(result)
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
         return _error(f"Jimeng gateway HTTP {exc.response.status_code}: {body}")
@@ -169,7 +171,7 @@ async def call_tool(
 
 # ── Handlers ────────────────────────────────────────────────────────────────
 
-async def _generate_image(args: Dict[str, Any], session_id: str) -> str:
+async def _generate_image(args: Dict[str, Any], session_id: str) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "model": args.get("model") or "jimeng-4.5",
         "prompt": args.get("prompt") or "",
@@ -185,7 +187,7 @@ async def _generate_image(args: Dict[str, Any], session_id: str) -> str:
     return _format_image_result(data, body["prompt"])
 
 
-async def _edit_image(args: Dict[str, Any], session_id: str) -> str:
+async def _edit_image(args: Dict[str, Any], session_id: str) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "model": args.get("model") or "jimeng-4.5",
         "prompt": args.get("prompt") or "",
@@ -200,7 +202,7 @@ async def _edit_image(args: Dict[str, Any], session_id: str) -> str:
     return _format_image_result(data, body["prompt"])
 
 
-async def _generate_video(args: Dict[str, Any], session_id: str) -> str:
+async def _generate_video(args: Dict[str, Any], session_id: str) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "model": args.get("model") or "jimeng-video-3.0",
         "prompt": args.get("prompt") or "",
@@ -214,12 +216,16 @@ async def _generate_video(args: Dict[str, Any], session_id: str) -> str:
 
     data = await _post(session_id, "/v1/videos/generations", body)
     videos = [item.get("url") for item in (data.get("data") or []) if item.get("url")]
-    return _truncate(json.dumps({
+    visible_text = _truncate(json.dumps({
         "prompt": body["prompt"],
         "model": body["model"],
         "videos": videos,
         "primary": videos[0] if videos else None,
     }, ensure_ascii=False, indent=2))
+    return build_mcp_text_result(
+        visible_text,
+        knowledge_artifacts=build_knowledge_artifacts(videos, kind="video"),
+    )
 
 
 # ── HTTP helpers ────────────────────────────────────────────────────────────
@@ -238,16 +244,20 @@ async def _post(session_id: str, path: str, body: Dict[str, Any]) -> Dict[str, A
         return r.json()
 
 
-def _format_image_result(data: Dict[str, Any], prompt: str) -> str:
+def _format_image_result(data: Dict[str, Any], prompt: str) -> Dict[str, Any]:
     items = data.get("data") or []
     urls = [it.get("url") for it in items if it.get("url")]
-    return _truncate(json.dumps({
+    visible_text = _truncate(json.dumps({
         "prompt": prompt,
         "model": data.get("model"),
         "count": len(urls),
         "images": urls,
         "primary": urls[0] if urls else None,
     }, ensure_ascii=False, indent=2))
+    return build_mcp_text_result(
+        visible_text,
+        knowledge_artifacts=build_knowledge_artifacts(urls, kind="image"),
+    )
 
 
 def _truncate(s: str) -> str:

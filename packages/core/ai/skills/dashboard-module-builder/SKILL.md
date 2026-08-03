@@ -1,6 +1,6 @@
 ---
 name: dashboard-module-builder
-version: 1.2.1
+version: 1.3.0
 description: Use this skill when the user asks Manor AI to add, edit, remove, rearrange, or personalize content on their Dashboard, including requests such as "show daily news", "add a stock module", or "change this dashboard module". It generates a private, loadable Dashboard module and submits it for live preview instead of returning code in chat.
 ---
 
@@ -196,6 +196,12 @@ Choose the source that best satisfies the user's requested content, freshness, s
 
 - Returns an array of `{id, title, url, source, published_at, language}`.
 - Params may include `query`, `days`, and `limit`.
+- Keep `query` to plain keywords or an OR list of keywords; the platform
+  already filters by the user's language and recency and falls back to a
+  key-free web news search when the primary feed is empty.
+- When the request needs specific sites, niche topics, or result types this
+  headline feed cannot serve, prefer the `web_search` read-only tool through
+  `source: tool` instead of forcing the `news` source.
 
 `stocks`
 
@@ -230,6 +236,8 @@ The URL, query construction, expected response shape, and parser belong to that 
 Use `source: tool` when an available connected read-only tool is the best authorized source for the requested module.
 
 Requests for public or location-based external information, including local events, things to do, conferences, meetups, exhibitions, and performances, require an authorized external or connected read-only tool unless a built-in source genuinely supplies that information. Never silently replace external information with Manor tasks, workspaces, or internal activity.
+
+For fresh public web information that neither the built-in `news` feed nor a stable `http_json` endpoint can serve, `web_search` is an authorized read-only data source: call it once during development with the real query, inspect the returned result shape, generate the renderer against that shape, then declare the identical `tool_name` and `tool_arguments` in `data_requests`. Full browser automation is not available to Dashboard modules; `web_search` is the supported way to reach live web content.
 
 For date-aware public event views, use `web_event_search` when available. Pass `location` as a geographic area only, `topics` as the user's required interests, and an explicit date range. Do not put UI instructions such as "add", "show", "weekly", or "calendar" into `location`, and do not drop a requested topic to increase the result count. The tool returns `{query, location, topics, start_date, end_date, events, sources_checked}` where each event contains `title`, `url`, `start_at`, `end_at`, `venue`, `summary`, `source`, and `location_query`. A calendar grouped by day requires this structured date data; do not group ordinary web search result pages into calendar dates.
 

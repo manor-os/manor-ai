@@ -94,6 +94,7 @@ async def log_token_usage(
     context_breakdown: Optional[dict[str, Any]] = None,
     cost_usd: Optional[float] = None,
     duration_ms: Optional[int] = None,
+    rounds: Optional[int] = None,
     source: Optional[str] = None,
     billing_mode: Optional[str] = None,
     api_key_source: Optional[str] = None,
@@ -105,7 +106,14 @@ async def log_token_usage(
     has_billing_mode = await _token_usage_has_column(db, "billing_mode")
     has_api_key_source = await _token_usage_has_column(db, "api_key_source")
     has_pricing_source = await _token_usage_has_column(db, "pricing_source")
-    if not (has_context_breakdown and has_billing_mode and has_api_key_source and has_pricing_source):
+    has_rounds = await _token_usage_has_column(db, "rounds")
+    if not (
+        has_context_breakdown
+        and has_billing_mode
+        and has_api_key_source
+        and has_pricing_source
+        and has_rounds
+    ):
         columns = [
             "id", "entity_id", "workspace_id", "agent_id", "user_id", "conversation_id",
             "model", "provider", "prompt_tokens", "completion_tokens", "total_tokens",
@@ -150,6 +158,10 @@ async def log_token_usage(
             columns.append("context_breakdown")
             values.append(":context_breakdown")
             params["context_breakdown"] = context_breakdown
+        if has_rounds:
+            columns.append("rounds")
+            values.append(":rounds")
+            params["rounds"] = rounds
         await db.execute(
             text(
                 "INSERT INTO token_usage_logs "
@@ -177,6 +189,7 @@ async def log_token_usage(
             billing_mode=billing_mode if has_billing_mode else None,
             api_key_source=api_key_source if has_api_key_source else None,
             pricing_source=pricing_source if has_pricing_source else None,
+            rounds=rounds if has_rounds else None,
         )
 
     entry_kwargs = {
@@ -204,6 +217,8 @@ async def log_token_usage(
         entry_kwargs["api_key_source"] = api_key_source
     if has_pricing_source:
         entry_kwargs["pricing_source"] = pricing_source
+    if has_rounds:
+        entry_kwargs["rounds"] = rounds
     entry = TokenUsageLog(**entry_kwargs)
     db.add(entry)
     await db.flush()
@@ -319,6 +334,7 @@ async def record_llm_usage(
     conversation_id: str | None = None,
     usage: dict,
     duration_ms: int = 0,
+    rounds: int | None = None,
     source: str = "chat",
 ) -> None:
     """Record LLM usage in one call: token log + billing + AI budget.
@@ -335,6 +351,8 @@ async def record_llm_usage(
     total_tokens = int(usage.get("total_tokens") or usage.get("total") or 0)
     cache_read = int(usage.get("cache_read") or usage.get("cache_read_input_tokens") or 0)
     cache_creation = int(usage.get("cache_creation") or usage.get("cache_creation_input_tokens") or 0)
+    audio_in = int(usage.get("audio_in") or usage.get("audio_input_tokens") or 0)
+    audio_out = int(usage.get("audio_out") or usage.get("audio_output_tokens") or 0)
     context_breakdown = (
         usage.get("context_attribution_total")
         or usage.get("context_attribution")
@@ -386,6 +404,8 @@ async def record_llm_usage(
                 provider=str(provider or ""),
                 cache_read_tokens=cache_read,
                 cache_creation_tokens=cache_creation,
+                audio_input_tokens=audio_in,
+                audio_output_tokens=audio_out,
             )
         except Exception:
             logger.debug("record_llm_usage: cost estimate failed", exc_info=True)
@@ -406,7 +426,7 @@ async def record_llm_usage(
             cache_creation_tokens=cache_creation,
             context_breakdown=context_breakdown,
             cost_usd=float(estimated_cost) if estimated_cost is not None else None,
-            duration_ms=duration_ms, source=source,
+            duration_ms=duration_ms, rounds=rounds, source=source,
             billing_mode=billing_mode,
             api_key_source=api_key_source,
             pricing_source=str(pricing_source or ""),
@@ -433,6 +453,8 @@ async def record_llm_usage(
                 conversation_id=conversation_id,
                 cache_read_tokens=cache_read,
                 cache_creation_tokens=cache_creation,
+                audio_input_tokens=audio_in,
+                audio_output_tokens=audio_out,
                 cost_usd=reported_cost,
                 business_type=source, duration_ms=duration_ms,
             )
@@ -446,6 +468,8 @@ async def record_llm_usage(
                     provider=str(provider or ""),
                     cache_read_tokens=cache_read,
                     cache_creation_tokens=cache_creation,
+                    audio_input_tokens=audio_in,
+                    audio_output_tokens=audio_out,
                 )
             )
             if workspace_id:
@@ -480,6 +504,7 @@ async def record_chat_llm_usage(
     usage: dict,
     duration_ms: int | None = None,
     fallback_model: str | None = None,
+    rounds: int | None = None,
 ) -> None:
     """Best-effort chat LLM usage persistence with chat-specific metadata."""
 
@@ -516,6 +541,7 @@ async def record_chat_llm_usage(
             conversation_id=conversation_id,
             usage=usage,
             duration_ms=duration_ms or 0,
+            rounds=rounds,
             source=RUNTIME_CHAT_SOURCE,
         )
     except Exception:
@@ -541,13 +567,15 @@ async def record_tool_call(
     success: bool = True,
     error: Optional[str] = None,
     tool_args: Optional[dict] = None,
+    outcome: str = "success",
 ) -> None:
     """Append-only insert into ``tool_call_logs``. Best-effort.
 
     Caller MUST commit. Failure is logged but never raised — this is
     observability, not a gate. ``tool_args`` is stored verbatim for
     audit + debugging; large values are truncated by the chat logger
-    before reaching here.
+    before reaching here. ``outcome`` is additive detail on top of
+    ``success``/``error`` — see ``ToolCallLog.outcome`` docstring.
     """
     try:
         row = ToolCallLog(
@@ -565,6 +593,7 @@ async def record_tool_call(
             success=success,
             error=error,
             tool_args=tool_args,
+            outcome=outcome,
         )
         db.add(row)
         await db.flush()

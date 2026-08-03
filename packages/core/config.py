@@ -114,17 +114,6 @@ class Settings:
     # boot when missing (with a loud warning).
     DEV_CREDENTIAL_KEY: str = os.getenv("DEV_CREDENTIAL_KEY", "")
 
-    # ── Temporal (durable plan workflows) ──
-    # Off by default — Manor falls back to the Celery-based PlanExecutor
-    # which handles the Demo A v0/v1 use case fine. Flip on when plans
-    # need durable long sleeps (>1h), replay debug, or signal-based
-    # human-in-the-loop on day-scale waits.
-    TEMPORAL_ENABLED: bool = os.getenv("TEMPORAL_ENABLED", "false").lower() in ("true", "1")
-    TEMPORAL_HOST: str = os.getenv("TEMPORAL_HOST", "localhost:7233")
-    TEMPORAL_NAMESPACE: str = os.getenv("TEMPORAL_NAMESPACE", "default")
-    TEMPORAL_TASK_QUEUE: str = os.getenv("TEMPORAL_TASK_QUEUE", "manor-plans")
-    TEMPORAL_TLS: bool = os.getenv("TEMPORAL_TLS", "false").lower() in ("true", "1")
-
     def __init__(self) -> None:
         self.API_WORKERS = int(os.getenv("API_WORKERS", "1"))
         self.API_LIMIT_CONCURRENCY = int(os.getenv("API_LIMIT_CONCURRENCY", "120"))

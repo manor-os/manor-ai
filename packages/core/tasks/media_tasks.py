@@ -16,7 +16,13 @@ from typing import Any
 
 import httpx
 
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 from packages.core.tasks import video_adapters
+from packages.core.constants.media import (
+    MEDIA_JOB_TERMINAL_STATUSES,
+    MediaJobStatus,
+    coerce_provider_media_status,
+)
 
 try:
     from packages.core.celery_app import celery_app
@@ -58,6 +64,10 @@ SEEDANCE_FAST_RESOLUTION_CHOICES = ("480p", "720p")
 OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1"
 COMPLETED_WITHOUT_VIDEO_URL_ERROR = "Provider reported completion but did not return a video URL"
 MEDIA_REFERENCE_URL_EXPIRES_SECONDS = int(os.getenv("MEDIA_REFERENCE_URL_EXPIRES_SECONDS", str(6 * 60 * 60)))
+#: Input snapshots under uploads/media-references/<job id>/ are copies of
+#: what was submitted to the provider, not deliverables. They are kept long
+#: enough to explain and re-run a generation, then reclaimed.
+MEDIA_REFERENCE_RETENTION_DAYS = int(os.getenv("MEDIA_REFERENCE_RETENTION_DAYS", "30"))
 MEDIA_REFERENCE_URL_PREFLIGHT_ENABLED = os.getenv(
     "MEDIA_REFERENCE_URL_PREFLIGHT_ENABLED", "true"
 ).strip().lower() not in {"0", "false", "no", "off"}
@@ -196,6 +206,76 @@ def process_video_job_task(job_id: str) -> dict:
 
 
 @celery_app.task(
+    name="media.cleanup_media_references",
+    max_retries=0,
+    soft_time_limit=900,
+    time_limit=1200,
+)
+def cleanup_media_references_task() -> dict:
+    """Reclaim provider input snapshots older than the retention window.
+
+    ``uploads/media-references/<job id>/`` holds copies of the images handed
+    to the generation provider — inputs, not output. Deliverables live under
+    the workspace's task archive and are never touched here.
+    """
+    from packages.core.services.entity_fs import get_entity_root, is_fs_enabled
+
+    if not is_fs_enabled():
+        return {"skipped": True, "reason": "fs_disabled"}
+
+    cutoff = time.time() - MEDIA_REFERENCE_RETENTION_DAYS * 86400
+    removed = 0
+    reclaimed_bytes = 0
+    scanned = 0
+
+    async def _entity_ids() -> list[str]:
+        from sqlalchemy import text as sql_text
+
+        from packages.core.database import create_worker_session
+        async with create_worker_session()() as db:
+            rows = await db.execute(sql_text("SELECT id FROM entities"))
+            return [row[0] for row in rows.all()]
+
+    for entity_id in _run_async(_entity_ids()):
+        try:
+            root = os.path.join(get_entity_root(entity_id), "uploads", "media-references")
+        except Exception:
+            continue
+        if not os.path.isdir(root):
+            continue
+        for job_dir in os.listdir(root):
+            abs_dir = os.path.join(root, job_dir)
+            if not os.path.isdir(abs_dir):
+                continue
+            scanned += 1
+            try:
+                if os.path.getmtime(abs_dir) >= cutoff:
+                    continue
+                size = sum(
+                    os.path.getsize(os.path.join(dirpath, name))
+                    for dirpath, _dirs, names in os.walk(abs_dir)
+                    for name in names
+                )
+                shutil.rmtree(abs_dir)
+            except OSError:
+                logger.warning("media reference cleanup skipped %s", abs_dir, exc_info=True)
+                continue
+            removed += 1
+            reclaimed_bytes += size
+
+    logger.info(
+        "media reference cleanup: scanned=%d removed=%d reclaimed=%.1fMB (retention %dd)",
+        scanned, removed, reclaimed_bytes / 1_048_576, MEDIA_REFERENCE_RETENTION_DAYS,
+    )
+    return {
+        "scanned": scanned,
+        "removed": removed,
+        "reclaimed_bytes": reclaimed_bytes,
+        "retention_days": MEDIA_REFERENCE_RETENTION_DAYS,
+    }
+
+
+@celery_app.task(
     name="media.recover_stale_jobs",
     max_retries=0,
     soft_time_limit=240,
@@ -259,11 +339,11 @@ async def _mark_video_job_processing(job_id: str) -> bool:
         if not job:
             logger.error("Video job %s not found", job_id)
             return False
-        if job.status in {"completed", "failed"}:
+        if job.status in MEDIA_JOB_TERMINAL_STATUSES:
             logger.info("Video job %s already terminal (%s); skipping", job_id, job.status)
             return False
 
-        job.status = "processing"
+        job.status = MediaJobStatus.PROCESSING.value
         if not job.started_at:
             job.started_at = datetime.now(timezone.utc)
         await db.commit()
@@ -283,17 +363,17 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
         if not job:
             logger.error("Video job %s vanished from DB", job_id)
             return False
-        if not force and job.status in {"completed", "failed"} and job.completed_at:
+        if not force and job.status in MEDIA_JOB_TERMINAL_STATUSES and job.completed_at:
             logger.info("Video job %s already finalized as %s", job_id, job.status)
             return True
 
         params = dict(job.params or {})
         if "error" in result:
-            job.status = "failed"
+            job.status = MediaJobStatus.FAILED.value
             job.error = str(result.get("error") or "Unknown error")
             params["provider_poll_status"] = "failed"
         else:
-            job.status = "completed"
+            job.status = MediaJobStatus.COMPLETED.value
             job.result_url = result.get("result_url")
             job.source_url = result.get("source_url")
             job.file_size = result.get("file_size")
@@ -307,7 +387,7 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
                 params["result_document_id"] = result["document_id"]
 
         try:
-            if not job.byok and job.status == "failed":
+            if not job.byok and job.status == MediaJobStatus.FAILED:
                 from packages.core.services.credit_reservations import release_reservation_by_source
 
                 await release_reservation_by_source(
@@ -325,11 +405,11 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
         await db.commit()
 
         # Bill usage (only on success + platform key)
-        if job.status == "completed" and not job.byok and job.cost_usd:
+        if job.status == MediaJobStatus.COMPLETED and not job.byok and job.cost_usd:
             billed = await _bill_usage(job)
             if billed:
                 await _consume_video_reservation(job.id, int(job.credits or 0) or None)
-        elif job.status == "completed" and not job.byok:
+        elif job.status == MediaJobStatus.COMPLETED and not job.byok:
             await _release_video_reservation(job.id, "video completed without billable cost")
 
         # Always push notification — success or failure.
@@ -424,7 +504,7 @@ async def recover_stale_video_jobs(
             select(MediaJob)
             .where(
                 MediaJob.kind == "video",
-                MediaJob.status == "pending",
+                MediaJob.status == MediaJobStatus.PENDING,
                 MediaJob.created_at <= cutoff,
             )
             .order_by(MediaJob.created_at.asc())
@@ -450,7 +530,7 @@ async def recover_stale_video_jobs(
             select(MediaJob)
             .where(
                 MediaJob.kind == "video",
-                MediaJob.status == "processing",
+                MediaJob.status == MediaJobStatus.PROCESSING,
                 or_(MediaJob.started_at.is_(None), MediaJob.started_at <= cutoff),
             )
             .order_by(MediaJob.started_at.asc().nullsfirst(), MediaJob.created_at.asc())
@@ -461,7 +541,7 @@ async def recover_stale_video_jobs(
             select(MediaJob)
             .where(
                 MediaJob.kind == "video",
-                MediaJob.status == "failed",
+                MediaJob.status == MediaJobStatus.FAILED,
                 MediaJob.error == COMPLETED_WITHOUT_VIDEO_URL_ERROR,
                 MediaJob.completed_at >= now - timedelta(hours=24),
             )
@@ -603,6 +683,8 @@ async def _resume_video_job_from_provider(job) -> dict[str, Any]:
         agent_id=getattr(job, "agent_id", None),
         conversation_id=getattr(job, "conversation_id", None),
         user_id=getattr(job, "user_id", None),
+        with_audio=_seedance_bool(params.get("generate_audio")),
+        has_video_input=bool(params.get("reference_video_urls")),
     )
 
 
@@ -666,13 +748,14 @@ async def _check_provider_poll_once(poll_url: str, headers: dict, *, provider: s
         or ""
     ).lower()
 
-    if video_url and (not status or status in {"completed", "complete", "succeeded", "success", "done"}):
+    provider_status = coerce_provider_media_status(status)
+    if video_url and (not status or provider_status == MediaJobStatus.COMPLETED):
         return {"video_url": video_url}
-    if provider == "openrouter" and status == "completed":
+    if provider == "openrouter" and provider_status == MediaJobStatus.COMPLETED:
         return {"video_url": video_url or _openrouter_video_content_url(data, request_url)}
-    if status in {"completed", "complete", "succeeded", "success", "done"}:
+    if provider_status == MediaJobStatus.COMPLETED:
         return {"video_url": video_url} if video_url else {"error": "Provider completed without a video URL"}
-    if status in {"failed", "failure", "error", "cancelled", "canceled", "expired"}:
+    if provider_status == MediaJobStatus.FAILED:
         return {"error": f"Provider failed: {_provider_error_message(data)}"}
 
     return {"status": "pending"}
@@ -743,14 +826,14 @@ async def _push_notification(job) -> None:
     from packages.core.services.notify import notify
 
     prompt_preview = job.prompt[:50] if job.prompt else "Video"
-    if job.status == "completed":
+    if job.status == MediaJobStatus.COMPLETED:
         title = f"Video ready: {prompt_preview}..."
         body = "Your video has been generated successfully."
     else:
         title = f"Video failed: {prompt_preview}..."
         body = job.error[:200] if job.error else "Unknown error"
     document_id = (job.params or {}).get("result_document_id")
-    link = f"/viewer/{document_id}" if job.status == "completed" and document_id else None
+    link = f"/viewer/{document_id}" if job.status == MediaJobStatus.COMPLETED and document_id else None
     display_resolution = normalize_video_resolution(
         job.model,
         (job.params or {}).get("resolution", "720p"),
@@ -1029,6 +1112,16 @@ async def _call_kling_api(job, api_key: str, base_url: str | None) -> dict:
     )
 
 
+async def _call_atlascloud_api(job, api_key: str, base_url: str | None) -> dict:
+    """Call Atlas Cloud unified video API (BYOK-only)."""
+    return await video_adapters.AtlasCloudVideoAdapter().submit(
+        job,
+        api_key,
+        base_url,
+        _video_adapter_runtime(),
+    )
+
+
 def _extract_video_url(value) -> str:
     """Best-effort recursive extraction across native video provider shapes."""
     if isinstance(value, dict):
@@ -1068,9 +1161,10 @@ async def _poll_volcengine_task(poll_url: str, headers: dict, *, timeout: float 
                 logger.debug("Volcengine poll error: %s", exc)
                 continue
             status = str(data.get("status") or (data.get("data") or {}).get("status") or "").lower()
-            if status in {"succeeded", "success", "completed"}:
+            provider_status = coerce_provider_media_status(status)
+            if provider_status == MediaJobStatus.COMPLETED:
                 return _extract_video_url(data)
-            if status in {"failed", "error", "cancelled", "expired"}:
+            if provider_status == MediaJobStatus.FAILED:
                 raise RuntimeError(f"Seedance generation failed: {_provider_error_message(data)}")
     raise ProviderPollTimeout(f"Seedance generation still pending after {timeout}s")
 
@@ -1089,9 +1183,10 @@ async def _poll_generic_video_task(poll_url: str, headers: dict, *, timeout: flo
                 logger.debug("Video poll error: %s", exc)
                 continue
             status = str(data.get("status") or (data.get("data") or {}).get("status") or "").lower()
-            if status in {"succeeded", "success", "completed"}:
+            provider_status = coerce_provider_media_status(status)
+            if provider_status == MediaJobStatus.COMPLETED:
                 return _extract_video_url(data)
-            if status in {"failed", "error", "cancelled", "expired"}:
+            if provider_status == MediaJobStatus.FAILED:
                 raise RuntimeError(f"Video generation failed: {_provider_error_message(data)}")
     raise ProviderPollTimeout(f"Video generation still pending after {timeout}s")
 
@@ -1119,6 +1214,8 @@ async def _download_and_save(
     agent_id: str | None = None,
     conversation_id: str | None = None,
     user_id: str | None = None,
+    with_audio: bool = False,
+    has_video_input: bool = False,
 ) -> dict:
     """Download video from URL, save to entity FS, register as KB document."""
     from packages.core.services.entity_fs import get_entity_root, write_entity_file_atomic
@@ -1144,6 +1241,7 @@ async def _download_and_save(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     target = build_generated_media_target(
         prompt=prompt,
@@ -1154,7 +1252,7 @@ async def _download_and_save(
         ),
         ext=ext,
         fallback="generated-video",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, "videos"),
+        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.VIDEOS.value),
         entity_root=entity_root,
     )
     filepath = write_entity_file_atomic(
@@ -1239,8 +1337,14 @@ async def _download_and_save(
     credits_charged = 0
     try:
         from packages.core.services.billing_service import estimate_video_cost, video_to_credits
-        cost_usd = estimate_video_cost(model, duration, resolution)
-        credits_charged = video_to_credits(model, duration, resolution)
+        cost_usd = estimate_video_cost(
+            model, duration, resolution,
+            with_audio=with_audio, has_video_input=has_video_input,
+        )
+        credits_charged = video_to_credits(
+            model, duration, resolution,
+            with_audio=with_audio, has_video_input=has_video_input,
+        )
     except Exception:
         pass
 
@@ -1285,7 +1389,7 @@ async def _poll_video_generation(
             ).lower()
             logger.debug("Poll status=%s, keys=%s", status, list(data.keys()))
 
-            if status in {"completed", "complete", "succeeded", "success", "done"}:
+            if coerce_provider_media_status(status) == MediaJobStatus.COMPLETED:
                 # OpenRouter returns video URL in unsigned_urls array
                 unsigned = data.get("unsigned_urls") or []
                 return (
@@ -1297,7 +1401,7 @@ async def _poll_video_generation(
                     or _openrouter_video_content_url(data, poll_url)
                     or ""
                 )
-            elif status in {"failed", "failure", "error", "cancelled", "canceled", "expired"}:
+            elif coerce_provider_media_status(status) == MediaJobStatus.FAILED:
                 raise RuntimeError(f"Video generation failed: {_provider_error_message(data)}")
             # else: pending/processing — keep polling
 

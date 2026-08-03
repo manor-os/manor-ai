@@ -101,13 +101,10 @@ async def _count_users(db: AsyncSession, entity_id: str) -> int:
 
 @counter("storage_mb")
 async def _count_storage(db: AsyncSession, entity_id: str) -> float:
-    from packages.core.models.document import Document
-    r = await db.execute(
-        select(func.coalesce(func.sum(Document.file_size), 0)).where(
-            Document.entity_id == entity_id,
-        )
-    )
-    return r.scalar_one() / (1024 * 1024)
+    from packages.core.services.document_service import storage_usage
+
+    size_bytes, _file_count = await storage_usage(db, entity_id)
+    return size_bytes / (1024 * 1024)
 
 
 @counter("ai_budget_usd")

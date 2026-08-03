@@ -21,7 +21,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.deps import get_current_user
+from apps.api.deps import (
+    get_current_user,
+    require_workspace_readable,
+    require_workspace_writable,
+)
 from packages.core.database import get_db
 from packages.core.goals import service as goal_service
 from packages.core.models.base import generate_ulid
@@ -240,6 +244,11 @@ async def list_goals(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_readable(db, user, workspace_id)
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
+    readable_ws = await readable_workspace_ids_for_user(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
     legacy = [
         _legacy_goal_response(row)
         for row in _LEGACY_GOAL_RUNS.values()
@@ -252,6 +261,7 @@ async def list_goals(
 
     rows = await goal_service.list_goals(
         db, user.entity_id, workspace_id=workspace_id, status=status,
+        readable_workspace_ids=readable_ws,
     )
     if _LEGACY_GOAL_RUNS and not rows:
         return {"items": [], "total": 0}
@@ -269,6 +279,7 @@ async def create_goal(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_writable(db, user, getattr(req, "workspace_id", None))
     if req.goal is not None or req.goal_id is not None or req.steps is not None:
         now = _now_iso()
         run_id = generate_ulid()
@@ -361,6 +372,11 @@ async def update_goal(
             legacy["completed_at"] = _now_iso()
         return _legacy_goal_response(legacy)
 
+    existing = await goal_service.get_goal(db, goal_id, user.entity_id)
+    if not existing:
+        raise HTTPException(404, "goal not found")
+    await require_workspace_writable(db, user, existing.workspace_id)
+
     payload = req.model_dump(exclude_unset=True)
     goal = await goal_service.update_goal(db, goal_id, user.entity_id, **payload)
     if not goal:
@@ -420,6 +436,10 @@ async def delete_goal(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    existing = await goal_service.get_goal(db, goal_id, user.entity_id)
+    if not existing:
+        raise HTTPException(404, "goal not found")
+    await require_workspace_writable(db, user, existing.workspace_id)
     ok = await goal_service.delete_goal(db, goal_id, user.entity_id)
     if not ok:
         raise HTTPException(404, "goal not found")

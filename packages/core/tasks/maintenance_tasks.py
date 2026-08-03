@@ -56,6 +56,30 @@ def repair_missing_document_files() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+@celery_app.task(name="maintenance.sync_openrouter_pricing")
+def sync_openrouter_pricing() -> dict:
+    """Refresh the local OpenRouter model pricing cache."""
+
+    async def _run() -> dict:
+        from packages.core.services.openrouter_pricing_sync import sync_openrouter_pricing_cache
+
+        return await sync_openrouter_pricing_cache(timeout_s=45.0)
+
+    try:
+        res = _run_async(_run())
+        logger.info(
+            "maintenance.sync_openrouter_pricing: synced %s models -> %s",
+            res.get("count"),
+            res.get("path"),
+        )
+        return {"ok": True, **res}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("maintenance.sync_openrouter_pricing failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))

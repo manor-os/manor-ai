@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 import logging
+from urllib.parse import quote
 from typing import Any, Optional
 
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import async_session
 from packages.core.workspace_chat import service as chat
 
@@ -54,7 +56,7 @@ async def notify_plan_started(
 
     body = headline
     if steps:
-        body += "\n\n" + _render_dag(steps)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
 
     # Plan thread (full DAG)
     await _safe_post(
@@ -94,7 +96,7 @@ async def notify_plan_completed(
     )
     headline = body
     if steps:
-        body += "\n\n" + _render_dag(steps)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
 
     # Plan thread (full DAG)
     await _safe_post(
@@ -105,6 +107,40 @@ async def notify_plan_completed(
     )
 
     # Main workspace chat
+    await _safe_post(
+        entity_id=entity_id, workspace_id=workspace_id,
+        body=headline, message_kind="agent_update", author_kind="agent",
+        refs=_plan_refs(plan_id, task_id),
+    )
+
+
+async def notify_plan_needs_attention(
+    *,
+    entity_id: str,
+    workspace_id: Optional[str],
+    plan_id: str,
+    task_id: Optional[str] = None,
+    task_title: Optional[str] = None,
+    issue: Optional[str] = None,
+    steps: Optional[list[dict]] = None,
+) -> None:
+    """Announce a mechanically finished plan whose task was not accepted."""
+    if not workspace_id:
+        return
+    subject = task_title or f"Plan {plan_id[:8]}"
+    headline = f"**Task needs attention — {subject}**"
+    if issue:
+        headline += f"\n\n{issue}"
+    body = headline
+    if steps:
+        body += "\n\n" + _render_dag(steps)
+
+    await _safe_post(
+        entity_id=entity_id, workspace_id=workspace_id,
+        body=body, message_kind="agent_update", author_kind="agent",
+        thread_ref_kind="plan", thread_ref_id=plan_id,
+        refs=_plan_refs(plan_id, task_id),
+    )
     await _safe_post(
         entity_id=entity_id, workspace_id=workspace_id,
         body=headline, message_kind="agent_update", author_kind="agent",
@@ -129,7 +165,7 @@ async def notify_plan_failed(
     headline = f"✗ **Task failed — {subject}**\n\nReason: {msg}"
     body = headline
     if steps:
-        body += "\n\n" + _render_dag(steps)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
 
     # Plan thread (full DAG)
     await _safe_post(
@@ -270,6 +306,7 @@ async def notify_step_needs_human(
     prompt: str,
     subscription_id: Optional[str] = None,
     pending_action: Optional[dict] = None,
+    approval_request_id: Optional[str] = None,
 ) -> None:
     """Lease-level HITL prompt — interactive message with a
     pending_action so the user can resolve it from the chat.
@@ -281,7 +318,13 @@ async def notify_step_needs_human(
     endpoint can look up the originating step.
 
     When omitted, falls back to the historical free-form text-input
-    card (``kind="human_input"``) that asks the user to type a reply.
+    card (``PendingActionKind.HUMAN_INPUT``) that asks the user to type
+    a reply.
+
+    ``approval_request_id`` is the unified HitlRequest row minted for
+    this pause. It is merged into whichever card shape we end up with —
+    the notifier is the single writer of that field — so answering the
+    card can close the request instead of orphaning it.
     """
     if not workspace_id:
         return
@@ -295,7 +338,7 @@ async def notify_step_needs_human(
         body = title
     else:
         merged_action = {
-            "kind": "human_input",
+            "kind": PendingActionKind.HUMAN_INPUT.value,
             "step_id": step_id,
             "plan_id": plan_id,
             "input_schema": {
@@ -305,6 +348,9 @@ async def notify_step_needs_human(
             },
         }
         body = f"⚠ Need your input on step `{step_key}`:\n\n{prompt}"
+
+    if approval_request_id:
+        merged_action["approval_request_id"] = approval_request_id
 
     await _safe_post(
         entity_id=entity_id, workspace_id=workspace_id,
@@ -414,6 +460,22 @@ def summarize_result_for_chat(result: Any, *, max_chars: int = 1200) -> Optional
     return _clip_text(_strip_boilerplate_completion_headings(text), max_chars)
 
 
+def _artifact_identity(kind: Any, value: Any) -> str:
+    """What makes two artifacts the same file.
+
+    One step result names the same file several ways — `fs_path`, `path`,
+    a leading slash, a workspace prefix — and comparing the raw strings let
+    every spelling through as a separate line. Paths compare by their
+    normalised form so the duplicates collapse.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if str(kind or "") != "file":
+        return text
+    return text.replace("\\", "/").lstrip("/").rstrip("/").casefold()
+
+
 def extract_artifacts_for_chat(result: Any) -> list[dict]:
     """Return user-visible files/URLs produced by a step result."""
     artifacts: list[dict] = []
@@ -424,8 +486,9 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
         value = value.strip()
         if not value or value.startswith("data:"):
             return
-        key = (kind, value)
-        if any((a.get("kind"), a.get("value")) == key for a in artifacts):
+        key = (kind, _artifact_identity(kind, value))
+        if any((a.get("kind"), _artifact_identity(a.get("kind"), a.get("value"))) == key
+               for a in artifacts):
             return
         artifacts.append({"kind": kind, "value": value, "name": name})
 
@@ -445,7 +508,12 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
             ("path", "file"),
             ("file_path", "file"),
             ("output_path", "file"),
-            ("name", "file"),
+            # ("name", "file") used to be here. A name is not a location:
+            # it produced a second "file" artifact for every file that also
+            # had a path, so the same MP4 was listed twice — once as
+            # `final/two_minute_rule.mp4` and once as `two_minute_rule.mp4`
+            # — and the bare one could never be opened. The name still rides
+            # along as the label of the real entry below.
             ("file_url", "url"),
             ("document_url", "url"),
             ("image_url", "url"),
@@ -624,14 +692,32 @@ def _strip_boilerplate_completion_headings(text: str) -> str:
     return "\n".join(lines).strip() or text.strip()
 
 
-def _format_artifact(artifact: dict) -> str:
+def _format_artifact(artifact: dict, *, entity_id: str = "") -> str:
+    """Render one produced file as something the reader can open.
+
+    This used to print the path inside backticks, which is inline code: a
+    name, not an address. The UI only builds a file card from a reference it
+    can actually resolve, so a real deliverable arrived as grey monospace
+    text that led nowhere. Naming a file is not delivering it — the link has
+    to be the address the step actually returned.
+    """
     kind = artifact.get("kind") or "output"
     value = _as_text(artifact.get("value")) or "output"
-    name = _as_text(artifact.get("name"))
-    if kind == "document" and name:
-        return f"{kind.title()}: `{name}`"
-    if name and name != value:
-        return f"{kind.title()}: `{name}` ({value})"
+    name = _as_text(artifact.get("name")) or value.rstrip("/").rsplit("/", 1)[-1] or value
+
+    href = ""
+    if kind == "document":
+        href = f"/viewer/{value}"
+    elif kind == "url":
+        href = value
+    elif kind == "file" and entity_id:
+        path = value.replace("\\", "/").lstrip("/")
+        href = f"/api/v1/fs/{entity_id}/{quote(path)}"
+
+    if href:
+        return f"{kind.title()}: [{name}]({href})"
+    # No address to link — say the name plainly rather than dress a
+    # non-address up as one.
     return f"{kind.title()}: `{value}`"
 
 
@@ -676,7 +762,7 @@ def _is_markdown_rule(line: str) -> bool:
     return set(line) <= {"-", "_", "*"} and len(line) >= 3
 
 
-def _render_dag(steps: list[dict]) -> str:
+def _render_dag(steps: list[dict], *, entity_id: str = "") -> str:
     """Render a plan DAG as markdown for chat / task comments.
 
     Input: list of step dicts with keys:
@@ -708,10 +794,10 @@ def _render_dag(steps: list[dict]) -> str:
             # Parallel steps
             lines.append(f"**Layer {i + 1}** (parallel):")
             for s in layer:
-                lines.append(_render_step(s, STATUS_ICONS, indent="  "))
+                lines.append(_render_step(s, STATUS_ICONS, indent="  ", entity_id=entity_id))
         else:
             s = layer[0]
-            lines.append(_render_step(s, STATUS_ICONS, indent=""))
+            lines.append(_render_step(s, STATUS_ICONS, indent="", entity_id=entity_id))
 
         # Arrow to next layer
         if i < len(layers) - 1:
@@ -720,7 +806,7 @@ def _render_dag(steps: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _render_step(s: dict, icons: dict, indent: str = "") -> str:
+def _render_step(s: dict, icons: dict, indent: str = "", *, entity_id: str = "") -> str:
     status = s.get("status") or "pending"
     icon = icons.get(status, "⬜")
     key = s.get("key", "?")
@@ -750,7 +836,7 @@ def _render_step(s: dict, icons: dict, indent: str = "") -> str:
     if status == "done" and artifacts:
         for artifact in artifacts[:3]:
             if isinstance(artifact, dict):
-                line += f"\n{indent}  ↳ {_format_artifact(artifact)}"
+                line += f"\n{indent}  ↳ {_format_artifact(artifact, entity_id=entity_id)}"
 
     return line
 

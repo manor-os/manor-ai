@@ -108,6 +108,7 @@ async def test_v11_full_export_install_roundtrip(
     assert export_resp.status_code == 201, export_resp.text
     bp = export_resp.json()
     payload = bp["payload"]
+    assert "artifact_folder_id" not in str(payload)
 
     # 5-section shape
     assert "manifest" in payload
@@ -117,8 +118,10 @@ async def test_v11_full_export_install_roundtrip(
     assert "policy" in payload
 
     assert payload["manifest"]["blueprint_version"] == "1.1"
+    assert payload["manifest"]["slug"] == "x-growth-v1"
     assert payload["manifest"]["title"] == "X Growth — Calvin's playbook"
     assert payload["manifest"]["kind"] == "social_media"
+    assert payload["manifest"]["author"]["handle"] == "calvin"
 
     # Empty envelope sections present (no seeded subs/skills/agents/etc.)
     assert payload["embedded"]["agents"] == []
@@ -153,6 +156,24 @@ async def test_v11_full_export_install_roundtrip(
     assert new_ws["kind"] == "social_media"
     assert new_ws["operating_context"] == "Running for {{brand_name}}."
     assert new_ws["primary_work"] == "Draft posts daily."
+    assert new_ws["artifact_folder_id"]
+    assert new_ws["artifact_folder_id"] != ws["artifact_folder_id"]
+
+    # Exporting an installed Workspace creates a first-class Remix lineage.
+    remix_resp = await client.post(
+        f"/api/v1/workspaces/{new_ws_id}/export-blueprint",
+        headers=headers,
+        json={"slug": "x-growth-remix-v1", "title": "X Growth Remix"},
+    )
+    assert remix_resp.status_code == 201, remix_resp.text
+    remix = remix_resp.json()
+    assert remix["remixed_from_id"] == bp["id"]
+    assert remix["payload"]["manifest"]["forked_from_id"] == bp["id"]
+
+    source_detail = (
+        await client.get(f"/api/v1/blueprints/{bp['id']}", headers=headers)
+    ).json()
+    assert source_detail["remix_count"] == 1
 
 
 # ── Test 2: install_count increments + listing ────────────────────────

@@ -31,6 +31,9 @@ import logging
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+from packages.core.constants.execution import (
+    WorkerStatus,
+)
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     runtime_active_user_message_from_context,
@@ -38,6 +41,15 @@ from packages.core.ai.runtime.tool_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+INTEGRATION_ACCOUNT_ARGUMENT = "integration_account_id"
+_INTEGRATION_ACCOUNT_PARAMETER = {
+    "type": "string",
+    "description": (
+        "Connected account ID to use for this operation. Choose an ID returned "
+        "by search_tools. Omit it to use the default account."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -104,26 +116,11 @@ _SERVER_TOOL_SCHEMAS: dict[str, list[dict]] = {
     # no static schemas registered here. The legacy in-process module
     # at packages/core/ai/mcp/stripe.py is retained on disk for
     # backward import compatibility but no longer dispatched.
-    "discord": [
-        {"name": "send_message", "description": "Send a message to a Discord channel.",
-         "parameters": {"type": "object", "required": ["channel_id", "content"],
-                        "properties": {"channel_id": {"type": "string"},
-                                       "content": {"type": "string"},
-                                       "tts": {"type": "boolean", "default": False}}}},
-        {"name": "list_channels", "description": "List channels in a Discord guild (server).",
-         "parameters": {"type": "object", "required": ["guild_id"],
-                        "properties": {"guild_id": {"type": "string"}}}},
-        {"name": "get_channel_messages", "description": "Fetch recent messages from a channel.",
-         "parameters": {"type": "object", "required": ["channel_id"],
-                        "properties": {"channel_id": {"type": "string"},
-                                       "limit": {"type": "integer", "default": 50}}}},
-        {"name": "add_reaction", "description": "Add a reaction emoji to a message.",
-         "parameters": {"type": "object", "required": ["channel_id", "message_id", "emoji"],
-                        "properties": {"channel_id": {"type": "string"},
-                                       "message_id": {"type": "string"},
-                                       "emoji": {"type": "string",
-                                                 "description": "URL-encoded unicode emoji or 'name:id' for custom"}}}},
-    ],
+    # ``discord`` has NO in-process module yet (packages/core/ai/mcp/discord.py
+    # does not exist) — advertising schemas for it sent agents into a
+    # guaranteed "No in-process MCP module" dead end. Do not add schemas
+    # here until the module ships; the catalog row stays visible in the
+    # UI via the coming_soon gate in integration_service.py.
     "telegram": [
         {"name": "send_message", "description": "Send a text message to a Telegram chat.",
          "parameters": {"type": "object", "required": ["chat_id", "text"],
@@ -259,29 +256,8 @@ _SERVER_TOOL_SCHEMAS: dict[str, list[dict]] = {
          "parameters": {"type": "object", "properties": {}}},
     ],
 
-    # Nango — open-source self-hosted OAuth aggregator. Same UX as
-    # Composio (one MCP server, hundreds of platforms) but free.
-    "nango": [
-        {"name": "nango_list_providers",
-         "description": "List integrations configured on this Nango server.",
-         "parameters": {"type": "object", "properties": {}}},
-        {"name": "nango_list_connections",
-         "description": "List active OAuth connections held for this entity.",
-         "parameters": {"type": "object",
-                        "properties": {"provider_config_key": {"type": "string"}}}},
-        {"name": "nango_proxy",
-         "description": "Make an authenticated HTTP call to a provider via Nango (handles OAuth + token refresh).",
-         "parameters": {"type": "object",
-                        "required": ["provider_config_key", "connection_id", "method", "endpoint"],
-                        "properties": {
-                            "provider_config_key": {"type": "string"},
-                            "connection_id": {"type": "string"},
-                            "method": {"enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
-                            "endpoint": {"type": "string"},
-                            "params": {"type": "object"},
-                            "headers": {"type": "object"},
-                            "data": {"type": "object"}}}},
-    ],
+    # ``nango`` (open-source self-hosted OAuth aggregator) is populated
+    # below via ``_adapt_module_tools`` from the module's ``list_tools()``.
 
 
     "producthunt": [
@@ -478,6 +454,19 @@ def _mcp_tool_result_to_text(result: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def _trusted_knowledge_artifacts(
+    result: Any,
+    *,
+    transport: str,
+    integration_scope: str | None,
+) -> list[dict[str, str]]:
+    if transport != "builtin" or str(integration_scope or "").lower() == "cli_worker":
+        return []
+    from packages.core.contracts.artifacts import extract_mcp_knowledge_artifacts
+
+    return extract_mcp_knowledge_artifacts(result)
+
+
 def _mcp_error_result_to_text(server_key: str, tool_name: str, result: dict) -> str:
     content = result.get("content") or []
     text = content[0].get("text") if content and isinstance(content[0], dict) else "Error"
@@ -533,6 +522,7 @@ from packages.core.ai.mcp import tiktok_shop as _tiktok_shop_module  # noqa: E40
 from packages.core.ai.mcp import amazon as _amazon_module  # noqa: E402
 from packages.core.ai.mcp import quickbooks as _qb_module  # noqa: E402
 from packages.core.ai.mcp import telegram as _telegram_module  # noqa: E402
+from packages.core.ai.mcp import nango as _nango_module  # noqa: E402
 
 _SERVER_TOOL_SCHEMAS["github"] = _adapt_module_tools(_gh_module)
 # quickbooks/telegram had hardcoded catalog entries above whose tool names
@@ -551,6 +541,7 @@ _SERVER_TOOL_SCHEMAS["onedrive"] = _adapt_module_tools(_onedrive_module)
 _SERVER_TOOL_SCHEMAS["ms_calendar"] = _adapt_module_tools(_mscal_module)
 _SERVER_TOOL_SCHEMAS["ms_teams"] = _adapt_module_tools(_msteams_module)
 _SERVER_TOOL_SCHEMAS["ms_excel"] = _adapt_module_tools(_msexcel_module)
+_SERVER_TOOL_SCHEMAS["nango"] = _adapt_module_tools(_nango_module)
 # linkedin had 3 hardcoded entries (create_post, get_profile,
 # comment_on_post) but the module exposes 17 tools (media uploads,
 # org pages, post stats, etc.). Auto-adapt so the agent sees the
@@ -639,6 +630,7 @@ def _build_handler(server_key: str, tool_name: str) -> Callable:
                 user_id=user_id,
                 entity_id=entity_id,
                 provider=server_key,
+                integration_account_id=kwargs.get(INTEGRATION_ACCOUNT_ARGUMENT),
                 allow_env_fallback=False,
             )
 
@@ -678,7 +670,9 @@ def _build_handler(server_key: str, tool_name: str) -> Callable:
         if should_resolve_bearer_token:
             bearer_token = await _resolve_bearer_token(
                 server_key=server_key, user_id=user_id, entity_id=entity_id,
-                scope=decision.scope, allow_env_fallback=False,
+                scope=decision.scope,
+                integration_account_id=decision.account_id,
+                allow_env_fallback=False,
             )
         # Some context-only servers do not use bearer tokens; the module's
         # own dispatch logic decides whether the user can proceed.
@@ -706,12 +700,25 @@ def _build_handler(server_key: str, tool_name: str) -> Callable:
             clear_ctx = getattr(module, "clear_call_context", None)
             if set_ctx:
                 call_ctx = {"user_id": user_id, "entity_id": entity_id}
+                runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+                if decision.account_id:
+                    call_ctx[INTEGRATION_ACCOUNT_ARGUMENT] = decision.account_id
                 for key in ("conversation_id", "workspace_id", "task_id"):
                     if kwargs.get(key):
                         call_ctx[key] = str(kwargs[key])
                 active_message = runtime_active_user_message_from_context(kwargs)
                 if active_message:
                     call_ctx["active_user_message"] = str(active_message)
+                for key in (
+                    "workflow_project_id",
+                    "workflow_action_grant_id",
+                    "workflow_scene_id",
+                    "workflow_batch_capture",
+                    "approved_plan_version",
+                ):
+                    value = getattr(runtime_context, key)
+                    if value:
+                        call_ctx[key] = value
                 set_ctx(call_ctx)
             try:
                 result = await module.call_tool(tool_name, tool_kwargs, bearer_token or "")
@@ -762,6 +769,11 @@ def _build_handler(server_key: str, tool_name: str) -> Callable:
                 })
 
         # MCP tools/call response → string
+        knowledge_artifacts = _trusted_knowledge_artifacts(
+            result,
+            transport=transport,
+            integration_scope=decision.scope,
+        )
         if isinstance(result, dict):
             if result.get("isError"):
                 return _mcp_error_result_to_text(server_key, tool_name, result)
@@ -782,13 +794,20 @@ def _build_handler(server_key: str, tool_name: str) -> Callable:
                 "tool_name": f"mcp__{server_key}__{tool_name}",
                 "mcp_server": server_key,
             }
-            await register_generated_files(
+            registered_count = await register_generated_files(
                 output_text,
                 entity_id=entity_id,
                 user_id=user_id,
                 source=server_key,
                 tool_args=tool_kwargs,
                 origin=origin,
+                knowledge_artifacts=knowledge_artifacts,
+            )
+            logger.debug(
+                "MCP artifact registration server=%s tool=%s contract=trusted_sidecar registered=%d",
+                server_key,
+                tool_name,
+                registered_count,
             )
         except Exception:
             logger.debug("file_registrar failed for %s/%s", server_key, tool_name, exc_info=True)
@@ -822,7 +841,10 @@ def _is_context_only_server(server_key: str) -> bool:
     return key in _CONTEXT_ONLY_SERVERS or key.startswith("manor_mcp_")
 
 
-_MCP_RUNTIME_ONLY_ARGUMENT_KEYS = frozenset(RUNTIME_TOOL_CONTEXT_KEYS)
+_MCP_RUNTIME_ONLY_ARGUMENT_KEYS = frozenset({
+    *RUNTIME_TOOL_CONTEXT_KEYS,
+    INTEGRATION_ACCOUNT_ARGUMENT,
+})
 
 
 # Capability-equivalent providers. When the primary is missing creds, we
@@ -889,6 +911,7 @@ async def _resolve_bearer_token(
     user_id: str,
     entity_id: str,
     scope: str,
+    integration_account_id: str | None = None,
     allow_env_fallback: bool = False,
 ) -> str | None:
     """Load the actual token based on the scope the permission decision
@@ -913,13 +936,14 @@ async def _resolve_bearer_token(
         provider_aliases = provider_key_aliases(server_key)
         if scope == "user":
             # Multi-account aware: prefer profile.is_default, then most-recent.
+            query = select(OAuthAccount).where(
+                OAuthAccount.user_id == user_id,
+                OAuthAccount.provider.in_(provider_aliases),
+            )
+            if integration_account_id:
+                query = query.where(OAuthAccount.id == integration_account_id)
             rows = (
-                await db.execute(
-                    select(OAuthAccount).where(
-                        OAuthAccount.user_id == user_id,
-                        OAuthAccount.provider.in_(provider_aliases),
-                    ).order_by(OAuthAccount.created_at.desc())
-                )
+                await db.execute(query.order_by(OAuthAccount.created_at.desc()))
             ).scalars().all()
             if rows:
                 default = next(
@@ -934,14 +958,15 @@ async def _resolve_bearer_token(
             # Multi-account: prefer config.is_default first, fall back
             # to most-recent. Keeps send_email() deterministic when an
             # entity has several inboxes / bots / senders.
+            query = select(Integration).where(
+                Integration.entity_id == entity_id,
+                Integration.provider.in_(provider_aliases),
+                Integration.status == "active",
+            )
+            if integration_account_id:
+                query = query.where(Integration.id == integration_account_id)
             rows = (
-                await db.execute(
-                    select(Integration).where(
-                        Integration.entity_id == entity_id,
-                        Integration.provider.in_(provider_aliases),
-                        Integration.status == "active",
-                    ).order_by(Integration.created_at.desc())
-                )
+                await db.execute(query.order_by(Integration.created_at.desc()))
             ).scalars().all()
             if rows:
                 default = next(
@@ -1095,14 +1120,21 @@ def get_tools() -> list[tuple[dict, Callable]]:
     for server_key, tools in _SERVER_TOOL_SCHEMAS.items():
         for tool_def in tools:
             mcp_name = _build_tool_name(server_key, tool_def["name"])
+            parameters = json.loads(json.dumps(tool_def.get(
+                "parameters", {"type": "object", "properties": {}}
+            )))
+            properties = parameters.setdefault("properties", {})
+            if not _is_context_only_server(server_key):
+                properties.setdefault(
+                    INTEGRATION_ACCOUNT_ARGUMENT,
+                    dict(_INTEGRATION_ACCOUNT_PARAMETER),
+                )
             schema = {
                 "type": "function",
                 "function": {
                     "name": mcp_name,
                     "description": f"[MCP:{server_key}] {tool_def['description']}",
-                    "parameters": tool_def.get(
-                        "parameters", {"type": "object", "properties": {}}
-                    ),
+                    "parameters": parameters,
                 },
             }
             out.append((schema, _build_handler(server_key, tool_def["name"])))

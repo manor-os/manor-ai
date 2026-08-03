@@ -1,0 +1,70 @@
+name: Docs CI
+
+# Build the Docusaurus site on PRs that touch it, so broken links and bad
+# markdown fail at review time instead of at deploy time
+# (docusaurus.config.js sets onBrokenLinks: "throw").
+on:
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - "docs-site/**"
+      - ".github/workflows/docs-ci.yml"
+
+concurrency:
+  group: docs-ci-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Install and build docs
+        working-directory: docs-site
+        run: |
+          npm ci
+          npm run build
+
+  # Advisory: flag English doc changes that lack a matching zh-Hans update.
+  # Untranslated pages fall back to English at runtime, so this warns rather
+  # than blocks — but every warning is a page drifting out of sync.
+  i18n-sync:
+    name: zh-Hans sync (advisory)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check zh-Hans files updated alongside English docs
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          changed="$(git diff --name-only "$base"...HEAD)"
+          missing=0
+          while IFS= read -r f; do
+            case "$f" in
+              docs-site/docs/*.md)
+                rel="${f#docs-site/docs/}"
+                zh="docs-site/i18n/zh-Hans/docusaurus-plugin-content-docs/current/$rel"
+                if ! grep -qxF "$zh" <<<"$changed"; then
+                  echo "::warning file=$f::English doc changed without matching zh-Hans update ($zh)"
+                  missing=1
+                fi
+                ;;
+            esac
+          done <<<"$changed"
+          exit "$missing"

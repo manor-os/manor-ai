@@ -1,0 +1,761 @@
+{
+  "manifest": {
+    "blueprint_version": "1.1",
+    "slug": "solo-faceless-stickman-studio-v1",
+    "title": "Faceless Stickman Video Studio (One-Person Company)",
+    "summary": "A daily stickman video workspace that independently creates one topic and one finished video for the user every day.",
+    "use_when": "Use when a user wants Manor to choose a fresh topic each day and turn it into a finished faceless stickman MP4 without requiring a prepared topic or script.",
+    "outcome_summary": "This workspace independently completes one simple daily loop: choose an on-theme topic, write the script and storyboard, produce the finished MP4 with the stickman-video-creator skill, and return the topic plus video for user review. Audience growth, revenue, monetization, and automatic publishing are not workspace goals.",
+    "description": "Creates a repeatable daily topic-to-video loop. Each day the workspace selects one useful topic from the current theme, drafts a concise stickman script and storyboard, runs the embedded Stickman Video Creator skill, and delivers a finished MP4 with a short production recap. The user does not need to supply a topic or script. The workspace does not require channel growth, revenue, monetization, or public publishing to be considered successful.",
+    "tags": [
+      "faceless",
+      "stickman",
+      "video",
+      "youtube",
+      "one-person-company"
+    ],
+    "kind": "one_person_company",
+    "category": "solo.video_account",
+    "author": {
+      "handle": "manor",
+      "display_name": "Manor AI"
+    },
+    "cover_image_url": null,
+    "forked_from_id": null,
+    "changelog": "v1.3 (2026-07-22): omit workflows until the workflow runtime is production-ready. v1.2 (2026-07-21): narrow the workspace to one goal—independently create one topic and its finished stickman video every day. v1.1 (2026-07-21): start the first Strategist proposal after install, declare media-tool dependencies, and bind all agents to the Chrome runtime skill. v1 (2026-07-16): initial faceless stickman studio blueprint."
+  },
+  "contract": {
+    "variables": [
+      {
+        "key": "business_name",
+        "label": "Business name",
+        "required": false,
+        "default": "Company"
+      },
+      {
+        "key": "operator_timezone",
+        "label": "Operator timezone",
+        "required": false,
+        "default": "America/Los_Angeles"
+      }
+    ],
+    "channels": [],
+    "sessions": [],
+    "requires": {
+      "manor_min_version": "1.0",
+      "tools": [
+        "compose_video_timeline",
+        "generate_file",
+        "generate_image",
+        "generate_video",
+        "merge_videos",
+        "normalize_audio_loudness",
+        "wait_media_jobs"
+      ],
+      "mcp_servers": [],
+      "skills": [
+        {
+          "slug": "chrome",
+          "min_version": "2.4.0"
+        }
+      ],
+      "agents": []
+    }
+  },
+  "embedded": {
+    "skills": [
+      {
+        "slug": "stickman-video-creator",
+        "name": "Stickman Video Creator",
+        "display_name": "Stickman Video Creator",
+        "description": "End-to-end generator for simple stickman explainer videos. From a topic or script it plans scenes, draws a consistent stickman for each beat, records one continuous voiceover, animates each drawing (image-to-video), and composes a finished widescreen MP4 with clean bottom subtitles using Manor's first-party media tools. Great for faceless YouTube/Shorts, explainers, and motivational content.",
+        "system_prompt": "ROLE: You are a professional AI video producer specializing in simple stickman explainers. You own the production from topic or approved script through a verified final MP4, using Manor's first-party media tools and preserving every durable receipt. You do not publish, schedule, upload, or claim completion without a real final artifact.\n\nINPUTS: topic or script; optional target_duration, default about 60 seconds; optional render_mode, where slideshow means nearly static drawings and video means restrained motion; optional workspace_context. If no topic is supplied, propose one focused motivational, educational, psychology, or personal-growth idea with one audience and one takeaway. Keep the scope small enough to finish reliably.\n\nNONNEGOTIABLE PRODUCTION RULES: Use one consistent stickman character across all scenes. Generate one continuous narration take, never one voice file per scene. A still image is not itself a video clip: each accepted drawing must be passed to generate_video as first_frame_url before merge_videos or compose_video_timeline can use it. Keep image and video aspect ratios consistent. Preserve the complete image by using the generated or padded widescreen result; never crop away text, limbs, props, or edge details to force an aspect ratio. Run this work as a Task so first-frame image-to-video references remain available. Never create a replacement paid job for an accepted job ID merely because it is pending, slow, or missing from one poll response.\n\nSTEP 1 - PLAN: Choose enough short scenes to cover the target duration, normally one visual beat every 4-7 seconds. Structure the story as hook, problem or tension, development, practical insight, and takeaway. Write a scene sheet before generating media. Each scene must include a stable scene ID, one concise narration line, the intended duration, the exact pose and expression, at least one relevant prop, and a visual transition note. The sum of scene durations must cover the complete narration.\n\nSTEP 2 - LOCK THE CHARACTER: Define one round-head stickman with stable body proportions, bold hand-drawn black outlines with varied line weight, a simple dot-and-line face capable of readable emotion, and a clean white or very light background. Reuse the same head, proportions, line style, and visual language in every prompt. Change only pose, expression, action, camera framing, and scene props. Favor exaggerated but clear expressions and useful motion marks such as effort lines, sweat drops, sleep marks, or a small hand-lettered sound effect when they support the beat. Avoid dense labels and tiny text.\n\nSTEP 3 - GENERATE DRAWINGS: Call generate_image for each approved scene with aspect_ratio=\"16:9\" and an appropriate high-resolution size. The provider may return a source canvas that Manor pads to the requested widescreen frame; accept the non-cropped padded result and use its concrete image_url or fs_path. Always generate images sequentially or in explicitly bounded groups of two or three. After each accepted image, store its scene ID, job ID when present, concrete URL or path, and Knowledge receipt before starting animation. Inspect continuity before moving on. If a frame is genuinely rejected, record why and replace only that frame.\n\nSTEP 4 - CREATE ONE NARRATION: Join all approved scene lines in story order into one complete script. Call generate_file with kind=\"audio\", purpose=\"narration\", and one consistent voice. Put tone, pace, energy, emphasis, and pause guidance in params.voice_instructions rather than inside the spoken script. Do not pass a model unless the operator explicitly requested one; normal Account-selected BYOK or OpenRouter routing is authoritative. Generate the entire narration in exactly one call, save its receipt immediately, then normalize loudness with normalize_audio_loudness. Use the concrete returned audio path downstream rather than reconstructing a guessed filename.\n\nSTEP 5 - ANIMATE ACCEPTED FRAMES: For each accepted scene image, call generate_video with first_frame_url equal to that exact image receipt, aspect_ratio=\"16:9\", camera_fixed=true, and native_audio=false. Slideshow mode uses near-zero motion; video mode uses slow, minimal movement that does not distort the drawing. Allocate clip duration from the narration line's share of the complete script and keep each provider clip within supported limits. Save every accepted video job ID immediately. Gather pending IDs and use wait_media_jobs. Continue only after every accepted media job is terminal, and reuse completed outputs. If an accepted job fails, preserve all successful jobs and retry only the failed scene when the failure is retryable and the operator has authorized another paid attempt. Otherwise return a precise blocker.\n\nSTEP 6 - BUILD THE PICTURE MASTER: Order clips by scene ID and call merge_videos once the required jobs are complete. Remove dead waits but do not cut meaningful poses or the takeaway. Measure the actual clean master duration and compare it with the normalized narration duration. The picture master must cover the full narration. If it is short, extend or recapture the relevant scene rather than cutting the voiceover or repeating an unrelated clip.\n\nSTEP 7 - SUBTITLES AND FINAL COMPOSITION: Build subtitles from the exact narration text in the same order and language. Split on natural clauses, prefer one line, allow at most two lines, and keep each cue readable. Use a clean bottom style with white text, black outline, no shadow, bottom alignment, and a safe lower margin. At 1920x1080 use about 52px font, outline 2, and margin 72; at other resolutions scale responsively from the short edge instead of hard-coding an unreadable 16px style. Compose the final with compose_video_timeline using the clean picture master, the single normalized narration track starting at zero, and the subtitle track. Exclude provider clip audio unless explicitly requested.\n\nSTEP 8 - VERIFY: Require a concrete final MP4 path or document ID. Confirm that the MP4 is readable, all planned scenes appear in order, the same character remains recognizable, narration is audible and complete, no voice line is cut, subtitles are visible in the bottom safe area and never exceed two lines, and the final duration is consistent with the plan. Confirm every source image, clip, narration file, clean master, and final output is represented by a durable receipt. Never report completion before a concrete final MP4 path or durable Knowledge receipt exists. Never report success from a requested filename alone.\n\nRECOVERY: Treat accepted receipts as checkpoints. On resume, inspect the checkpoint list first and continue from the first missing or rejected scene. Do not restart successful paid generation. For login, permissions, provider rejection, missing files, incompatible media, or unclear operator input, stop with the exact failed stage, observed evidence, preserved receipts, and the smallest input change or retry needed. A blocked result is valid; silent substitution and fabricated completion are not.\n\nOUTPUT: Return Markdown containing the verified final MP4 Knowledge path or link, topic and takeaway, scene count and scene narration lines, render mode, measured duration, narration and subtitle paths, and a compact QA recap. State whether any scene was retried or preserved from an earlier checkpoint. End with either Ready for operator review or Blocked followed by the concrete reason.",
+        "tools": [
+          "compose_video_timeline",
+          "generate_file",
+          "generate_image",
+          "generate_video",
+          "merge_videos",
+          "normalize_audio_loudness",
+          "wait_media_jobs"
+        ],
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string"
+            },
+            "target_duration": {
+              "type": "string"
+            },
+            "render_mode": {
+              "type": "string"
+            },
+            "workspace_context": {
+              "type": "object"
+            }
+          }
+        },
+        "output_format": "markdown",
+        "category": "media",
+        "tags": [
+          "workspace-blueprint",
+          "solo-faceless-stickman-studio-v1",
+          "stickman",
+          "faceless",
+          "video"
+        ],
+        "version": "1.4.0",
+        "config": {
+          "frozen_at": "2026-07-16",
+          "type": "prompt",
+          "default_render_mode": "slideshow",
+          "default_target_duration": "60s"
+        },
+        "status": "active"
+      }
+    ],
+    "agents": [
+      {
+        "slug": "solo-stickman-niche-strategist-v1",
+        "name": "Niche & Content Strategist",
+        "description": "Selects one fresh, useful, on-theme stickman video topic for each day and hands it to the script writer.",
+        "system_prompt": "You are the daily topic planner for a faceless stickman video workspace. Select one fresh, useful topic each day from the current theme and content pillars. Define its audience, hook, and single takeaway, then hand it directly to the script and storyboard writer. Do not wait for the user to supply a topic. Do not optimize for subscriber, revenue, monetization, or publishing goals. Never publish, delete, reply to viewers, or edit public assets without explicit operator approval.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.3,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-faceless-stickman-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "chrome",
+          "stickman-video-creator"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "operating_principle",
+            "content": "The workspace has one goal: independently choose one topic and complete its finished stickman video every day. Protect the user's attention and do not introduce growth, revenue, monetization, or publishing goals.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-stickman-script-writer-v1",
+        "name": "Script & Storyboard Writer",
+        "description": "Turns approved angles into hooks, scene-by-scene storyboards, voiceover scripts, title options, descriptions, and tags ready for stickman production.",
+        "system_prompt": "You are the script and storyboard agent for a faceless stickman video-account workspace. Turn approved angles into review-ready packets with a strong first-five-seconds hook, a hook -> middle -> takeaway scene list, one short voiceover line per scene, title options, descriptions, tags, and a review checklist. Write scenes so the Stickman Video Creator skill can produce them: one consistent stickman, one prop per scene, clear bottom space for subtitles. Do not claim that public publishing happened.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.45,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-faceless-stickman-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "chrome",
+          "stickman-video-creator"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Write concise, producible stickman scripts and storyboards for an owner-operator. Prioritize hook clarity, one audience promise, per-scene voiceover lines, and stickman production simplicity.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-stickman-video-producer-v1",
+        "name": "Stickman Video Producer",
+        "description": "Runs the stickman-video-creator skill end-to-end to produce one finished widescreen MP4 every day from the queue or an on-niche topic it selects.",
+        "system_prompt": "You are the production agent for a faceless stickman video-account workspace. Produce one finished video every day. Use the next queued script or approved angle when available; otherwise choose one on-niche topic from the current content pillars and continue without waiting for more input. Run the stickman-video-creator skill end-to-end as a Task: plan scenes, draw a consistent stickman, record one continuous voiceover, animate each drawing image-to-video (native 3:2, aspect_ratio=adaptive), and compose a finished widescreen MP4 with small bottom subtitles. Measure the actual merged master duration and keep it >= the narration so no voiceover is cut. Return the final MP4 Knowledge path plus a short recap. Do not publish the MP4; hand it to the publisher for an operator-reviewed packet.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.2,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-faceless-stickman-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "chrome",
+          "stickman-video-creator"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Produce one finished video every day by running the stickman-video-creator skill as a Task. If no script is queued, choose one on-niche topic from the current pillars and continue. Keep the stickman character consistent, images native 3:2 uncropped, one continuous narration, and the merged master >= narration. Never auto-publish the finished MP4.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-stickman-publisher-community-v1",
+        "name": "Daily Video Review Packager",
+        "description": "Packages today's topic, script, production recap, and finished MP4 into one clear review packet for the user.",
+        "system_prompt": "You are the review-packaging agent for a daily stickman video workspace. Package today's selected topic, script and storyboard summary, finished MP4 Knowledge link, and production recap into one concise user-review packet. Your job ends when the user can review the topic and corresponding video together. Do not introduce publishing, community, growth, revenue, or monetization work. Never publish, schedule, delete, moderate, or send external messages without explicit user approval.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.35,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-faceless-stickman-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "chrome",
+          "stickman-video-creator"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Keep today's topic and corresponding finished MP4 together in one concise user-review packet. Do not expand the workspace into publishing or community-management work.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "solo-stickman-analytics-monetization-v1",
+        "name": "Daily Topic & Video Reviewer",
+        "description": "Checks whether today's independently selected topic and its corresponding finished MP4 were both completed.",
+        "system_prompt": "You are the completion-review agent for a daily stickman video workspace. Check whether today's topic brief and its corresponding finished MP4 both exist, link the evidence, identify any production blocker, and recommend exactly one simplification for tomorrow. A day is complete only when both outputs exist. Do not analyze subscriber growth, revenue, monetization, sponsorship, or publishing performance.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.2,
+          "default_review_mode": "operator_review_before_external_action"
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-faceless-stickman-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "chrome",
+          "stickman-video-creator"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "role",
+            "content": "Mark the daily goal complete only when both today's topic and corresponding finished MP4 exist. Recommend at most one production simplification for tomorrow.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      }
+    ],
+    "knowledge_packs": [
+      {
+        "slug": "solo-stickman-studio-ops",
+        "title": "Faceless Stickman Studio Ops",
+        "purpose": "Store the current theme, reusable topic pillars, daily topic briefs, scripts, finished stickman videos, and daily completion reviews.",
+        "mode": "inline_text",
+        "folder_structure": [
+          "strategy/",
+          "scripts/",
+          "review-packets/",
+          "completion-reviews/"
+        ],
+        "starter_documents": [
+          {
+            "path": "strategy/niche-and-promise.md",
+            "body_md": "# Theme and Daily Topic Rules\n\n## Theme\nChoose one clear theme for the faceless stickman videos (for example productivity, self-improvement, tech explainers, or small-business how-to).\n\n## Daily promise\nEvery day, independently select one fresh topic that helps the viewer understand one idea, avoid one mistake, or take one action. Do not wait for the user to supply a topic.\n\n## Content pillars\n- Explainer: break down one concept in plain language.\n- How-to: teach one repeatable step-by-step.\n- Myth vs reality: correct one common misconception.\n- Motivation: connect a lesson to action.\n\n## Format rules\n- One audience, one promise, one takeaway per video.\n- Hook in the first five seconds.\n- Keep the stickman character consistent across all scenes.\n- Complete both the daily topic and its corresponding finished MP4.\n"
+          },
+          {
+            "path": "scripts/stickman-script-packet-template.md",
+            "body_md": "# Daily Stickman Script Packet\n\n## Today's topic\nTopic, audience, pillar, target duration, render_mode (slideshow or video), hook, and single takeaway.\n\n## Script and storyboard\n- Hook (first 5 seconds):\n- Scene list (hook -> middle -> takeaway), one voiceover line per scene:\n- Prop per scene:\n- Title:\n- Short description:\n\n## Production notes for the stickman-video-creator skill\n- Consistent stickman: round head, bold varied line weight, plain white background, 3:2 (1536x1024) uncropped.\n- One continuous voiceover; small bottom subtitles.\n\n## Completion checklist\n- Was the topic selected without waiting for user input?\n- Does the hook state a concrete tension in 5 seconds?\n- Is the takeaway one clear action or idea?\n- Can the stickman-video-creator skill produce every scene as written?\n"
+          },
+          {
+            "path": "completion-reviews/daily-review-template.md",
+            "body_md": "# Daily Topic and Video Completion Review\n\n## Today's outputs\n- Topic brief:\n- Script and storyboard:\n- Finished MP4 Knowledge link:\n\n## Completion\nMark complete only when the topic and its corresponding finished video both exist.\n\n## Blocker\nWhat prevented or slowed today's topic-to-video loop?\n\n## Tomorrow\nChoose one production simplification that makes tomorrow's completion more reliable.\n"
+          },
+          {
+            "path": "review-packets/daily-topic-video-checklist.md",
+            "body_md": "# Daily Topic and Video Review Checklist\n\nConfirm:\n\n- Today's topic brief exists.\n- The finished MP4 matches today's topic and script.\n- Stickman is consistent, voiceover is not cut, and subtitles sit at the bottom.\n- No private, financial, health, legal, or credential-like information is included.\n- The topic and MP4 are linked together in one review packet.\n\nDaily completion status: pending.\n"
+          }
+        ],
+        "external_source": null
+      }
+    ]
+  },
+  "recipe": {
+    "operating_model": {
+      "kind": "one_person_company",
+      "context": "One solo operator is running a faceless stickman video channel across YouTube, Shorts, and TikTok, producing videos with AI and no on-camera presence or editor.",
+      "primary_work": "Independently choose one fresh topic every day, draft its stickman script and storyboard, produce the finished MP4 with the stickman-video-creator skill, and return the topic plus video for user review.",
+      "settings": {
+        "timezone": "America/Los_Angeles",
+        "blueprint_frozen": true,
+        "frozen_at": "2026-07-16",
+        "install_expectation": "simulate_first_then_promote"
+      },
+      "services": [
+        {
+          "key": "stickman.strategy",
+          "name": "Niche and content strategy",
+          "description": "Choose one fresh on-theme topic every day with a clear audience, hook, and takeaway."
+        },
+        {
+          "key": "stickman.script",
+          "name": "Script and storyboard queue",
+          "description": "Keep the next stickman scripts, scene storyboards, titles, and descriptions ready for production."
+        },
+        {
+          "key": "stickman.production",
+          "name": "Stickman video production",
+          "description": "Run the stickman-video-creator skill end-to-end to produce one finished widescreen MP4 every day from the queue or a selected on-niche topic."
+        },
+        {
+          "key": "stickman.distribution",
+          "name": "Daily topic and video review packet",
+          "description": "Package today's topic, script summary, finished MP4, and production recap together for user review."
+        },
+        {
+          "key": "stickman.analytics",
+          "name": "Daily topic and video completion review",
+          "description": "Confirm that today's topic and its corresponding finished video were both completed, then identify any production-quality issue to fix tomorrow."
+        }
+      ],
+      "rules": [
+        "One primary audience and one clear takeaway per stickman video.",
+        "Produce every video by running the stickman-video-creator skill; keep the stickman character consistent.",
+        "Public publishing, deletion, or profile edits require operator approval."
+      ],
+      "review_cadence": {
+        "daily": "Confirm that one new topic and its corresponding finished MP4 are complete for the day.",
+        "weekly": "Review only whether the daily topic-to-video loop stayed reliable and what production constraint should be simplified."
+      }
+    },
+    "strategist": {
+      "business_model": {
+        "model_type": "content_publishing",
+        "primary_metric": "daily_topic_video_completed",
+        "secondary_metrics": [
+          "daily_topic_count",
+          "daily_finished_video_count"
+        ]
+      },
+      "cadence": {
+        "schedule": "daily",
+        "trigger_conditions": [
+          "daily_topic_missing",
+          "daily_video_missing",
+          "production_blocked"
+        ]
+      },
+      "proposal_shape": {
+        "max_tasks_per_cycle": 2,
+        "preferred_categories": [
+          "strategy",
+          "production"
+        ],
+        "task_horizon_hours": [
+          0,
+          24
+        ]
+      },
+      "priors": [
+        "The workspace must choose the topic itself instead of waiting for user input.",
+        "A day is successful only when both the topic and its corresponding finished MP4 exist."
+      ],
+      "evaluation_rubric": {
+        "weights": {
+          "leverage": 0.35,
+          "operator_time": 0.25,
+          "learning_speed": 0.25,
+          "risk": 0.15
+        }
+      },
+      "do_not_propose": [
+        "Production plans that abandon the stickman-video-creator pipeline or the consistent character.",
+        "Subscriber growth, revenue, monetization, sponsorship, or public-publishing work.",
+        "Plans that stop after proposing a topic without completing its video."
+      ],
+      "voice": "direct, analytical, practical"
+    },
+    "prompts": [
+      {
+        "key": "niche_and_pillar_map",
+        "title": "Theme and daily topic map",
+        "body": "Choose one clear theme for the stickman videos and create four reusable content pillars. For each pillar, define the audience need, repeatable stickman format, and three topic examples that the workspace can select without asking the user for input."
+      },
+      {
+        "key": "stickman_script_packet",
+        "title": "Review-ready stickman script packet",
+        "body": "Draft three stickman video candidates with a 5-second hook, a hook -> middle -> takeaway scene list with one voiceover line per scene, props, title options, description, tags, and an operator approval checklist ready for the stickman-video-creator skill."
+      },
+      {
+        "key": "weekly_review",
+        "title": "Weekly operator review",
+        "body": "Summarize which daily topics and finished videos were completed, which days were missed, what blocked production, and the single production-process change that will make the daily topic-to-video loop more reliable."
+      },
+      {
+        "key": "experiment_decision",
+        "title": "Daily production reliability decision",
+        "body": "Review whether each day produced both a topic and finished video, then choose one production simplification with a hypothesis, action, and completion measure."
+      }
+    ],
+    "subscriptions": [
+      {
+        "service_key": "stickman.strategy",
+        "agent_slug": "solo-stickman-niche-strategist-v1",
+        "custom_prompt": "Choose one fresh on-theme topic every day without waiting for user input. Define its audience, hook, and takeaway, then hand it to script and storyboard. Do not introduce subscriber, revenue, monetization, or publishing goals.",
+        "config": {
+          "workspace_blueprint_slug": "solo-faceless-stickman-studio-v1",
+          "primary_service": "stickman.strategy",
+          "service_name": "Niche and content strategy"
+        }
+      },
+      {
+        "service_key": "stickman.script",
+        "agent_slug": "solo-stickman-script-writer-v1",
+        "custom_prompt": "Draft review-ready stickman script and storyboard packets from approved angles. Include 5-second hooks, per-scene voiceover lines, props, title options, descriptions, tags, and an operator review checklist producible by the stickman-video-creator skill.",
+        "config": {
+          "workspace_blueprint_slug": "solo-faceless-stickman-studio-v1",
+          "primary_service": "stickman.script",
+          "service_name": "Script and storyboard queue"
+        }
+      },
+      {
+        "service_key": "stickman.production",
+        "agent_slug": "solo-stickman-video-producer-v1",
+        "custom_prompt": "Produce one finished stickman video every day. Run the stickman-video-creator skill end-to-end as a Task using the next queued script or approved angle; when neither exists, choose one on-niche topic from the current content pillars and continue. Keep the stickman consistent, images native 3:2 uncropped, one continuous narration, and the merged master >= narration. Return the MP4 Knowledge path and recap; do not publish.",
+        "config": {
+          "workspace_blueprint_slug": "solo-faceless-stickman-studio-v1",
+          "primary_service": "stickman.production",
+          "service_name": "Stickman video production"
+        }
+      },
+      {
+        "service_key": "stickman.distribution",
+        "agent_slug": "solo-stickman-publisher-community-v1",
+        "custom_prompt": "Package finished MP4s into platform-specific publish-ready review packets and triage viewer comments into reply drafts. Do not publish, schedule, delete, moderate, or send external messages without explicit operator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-faceless-stickman-studio-v1",
+          "primary_service": "stickman.distribution",
+          "service_name": "Daily topic and video review packet"
+        }
+      },
+      {
+        "service_key": "stickman.analytics",
+        "agent_slug": "solo-stickman-analytics-monetization-v1",
+        "custom_prompt": "Check whether today's topic and its corresponding finished MP4 were both completed. Report missing output or production-quality problems and recommend exactly one simplification for tomorrow. Do not introduce growth, revenue, monetization, or publishing goals.",
+        "config": {
+          "workspace_blueprint_slug": "solo-faceless-stickman-studio-v1",
+          "primary_service": "stickman.analytics",
+          "service_name": "Daily topic and video completion review"
+        }
+      }
+    ],
+    "scheduled_jobs": [
+      {
+        "job_id": "solo-stickman-daily-production-queue",
+        "name": "Daily stickman production queue",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 8 * * *",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "stickman.production",
+          "max_turns": 12,
+          "deliverable": "Produce today's finished video with the stickman-video-creator skill and return, inline in workspace_chat as markdown, the finished MP4 Knowledge path plus a short recap (topic, scene lines, render_mode, actual duration) and a production checklist. Use the next queued script or approved angle when available; otherwise choose one on-niche topic from the current content pillars and continue. The MP4 is a Knowledge artifact produced by the skill, not a docx/pdf/spreadsheet attachment.",
+          "done_when": "The workspace_chat response links today's finished stickman MP4 produced by the stickman-video-creator skill, confirms images were native 3:2 uncropped, narration was one continuous take and not cut, subtitles used the small bottom style, states that no external publishing action was taken, and does not require or claim any docx/pdf/spreadsheet file attachment."
+        },
+        "payload_message": "Produce today's finished stickman video by running the stickman-video-creator skill as a Task. Use the next queued script or approved angle when available. If neither exists, choose one on-niche topic from the current content pillars and continue without waiting for more input. Return inline markdown in workspace_chat with the finished MP4 Knowledge link and a recap. Do not create docx, PDF, or spreadsheet attachments, and do not publish externally.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "solo-stickman-monday-batch-plan",
+        "name": "Daily stickman topic plan",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 7 * * *",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "stickman.strategy",
+          "max_turns": 6,
+          "deliverable": "Inline markdown daily topic brief in workspace_chat. Include today's selected topic, audience, hook, single takeaway, target duration, and the reason it fits the current theme. No file attachment is required.",
+          "done_when": "The workspace_chat response contains exactly one usable topic for today, gives the script writer enough direction to continue without user input, states that no external publishing action was taken, and does not require or claim any docx/pdf/file attachment."
+        },
+        "payload_message": "Choose today's stickman video topic without waiting for user input. Return one inline markdown topic brief in workspace_chat only. Include the topic, audience, hook, single takeaway, target duration, and why it fits the current theme. Do not create docx, PDF, spreadsheet, or other file attachments, and do not introduce growth, revenue, monetization, or publishing goals.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "solo-stickman-weekly-analytics-review",
+        "name": "Daily topic and video completion review",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 10 * * *",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "stickman.analytics",
+          "max_turns": 6,
+          "deliverable": "Inline markdown daily completion review in workspace_chat. Confirm whether today's topic brief and corresponding finished MP4 both exist, link the available outputs, identify any production blocker, and recommend one simplification for tomorrow. No file attachment is required.",
+          "done_when": "The workspace_chat response clearly marks today's combined topic-and-video goal complete or incomplete, links the available topic and MP4 evidence, avoids growth or revenue analysis, and does not require or claim any docx/pdf/file attachment."
+        },
+        "payload_message": "Check whether today's selected topic and corresponding finished stickman MP4 were both completed. Return an inline markdown completion review in workspace_chat, link the available evidence, identify any blocker, and recommend one simplification for tomorrow. Do not create docx, PDF, spreadsheet, or other file attachments, and do not introduce growth, revenue, monetization, or publishing work.",
+        "default_delivery_mode": "workspace_chat"
+      }
+    ],
+    "workflows": [],
+    "goals": [
+      {
+        "title": "Create one topic and its finished stickman video every day",
+        "description": "Independently select one fresh on-theme topic each calendar day, turn it into a script and storyboard, produce the corresponding finished MP4 with the stickman-video-creator skill, and return both outputs for user review without requiring the user to supply a topic or script.",
+        "metric_key": "daily_topic_video_completed",
+        "target_value": 1,
+        "baseline_value": 0,
+        "measurement_source": {
+          "type": "manual",
+          "metric": "daily_topic_video_pair_count"
+        },
+        "measurement_cadence": "daily",
+        "priority": 1
+      }
+    ],
+    "task_categories": [
+      {
+        "key": "strategy",
+        "label": "Strategy",
+        "sort_order": 10
+      },
+      {
+        "key": "script",
+        "label": "Script",
+        "sort_order": 20
+      },
+      {
+        "key": "production",
+        "label": "Production",
+        "sort_order": 30
+      },
+      {
+        "key": "distribution",
+        "label": "Distribution",
+        "sort_order": 35
+      },
+      {
+        "key": "community",
+        "label": "Community",
+        "sort_order": 38
+      },
+      {
+        "key": "analytics",
+        "label": "Analytics",
+        "sort_order": 40
+      }
+    ],
+    "custom_fields": [
+      {
+        "name": "content_pillar",
+        "display_name": "Content pillar",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "explainer",
+          "how_to",
+          "myth_vs_reality",
+          "motivation"
+        ],
+        "sort_order": 10
+      },
+      {
+        "name": "platform",
+        "display_name": "Platform",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "youtube",
+          "shorts",
+          "tiktok",
+          "instagram"
+        ],
+        "sort_order": 20
+      },
+      {
+        "name": "production_status",
+        "display_name": "Production status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "idea",
+          "scripted",
+          "producing",
+          "rendered",
+          "reviewed",
+          "scheduled"
+        ],
+        "sort_order": 30
+      },
+      {
+        "name": "review_status",
+        "display_name": "Review status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "draft",
+          "needs_operator_review",
+          "approved",
+          "blocked"
+        ],
+        "sort_order": 40
+      },
+      {
+        "name": "experiment_hypothesis",
+        "display_name": "Experiment hypothesis",
+        "field_type": "text",
+        "target": "task",
+        "sort_order": 50
+      },
+      {
+        "name": "community_status",
+        "display_name": "Community status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "new_question",
+          "reply_drafted",
+          "needs_operator_review",
+          "approved_to_send",
+          "escalated"
+        ],
+        "sort_order": 60
+      }
+    ],
+    "sla_policies": [
+      {
+        "key": "operator_review",
+        "target": "task",
+        "threshold_hours": 24,
+        "description": "Review generated videos, packets, or decisions within one workday."
+      }
+    ],
+    "escalation_rules": [
+      {
+        "key": "public_or_financial_action",
+        "condition": "public_publish_or_money_movement",
+        "action": "pause_for_operator_review"
+      }
+    ]
+  },
+  "policy": {
+    "governance": {
+      "never_allow_actions": [
+        "billing.*",
+        "video.delete_*",
+        "social.delete_*",
+        "community.delete_*"
+      ],
+      "hitl_required_actions": [
+        "video.publish_*",
+        "social.publish_*",
+        "community.reply_*",
+        "community.moderate_*",
+        "workspace.file.modify"
+      ],
+      "auto_approve_actions": [
+        "workspace.task.create",
+        "workspace.search"
+      ],
+      "max_risk_level": "medium",
+      "budget_caps_per_kind": {
+        "llm": 300,
+        "action": 120
+      }
+    },
+    "post_install_checks": [
+      {
+        "kind": "agent_callable",
+        "service_key": "stickman.production"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "stickman.distribution"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-stickman-daily-production-queue"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-stickman-monday-batch-plan"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "solo-stickman-weekly-analytics-review"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "stickman.strategy"
+      }
+    ],
+    "expected_baseline": {
+      "maturity_level": "Validated operating blueprint",
+      "validation_summary": "Validated as a sandbox-first daily topic-to-video workspace: it chooses the topic itself, produces the corresponding finished MP4 with the embedded stickman-video-creator skill, and returns both outputs for user review with zero blocking setup.",
+      "runnable_in_simulation": true,
+      "blocking_todos_expected": 0,
+      "first_week_outputs": [
+        "seven independently selected daily topics",
+        "seven matching stickman script and storyboard packets",
+        "one finished stickman MP4 per day produced by the stickman-video-creator skill",
+        "daily topic-and-video completion evidence"
+      ],
+      "validation_evidence": [
+        "Blueprint v1.1 payload schema validation passes.",
+        "Sandbox install path creates dedicated topic planning, script, production, review-packet, and completion-review agents.",
+        "The daily topic job selects one topic without user input, and the daily production service invokes the embedded stickman-video-creator skill to produce its matching finished MP4.",
+        "All automations deliver inline workspace_chat packets (the MP4 is a Knowledge artifact) and explicitly avoid docx, PDF, spreadsheet, or other file attachments.",
+        "The daily topic-to-video goal does not depend on YouTube, TikTok, Telegram, subscriber data, revenue data, or public publishing."
+      ],
+      "acceptance_criteria": [
+        "Install in simulation with zero blocking todos.",
+        "Daily topic planning runs seven days a week and returns exactly one usable on-theme topic without waiting for user input.",
+        "Daily production runs seven days a week and returns a finished MP4 Knowledge link that corresponds to today's topic.",
+        "Daily completion review marks the combined goal complete only when both today's topic and its finished MP4 exist.",
+        "No public publishing, deletion, profile edit, external reply, moderation action, or external file modification runs without operator approval."
+      ],
+      "not_included": [
+        "No real YouTube, TikTok, or Telegram account is connected by default.",
+        "No automatic public publishing, comment replies, moderation, or deletion.",
+        "No subscriber-growth, revenue, monetization, sponsorship, or analytics target.",
+        "No requirement for the user to provide a daily topic or prepared script."
+      ]
+    }
+  }
+}

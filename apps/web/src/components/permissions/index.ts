@@ -21,7 +21,7 @@
  *   VisibilityIcon      ← Share dialog "currently visible to" line
  *   WatermarkLayer      ← Always-on for confidential+ content (functional,
  *                          not decorative — protects content)
- *   PermissionBanner    ← Top of viewer when legal_hold / quarantine /
+ *   PermissionBanner    ← Top of viewer when quarantine /
  *                          pii / no_access / client_view applies
  *                          (functional — explains why something is off)
  *

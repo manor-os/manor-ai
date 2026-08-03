@@ -31,6 +31,7 @@ What stays IN the workspace (never exported):
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -64,6 +65,29 @@ from packages.core.models.workspace import (
 logger = logging.getLogger(__name__)
 
 
+def _portable_slug(value: Any, *, fallback: str, row_id: str) -> str:
+    """Build a stable payload-only slug for legacy rows that lack one."""
+    base = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    base = (base or fallback)[:72].rstrip("-")
+    return f"{base}-{str(row_id)[-8:].lower()}"
+
+
+def _portable_agent_slug(agent: Agent) -> str:
+    return str(agent.slug or "").strip() or _portable_slug(
+        agent.name,
+        fallback="workspace-agent",
+        row_id=agent.id,
+    )
+
+
+def _portable_skill_slug(skill: Skill) -> str:
+    return str(skill.slug or "").strip() or _portable_slug(
+        skill.name,
+        fallback="workspace-skill",
+        row_id=skill.id,
+    )
+
+
 class ExportError(Exception):
     """Raised when a workspace can't be exported as a blueprint."""
 
@@ -73,7 +97,41 @@ _RUNTIME_SETTINGS_KEYS = frozenset({
     "sandbox",          # gets re-set by installer based on mode
     "_blueprint",       # blueprint provenance metadata
     "last_briefing_at", # runtime cursor
+    "created_by_user_id",
+    "provisioning",
 })
+
+_NONPORTABLE_REFERENCE_KEYS = frozenset({
+    "entity_id",
+    "workspace_id",
+    "user_id",
+    "agent_id",
+    "agent_subscription_id",
+    "subscription_id",
+    "conversation_id",
+    "channel_config_id",
+    "document_id",
+    "group_id",
+    "task_id",
+    "goal_id",
+    "created_by_user_id",
+    "source_existing_group_id",
+    "source_template_group_id",
+    "minio_dir",
+})
+
+
+def _without_nonportable_references(value: Any) -> Any:
+    """Drop source-row references while preserving logical external config."""
+    if isinstance(value, dict):
+        return {
+            key: _without_nonportable_references(item)
+            for key, item in value.items()
+            if key not in _NONPORTABLE_REFERENCE_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_nonportable_references(item) for item in value]
+    return value
 
 
 # ── Public API ────────────────────────────────────────────────────────
@@ -136,7 +194,12 @@ async def export_workspace(
     # Pre-fetch the sections that depend on toggles. Doing them up front
     # keeps the v1.1 assembly below declarative.
     subscriptions = (
-        await _export_subscriptions(db, workspace.entity_id, workspace_id)
+        await _export_subscriptions(
+            db,
+            workspace.entity_id,
+            workspace_id,
+            allow_generated_private_agent_slugs=ctx.include_embedded_agents,
+        )
         if ctx.include_subscriptions else []
     )
     goals = (
@@ -200,13 +263,27 @@ async def export_workspace(
 
     # Workspace shell — kind / context / primary_work / settings absorb
     # into operating_model so the v1.1 recipe has one place to read from.
-    om: dict[str, Any] = dict(workspace.operating_model or {})
+    om: dict[str, Any] = _without_nonportable_references(
+        dict(workspace.operating_model or {})
+    )
+    # recipe.subscriptions is the canonical portable replacement for source
+    # agent mappings. Knowledge packs replace source DocumentGroup ids.
+    om.pop("agent_mappings", None)
+    knowledge = om.get("knowledge")
+    if isinstance(knowledge, dict):
+        knowledge = dict(knowledge)
+        knowledge.pop("default_group_ids", None)
+        knowledge.pop("group_purposes", None)
+        om["knowledge"] = knowledge
     if workspace.operating_context:
         om.setdefault("context", workspace.operating_context)
     if workspace.primary_work:
         om.setdefault("primary_work", workspace.primary_work)
     if workspace.kind:
         om.setdefault("kind", workspace.kind)
+    om["heartbeat_enabled"] = bool(workspace.heartbeat_enabled)
+    if workspace.heartbeat_cadence:
+        om["heartbeat_cadence"] = workspace.heartbeat_cadence
     ws_settings = {
         k: v for k, v in (workspace.settings or {}).items()
         if k not in _RUNTIME_SETTINGS_KEYS
@@ -283,10 +360,13 @@ async def export_workspace(
 # ``export_workspace`` — see the operating_model absorption pass there.
 
 async def _export_subscriptions(
-    db: AsyncSession, entity_id: str, workspace_id: str,
+    db: AsyncSession,
+    entity_id: str,
+    workspace_id: str,
+    *,
+    allow_generated_private_agent_slugs: bool,
 ) -> list[dict[str, Any]]:
-    """Resolve agent_id → agent_slug. Subscriptions whose agent has
-    no slug are skipped with a warning — we can't re-bind them on import."""
+    """Resolve agent_id to a portable Agent slug for import."""
     rows = list((await db.execute(
         select(AgentSubscription).where(
             AgentSubscription.entity_id == entity_id,
@@ -306,17 +386,24 @@ async def _export_subscriptions(
     out: list[dict[str, Any]] = []
     for r in rows:
         a = agent_by_id.get(r.agent_id)
-        if a is None or not a.slug:
+        can_embed = bool(
+            a is not None
+            and a.entity_id == entity_id
+            and not a.is_public
+            and allow_generated_private_agent_slugs
+        )
+        agent_slug = _portable_agent_slug(a) if a is not None and (a.slug or can_embed) else ""
+        if not agent_slug:
             logger.warning(
-                "blueprint export: dropping subscription %s — agent %s has no slug",
+                "blueprint export: dropping subscription %s — external agent %s has no portable slug",
                 r.id, r.agent_id,
             )
             continue
         out.append({
             "service_key": r.service_key,
-            "agent_slug": a.slug,
+            "agent_slug": agent_slug,
             "custom_prompt": r.custom_prompt,
-            "config": dict(r.config or {}),
+            "config": _without_nonportable_references(dict(r.config or {})),
         })
     return out
 
@@ -341,7 +428,9 @@ async def _export_goals(
             # we keep it; current_value / pace are runtime — dropped.
             "baseline_value": float(g.baseline_value) if g.baseline_value is not None else None,
             "deadline": g.deadline.isoformat() if g.deadline else None,
-            "measurement_source": g.measurement_source,
+            "measurement_source": _without_nonportable_references(
+                g.measurement_source
+            ),
             "measurement_cadence": g.measurement_cadence,
             "priority": g.priority,
         }
@@ -358,8 +447,28 @@ async def _export_scheduled_jobs(
             ScheduledJob.enabled.is_(True),
         )
     )).scalars().all())
+    subscriptions = list((await db.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.status == "active",
+        )
+    )).scalars().all())
+    service_by_agent_id = {
+        subscription.agent_id: subscription.service_key
+        for subscription in subscriptions
+        if subscription.agent_id and subscription.service_key
+    }
     out: list[dict[str, Any]] = []
     for j in rows:
+        raw_target = dict(j.execution_target or {})
+        source_agent_id = raw_target.get("agent_id") or j.agent_id
+        execution_target = _without_nonportable_references(raw_target)
+        if (
+            isinstance(execution_target, dict)
+            and not execution_target.get("service_key")
+            and source_agent_id in service_by_agent_id
+        ):
+            execution_target["service_key"] = service_by_agent_id[source_agent_id]
         out.append({
             # job_id is logically a slug — keep it for portability.
             "job_id": j.job_id,
@@ -372,7 +481,7 @@ async def _export_scheduled_jobs(
             "timezone": j.timezone,
             "payload_message": j.payload_message,
             "execution_type": j.execution_type,
-            "execution_target": dict(j.execution_target or {}),
+            "execution_target": execution_target,
             "execution_script": j.execution_script,
             "default_delivery_mode": j.default_delivery_mode,
         })
@@ -522,7 +631,6 @@ async def _export_embedded_agents_and_skills(
         is_embedded = (
             a.entity_id == entity_id
             and not a.is_public
-            and a.slug  # without a slug there's no portable handle
         )
         if is_embedded and include_agents:
             embedded_agent_ids.append(a.id)
@@ -640,31 +748,38 @@ async def _export_embedded_agents_and_skills(
         required_skill_keys: dict[str, dict[str, Any]] = {}
         for b in sb_rows:
             sk = skill_by_id.get(b.skill_id)
-            if not sk or not sk.slug:
+            if not sk:
                 logger.warning(
-                    "blueprint export: skill_id %s missing/slugless — skipping binding",
+                    "blueprint export: skill_id %s missing — skipping binding",
                     b.skill_id,
                 )
                 continue
-            skill_bindings.setdefault(b.agent_id, []).append(sk.slug)
             sk_is_embedded = (
                 sk.entity_id == entity_id
                 and not sk.is_public
                 and include_skills
             )
+            sk_slug = _portable_skill_slug(sk) if sk.slug or sk_is_embedded else ""
+            if not sk_slug:
+                logger.warning(
+                    "blueprint export: external skill_id %s has no portable slug — skipping binding",
+                    b.skill_id,
+                )
+                continue
+            skill_bindings.setdefault(b.agent_id, []).append(sk_slug)
             if sk_is_embedded:
-                if sk.slug in embedded_skill_slugs_seen:
+                if sk_slug in embedded_skill_slugs_seen:
                     continue
-                embedded_skill_slugs_seen.add(sk.slug)
-                embedded_skills_out.append(_export_skill_row(sk))
+                embedded_skill_slugs_seen.add(sk_slug)
+                embedded_skills_out.append(_export_skill_row(sk, slug=sk_slug))
                 # Skill tools also flow into requires.tools
                 for t in (sk.tools or []):
                     if isinstance(t, str):
                         required_tools.add(t)
             else:
-                if sk.slug not in required_skill_keys:
-                    required_skill_keys[sk.slug] = {
-                        "slug": sk.slug,
+                if sk_slug not in required_skill_keys:
+                    required_skill_keys[sk_slug] = {
+                        "slug": sk_slug,
                         "min_version": sk.version or "1.0.0",
                     }
         required_skills_out = [
@@ -699,17 +814,22 @@ async def _export_embedded_agents_and_skills(
     # 3) Assemble embedded.agents[] in the order their slugs sort —
     #    deterministic output is important for diff-based review.
     by_id = {a.id: a for a in agents}
-    for aid in sorted(embedded_agent_ids, key=lambda i: (by_id[i].slug or "", i)):
+    for aid in sorted(embedded_agent_ids, key=lambda i: (_portable_agent_slug(by_id[i]), i)):
         a = by_id[aid]
         embedded_agents_out.append({
-            "slug": a.slug,
+            "slug": _portable_agent_slug(a),
             "version": getattr(a, "version", None) or "1.0",
             "name": a.name,
             "description": a.description,
             "system_prompt": a.system_prompt,
-            "config": dict(a.config or {}),
+            "config": _without_nonportable_references(dict(a.config or {})),
             "category": a.category,
             "tags": list(a.tags or []),
+            "business_capabilities": sorted({
+                str(capability).strip()
+                for capability in (a.config or {}).get("business_capabilities", [])
+                if str(capability or "").strip()
+            }),
             "tool_bindings": sorted(tool_bindings.get(a.id, [])),
             "mcp_bindings": mcp_bindings.get(a.id, []),
             "skill_bindings": sorted(skill_bindings.get(a.id, [])),
@@ -731,11 +851,11 @@ async def _export_embedded_agents_and_skills(
     }
 
 
-def _export_skill_row(sk: Skill) -> dict[str, Any]:
+def _export_skill_row(sk: Skill, *, slug: str | None = None) -> dict[str, Any]:
     """Serialise a Skill row to the embedded.skills shape. Tools listed
     here also need to land in contract.requires.tools — caller does that."""
     return {
-        "slug": sk.slug,
+        "slug": slug or sk.slug,
         "version": sk.version or "1.0.0",
         "name": sk.name,
         "display_name": sk.display_name,
@@ -747,7 +867,7 @@ def _export_skill_row(sk: Skill) -> dict[str, Any]:
         "category": sk.category,
         "tags": list(sk.tags or []),
         "is_public": False,  # embedded skills are private by definition
-        "config": dict(sk.config or {}),
+        "config": _without_nonportable_references(dict(sk.config or {})),
     }
 
 
@@ -764,7 +884,6 @@ async def _export_knowledge_packs(
 
     Hard rules — applied even when the operator passes ``mode='inline_text'``:
       * Document.classification not in {'public'}  → drop
-      * Document.legal_hold = true                  → drop
       * Document.pii_detected = true                → drop
       * Document.quarantine_status != 'clean'       → drop
       * Document.is_trashed = true                  → drop
@@ -834,8 +953,6 @@ async def _export_knowledge_packs(
 
 def _document_safe_to_export(d: Document) -> bool:
     if d.is_trashed:
-        return False
-    if d.legal_hold:
         return False
     if d.pii_detected:
         return False

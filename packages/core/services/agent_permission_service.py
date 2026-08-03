@@ -25,16 +25,22 @@ Env-var fallback (explicitly enabled self-hosted / infrastructure defaults):
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    WorkerStatus,
+)
 from packages.core.models.document import Integration
-from packages.core.models.user import OAuthAccount
-from packages.core.permissions import user_has_permission
 from packages.core.services.provider_keys import canonical_provider_key, provider_key_aliases
+from packages.core.services.integration_account_service import (
+    entity_account_has_credentials,
+    list_runtime_integration_accounts,
+    select_runtime_integration_account,
+)
 
 
 # provider → list of env-var names to check, in priority order.
@@ -96,6 +102,7 @@ class ToolAccessDecision:
     allowed: bool
     reason: str
     scope: str = ""  # "user" | "entity" | "none" — which credential source resolved
+    account_id: str | None = None
 
 
 def _entity_integration_has_usable_credentials(integration: Integration) -> bool:
@@ -106,12 +113,7 @@ def _entity_integration_has_usable_credentials(integration: Integration) -> bool
     provider with no token, so runtime gating mirrors the Integrations page's
     ``agent_can_use`` check here.
     """
-    cfg = integration.config or {}
-    return bool(
-        integration.credentials
-        or integration.credential_ref
-        or cfg.get("nango")
-    )
+    return entity_account_has_credentials(integration)
 
 
 async def can_use_integration(
@@ -120,6 +122,7 @@ async def can_use_integration(
     user_id: str,
     entity_id: str,
     provider: str,
+    integration_account_id: str | None = None,
     allow_env_fallback: bool = True,
 ) -> ToolAccessDecision:
     """Can the acting user use this integration via an agent right now?
@@ -142,40 +145,79 @@ async def can_use_integration(
             scope="internal",
         )
 
-    # 1. Try user-scope
-    provider_aliases = provider_key_aliases(provider)
-    user_row = (
-        await db.execute(
-            select(OAuthAccount).where(
-                OAuthAccount.user_id == user_id,
-                OAuthAccount.provider.in_(provider_aliases),
-            )
+    # 1–2. Resolve an explicitly selected account, or the ordered default.
+    # The account service includes personal OAuth and entity credentials and
+    # filters entity rows by the acting user's permission.
+    accounts = await list_runtime_integration_accounts(
+        db,
+        user_id=user_id,
+        entity_id=entity_id,
+        provider=provider,
+    )
+    selected, selection_error = select_runtime_integration_account(
+        accounts,
+        integration_account_id,
+    )
+    if selection_error:
+        return ToolAccessDecision(
+            allowed=False,
+            reason=selection_error,
+            scope="none",
         )
-    ).scalar_one_or_none()
 
-    if user_row and user_row.access_token:
+    if selected and selected.scope == "user":
         return ToolAccessDecision(
             allowed=True,
             reason=f"User has personal {provider} connection.",
             scope="user",
+            account_id=selected.id,
         )
 
-    # 2. Fall back to entity-scope. Multi-account credential providers
-    # (email inboxes, WhatsApp senders, …) can have several rows per
-    # (entity, provider) — pick the most recent and hand off; the
-    # caller's later resolution code (``_resolve_bearer_token``)
-    # honours ``config.is_default`` if set.
-    entity_row = (
-        await db.execute(
+    if selected and selected.scope == "entity":
+        return ToolAccessDecision(
+            allowed=True,
+            reason=f"Using entity-level {provider} credentials.",
+            scope="entity",
+            account_id=selected.id,
+        )
+
+    if not accounts:
+        provider_aliases = provider_key_aliases(provider)
+        configured_rows = list((await db.execute(
             select(Integration).where(
                 Integration.entity_id == entity_id,
                 Integration.provider.in_(provider_aliases),
                 Integration.status == "active",
-            ).order_by(Integration.created_at.desc()).limit(1)
-        )
-    ).scalar_one_or_none()
-
-    if not entity_row:
+            ).order_by(Integration.created_at.desc())
+        )).scalars().all())
+        if configured_rows:
+            usable_rows = [
+                row for row in configured_rows
+                if _entity_integration_has_usable_credentials(row)
+            ]
+            if not usable_rows:
+                return ToolAccessDecision(
+                    allowed=False,
+                    reason=(
+                        f"The {provider} integration is configured but has no usable "
+                        "credentials. Reconnect it under Settings → Integrations."
+                    ),
+                    scope="entity",
+                )
+            required = next(
+                (row.required_permission for row in usable_rows if row.required_permission),
+                None,
+            )
+            if required:
+                return ToolAccessDecision(
+                    allowed=False,
+                    reason=(
+                        f"The {provider} integration requires the '{required}' permission, "
+                        "which your role doesn't have. Ask an admin to grant access, or "
+                        f"connect your own {provider} account."
+                    ),
+                    scope="entity",
+                )
         # 3. Dev / cloud-default env fallback (only when flag is set)
         if allow_env_fallback and _env_token_for(provider):
             return ToolAccessDecision(
@@ -192,35 +234,48 @@ async def can_use_integration(
             scope="none",
         )
 
-    if not _entity_integration_has_usable_credentials(entity_row):
-        return ToolAccessDecision(
-            allowed=False,
-            reason=(
-                f"The {provider} integration is configured but has no usable "
-                "credentials. Reconnect it under Settings → Integrations."
-            ),
-            scope="entity",
-        )
-
-    required = entity_row.required_permission
-    if required:
-        granted = await user_has_permission(db, user_id, entity_id, required)
-        if not granted:
-            return ToolAccessDecision(
-                allowed=False,
-                reason=(
-                    f"The {provider} integration requires the '{required}' permission, "
-                    f"which your role doesn't have. Ask an admin to invite you with a "
-                    f"higher role, or connect your own {provider} account."
-                ),
-                scope="entity",
-            )
-
     return ToolAccessDecision(
-        allowed=True,
-        reason=f"Using entity-level {provider} credentials.",
-        scope="entity",
+        allowed=False,
+        reason=f"No usable {provider} integration account is available.",
+        scope="none",
     )
+
+
+async def resolve_usable_mcp_providers(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    entity_id: str,
+    provider_keys: Iterable[str],
+) -> frozenset[str]:
+    """Batch 'which MCP servers can this user use right now'.
+
+    Used by search-time pre-filtering (tool_discovery_v2). Reuses
+    can_use_integration per provider so admin gating / first-party /
+    credential logic can't drift from the dispatch-time check. Failures
+    fail-open per provider (discovery-only surface; execution still gates).
+
+    ``provider_keys`` is required (no default catalog import here): this
+    file is a non-runtime production module and importing
+    packages.core.ai.tools.mcp_builtin directly from it would violate the
+    tool-to-tool import boundary enforced by
+    test_production_tool_to_tool_imports_stay_runtime_owned. The caller
+    (packages/core/ai/runtime/tool_search.py's search handler, which is
+    runtime-owned and exempt from that scan) derives the provider keys
+    from its own view of the tool schemas instead.
+    """
+    usable: set[str] = set()
+    for key in provider_keys:
+        try:
+            decision = await can_use_integration(
+                db, user_id=user_id, entity_id=entity_id,
+                provider=key, allow_env_fallback=False,
+            )
+            if decision.allowed:
+                usable.add(key)
+        except Exception:
+            usable.add(key)  # fail-open: never hide tools due to an error
+    return frozenset(usable)
 
 
 async def can_use_mcp_server(
@@ -229,6 +284,7 @@ async def can_use_mcp_server(
     user_id: str,
     entity_id: str,
     server_key: str,
+    integration_account_id: str | None = None,
     allow_env_fallback: bool = False,
 ) -> ToolAccessDecision:
     """Thin alias — MCP server keys equal integration provider keys.
@@ -241,6 +297,7 @@ async def can_use_mcp_server(
         user_id=user_id,
         entity_id=entity_id,
         provider=server_key,
+        integration_account_id=integration_account_id,
         allow_env_fallback=allow_env_fallback,
     )
 

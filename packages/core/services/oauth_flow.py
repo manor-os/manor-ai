@@ -93,6 +93,7 @@ def _store_pending(
     server_key: str,
     code_verifier: str,
     return_to: str | None = None,
+    connection_id: str | None = None,
 ) -> None:
     pending = {
         "user_id": user_id,
@@ -101,6 +102,8 @@ def _store_pending(
     }
     if return_to:
         pending["return_to"] = return_to
+    if connection_id:
+        pending["connection_id"] = connection_id
     _pending_oauth_states[state] = pending
 
 
@@ -131,6 +134,14 @@ def get_pending_return_to(state: str, *, server_key: str) -> str | None:
     return pending.get("return_to")
 
 
+def get_pending_connection_id(state: str, *, server_key: str) -> str | None:
+    """Return the OAuthAccount row explicitly being reconnected, if any."""
+    pending = _pending_oauth_states.get(state)
+    if not pending or pending.get("server_key") != server_key:
+        raise OAuthFlowError(400, "Invalid or expired OAuth state")
+    return pending.get("connection_id")
+
+
 # ── Authorization step ─────────────────────────────────────────────────────
 
 
@@ -140,6 +151,7 @@ def begin_authorization(
     user_id: str,
     redirect_uri: str,
     return_to: str | None = None,
+    connection_id: str | None = None,
 ) -> AuthorizationStart:
     """Build the provider's authorize URL for ``user_id``.
 
@@ -161,7 +173,8 @@ def begin_authorization(
                    user_id=user_id,
                    server_key=config.server_key,
                    code_verifier=code_verifier,
-                   return_to=return_to)
+                   return_to=return_to,
+                   connection_id=connection_id)
 
     params = {
         "client_id": config.client_id,
@@ -269,6 +282,129 @@ async def complete_authorization(
     )
 
 
+_PROFILE_ENDPOINTS: dict[str, tuple[str, dict[str, str] | None]] = {
+    "gmail": ("https://openidconnect.googleapis.com/v1/userinfo", None),
+    "google_calendar": ("https://openidconnect.googleapis.com/v1/userinfo", None),
+    "google_drive": ("https://openidconnect.googleapis.com/v1/userinfo", None),
+    "youtube": ("https://openidconnect.googleapis.com/v1/userinfo", None),
+    "github": ("https://api.github.com/user", None),
+    "discord": ("https://discord.com/api/users/@me", None),
+    "linkedin": ("https://api.linkedin.com/v2/userinfo", None),
+    "twitter_x": ("https://api.x.com/2/users/me", {"user.fields": "name,username"}),
+    "slack": ("https://slack.com/api/auth.test", None),
+    "outlook": ("https://graph.microsoft.com/v1.0/me", None),
+    "onedrive": ("https://graph.microsoft.com/v1.0/me", None),
+    "ms_calendar": ("https://graph.microsoft.com/v1.0/me", None),
+    "ms_teams": ("https://graph.microsoft.com/v1.0/me", None),
+    "ms_excel": ("https://graph.microsoft.com/v1.0/me", None),
+    "paypal": (
+        "https://api-m.paypal.com/v1/identity/oauth2/userinfo",
+        {"schema": "paypalv1.1"},
+    ),
+}
+
+
+def _nested_value(data: dict[str, Any], *paths: tuple[str, ...]) -> Any:
+    for path in paths:
+        current: Any = data
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if current not in (None, ""):
+            return current
+    return None
+
+
+def _identity_from_payload(payload: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    provider_user_id = _nested_value(
+        payload,
+        ("user_id",),
+        ("open_id",),
+        ("sub",),
+        ("id",),
+        ("stripe_user_id",),
+        ("authed_user", "id"),
+        ("user", "id"),
+        ("user", "open_id"),
+        ("data", "id"),
+        ("data", "user", "open_id"),
+    )
+    email = _nested_value(
+        payload,
+        ("email",),
+        ("mail",),
+        ("userPrincipalName",),
+        ("data", "email"),
+        ("user", "email"),
+    )
+    display_name = _nested_value(
+        payload,
+        ("display_name",),
+        ("displayName",),
+        ("name",),
+        ("username",),
+        ("login",),
+        ("real_name",),
+        ("team", "name"),
+        ("data", "name"),
+        ("data", "username"),
+        ("data", "user", "display_name"),
+    )
+    profile = {
+        key: value
+        for key, value in {
+            "email": email,
+            "display_name": display_name,
+        }.items()
+        if value not in (None, "")
+    }
+    return (
+        str(provider_user_id).strip() if provider_user_id not in (None, "") else None,
+        profile,
+    )
+
+
+async def resolve_oauth_identity(
+    server_key: str,
+    tokens: TokenSet,
+    *,
+    timeout: float = 10.0,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve a stable external account id and safe display profile.
+
+    Token responses vary widely. We first inspect the response, then use the
+    provider's profile endpoint when available. If a provider exposes neither,
+    a non-reversible token fingerprint keeps separate connections distinct;
+    explicit reconnect state still targets the original row.
+    """
+    provider_user_id, profile = _identity_from_payload(tokens.raw or {})
+    endpoint = _PROFILE_ENDPOINTS.get(server_key)
+    if endpoint and (not provider_user_id or not profile):
+        url, params = endpoint
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(
+                    url,
+                    params=params,
+                    headers={"Authorization": f"Bearer {tokens.access_token}"},
+                )
+            if response.status_code < 400:
+                fetched = response.json()
+                fetched_id, fetched_profile = _identity_from_payload(fetched)
+                provider_user_id = provider_user_id or fetched_id
+                profile = {**fetched_profile, **profile}
+        except Exception:
+            logger.debug("Could not fetch OAuth identity for %s", server_key, exc_info=True)
+
+    provider_user_id = provider_user_id or tokens.provider_user_id
+    if not provider_user_id:
+        digest = hashlib.sha256(tokens.access_token.encode("utf-8")).hexdigest()[:24]
+        provider_user_id = f"token:{digest}"
+    return provider_user_id, profile
+
+
 # ── User-facing error page ─────────────────────────────────────────────────
 
 
@@ -307,6 +443,8 @@ __all__ = [
     "begin_authorization",
     "complete_authorization",
     "get_pending_return_to",
+    "get_pending_connection_id",
+    "resolve_oauth_identity",
     "validate_pending_state",
     "render_oauth_error_page",
 ]

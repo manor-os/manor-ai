@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
@@ -18,13 +18,12 @@ import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import Calendar from "../components/ui/Calendar";
 import type { CalendarEvent } from "../components/ui/Calendar";
-import { IconClose, IconClock, IconFlag, IconUser, IconUsers, IconComment, IconCircleDot, IconCalendar, IconCategory, IconEdit, IconSend, IconUpload, IconDocument, IconDownload, IconExternalLink, IconManorLogo, IconAgent, IconPlay, IconHeadphones, IconCheckCircle, IconTrash, IconPaperclip, IconWorkspace, IconBuilding, IconLayers, IconWarning } from "../components/icons";
+import { IconClose, IconClock, IconFlag, IconUser, IconUsers, IconComment, IconCircleDot, IconCalendar, IconCategory, IconEdit, IconSend, IconUpload, IconDocument, IconDownload, IconExternalLink, IconManorLogo, IconAgent, IconPlay, IconHeadphones, IconCheckCircle, IconTrash, IconPaperclip, IconWorkspace, IconBuilding, IconLayers, IconWarning, IconChevronRight, IconChevronDown, IconGrid, IconList } from "../components/icons";
 import Select from "../components/ui/Select";
 import DateTimePicker from "../components/ui/DateTimePicker";
 import TabSwitcher from "../components/ui/TabSwitcher";
-import CategoryChip from "../components/ui/CategoryChip";
 import UserAvatar from "../components/ui/UserAvatar";
-import PriorityPill from "../components/ui/PriorityPill";
+import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
 import StatusPill from "../components/ui/StatusPill";
 import { FilterBar, FilterSelect } from "../components/ui/FilterBar";
 import { MANOR_AGENT_ID, MANOR_AGENT_TYPE, MANOR_AGENT_NAME, isMasterAgent } from "../lib/constants";
@@ -37,22 +36,18 @@ import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 import { inferRuntimeRuleFromText, shouldFallbackToWildcardRule } from "../lib/runtimeRules";
 import { formatTaskDescriptionForDisplay, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
-
-const LazyScheduledJobs = lazy(() => import("./ScheduledJobs"));
-function ScheduledJobsEmbed({ headerTabs }: { headerTabs?: React.ReactNode }) {
-  return (
-    <Suspense fallback={<div style={{ padding: 40, textAlign: "center", color: "#a8a29e" }}>{t("status.loading")}</div>}>
-      <LazyScheduledJobs headerTabs={headerTabs} />
-    </Suspense>
-  );
-}
+import {
+  ADD_SELECTION_TO_TASK_EVENT,
+  SELECTED_TEXT_TASK_DRAFT_KEY,
+  type SelectedTextTaskDraft,
+} from "../lib/selectionActions";
 
 /* ── constants ──────────────────────────────────────────── */
 
 const VIEW_TABS: { key: string; label: string; icon: React.ReactNode }[] = [
   {
     key: "board",
-    label: t("page.tasks.board"),
+    label: "Tickets",
     icon: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
         <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" />
@@ -65,15 +60,6 @@ const VIEW_TABS: { key: string; label: string; icon: React.ReactNode }[] = [
     icon: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
         <rect x="3" y="4" width="18" height="18" rx="2" /><path d="M16 2v4M8 2v4M3 10h18" />
-      </svg>
-    ),
-  },
-  {
-    key: "automations",
-    label: t("page.tasks.automations"),
-    icon: (
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="12" r="10" /><path d="M12 6v6l4 2" />
       </svg>
     ),
   },
@@ -95,8 +81,17 @@ const TASK_STATUSES: Record<string, { label: string; color: string; order: numbe
   failed:               { label: t("page.dashboard.failed"),               color: "#c14a44", order: 10 },
 };
 
-// Board groups 10 statuses into 5 visual columns (like old repo)
 const BOARD_COLUMNS = ["todo", "scheduled", "in_progress", "review", "done"] as const;
+type BoardColumnKey = typeof BOARD_COLUMNS[number];
+const TASK_BOARD_VISIBLE_COLUMNS_STORAGE_KEY = "manor_tasks_board_visible_columns_v1";
+const TASK_BOARD_COLUMN_ORDER_STORAGE_KEY = "manor_tasks_board_column_order_v1";
+const TASK_BOARD_MODE_STORAGE_KEY = "manor_tasks_board_mode_v1";
+
+type LocalTaskBoardPreferences = {
+  mode: "kanban" | "list";
+  visibleColumns: Set<BoardColumnKey>;
+  columnOrder: BoardColumnKey[];
+};
 
 type ColumnMeta = {
   label: string;
@@ -107,10 +102,10 @@ type ColumnMeta = {
 };
 
 const COLUMN_META: Record<string, ColumnMeta> = {
-  todo:        { label: t("page.tasks.to_do"),            dot: "#cf9b44", headerBg: "rgba(207,155,68,0.08)",  statuses: ["created", "pending", "proposed"],                Icon: IconClock },
-  scheduled:   { label: t("status.scheduled"),        dot: "#9079c2", headerBg: "rgba(144,121,194,0.09)",  statuses: ["scheduled"],                                     Icon: IconCalendar },
-  in_progress: { label: t("status.in_progress"),      dot: "#4a7d96", headerBg: "rgba(90,142,166,0.09)",   statuses: ["in_progress"],                                   Icon: IconPlay },
-  review:      { label: t("page.tasks.needs_attention"), dot: "#d3873f", headerBg: "rgba(211,135,63,0.08)",  statuses: ["waiting_on_customer", "on_hold", "blocked", "failed"],     Icon: IconHeadphones },
+  todo:        { label: t("page.tasks.to_do"),            dot: "#7d8884", headerBg: "rgba(125,136,132,0.08)", statuses: ["created", "pending", "proposed"], Icon: IconClock },
+  scheduled:   { label: t("status.scheduled"),            dot: "#788596", headerBg: "rgba(120,133,150,0.08)", statuses: ["scheduled"], Icon: IconCalendar },
+  in_progress: { label: t("status.in_progress"),          dot: "#4f8177", headerBg: "rgba(79,129,119,0.09)", statuses: ["in_progress"], Icon: IconPlay },
+  review:      { label: t("page.tasks.needs_attention"),  dot: "#c9645b", headerBg: "rgba(201,100,91,0.08)", statuses: ["waiting_on_customer", "on_hold", "blocked", "failed"], Icon: IconHeadphones },
   done:        { label: t("page.team_people.done"),             dot: "#4f9c84", headerBg: "rgba(79,156,132,0.08)",  statuses: ["completed", "cancelled"],              Icon: IconCheckCircle },
 };
 
@@ -124,6 +119,9 @@ const STATUS_OPTIONS = [
 
 const TASK_POLL_INTERVAL_MS = 60_000;
 const ENTITY_LEVEL_WORKSPACE_FILTER = "__entity__";
+const LARGE_BOARD_COLUMN_THRESHOLD = 24;
+const LARGE_BOARD_GROUP_PREVIEW_COUNT = 3;
+const LARGE_BOARD_FOCUS_COUNT = 3;
 const LIVE_TASK_STATUSES = new Set(["pending", "in_progress"]);
 const TERMINAL_TASK_STATUSES = new Set(["completed", "cancelled", "failed"]);
 const DONE_RECENT_WINDOW_DAYS = 14;
@@ -201,7 +199,7 @@ const PRIORITY_CONFIG: Record<number, { label: string; color: string; badge: "da
   1: { label: t("page.tasks.minimal"),  color: "#a8a29e", badge: "inactive" },
 };
 
-type TaskStatusFilter = "all" | "overdue" | typeof BOARD_COLUMNS[number];
+type TaskStatusFilter = "all" | "overdue" | "done" | typeof BOARD_COLUMNS[number];
 type TaskOwnerFilter = "all" | "unassigned" | `agent:${string}` | `person:${string}`;
 type TaskDueFilter = "all" | "overdue" | "today" | "upcoming" | "no_due";
 
@@ -227,6 +225,116 @@ const DUE_FILTER_OPTIONS: TaskFilterOption<TaskDueFilter>[] = [
   { key: "upcoming", label: "Upcoming", icon: <IconClock size={14} style={{ color: "#4869ac" }} /> },
   { key: "no_due", label: "No due", icon: <IconClose size={14} style={{ color: "#a8a29e" }} /> },
 ];
+
+function isBoardColumnKey(value: string): value is BoardColumnKey {
+  return (BOARD_COLUMNS as readonly string[]).includes(value);
+}
+
+function normalizeBoardColumnOrder(value: unknown): BoardColumnKey[] {
+  const seen = new Set<BoardColumnKey>();
+  const ordered = Array.isArray(value)
+    ? value.filter((key): key is BoardColumnKey => {
+      if (typeof key !== "string" || !isBoardColumnKey(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    : [];
+  return [...ordered, ...BOARD_COLUMNS.filter((key) => !seen.has(key))];
+}
+
+function dataTransferHasType(types: readonly string[] | DOMStringList, expected: string): boolean {
+  const normalized = expected.toLowerCase();
+  return Array.from(types).some((type) => type.toLowerCase() === normalized);
+}
+
+function taskBoardStorageKey(baseKey: string, userId: string): string {
+  return `${baseKey}:${userId}`;
+}
+
+function loadLocalTaskBoardPreferences(userId?: string): LocalTaskBoardPreferences {
+  const defaults: LocalTaskBoardPreferences = {
+    mode: "kanban",
+    visibleColumns: new Set(BOARD_COLUMNS),
+    columnOrder: [...BOARD_COLUMNS],
+  };
+  if (typeof window === "undefined" || !userId) return defaults;
+
+  try {
+    const baseKeys = [
+      TASK_BOARD_VISIBLE_COLUMNS_STORAGE_KEY,
+      TASK_BOARD_COLUMN_ORDER_STORAGE_KEY,
+      TASK_BOARD_MODE_STORAGE_KEY,
+    ];
+    const scopedValues = baseKeys.map((key) =>
+      window.localStorage.getItem(taskBoardStorageKey(key, userId)),
+    );
+    const hasScopedPreferences = scopedValues.some((value) => value !== null);
+    const values = hasScopedPreferences
+      ? scopedValues
+      : baseKeys.map((key) => window.localStorage.getItem(key));
+
+    if (!hasScopedPreferences && values.some((value) => value !== null)) {
+      baseKeys.forEach((key, index) => {
+        const value = values[index];
+        if (value !== null) {
+          window.localStorage.setItem(taskBoardStorageKey(key, userId), value);
+        }
+        window.localStorage.removeItem(key);
+      });
+    }
+
+    const parsedVisible = values[0] ? JSON.parse(values[0]) : null;
+    const visibleColumns = Array.isArray(parsedVisible)
+      ? parsedVisible.filter((key): key is BoardColumnKey =>
+          typeof key === "string" && isBoardColumnKey(key),
+        )
+      : [];
+    const parsedOrder = values[1] ? JSON.parse(values[1]) : null;
+    return {
+      mode: values[2] === "list" ? "list" : "kanban",
+      visibleColumns: new Set(visibleColumns.length > 0 ? visibleColumns : BOARD_COLUMNS),
+      columnOrder: normalizeBoardColumnOrder(parsedOrder),
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function persistVisibleBoardColumns(userId: string | undefined, columns: Set<BoardColumnKey>) {
+  if (typeof window === "undefined" || !userId) return;
+  try {
+    window.localStorage.setItem(
+      taskBoardStorageKey(TASK_BOARD_VISIBLE_COLUMNS_STORAGE_KEY, userId),
+      JSON.stringify(BOARD_COLUMNS.filter((key) => columns.has(key))),
+    );
+  } catch {
+    // The server preference remains authoritative when browser storage is unavailable.
+  }
+}
+
+function persistBoardColumnOrder(userId: string | undefined, columns: BoardColumnKey[]) {
+  if (typeof window === "undefined" || !userId) return;
+  try {
+    window.localStorage.setItem(
+      taskBoardStorageKey(TASK_BOARD_COLUMN_ORDER_STORAGE_KEY, userId),
+      JSON.stringify(normalizeBoardColumnOrder(columns)),
+    );
+  } catch {
+    // The server preference remains authoritative when browser storage is unavailable.
+  }
+}
+
+function persistTaskBoardMode(userId: string | undefined, mode: "kanban" | "list") {
+  if (typeof window === "undefined" || !userId) return;
+  try {
+    window.localStorage.setItem(
+      taskBoardStorageKey(TASK_BOARD_MODE_STORAGE_KEY, userId),
+      mode,
+    );
+  } catch {
+    // The server preference remains authoritative when browser storage is unavailable.
+  }
+}
 
 function sameLocalDate(a: Date, b: Date): boolean {
   return a.getFullYear() === b.getFullYear()
@@ -337,129 +445,224 @@ const CATEGORY_OPTIONS = [
 /* ── sub-components ─────────────────────────────────────── */
 
 const TASK_CARD_AI_PROCESSING_STYLES = `
-  .task-card-ai-processing::before {
+  .task-board-card-avatar-shell {
+    position: relative;
+    width: 26px;
+    height: 26px;
+    flex: 0 0 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .task-board-card-avatar-shell.is-running::before {
     content: "";
     position: absolute;
-    inset: 0;
-    border-radius: inherit;
-    border: 1px solid rgba(125,211,252,0.34);
-    box-shadow:
-      inset 0 0 0 1px rgba(244,247,250,0.58),
-      0 0 14px rgba(90,142,166,0.06);
-    animation: task-card-processing-pulse 2.6s ease-in-out infinite;
-    pointer-events: none;
-    z-index: 2;
+    inset: -2px;
+    border-radius: 50%;
+    border: 1.5px solid transparent;
+    border-top-color: #4f8177;
+    border-right-color: rgba(79,129,119,0.28);
+    animation: task-avatar-spin 2.8s linear infinite;
   }
-  .task-card-comet-runner {
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 1px;
-    height: 1px;
-    offset-path: inset(4px round 10px);
-    offset-distance: 0%;
-    offset-rotate: auto;
-    animation: task-card-comet-run 5.8s linear infinite;
-    pointer-events: none;
-    z-index: 4;
-    filter: drop-shadow(0 0 4px rgba(90,142,166,0.30));
-  }
-  .task-card-comet-tail {
+  .task-board-card-avatar-pulse {
     position: absolute;
     right: -1px;
-    top: -0.75px;
-    width: 64px;
-    height: 1.5px;
-    border-radius: 999px;
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(56,189,248,0.05) 18%,
-      rgba(56,189,248,0.22) 52%,
-      rgba(34,211,238,0.68) 82%,
-      rgba(232,239,244,0.96) 94%,
-      rgba(255,255,255,1) 100%
-    );
-    box-shadow:
-      0 0 3px rgba(56,189,248,0.36),
-      0 0 7px rgba(95,146,138,0.16);
+    bottom: 0;
+    width: 6px;
+    height: 6px;
+    border: 1.5px solid var(--surface-panel);
+    border-radius: 50%;
+    background: #4f9c84;
+    animation: task-running-pulse 1.8s ease-in-out infinite;
   }
-  .task-card-comet-tail::before {
-    content: "";
-    position: absolute;
-    inset: -2px -3px;
-    border-radius: inherit;
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(90,142,166,0.04) 30%,
-      rgba(90,142,166,0.11) 62%,
-      rgba(34,211,238,0.24) 88%,
-      rgba(255,255,255,0.42) 100%
-    );
-    filter: blur(2px);
-    opacity: 0.72;
+  .task-board-running-dots span {
+    animation: task-running-dot 1.4s ease-in-out infinite;
   }
-  .task-card-comet-tail::after {
-    content: "";
-    position: absolute;
-    right: 0;
-    top: 0;
-    width: 22px;
-    height: 1px;
-    border-radius: inherit;
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(186,230,253,0.70) 72%,
-      rgba(255,255,255,1) 100%
-    );
-  }
-  .task-card-ai-processing > :not(.task-card-comet-runner) { position: relative; z-index: 3; }
-  html[data-theme="dark"] .task-card-ai-processing::before {
-    animation: none;
-    border-color: rgba(148, 163, 184, 0.18);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
-  }
-  html[data-theme="dark"] .task-card-comet-runner {
-    display: none;
-  }
-  @keyframes task-card-processing-pulse {
-    0%, 100% {
-      box-shadow:
-        inset 0 0 0 1px rgba(244,247,250,0.58),
-        0 0 10px rgba(90,142,166,0.05),
-        0 0 0 rgba(34,211,238,0);
-    }
-    50% {
-      box-shadow:
-        inset 0 0 0 1px rgba(244,247,250,0.72),
-        0 0 18px rgba(90,142,166,0.14),
-        0 0 26px rgba(34,211,238,0.13);
-    }
-  }
-  @keyframes task-card-comet-run {
-    to { offset-distance: 100%; }
-  }
+  .task-board-running-dots span:nth-child(2) { animation-delay: 0.16s; }
+  .task-board-running-dots span:nth-child(3) { animation-delay: 0.32s; }
+  @keyframes task-avatar-spin { to { transform: rotate(360deg); } }
+  @keyframes task-running-pulse { 50% { transform: scale(1.3); opacity: 0.62; } }
+  @keyframes task-running-dot { 50% { opacity: 1; transform: translateY(-1px); } }
   @media (prefers-reduced-motion: reduce) {
-    .task-card-comet-runner {
-      display: none;
-    }
-    .task-card-ai-processing::before {
-      animation: none;
-    }
+    .task-board-card-avatar-shell.is-running::before,
+    .task-board-card-avatar-pulse,
+    .task-board-running-dots span { animation: none; }
   }
 `;
 
-function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsName, workspaceScoped }: { task: Task; onClick: () => void; onOpenFull: () => void; agents?: any[]; dimmed?: boolean; compact?: boolean; wsName?: string; workspaceScoped?: boolean }) {
+function ColumnVisibilityMenu({
+  columnOrder,
+  visibleColumns,
+  onToggle,
+  onShowAll,
+  onMoveColumn,
+  onReorderColumn,
+}: {
+  columnOrder: BoardColumnKey[];
+  visibleColumns: Set<BoardColumnKey>;
+  onToggle: (key: BoardColumnKey, visible: boolean) => void;
+  onShowAll: () => void;
+  onMoveColumn: (key: BoardColumnKey, direction: -1 | 1) => void;
+  onReorderColumn: (source: BoardColumnKey, target: BoardColumnKey, placement?: "before" | "after") => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draggingColumn, setDraggingColumn] = useState<BoardColumnKey | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const visibleCount = columnOrder.filter((key) => visibleColumns.has(key)).length;
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [open]);
+
+  return (
+    <div className="task-column-menu" ref={menuRef}>
+      <button
+        type="button"
+        className="task-column-menu-button"
+        onClick={() => setOpen((value) => !value)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={`Customize Kanban columns. ${visibleCount} visible.`}
+        title="Customize Kanban columns"
+      >
+        <IconLayers size={14} />
+      </button>
+      {open && (
+        <div className="task-column-menu-popover" role="menu">
+          <div className="task-column-menu-header">
+            <span>Columns</span>
+            <button type="button" onClick={onShowAll}>Show all</button>
+          </div>
+          {columnOrder.map((key, index) => {
+            const meta = COLUMN_META[key];
+            const Icon = meta.Icon;
+            const checked = visibleColumns.has(key);
+            const disabled = checked && visibleCount <= 1;
+            const isDragging = draggingColumn === key;
+            return (
+              <div
+                key={key}
+                className={`task-column-menu-option${checked ? " is-checked" : ""}${isDragging ? " is-dragging" : ""}`}
+                draggable
+                onDragStart={(event) => {
+                  event.dataTransfer.setData("boardColumnKey", key);
+                  event.dataTransfer.effectAllowed = "move";
+                  setDraggingColumn(key);
+                }}
+                onDragOver={(event) => {
+                  if (!dataTransferHasType(event.dataTransfer.types, "boardColumnKey")) return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "move";
+                }}
+                onDrop={(event) => {
+                  const source = event.dataTransfer.getData("boardColumnKey") || event.dataTransfer.getData("boardcolumnkey");
+                  if (!source || !isBoardColumnKey(source) || source === key) return;
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  const placement = event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+                  onReorderColumn(source, key, placement);
+                  setDraggingColumn(null);
+                }}
+                onDragEnd={() => setDraggingColumn(null)}
+              >
+                <span className="task-column-menu-drag-handle" aria-hidden="true" />
+                <button
+                  type="button"
+                  className="task-column-menu-option-main"
+                  onClick={() => {
+                    if (!disabled) onToggle(key, !checked);
+                  }}
+                  disabled={disabled}
+                  role="menuitemcheckbox"
+                  aria-checked={checked}
+                >
+                  <span className="task-column-menu-check" aria-hidden="true">
+                    {checked && <IconCheckCircle size={12} />}
+                  </span>
+                  <span className="task-column-menu-option-icon" style={{ color: meta.dot }}>
+                    <Icon size={13} />
+                  </span>
+                  <span className="task-column-menu-option-label">{meta.label}</span>
+                </button>
+                <div className="task-column-menu-reorder-controls" aria-label={`Move ${meta.label}`}>
+                  <button
+                    type="button"
+                    className="task-column-menu-move"
+                    onClick={() => onMoveColumn(key, -1)}
+                    disabled={index === 0}
+                    title="Move up"
+                    aria-label={`Move ${meta.label} up`}
+                  >
+                    <IconChevronDown className="task-column-menu-move-icon is-up" size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    className="task-column-menu-move"
+                    onClick={() => onMoveColumn(key, 1)}
+                    disabled={index === columnOrder.length - 1}
+                    title="Move down"
+                    aria-label={`Move ${meta.label} down`}
+                  >
+                    <IconChevronDown className="task-column-menu-move-icon" size={12} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaskBoardModeSwitch({
+  value,
+  onChange,
+}: {
+  value: "kanban" | "list";
+  onChange: (value: "kanban" | "list") => void;
+}) {
+  return (
+    <div className="task-board-mode-switch" aria-label="Ticket view mode">
+      <button
+        type="button"
+        className={value === "kanban" ? "is-active" : ""}
+        onClick={() => onChange("kanban")}
+        title="Kanban"
+        aria-label="Show Kanban view"
+        aria-pressed={value === "kanban"}
+      >
+        <IconGrid size={15} />
+      </button>
+      <button
+        type="button"
+        className={value === "list" ? "is-active" : ""}
+        onClick={() => onChange("list")}
+        title="List"
+        aria-label="Show List view"
+        aria-pressed={value === "list"}
+      >
+        <IconList size={15} />
+      </button>
+    </div>
+  );
+}
+
+function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsName, workspaceScoped, grouped }: { task: Task; onClick: () => void; onOpenFull: () => void; agents?: any[]; dimmed?: boolean; compact?: boolean; wsName?: string; workspaceScoped?: boolean; grouped?: boolean }) {
   const handleDragStart = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.dataTransfer.setData("taskId", task.id);
     e.dataTransfer.effectAllowed = "move";
-    e.currentTarget.style.opacity = "0.4";
+    e.currentTarget.classList.add("is-dragging");
   }, [task.id]);
   const handleDragEnd = useCallback((e: DragEvent<HTMLDivElement>) => {
-    e.currentTarget.style.opacity = dimmed ? "0.5" : "1";
-  }, [dimmed]);
+    e.currentTarget.classList.remove("is-dragging");
+  }, []);
   const handleKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -476,184 +679,129 @@ function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsN
     "",
   ) || null;
   const assigneeAvatar = task.agent_avatar || task.assignee_avatar || null;
-  const aiResult = (task.details as any)?.ai_result;
   const hasChecklist = !compact && (task.details as any)?.checklist_total > 0;
   const checkDone = (task.details as any)?.checklist_done || 0;
   const checkTotal = (task.details as any)?.checklist_total || 0;
   const dependencyInfo = _taskDependencyInfo(task);
   const isWorkspaceTask = Boolean(task.workspace_id || task.workspace_name || wsName || workspaceScoped);
   const isProcessingGlow = (isAI || isWorkspaceTask) && task.status === "in_progress" && !dimmed;
-  const scopeName = wsName || (!task.workspace_id ? "Entity-level" : "");
+  const scopeName = wsName || task.workspace_name || (!task.workspace_id ? "Entity-level" : "");
   const scopeIsEntityLevel = !task.workspace_id;
+  const statusConfig = TASK_STATUSES[task.status];
+  const statusLabel = statusConfig?.label || formatUserFacingLabel(task.status);
 
   return (
     <div
-        draggable
-        role="button"
-        tabIndex={0}
-        aria-label={`${t("component.workspace_chat.view_task")}: ${task.title}`}
-        title={t("component.workspace_chat.view_task")}
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-        onClick={onClick}
-        onKeyDown={handleKeyDown}
-        className={`task-board-card${isProcessingGlow ? " task-card-ai-processing" : ""}`}
-        style={{
-          position: "relative",
-          isolation: "isolate",
-          background: dimmed
-            ? "linear-gradient(180deg, rgba(255,255,255,0.56), rgba(255,254,252,0.42))"
-            : "linear-gradient(180deg, rgba(255,255,255,0.86), rgba(255,254,252,0.72))",
-          backdropFilter: "blur(14px) saturate(1.08)",
-          WebkitBackdropFilter: "blur(14px) saturate(1.08)",
-          borderRadius: 14,
-          border: isProcessingGlow ? "1px solid rgba(186,230,253,0.46)" : "1px solid rgba(117,96,66,0.07)",
-          padding: 0, cursor: "grab", userSelect: "none",
-          transition: "all 0.2s cubic-bezier(0.4,0,0.2,1)",
-          opacity: dimmed ? 0.5 : 1, overflow: "hidden", flexShrink: 0,
-        }}
-        onMouseEnter={(e) => {
-          if (!dimmed) {
-            e.currentTarget.style.borderColor = "var(--card-hover-border)";
-            e.currentTarget.style.background = "var(--card-hover-bg)";
-            e.currentTarget.style.boxShadow = "var(--card-hover-shadow)";
-            e.currentTarget.style.transform = "var(--card-hover-transform)";
-          }
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.borderColor = isProcessingGlow ? "rgba(186,230,253,0.46)" : "rgba(117,96,66,0.07)";
-          e.currentTarget.style.background = dimmed
-            ? "linear-gradient(180deg, rgba(255,255,255,0.56), rgba(255,254,252,0.42))"
-            : "linear-gradient(180deg, rgba(255,255,255,0.86), rgba(255,254,252,0.72))";
-          e.currentTarget.style.boxShadow = "none";
-          e.currentTarget.style.transform = "none";
-        }}
-      >
-      {isProcessingGlow && (
-        <div className="task-card-comet-runner" aria-hidden="true">
-          <span className="task-card-comet-tail" />
-        </div>
-      )}
-      {/* Priority accent */}
-      <div style={{ height: compact ? 2 : 3, background: isProcessingGlow ? "transparent" : `linear-gradient(90deg, ${pcfg.color}, ${pcfg.color}50)` }} />
-
-      <div style={{ padding: compact ? "6px 10px" : "10px 12px" }}>
-        {/* Header: avatar + title + id */}
-        <div style={{ display: "flex", alignItems: "flex-start", gap: compact ? 6 : 8, marginBottom: compact ? 2 : 4 }}>
-          {(isAI || task.assignee_id) && (
+      draggable
+      role="button"
+      tabIndex={0}
+      aria-label={`${t("component.workspace_chat.view_task")}: ${task.title}`}
+      title={t("component.workspace_chat.view_task")}
+      onDragStart={handleDragStart}
+      onDragEnd={handleDragEnd}
+      onClick={onClick}
+      onKeyDown={handleKeyDown}
+      className={`task-board-card${isProcessingGlow ? " task-card-ai-processing is-processing" : ""}${dimmed ? " is-dimmed" : ""}${compact ? " is-compact" : ""}${grouped ? " is-workspace-child" : ""}`}
+      style={{ "--task-priority": pcfg.color } as React.CSSProperties}
+    >
+      <div className="task-board-card-body">
+        <div className="task-board-card-header">
+          <span className={`task-board-card-avatar-shell${isProcessingGlow ? " is-running" : ""}`}>
             <UserAvatar
-              type={isMaster ? "manor" : isAI ? "agent" : "user"}
+              type={isMaster ? "manor" : isAI ? "agent" : task.assignee_id ? "user" : "none"}
               name={assigneeName}
               avatarUrl={assigneeAvatar}
               seed={isAI ? task.agent_id || task.assignee_id || undefined : undefined}
-              size={compact ? 18 : 22}
-              style={!isAI ? {
-                background: "var(--task-board-avatar-bg, linear-gradient(135deg, #e8eff4, #ddd6fe))",
-                borderColor: "var(--task-board-avatar-border, rgba(255,255,255,0.8))",
-                color: "var(--task-board-avatar-fg, #78716c)",
-              } : undefined}
+              size={compact ? 20 : 22}
             />
-          )}
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <p className="task-board-card-title" style={{
-              fontSize: compact ? 12 : 13, fontWeight: 600, color: dimmed ? "#a8a29e" : "#1c1917",
-              lineHeight: 1.35, margin: 0, textDecoration: dimmed ? "line-through" : "none",
-              display: "-webkit-box", WebkitLineClamp: compact ? 1 : 2,
-              WebkitBoxOrient: "vertical" as const, overflow: "hidden",
-            }}>
+            {isProcessingGlow && <span className="task-board-card-avatar-pulse" aria-hidden="true" />}
+          </span>
+          <div className="task-board-card-heading">
+            <p className="task-board-card-title">
               {formatUserFacingText(task.title)}
             </p>
             {assigneeName && (
-              <p className="task-board-card-assignee" style={{ fontSize: 10, color: isAI ? "#436b65" : "#a8a29e", margin: "1px 0 0", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <p className={`task-board-card-assignee${isAI ? " is-agent" : ""}`}>
                 {assigneeName}
               </p>
             )}
           </div>
-          <span className="task-board-card-id" style={{ fontSize: 9, color: "#d6d3d1", fontFamily: "monospace", flexShrink: 0, marginTop: compact ? 1 : 3 }}>#{task.id.slice(-4)}</span>
+          <button
+            type="button"
+            className="task-board-card-open"
+            title={t("page.tasks.open_full_view")}
+            aria-label={t("page.tasks.open_full_view")}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenFull();
+            }}
+          >
+            <IconChevronRight size={13} />
+          </button>
         </div>
 
-        {/* Scope badge */}
-        {scopeName && (
-          <span className="task-board-card-scope" style={{
-            display: "inline-flex", alignItems: "center", gap: 3,
-            fontSize: 9, fontWeight: 600, color: scopeIsEntityLevel ? "#57534e" : "#436b65",
-            background: scopeIsEntityLevel ? "#fafaf9" : "#f5f5f4", padding: "1px 6px", borderRadius: 4,
-            marginBottom: compact ? 2 : 4, maxWidth: "100%",
-            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-          }}>
-            <span className="task-board-card-scope-dot" style={{ width: 4, height: 4, borderRadius: "50%", background: scopeIsEntityLevel ? "#a8a29e" : "#5f928a", flexShrink: 0 }} />
-            {scopeName}
+        <div className="task-board-card-context">
+          {scopeName && !grouped && (
+            <span className={`task-board-card-scope${scopeIsEntityLevel ? " is-entity" : ""}`}>
+              <IconWorkspace size={10} />
+              <span>{scopeName}</span>
+            </span>
+          )}
+          <span className="task-board-card-status">
+            {isProcessingGlow ? (
+              <>
+                <span style={{ background: "#4f9c84" }} />
+                {t("page.dashboard.running_now")}
+                <span className="task-board-running-dots" aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+              </>
+            ) : (
+              <>
+                <span style={{ background: statusConfig?.color || "#a8a29e" }} />
+                {statusLabel}
+              </>
+            )}
           </span>
-        )}
-
-        {/* Description — hidden in compact mode */}
-        {!compact && task.description && !dimmed && (
-          <p className="task-board-card-description" style={{ fontSize: 11, color: "#78716c", margin: "0 0 6px", lineHeight: 1.4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {formatUserFacingText(task.description)}
-          </p>
-        )}
-
-        {/* Tags — compact mode: only priority + overdue */}
-        <div style={{ display: "flex", alignItems: "center", gap: 3, flexWrap: "wrap", marginBottom: compact ? 0 : 6 }}>
-          <PriorityPill priority={task.priority} size="sm" />
-          {!compact && <CategoryChip categoryKey={task.category_id} size="sm" />}
-          {overdue && (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 9, fontWeight: 700, color: "#c14a44", padding: "2px 7px", borderRadius: 20, background: "#f8f0ef" }}>
-              <IconClock size={8} /> {t("page.task_detail.overdue")}
-            </span>
-          )}
-          {dependencyInfo && <DependencyStatusPill info={dependencyInfo} compact={compact} />}
-          {!compact && aiResult?.supervisor_verdict?.verdict && (
-            <StatusPill
-              label={formatUserFacingLabel(aiResult.supervisor_verdict.verdict)}
-              color={aiResult.supervisor_verdict.verdict === "done" ? "#059669" : aiResult.supervisor_verdict.verdict === "failed" ? "#dc2626" : "#d97706"}
-              bg={aiResult.supervisor_verdict.verdict === "done" ? "#d1fae5" : aiResult.supervisor_verdict.verdict === "failed" ? "#fee2e2" : "#fef3c7"}
-              size="sm"
-            />
-          )}
-          {compact && (
-            <StatusPill status={task.status} size="sm" />
-          )}
-          {compact && task.deadline && (
-            <span style={{ fontSize: 9, color: overdue ? "#d65f59" : "#a8a29e", fontWeight: 500 }}>
-              {formatDate(task.deadline)}
-            </span>
-          )}
         </div>
 
-        {/* Checklist — hidden in compact */}
         {!compact && hasChecklist && (
-          <div style={{ marginBottom: 8 }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 3 }}>
-              <span style={{ fontSize: 10, color: "#78716c", fontWeight: 500 }}>{t("page.tasks.checklist")}</span>
-              <span style={{ fontSize: 10, fontWeight: 700, color: checkDone === checkTotal ? "#437f6b" : "#57534e" }}>{checkDone}/{checkTotal}</span>
-            </div>
-            <div style={{ height: 4, borderRadius: 2, background: "#f5f5f4" }}>
-              <div style={{ height: "100%", borderRadius: 2, background: checkDone === checkTotal ? "#4f9c84" : "linear-gradient(90deg, #436b65, #5f928a)", width: `${(checkDone / checkTotal) * 100}%`, transition: "width 0.4s ease" }} />
-            </div>
+          <div className="task-board-card-progress">
+            <IconCheckCircle size={10} />
+            <span>{checkDone}/{checkTotal}</span>
           </div>
         )}
 
-        {/* Footer — hidden in compact (info merged into tags row) */}
-        {!compact && (
-          <div className="task-board-card-footer" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: 6, borderTop: "1px solid rgba(245,245,244,0.8)" }}>
-            <StatusPill status={task.status} size="sm" />
-            {task.deadline ? (
-              <span className="task-board-card-deadline" style={{ fontSize: 10, color: overdue ? "#d65f59" : "#a8a29e", fontWeight: 500, display: "flex", alignItems: "center", gap: 3 }}>
-                <IconClock size={9} />
+        <div className="task-board-card-footer">
+          <div className="task-board-card-footer-meta">
+            <span className="task-board-card-priority-label">
+              <IconFlag size={10} />
+              {pcfg.label}
+            </span>
+            {overdue && (
+              <span className="task-board-card-overdue">
+                <IconWarning size={10} />
+                {t("page.task_detail.overdue")}
+              </span>
+            )}
+            {!overdue && task.deadline && (
+              <span className="task-board-card-due">
+                <IconClock size={10} />
                 {formatDate(task.deadline)}
               </span>
-            ) : (
-              <span className="task-board-card-no-deadline" style={{ fontSize: 10, color: "#e7e5e4" }}>{t("page.tasks.no_deadline")}</span>
             )}
+            {dependencyInfo && <DependencyStatusPill info={dependencyInfo} compact />}
           </div>
-        )}
+          <span className="task-board-card-id">#{task.id.slice(-4)}</span>
+        </div>
       </div>
     </div>
   );
 }
 
-const _COLLAPSIBLE = new Set(["done"]);
+const _COLLAPSIBLE = new Set<string>();
 
 function taskDoneDate(task: Task): Date | null {
   const raw = task.completed_at || (task as any).updated_at || task.created_at || "";
@@ -668,6 +816,171 @@ function compareDoneTasks(a: Task, b: Task): number {
   if (bTime !== aTime) return bTime - aTime;
   if ((b.priority || 0) !== (a.priority || 0)) return (b.priority || 0) - (a.priority || 0);
   return (b.title || "").localeCompare(a.title || "");
+}
+
+function compareBoardTasks(a: Task, b: Task): number {
+  const aOverdue = isDeadlineOverdue(a.deadline, a.status) ? 1 : 0;
+  const bOverdue = isDeadlineOverdue(b.deadline, b.status) ? 1 : 0;
+  if (aOverdue !== bOverdue) return bOverdue - aOverdue;
+  if ((a.priority || 0) !== (b.priority || 0)) return (b.priority || 0) - (a.priority || 0);
+
+  const aDue = a.scheduled_at || a.deadline;
+  const bDue = b.scheduled_at || b.deadline;
+  if (aDue || bDue) {
+    if (!aDue) return 1;
+    if (!bDue) return -1;
+    const aTime = new Date(aDue).getTime();
+    const bTime = new Date(bDue).getTime();
+    if (!Number.isNaN(aTime) && !Number.isNaN(bTime) && aTime !== bTime) return aTime - bTime;
+  }
+
+  const aCreated = a.created_at ? new Date(a.created_at).getTime() : 0;
+  const bCreated = b.created_at ? new Date(b.created_at).getTime() : 0;
+  return bCreated - aCreated;
+}
+
+type TaskListSortKey = "ticket" | "workspace" | "owner" | "status" | "priority" | "due" | "created";
+type TaskListSortDirection = "asc" | "desc";
+type TaskListSortState = { key: TaskListSortKey; direction: TaskListSortDirection };
+
+const DEFAULT_TASK_LIST_SORT: TaskListSortState = { key: "created", direction: "desc" };
+const TASK_LIST_SORT_LABELS: Record<TaskListSortKey, string> = {
+  ticket: "Ticket",
+  workspace: "Workspace",
+  owner: "Owner",
+  status: "Status",
+  priority: "Priority",
+  due: "Due",
+  created: "Created",
+};
+
+function defaultTaskListSortDirection(key: TaskListSortKey): TaskListSortDirection {
+  return key === "created" || key === "priority" ? "desc" : "asc";
+}
+
+function taskDateValue(raw?: string | null): number | null {
+  if (!raw) return null;
+  const value = new Date(raw).getTime();
+  return Number.isNaN(value) ? null : value;
+}
+
+function taskCreatedValue(task: Task): number | null {
+  return taskDateValue(task.created_at);
+}
+
+function taskDueValue(task: Task): number | null {
+  return taskDateValue(task.deadline || task.scheduled_at || null);
+}
+
+function compareNullableNumber(
+  aValue: number | null,
+  bValue: number | null,
+  direction: TaskListSortDirection,
+): number {
+  const aMissing = aValue === null;
+  const bMissing = bValue === null;
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  const delta = aValue - bValue;
+  return direction === "asc" ? delta : -delta;
+}
+
+function compareTaskListFallback(a: Task, b: Task): number {
+  const created = compareNullableNumber(taskCreatedValue(a), taskCreatedValue(b), "desc");
+  if (created !== 0) return created;
+  return (a.title || "").localeCompare(b.title || "");
+}
+
+function taskListOwnerName(task: Task, currentUser?: any, agentById?: Map<string, any>): string {
+  const isMaster = isMasterAgent(task.agent_id, task.agent_type);
+  const agentId = task.agent_id || (isMaster ? MANOR_AGENT_ID : "");
+  const agent = agentId && agentById ? agentById.get(agentId) : null;
+  const isAI = Boolean(task.agent_id || isMaster);
+  return isAI
+    ? task.agent_name || agent?.name || (isMaster ? MANOR_AGENT_NAME : t("page.tasks.ai_agent"))
+    : task.assignee_name
+      || (task.assignee_id === currentUser?.id ? currentUser?.display_name || currentUser?.email : "")
+      || "Unassigned";
+}
+
+function taskListWorkspaceName(task: Task, wsMap?: Record<string, string>): string {
+  return (task.workspace_id && wsMap?.[task.workspace_id])
+    || task.workspace_name
+    || "Entity-level";
+}
+
+function compareTaskListItems(
+  a: Task,
+  b: Task,
+  sort: TaskListSortState,
+  context: { currentUser?: any; agentById?: Map<string, any>; wsMap?: Record<string, string> },
+): number {
+  let result = 0;
+  if (sort.key === "ticket") {
+    result = (a.title || "").localeCompare(b.title || "");
+  } else if (sort.key === "workspace") {
+    result = taskListWorkspaceName(a, context.wsMap).localeCompare(taskListWorkspaceName(b, context.wsMap));
+  } else if (sort.key === "owner") {
+    result = taskListOwnerName(a, context.currentUser, context.agentById).localeCompare(taskListOwnerName(b, context.currentUser, context.agentById));
+  } else if (sort.key === "status") {
+    const aOrder = TASK_STATUSES[a.status]?.order ?? 999;
+    const bOrder = TASK_STATUSES[b.status]?.order ?? 999;
+    result = aOrder - bOrder || (TASK_STATUSES[a.status]?.label || a.status).localeCompare(TASK_STATUSES[b.status]?.label || b.status);
+  } else if (sort.key === "priority") {
+    result = (a.priority || 0) - (b.priority || 0);
+  } else if (sort.key === "due") {
+    result = compareNullableNumber(taskDueValue(a), taskDueValue(b), sort.direction);
+  } else {
+    result = compareNullableNumber(taskCreatedValue(a), taskCreatedValue(b), sort.direction);
+  }
+
+  if (sort.key !== "due" && sort.key !== "created" && sort.direction === "desc") result *= -1;
+  if (result !== 0) return result;
+  return compareTaskListFallback(a, b);
+}
+
+function taskStatusBadgeType(task: Task): string {
+  if (task.status === "failed" || task.status === "blocked" || isDeadlineOverdue(task.deadline, task.status)) return "danger";
+  if (task.status === "waiting_on_customer" || task.status === "on_hold") return "warning";
+  if (task.status === "in_progress") return "teal";
+  if (task.status === "completed") return "success";
+  if (task.status === "cancelled") return "gray";
+  return "info";
+}
+
+function taskDueText(task: Task): { label: string; overdue: boolean } {
+  const raw = task.deadline || task.scheduled_at || "";
+  if (!raw) return { label: "No due", overdue: false };
+  return {
+    label: formatDate(raw),
+    overdue: isDeadlineOverdue(task.deadline, task.status),
+  };
+}
+
+function taskCreatedText(task: Task): string {
+  return task.created_at ? formatDate(task.created_at) : "Unknown";
+}
+
+type WorkspaceTaskGroup = {
+  name: string;
+  workspace?: Workspace | null;
+  tasks: Task[];
+  overdue: number;
+  highPriority: number;
+  attention: number;
+};
+
+function summarizeWorkspaceTasks(tasks: Task[]): Omit<WorkspaceTaskGroup, "name" | "tasks"> {
+  return tasks.reduce(
+    (summary, task) => {
+      if (isDeadlineOverdue(task.deadline, task.status)) summary.overdue += 1;
+      if ((task.priority || 0) >= 4) summary.highPriority += 1;
+      if (COLUMN_META.review.statuses.includes(task.status)) summary.attention += 1;
+      return summary;
+    },
+    { overdue: 0, highPriority: 0, attention: 0 },
+  );
 }
 
 function isRecentDoneTask(task: Task): boolean {
@@ -1364,26 +1677,38 @@ function KanbanColumn({
   agents,
   tasks,
   onDrop,
+  onColumnDragStart,
+  onColumnDragOver,
+  onColumnDragEnd,
+  onColumnDrop,
   onCardClick,
   onOpenTask,
   dragOver,
+  columnDragOver,
   onDragEnter,
   onDragLeave,
   wsMap,
+  workspaceById,
   totalCount,
   filtersActive,
   workspaceScoped,
 }: {
-  status: string;
+  status: BoardColumnKey;
   tasks: Task[];
   agents?: any[];
   onDrop: (taskId: string) => void;
+  onColumnDragStart: (key: BoardColumnKey) => void;
+  onColumnDragOver: (key: BoardColumnKey) => void;
+  onColumnDragEnd: () => void;
+  onColumnDrop: (source: BoardColumnKey, target: BoardColumnKey, placement?: "before" | "after") => void;
   onCardClick: (task: Task) => void;
   onOpenTask: (task: Task) => void;
   dragOver: boolean;
+  columnDragOver: boolean;
   onDragEnter: () => void;
   onDragLeave: () => void;
   wsMap?: Record<string, string>;
+  workspaceById?: Record<string, Workspace>;
   totalCount?: number;
   filtersActive?: boolean;
   workspaceScoped?: boolean;
@@ -1391,13 +1716,16 @@ function KanbanColumn({
   const meta = COLUMN_META[status] ?? { label: status, dot: "#a8a29e", headerBg: "rgba(168,162,158,0.08)", statuses: [], Icon: IconCircleDot };
   const canCollapse = _COLLAPSIBLE.has(status);
   const isDone = status === "done";
+  const isSecondary = status === "scheduled" || status === "done";
   const [collapsed, setCollapsed] = useState(() => canCollapse);
   const [showAllDone, setShowAllDone] = useState(false);
-  const PAGE_SIZE = 20;
+  const PAGE_SIZE = 8;
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [expandedWorkspaceGroups, setExpandedWorkspaceGroups] = useState<Set<string>>(() => new Set());
+  const [standaloneExpanded, setStandaloneExpanded] = useState(false);
   const doneBoardManaged = isDone && !filtersActive;
   const orderedTasks = useMemo(
-    () => isDone ? [...tasks].sort(compareDoneTasks) : tasks,
+    () => [...tasks].sort(isDone ? compareDoneTasks : compareBoardTasks),
     [isDone, tasks],
   );
   const recentDoneTasks = useMemo(
@@ -1405,11 +1733,53 @@ function KanbanColumn({
     [orderedTasks],
   );
   const displayTasks = doneBoardManaged && !showAllDone ? recentDoneTasks : orderedTasks;
+  const columnTotal = totalCount ?? displayTasks.length;
+  const largeColumnMode = !workspaceScoped && !filtersActive && columnTotal >= LARGE_BOARD_COLUMN_THRESHOLD;
+  const focusTasks = largeColumnMode ? displayTasks.slice(0, LARGE_BOARD_FOCUS_COUNT) : [];
+  const focusTaskIds = useMemo(() => new Set(focusTasks.map((task) => task.id)), [focusTasks]);
   const visibleTasks = displayTasks.slice(0, visibleCount);
-  const hasMore = displayTasks.length > visibleCount;
+  const hasMore = !largeColumnMode && displayTasks.length > visibleCount;
   const hiddenDoneCount = doneBoardManaged && !showAllDone
     ? Math.max(0, (totalCount ?? orderedTasks.length) - displayTasks.length)
     : 0;
+  const workspaceTaskGroups = useMemo(() => {
+    if (workspaceScoped) return [];
+    const groups = new Map<string, WorkspaceTaskGroup>();
+    const groupSource = largeColumnMode ? displayTasks : visibleTasks;
+    groupSource.forEach((task) => {
+      const key = task.workspace_id || task.workspace_name || "";
+      if (!key) return;
+      const workspace = task.workspace_id ? workspaceById?.[task.workspace_id] : undefined;
+      const name = workspace?.name || (task.workspace_id && wsMap?.[task.workspace_id]) || task.workspace_name || t("nav.workspaces");
+      const group = groups.get(key) || { name, workspace, tasks: [], overdue: 0, highPriority: 0, attention: 0 };
+      if (!group.workspace && workspace) group.workspace = workspace;
+      group.tasks.push(task);
+      if (isDeadlineOverdue(task.deadline, task.status)) group.overdue += 1;
+      if ((task.priority || 0) >= 4) group.highPriority += 1;
+      if (COLUMN_META.review.statuses.includes(task.status)) group.attention += 1;
+      groups.set(key, group);
+    });
+    return [...groups.entries()].sort(([, a], [, b]) => {
+      if (largeColumnMode) {
+        const aScore = a.overdue * 5 + a.attention * 3 + a.highPriority * 2 + a.tasks.length;
+        const bScore = b.overdue * 5 + b.attention * 3 + b.highPriority * 2 + b.tasks.length;
+        if (aScore !== bScore) return bScore - aScore;
+      }
+      return b.tasks.length - a.tasks.length;
+    });
+  }, [displayTasks, largeColumnMode, visibleTasks, workspaceById, workspaceScoped, wsMap]);
+  const groupedTaskIds = useMemo(
+    () => new Set(workspaceTaskGroups.flatMap(([, group]) => group.tasks.map((task) => task.id))),
+    [workspaceTaskGroups],
+  );
+  const standaloneSource = largeColumnMode
+    ? displayTasks.filter((task) => !focusTaskIds.has(task.id) && !groupedTaskIds.has(task.id))
+    : visibleTasks.filter((task) => !groupedTaskIds.has(task.id));
+  const standaloneTasks = largeColumnMode && !standaloneExpanded
+    ? standaloneSource.slice(0, LARGE_BOARD_GROUP_PREVIEW_COUNT)
+    : standaloneSource;
+  const hiddenStandaloneCount = Math.max(0, standaloneSource.length - standaloneTasks.length);
+  const columnSummary = useMemo(() => summarizeWorkspaceTasks(displayTasks), [displayTasks]);
 
   useEffect(() => {
     if (canCollapse && filtersActive && tasks.length > 0) {
@@ -1425,6 +1795,7 @@ function KanbanColumn({
 
   useEffect(() => {
     setVisibleCount(PAGE_SIZE);
+    setStandaloneExpanded(false);
   }, [status, showAllDone, filtersActive, tasks.length]);
 
   useEffect(() => {
@@ -1435,157 +1806,120 @@ function KanbanColumn({
 
   const handleDrop = useCallback(
     (e: DragEvent<HTMLDivElement>) => {
+      if (!dataTransferHasType(e.dataTransfer.types, "taskId")) return;
       e.preventDefault();
       const taskId = e.dataTransfer.getData("taskId");
       if (taskId) onDrop(taskId);
       onDragLeave();
     },
-    [onDrop, status, onDragLeave],
+    [onDrop, onDragLeave],
   );
 
   const handleDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
+    if (!dataTransferHasType(e.dataTransfer.types, "taskId")) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
   }, []);
 
+  const handleDragEnter = useCallback((e: DragEvent<HTMLDivElement>) => {
+    if (dataTransferHasType(e.dataTransfer.types, "taskId")) onDragEnter();
+  }, [onDragEnter]);
+
+  const handleDragLeave = useCallback((e: DragEvent<HTMLDivElement>) => {
+    if (dataTransferHasType(e.dataTransfer.types, "taskId")) onDragLeave();
+  }, [onDragLeave]);
+
+  const handleColumnDragStart = useCallback((e: DragEvent<HTMLDivElement>) => {
+    e.dataTransfer.setData("boardColumnKey", status);
+    e.dataTransfer.effectAllowed = "move";
+    onColumnDragStart(status);
+  }, [onColumnDragStart, status]);
+
+  const handleColumnDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
+    if (!dataTransferHasType(e.dataTransfer.types, "boardColumnKey")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "move";
+    onColumnDragOver(status);
+  }, [onColumnDragOver, status]);
+
+  const handleColumnDrop = useCallback((e: DragEvent<HTMLDivElement>) => {
+    const source = e.dataTransfer.getData("boardColumnKey") || e.dataTransfer.getData("boardcolumnkey");
+    if (!source || !isBoardColumnKey(source)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const placement = e.clientX > rect.left + rect.width / 2 ? "after" : "before";
+    onColumnDrop(source, status, placement);
+  }, [onColumnDrop, status]);
+
   return (
     <div
-      className="task-board-column"
+      className={`task-board-column${collapsed ? " is-collapsed" : ""}${dragOver ? " is-drag-over" : ""}${columnDragOver ? " is-column-drag-over" : ""}${isDone ? " is-done" : ""}${isSecondary ? " is-secondary" : ""}`}
       title={canCollapse ? `${meta.label} · ${totalCount ?? tasks.length}` : undefined}
       style={{
-        flex: collapsed ? "0 0 56px" : "1 0 280px",
-        width: collapsed ? 56 : "auto",
-        minWidth: collapsed ? 56 : 280,
-        maxWidth: collapsed ? 56 : 420,
-        background: dragOver
-          ? "rgba(255, 255, 254, 0.86)"
-          : isDone
-            ? "linear-gradient(180deg, rgba(255,255,255,0.74), rgba(255,254,252,0.58))"
-            : "linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,254,252,0.66))",
-        backdropFilter: "blur(18px) saturate(1.08)",
-        WebkitBackdropFilter: "blur(18px) saturate(1.08)",
-        borderRadius: 18,
-        border: dragOver ? "2px dashed rgba(79,125,117,0.24)" : "1px solid rgba(117,96,66,0.07)",
-        transition: "all 0.25s cubic-bezier(0.4,0,0.2,1)",
-        display: "flex",
-        flexDirection: "column",
-        height: "100%",
-        minHeight: 0,
-        overflow: "hidden",
-        boxShadow: dragOver
-          ? "0 0 0 4px rgba(79,125,117,0.04)"
-          : "inset 0 1px 0 rgba(255,255,255,0.92), inset 0 -1px 0 rgba(255,255,254,0.48)",
-      }}
+        "--task-column-accent": meta.dot,
+        "--task-column-tint": meta.headerBg,
+      } as React.CSSProperties}
       onDragOver={handleDragOver}
-      onDragEnter={onDragEnter}
-      onDragLeave={onDragLeave}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Column header */}
       <div
         className="task-board-column-header"
+        draggable
+        onDragStart={handleColumnDragStart}
+        onDragOver={handleColumnDragOver}
+        onDrop={handleColumnDrop}
+        onDragEnd={onColumnDragEnd}
         onClick={canCollapse ? () => setCollapsed(!collapsed) : undefined}
         onKeyDown={canCollapse ? (event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            setCollapsed(!collapsed);
+            setCollapsed((value) => !value);
           }
         } : undefined}
         role={canCollapse ? "button" : undefined}
         tabIndex={canCollapse ? 0 : undefined}
-        aria-expanded={canCollapse ? !collapsed : undefined}
-        style={{
-          display: "flex",
-          flexDirection: collapsed ? "column" : "row",
-          alignItems: "center",
-          justifyContent: collapsed ? "center" : "space-between",
-          gap: collapsed ? 6 : 0,
-          width: "100%",
-          boxSizing: "border-box",
-          padding: collapsed ? "10px 6px" : "10px 14px",
-          borderRadius: collapsed ? 18 : "18px 18px 0 0",
-          background: meta.headerBg,
-          cursor: canCollapse ? "pointer" : "default",
-          userSelect: "none",
-          borderBottom: collapsed ? "none" : "1px solid rgba(231,229,228,0.3)",
-        }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-          {/* Per-column glyph — picked from STATUS_CONFIG family so the
-              header reads at a glance even when collapsed. Keeps the
-              colored dot below it for the brand colour stripe. */}
-          <span style={{
-            width: 22, height: 22, borderRadius: 6, background: `${meta.dot}1a`,
-            color: meta.dot, flexShrink: 0,
-            display: "flex", alignItems: "center", justifyContent: "center",
-          }}>
+        <div className="task-board-column-heading">
+          <span className="task-board-column-icon">
             <meta.Icon size={13} />
           </span>
-          {!collapsed && <h3 className="task-board-column-title" style={{ fontWeight: 700, fontSize: 12, color: "#292524", margin: 0, letterSpacing: 0 }}>{meta.label}</h3>}
+          {!collapsed && <h3 className="task-board-column-title">{meta.label}</h3>}
         </div>
-        <span className="task-board-column-count" style={{
-          fontSize: 10, fontWeight: 700, color: "#57534e",
-          background: "rgba(255,255,255,0.7)", padding: collapsed ? "2px 5px" : "2px 8px", borderRadius: 10,
-          minWidth: 20, textAlign: "center" as const,
-          border: "1px solid rgba(28,25,23,0.06)",
-        }}>
-          {totalCount ?? tasks.length}
-        </span>
+        <div className="task-board-column-header-meta">
+          <span className="task-board-column-count">{totalCount ?? tasks.length}</span>
+          {canCollapse && (
+            <span className="task-board-column-toggle" aria-hidden="true">
+              {collapsed ? <IconChevronRight size={12} /> : <IconChevronDown size={12} />}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Collapsed state */}
       {collapsed && (
-        <button
-          type="button"
-          className="task-board-column-collapsed-label"
-          aria-label={`Expand ${meta.label}`}
-          onClick={() => setCollapsed(false)}
-          style={{
-            writingMode: "vertical-rl",
-            textOrientation: "mixed",
-            padding: "16px 0",
-            textAlign: "center",
-            fontSize: 11,
-            fontWeight: 600,
-            color: "#a8a29e",
-            flex: 1,
-            width: "100%",
-            border: 0,
-            background: "transparent",
-            cursor: "pointer",
-            letterSpacing: 0,
-          }}
-        >
+        <div className="task-board-column-collapsed-label">
           {meta.label}
-        </button>
+        </div>
       )}
 
       {/* Cards */}
       {!collapsed && (
-        <div style={{ display: "flex", flexDirection: "column", gap: visibleTasks.length > 4 ? 6 : 8, padding: "8px 8px 12px", flex: 1, minHeight: 0, overflowY: "auto", overscrollBehavior: "contain" }}>
+        <div className={`task-board-column-body${visibleTasks.length > 5 || largeColumnMode ? " is-dense" : ""}${largeColumnMode ? " is-large-mode" : ""}`}>
           {doneBoardManaged && (
-            <div
-              className="task-board-done-summary"
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                justifyContent: "space-between",
-                gap: 8,
-                padding: "9px 10px",
-                borderRadius: 12,
-                border: "1px solid rgba(79, 156, 132, 0.13)",
-                background: "rgba(250, 253, 251, 0.76)",
-                color: "#57534e",
-              }}
-            >
-              <div style={{ minWidth: 0 }}>
-                <div className="task-board-done-summary-title" style={{ fontSize: 11, fontWeight: 780, color: "#436b65", lineHeight: 1.35 }}>
+            <div className="task-board-done-summary">
+              <div className="task-board-done-summary-copy">
+                <div className="task-board-done-summary-title">
                   {showAllDone
                     ? t("page.tasks.done_showing_all")
                     : t("page.tasks.done_recent_window").replace("{days}", String(DONE_RECENT_WINDOW_DAYS))}
                 </div>
                 {!showAllDone && hiddenDoneCount > 0 && (
-                  <div className="task-board-done-summary-meta" style={{ marginTop: 3, fontSize: 10, color: "#8a8179", lineHeight: 1.35 }}>
+                  <div className="task-board-done-summary-meta">
                     {t("page.tasks.done_older_hidden").replace("{count}", String(hiddenDoneCount))}
                   </div>
                 )}
@@ -1593,36 +1927,123 @@ function KanbanColumn({
               <button
                 type="button"
                 onClick={(e) => { e.stopPropagation(); setShowAllDone((v) => !v); }}
-                style={{
-                  flexShrink: 0,
-                  height: 26,
-                  padding: "0 8px",
-                  borderRadius: 9,
-                  border: "1px solid rgba(79, 113, 105, 0.16)",
-                  background: "rgba(255,255,255,0.84)",
-                  color: "#4f7169",
-                  fontSize: 10,
-                  fontWeight: 760,
-                  cursor: "pointer",
-                }}
+                className="task-board-done-summary-action"
               >
                 {showAllDone ? t("page.tasks.show_recent_done") : t("page.tasks.show_all_done")}
               </button>
             </div>
           )}
           {displayTasks.length === 0 && (
-            <div className="task-board-empty" style={{
-              padding: "28px 14px", textAlign: "center", color: "#d6d3d1", fontSize: 12,
-              border: "2px dashed rgba(128,102,64,0.08)", borderRadius: 12,
-              background: "rgba(255,254,252,0.58)",
-            }}>
-              {doneBoardManaged && tasks.length > 0
-                ? t("page.tasks.no_recent_done")
-                : t("page.tasks.drop_tasks_here")}
+            <div className="task-board-empty">
+              <meta.Icon size={16} />
+              <span>
+                {doneBoardManaged && tasks.length > 0
+                  ? t("page.tasks.no_recent_done")
+                  : t("page.tasks.drop_tasks_here")}
+              </span>
             </div>
           )}
-          {visibleTasks.map((task) => {
-            const isCrowded = visibleTasks.length > 4;
+          {largeColumnMode && displayTasks.length > 0 && (
+            <div className="task-board-large-mode-summary">
+              <div>
+                <strong>{columnTotal}</strong>
+                <span>{workspaceTaskGroups.length} workspaces</span>
+              </div>
+              <div>
+                <strong>{columnSummary.overdue}</strong>
+                <span>overdue</span>
+              </div>
+              <div>
+                <strong>{columnSummary.highPriority}</strong>
+                <span>high priority</span>
+              </div>
+            </div>
+          )}
+          {largeColumnMode && focusTasks.length > 0 && (
+            <div className="task-board-focus-stack">
+              <div className="task-board-focus-label">Focus first</div>
+              {focusTasks.map((task) => (
+                <BoardTaskCard
+                  key={task.id}
+                  task={task}
+                  agents={agents}
+                  onClick={() => onCardClick(task)}
+                  onOpenFull={() => onOpenTask(task)}
+                  compact
+                  wsName={task.workspace_id && wsMap ? wsMap[task.workspace_id] : undefined}
+                  workspaceScoped={workspaceScoped}
+                />
+              ))}
+            </div>
+          )}
+          {workspaceTaskGroups.map(([groupKey, group]) => {
+            const expanded = expandedWorkspaceGroups.has(groupKey);
+            const groupTaskPreviewSource = largeColumnMode
+              ? group.tasks.filter((task) => !focusTaskIds.has(task.id))
+              : group.tasks;
+            const visibleGroupTasks = expanded
+              ? groupTaskPreviewSource.slice(0, largeColumnMode ? LARGE_BOARD_GROUP_PREVIEW_COUNT : group.tasks.length)
+              : largeColumnMode ? [] : group.tasks.slice(0, 2);
+            const hiddenGroupTasks = Math.max(0, group.tasks.length - visibleGroupTasks.length);
+            return (
+              <div key={groupKey} className={`task-board-workspace-group${expanded ? " is-expanded" : ""}${largeColumnMode ? " is-summary" : ""}`}>
+                <button
+                  type="button"
+                  className="task-board-workspace-group-trigger"
+                  onClick={() => setExpandedWorkspaceGroups((current) => {
+                    const next = new Set(current);
+                    if (next.has(groupKey)) next.delete(groupKey);
+                    else next.add(groupKey);
+                    return next;
+                  })}
+                  aria-expanded={expanded}
+                >
+                  <span className="task-board-workspace-group-icon">
+                    {group.workspace ? (
+                      <WorkspaceIconTile workspace={group.workspace} size={24} iconSize={12} style={{ borderRadius: 6 }} />
+                    ) : (
+                      <IconWorkspace size={12} />
+                    )}
+                  </span>
+                  <span className="task-board-workspace-group-copy">
+                    <strong>{group.name}</strong>
+                    <span>
+                      {group.tasks.length} {t("page.tasks.tasks")}
+                      {group.overdue > 0 ? ` · ${group.overdue} overdue` : ""}
+                      {group.attention > 0 ? ` · ${group.attention} attention` : ""}
+                    </span>
+                  </span>
+                  {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+                </button>
+                <div className="task-board-workspace-group-items">
+                  {visibleGroupTasks.map((task) => (
+                    <BoardTaskCard
+                      key={task.id}
+                      task={task}
+                      agents={agents}
+                      onClick={() => onCardClick(task)}
+                      onOpenFull={() => onOpenTask(task)}
+                      compact
+                      grouped
+                      wsName={task.workspace_id && wsMap ? wsMap[task.workspace_id] : undefined}
+                      workspaceScoped={workspaceScoped}
+                    />
+                  ))}
+                  {hiddenGroupTasks > 0 && (!largeColumnMode || expanded) && (
+                    <button
+                      type="button"
+                      className="task-board-workspace-group-more"
+                      onClick={() => setExpandedWorkspaceGroups((current) => new Set(current).add(groupKey))}
+                    >
+                      +{hiddenGroupTasks} more
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {standaloneTasks.map((task) => {
+            const isCrowded = visibleTasks.length > 5;
             return (
               <BoardTaskCard
                 key={task.id} task={task} agents={agents}
@@ -1635,24 +2056,158 @@ function KanbanColumn({
               />
             );
           })}
+          {largeColumnMode && hiddenStandaloneCount > 0 && (
+            <button
+              type="button"
+              className="task-board-workspace-group-more"
+              onClick={() => setStandaloneExpanded(true)}
+            >
+              +{hiddenStandaloneCount} more
+            </button>
+          )}
           {hasMore && (
             <button
               className="task-board-load-more"
               onClick={() => setVisibleCount((c) => c + PAGE_SIZE)}
-              style={{
-                padding: "8px 0", borderRadius: 10, border: "1px dashed rgba(128,102,64,0.09)",
-                background: "rgba(255,254,252,0.7)", cursor: "pointer",
-                fontSize: 11, fontWeight: 600, color: "#78716c",
-                transition: "all 0.15s",
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.82)"; e.currentTarget.style.color = "#436b65"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,254,252,0.7)"; e.currentTarget.style.color = "#78716c"; }}
             >
-              {t("page.team_people.show")} {Math.min(PAGE_SIZE, displayTasks.length - visibleCount)} {t("page.tasks.more")}{displayTasks.length - visibleCount} {t("page.tasks.remaining")}
+              Show {displayTasks.length - visibleCount} more
             </button>
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function TaskListView({
+  tasks,
+  totalCount,
+  sort,
+  onSortChange,
+  currentUser,
+  agentById,
+  wsMap,
+  onOpenTask,
+}: {
+  tasks: Task[];
+  totalCount: number;
+  sort: TaskListSortState;
+  onSortChange: (key: TaskListSortKey) => void;
+  currentUser?: any;
+  agentById: Map<string, any>;
+  wsMap: Record<string, string>;
+  onOpenTask: (task: Task) => void;
+}) {
+  const shownText = totalCount > tasks.length
+    ? `${tasks.length} shown of ${totalCount}`
+    : `${tasks.length} tickets`;
+  const sortDescription = sort.key === "created" && sort.direction === "desc"
+    ? "Newest tickets first"
+    : `Sorted by ${TASK_LIST_SORT_LABELS[sort.key].toLowerCase()} ${sort.direction === "asc" ? "ascending" : "descending"}`;
+  const renderSortHeader = (key: TaskListSortKey) => {
+    const active = sort.key === key;
+    return (
+      <button
+        type="button"
+        className={`task-list-sort-header${active ? " is-active" : ""}`}
+        onClick={() => onSortChange(key)}
+        aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}
+        title={`Sort by ${TASK_LIST_SORT_LABELS[key]}`}
+      >
+        <span>{TASK_LIST_SORT_LABELS[key]}</span>
+        <IconChevronDown
+          className={`task-list-sort-icon${active && sort.direction === "asc" ? " is-ascending" : ""}`}
+          size={12}
+        />
+      </button>
+    );
+  };
+
+  if (tasks.length === 0) {
+    return (
+      <div className="task-list-view">
+        <EmptyState title={t("page.tasks.no_tasks_found")} description={t("page.tasks.create_to_get_started")} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="task-list-view">
+      <div className="task-list-toolbar">
+        <div>
+          <strong>{shownText}</strong>
+          <span>{sortDescription}</span>
+        </div>
+      </div>
+      <div className="task-list-table" role="table" aria-label="Tasks list">
+        <div className="task-list-row task-list-row--header" role="row">
+          {renderSortHeader("ticket")}
+          {renderSortHeader("workspace")}
+          {renderSortHeader("owner")}
+          {renderSortHeader("status")}
+          {renderSortHeader("priority")}
+          {renderSortHeader("due")}
+          {renderSortHeader("created")}
+        </div>
+        {tasks.map((task) => {
+          const isMaster = isMasterAgent(task.agent_id, task.agent_type);
+          const agentId = task.agent_id || (isMaster ? MANOR_AGENT_ID : "");
+          const agent = agentId ? agentById.get(agentId) : null;
+          const isAI = Boolean(task.agent_id || isMaster);
+          const ownerName = isAI
+            ? task.agent_name || agent?.name || (isMaster ? MANOR_AGENT_NAME : t("page.tasks.ai_agent"))
+            : task.assignee_name
+              || (task.assignee_id === currentUser?.id ? currentUser?.display_name || currentUser?.email : "")
+              || "Unassigned";
+          const ownerAvatar = isAI
+            ? task.agent_avatar || agent?.avatar_url || null
+            : task.assignee_avatar || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null) || null;
+          const workspaceName = taskListWorkspaceName(task, wsMap);
+          const statusLabel = TASK_STATUSES[task.status]?.label || formatUserFacingLabel(task.status);
+          const due = taskDueText(task);
+          return (
+            <div
+              key={task.id}
+              className="task-list-row"
+              role="button"
+              tabIndex={0}
+              onClick={() => onOpenTask(task)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onOpenTask(task);
+                }
+              }}
+            >
+              <div className="task-list-ticket-cell">
+                <UserAvatar
+                  type={isMaster ? "manor" : isAI ? "agent" : task.assignee_id ? "user" : "none"}
+                  name={ownerName}
+                  avatarUrl={ownerAvatar}
+                  seed={isAI ? agentId || undefined : undefined}
+                  size={22}
+                />
+                <div>
+                  <strong>{formatUserFacingText(task.title)}</strong>
+                  <span>#{task.id.slice(-4)} · Created {taskCreatedText(task)}</span>
+                </div>
+              </div>
+              <div className="task-list-muted-cell">{workspaceName}</div>
+              <div className="task-list-owner-cell">
+                <span>{ownerName}</span>
+              </div>
+              <div>
+                <StatusBadge type={taskStatusBadgeType(task)} dot>
+                  {statusLabel}
+                </StatusBadge>
+              </div>
+              <div className="task-list-priority-cell">P{task.priority || 0}</div>
+              <div className={`task-list-due-cell${due.overdue ? " is-overdue" : ""}`}>{due.label}</div>
+              <div className="task-list-muted-cell">{taskCreatedText(task)}</div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1668,10 +2223,80 @@ export default function Tasks() {
   const currentUser = useAuthStore((s) => s.user);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [initialTaskBoardPreferences] = useState(() =>
+    loadLocalTaskBoardPreferences(currentUser?.id),
+  );
   const [view, setView] = useState("board");
+  const [boardMode, setBoardMode] = useState<"kanban" | "list">(
+    initialTaskBoardPreferences.mode,
+  );
+  const [taskListSort, setTaskListSort] = useState<TaskListSortState>(DEFAULT_TASK_LIST_SORT);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [dragOverCol, setDragOverCol] = useState<string | null>(null);
+  const [dragOverBoardColumn, setDragOverBoardColumn] = useState<BoardColumnKey | null>(null);
+  const [draggingBoardColumn, setDraggingBoardColumn] = useState<BoardColumnKey | null>(null);
+  const [visibleBoardColumns, setVisibleBoardColumns] = useState<Set<BoardColumnKey>>(
+    initialTaskBoardPreferences.visibleColumns,
+  );
+  const [boardColumnOrder, setBoardColumnOrder] = useState<BoardColumnKey[]>(
+    initialTaskBoardPreferences.columnOrder,
+  );
+  const [taskBoardPreferencesHydrated, setTaskBoardPreferencesHydrated] = useState(false);
+  const { data: storedTaskBoardPreferences } = useQuery({
+    queryKey: ["task-board-preferences", currentUser?.id],
+    queryFn: () => api.tasks.getBoardPreferences(),
+    enabled: Boolean(currentUser?.id),
+  });
+  useEffect(() => {
+    setTaskBoardPreferencesHydrated(false);
+    const localPreferences = loadLocalTaskBoardPreferences(currentUser?.id);
+    setBoardMode(localPreferences.mode);
+    setVisibleBoardColumns(localPreferences.visibleColumns);
+    setBoardColumnOrder(localPreferences.columnOrder);
+  }, [currentUser?.id]);
+  useEffect(() => {
+    if (!currentUser?.id || !storedTaskBoardPreferences) return;
+    if (storedTaskBoardPreferences.configured) {
+      const remoteVisibleColumns = storedTaskBoardPreferences.visible_columns.filter(
+        (key): key is BoardColumnKey => isBoardColumnKey(key),
+      );
+      setBoardMode(storedTaskBoardPreferences.mode);
+      setVisibleBoardColumns(new Set(
+        remoteVisibleColumns.length > 0 ? remoteVisibleColumns : BOARD_COLUMNS,
+      ));
+      setBoardColumnOrder(normalizeBoardColumnOrder(storedTaskBoardPreferences.column_order));
+    }
+    setTaskBoardPreferencesHydrated(true);
+  }, [currentUser?.id, storedTaskBoardPreferences]);
+  useEffect(() => {
+    persistVisibleBoardColumns(currentUser?.id, visibleBoardColumns);
+  }, [currentUser?.id, visibleBoardColumns]);
+  useEffect(() => {
+    persistBoardColumnOrder(currentUser?.id, boardColumnOrder);
+  }, [boardColumnOrder, currentUser?.id]);
+  useEffect(() => {
+    persistTaskBoardMode(currentUser?.id, boardMode);
+  }, [boardMode, currentUser?.id]);
+  useEffect(() => {
+    if (!currentUser?.id || !taskBoardPreferencesHydrated) return;
+    const timeout = window.setTimeout(() => {
+      void api.tasks.updateBoardPreferences({
+        mode: boardMode,
+        visible_columns: BOARD_COLUMNS.filter((key) => visibleBoardColumns.has(key)),
+        column_order: normalizeBoardColumnOrder(boardColumnOrder),
+      }).catch(() => {
+        // Keep the user-scoped browser copy as an offline fallback.
+      });
+    }, 350);
+    return () => window.clearTimeout(timeout);
+  }, [
+    boardColumnOrder,
+    boardMode,
+    currentUser?.id,
+    taskBoardPreferencesHydrated,
+    visibleBoardColumns,
+  ]);
   // workspaceFilter now comes from global useWorkspaceFilter store (wsFilter)
   const [searchQuery, setSearchQuery] = useState("");
   const [priorityFilter, setPriorityFilter] = useState<number | null>(null);
@@ -1681,6 +2306,8 @@ export default function Tasks() {
   const [calendarMonth, setCalendarMonth] = useState(() => new Date());
   const wsId = useWorkspaceFilter((s) => s.activeWorkspaceId);
   const workspaceIdParam = searchParams.get("workspaceId") || searchParams.get("workspace_id") || "";
+  const previousWorkspaceIdParamRef = useRef<string | null>(null);
+  const suppressWorkspaceUrlWriteRef = useRef(false);
   const isEntityScopeFilter = workspaceIdParam === ENTITY_LEVEL_WORKSPACE_FILTER;
   const wsFilter = isEntityScopeFilter ? ENTITY_LEVEL_WORKSPACE_FILTER : wsId !== "all" ? wsId : undefined;
   const apiWorkspaceFilter = wsFilter === ENTITY_LEVEL_WORKSPACE_FILTER ? undefined : wsFilter;
@@ -1727,11 +2354,50 @@ export default function Tasks() {
   // WebSocket task_update events invalidate these queries live. Poll only while
   // a task is actively changing so idle task boards do not keep hitting the API.
   useEffect(() => {
-    const nextWorkspaceId = workspaceIdParam && workspaceIdParam !== ENTITY_LEVEL_WORKSPACE_FILTER ? workspaceIdParam : "all";
-    if (nextWorkspaceId !== wsId) {
+    const previousParam = previousWorkspaceIdParamRef.current;
+    previousWorkspaceIdParamRef.current = workspaceIdParam;
+    const shouldApplyUrlParam =
+      (previousParam === null && Boolean(workspaceIdParam)) ||
+      (previousParam !== null && previousParam !== workspaceIdParam);
+
+    if (!shouldApplyUrlParam) return;
+
+    const nextWorkspaceId =
+      workspaceIdParam && workspaceIdParam !== ENTITY_LEVEL_WORKSPACE_FILTER
+        ? workspaceIdParam
+        : "all";
+    suppressWorkspaceUrlWriteRef.current = true;
+    if (nextWorkspaceId !== useWorkspaceFilter.getState().activeWorkspaceId) {
       useWorkspaceFilter.getState().setActiveWorkspaceId(nextWorkspaceId);
     }
-  }, [workspaceIdParam, wsId]);
+  }, [workspaceIdParam]);
+
+  useEffect(() => {
+    if (suppressWorkspaceUrlWriteRef.current) {
+      if (
+        !workspaceIdParam ||
+        workspaceIdParam === wsId ||
+        (workspaceIdParam === ENTITY_LEVEL_WORKSPACE_FILTER && wsId === "all")
+      ) {
+        suppressWorkspaceUrlWriteRef.current = false;
+      }
+      return;
+    }
+
+    if (isEntityScopeFilter && wsId === "all") return;
+
+    const desiredWorkspaceParam = wsId !== "all" ? wsId : "";
+    if (workspaceIdParam === desiredWorkspaceParam) return;
+
+    const next = new URLSearchParams(searchParams);
+    if (desiredWorkspaceParam) {
+      next.set("workspaceId", desiredWorkspaceParam);
+    } else {
+      next.delete("workspaceId");
+    }
+    next.delete("workspace_id");
+    setSearchParams(next, { replace: true });
+  }, [isEntityScopeFilter, searchParams, setSearchParams, workspaceIdParam, wsId]);
 
   const setWorkspaceFilter = useCallback((id: string) => {
     useWorkspaceFilter.getState().setActiveWorkspaceId(id === ENTITY_LEVEL_WORKSPACE_FILTER ? "all" : id);
@@ -1747,6 +2413,59 @@ export default function Tasks() {
   }, [searchParams, setSearchParams]);
 
   const tasksPath = wsFilter ? `/tasks?workspaceId=${encodeURIComponent(wsFilter)}` : "/tasks";
+  const displayedBoardColumns = useMemo(
+    () => boardColumnOrder.filter((key) => visibleBoardColumns.has(key)),
+    [boardColumnOrder, visibleBoardColumns],
+  );
+  const toggleBoardColumn = useCallback((key: BoardColumnKey, visible: boolean) => {
+    setVisibleBoardColumns((current) => {
+      const next = new Set(current);
+      if (visible) {
+        next.add(key);
+      } else if (next.size > 1) {
+        next.delete(key);
+      }
+      return next;
+    });
+    if (!visible && statusFilter === key) {
+      setStatusFilter("all");
+    }
+  }, [statusFilter]);
+  const showAllBoardColumns = useCallback(() => {
+    const next = new Set<BoardColumnKey>(BOARD_COLUMNS);
+    setVisibleBoardColumns(next);
+  }, []);
+  const moveBoardColumn = useCallback((key: BoardColumnKey, direction: -1 | 1) => {
+    setBoardColumnOrder((current) => {
+      const normalized = normalizeBoardColumnOrder(current);
+      const index = normalized.indexOf(key);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= normalized.length) return normalized;
+      const next = [...normalized];
+      const [item] = next.splice(index, 1);
+      next.splice(nextIndex, 0, item);
+      return next;
+    });
+  }, []);
+  const reorderBoardColumn = useCallback((source: BoardColumnKey, target: BoardColumnKey, placement: "before" | "after" = "before") => {
+    if (source === target) {
+      setDragOverBoardColumn(null);
+      setDraggingBoardColumn(null);
+      return;
+    }
+    setBoardColumnOrder((current) => {
+      const normalized = normalizeBoardColumnOrder(current);
+      const withoutSource = normalized.filter((key) => key !== source);
+      const targetIndex = withoutSource.indexOf(target);
+      if (targetIndex < 0) return normalized;
+      const insertAt = placement === "after" ? targetIndex + 1 : targetIndex;
+      const next = [...withoutSource];
+      next.splice(insertAt, 0, source);
+      return next;
+    });
+    setDragOverBoardColumn(null);
+    setDraggingBoardColumn(null);
+  }, []);
 
   const { data: board, isLoading: boardLoading } = useQuery({
     queryKey: ["taskBoard", wsFilter],
@@ -1759,9 +2478,9 @@ export default function Tasks() {
     queryFn: () => api.tasks.constants(),
   });
 
-  const { data: taskList } = useQuery({
+  const { data: taskList, isLoading: taskListLoading } = useQuery({
     queryKey: ["tasks", "all", wsFilter],
-    queryFn: () => api.tasks.list({ limit: 100, workspace_id: apiWorkspaceFilter }),
+    queryFn: () => api.tasks.list({ limit: 200, workspace_id: apiWorkspaceFilter }),
     refetchInterval: (query) => hasLiveTasks(query.state.data) ? TASK_POLL_INTERVAL_MS : false,
   });
 
@@ -1772,6 +2491,11 @@ export default function Tasks() {
   const wsMap = useMemo(() => {
     const m: Record<string, string> = {};
     for (const ws of (workspaces ?? []) as any[]) m[ws.id] = ws.name;
+    return m;
+  }, [workspaces]);
+  const workspaceById = useMemo(() => {
+    const m: Record<string, Workspace> = {};
+    for (const ws of (workspaces ?? []) as Workspace[]) m[ws.id] = ws;
     return m;
   }, [workspaces]);
 
@@ -1965,12 +2689,52 @@ export default function Tasks() {
     setFormRequiredRefs("");
   };
 
-  const openCreateModal = (deadline?: string) => {
+  const openCreateModal = (deadline?: string, draft?: Partial<SelectedTextTaskDraft>) => {
     resetForm();
     if (apiWorkspaceFilter) setFormWorkspace(apiWorkspaceFilter);
     if (deadline) setFormDeadline(deadline);
+    if (draft?.title) setFormTitle(draft.title);
+    if (draft?.description) {
+      const source = draft.sourcePath ? `\n\nSource: ${draft.sourcePath}` : "";
+      setFormDesc(`${draft.description}${source}`);
+    }
+    if (draft?.title || draft?.description) setFormStep(2);
     setShowCreateModal(true);
   };
+
+  useEffect(() => {
+    const consumeStoredDraft = () => {
+      const raw = sessionStorage.getItem(SELECTED_TEXT_TASK_DRAFT_KEY);
+      if (!raw) return;
+      sessionStorage.removeItem(SELECTED_TEXT_TASK_DRAFT_KEY);
+      try {
+        const draft = JSON.parse(raw) as SelectedTextTaskDraft;
+        openCreateModal(undefined, draft);
+      } catch {
+        // Ignore malformed local drafts.
+      }
+    };
+
+    const handleSelectionDraft = (event: Event) => {
+      const draft =
+        (event as CustomEvent<SelectedTextTaskDraft>).detail || undefined;
+      if (draft) {
+        sessionStorage.removeItem(SELECTED_TEXT_TASK_DRAFT_KEY);
+        openCreateModal(undefined, draft);
+      }
+    };
+
+    consumeStoredDraft();
+    window.addEventListener(
+      ADD_SELECTION_TO_TASK_EVENT,
+      handleSelectionDraft as EventListener,
+    );
+    return () =>
+      window.removeEventListener(
+        ADD_SELECTION_TO_TASK_EVENT,
+        handleSelectionDraft as EventListener,
+      );
+  }, [apiWorkspaceFilter]);
 
   useEffect(() => {
     setFormSelectedStaffUserId("");
@@ -2038,6 +2802,19 @@ export default function Tasks() {
   const taskCreateDisabled = !formTitle.trim()
     || createMutation.isPending
     || (formAssigneeTab === "staff" && !formSelectedStaffUserId);
+
+  const setTaskBoardMode = useCallback((mode: "kanban" | "list") => {
+    setBoardMode(mode);
+  }, []);
+
+  const handleTaskListSortChange = useCallback((key: TaskListSortKey) => {
+    setTaskListSort((current) => ({
+      key,
+      direction: current.key === key
+        ? current.direction === "asc" ? "desc" : "asc"
+        : defaultTaskListSortDirection(key),
+    }));
+  }, []);
 
   const handleDrop = useCallback(
     (tid: string, newStatus: string) => {
@@ -2206,6 +2983,12 @@ export default function Tasks() {
     () => allTasks.filter(taskMatchesFilters),
     [allTasks, taskMatchesFilters],
   );
+  const filteredListTasks = useMemo(
+    () => allTasks
+      .filter(taskMatchesFilters)
+      .sort((a, b) => compareTaskListItems(a, b, taskListSort, { currentUser, agentById, wsMap })),
+    [agentById, allTasks, currentUser, taskListSort, taskMatchesFilters, wsMap],
+  );
   const todayKey = useMemo(() => localDateKey(new Date()), []);
   const { data: dailyAgenda } = useQuery({
     queryKey: ["calendar-agenda-day", todayKey],
@@ -2345,34 +3128,45 @@ export default function Tasks() {
     })),
   ];
 
-  // Operation status counts
-  const statusCounts = {
-    pending: board ? ((board as Record<string, Task[]>)["pending"] ?? []).length : 0,
-    in_progress: board ? ((board as Record<string, Task[]>)["in_progress"] ?? []).length : 0,
-    completed: board ? ((board as Record<string, Task[]>)["completed"] ?? []).length : 0,
-  };
-  const taskViewTabs = <TabSwitcher tabs={VIEW_TABS} value={view} onChange={setView} wrap />;
+  const activeTaskCount = (boardCounts.in_progress || 0) + (boardCounts.scheduled || 0);
+  const attentionTaskCount = COLUMN_META.review.statuses.reduce(
+    (sum, status) => sum + (boardCounts[status] || 0),
+    0,
+  );
+  const completedTasks = board
+    ? COLUMN_META.done.statuses
+        .flatMap((status) => ((board[status] ?? []) as Task[]))
+        .filter(taskMatchesFilters)
+        .sort(compareDoneTasks)
+    : [];
+  const taskSummary = [
+    `${totalBoardTasks || allTasks.length} ${t("page.tasks.tasks")}`,
+    activeTaskCount > 0 ? `${activeTaskCount} ${t("status.in_progress")}` : null,
+    attentionTaskCount > 0 ? `${attentionTaskCount} ${t("page.tasks.needs_attention")}` : null,
+  ].filter(Boolean).join(" · ");
+  const taskViewTabs = <TabSwitcher tabs={VIEW_TABS} value={view} onChange={setView} wrap className="tasks-view-tabs" />;
 
   /* ── render ───────────────────────────────────────── */
 
   return (
-    <div style={{ display: "flex", height: "100%" }}>
+    <div className="tasks-page" style={{ display: "flex", height: "100%" }}>
       <style>{TASK_CARD_AI_PROCESSING_STYLES}</style>
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-        {view !== "automations" && (
-          <div style={{ padding: "24px 24px 0" }}>
+      <div className="tasks-page-main" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div className="tasks-page-header" style={{ padding: 0 }}>
             <PageHeader
               title={t("page.tasks.my_tasks")}
-              subtitle={`${totalBoardTasks || allTasks.length} ${t("page.tasks.tasks")}`}
-              compactControls
+              subtitle={t("page.tasks.subtitle")}
+              meta={taskSummary}
               tabs={taskViewTabs}
               toolbar={(
-                <SmartToolbar
-                  searchValue={searchQuery}
-                  onSearchChange={setSearchQuery}
-                  searchPlaceholder={t("page.tasks.search_tasks")}
-                  className="w-full sm:w-52"
-                />
+                <div className="tasks-header-tools">
+                  <SmartToolbar
+                    searchValue={searchQuery}
+                    onSearchChange={setSearchQuery}
+                    searchPlaceholder={t("page.tasks.search_tasks")}
+                    className="w-full sm:w-52"
+                  />
+                </div>
               )}
               actions={<PageHeaderAddButton label={t("page.tasks.add_task")} onClick={() => openCreateModal()} />}
             />
@@ -2411,6 +3205,19 @@ export default function Tasks() {
                       <IconClose size={13} />
                       {t("common.clear")}
                     </button>
+                  )}
+                  {view === "board" && (
+                    <TaskBoardModeSwitch value={boardMode} onChange={setTaskBoardMode} />
+                  )}
+                  {view === "board" && boardMode === "kanban" && (
+                    <ColumnVisibilityMenu
+                      columnOrder={boardColumnOrder}
+                      visibleColumns={visibleBoardColumns}
+                      onToggle={toggleBoardColumn}
+                      onShowAll={showAllBoardColumns}
+                      onMoveColumn={moveBoardColumn}
+                      onReorderColumn={reorderBoardColumn}
+                    />
                   )}
                   <button
                     type="button"
@@ -2506,35 +3313,63 @@ export default function Tasks() {
                 </button>
               )}
             </FilterBar>
-          </div>
-        )}
+        </div>
 
         {/* View content */}
         <div
-          key={view}
+          key={`${view}-${view === "board" ? boardMode : ""}`}
+          className={`tasks-page-content tasks-page-content--${view}${view === "board" ? ` tasks-page-content--board-${boardMode}` : ""}`}
           style={{
             flex: 1,
             minHeight: 0,
-            overflowX: view === "automations" ? "hidden" : "auto",
-            overflowY: view === "automations" ? "auto" : "hidden",
-            padding: view === "automations" ? "24px 24px 24px" : "8px 24px 24px",
+            overflowX: view === "board" && boardMode === "kanban" ? "auto" : "hidden",
+            overflowY: view === "board" && boardMode === "list" ? "auto" : "hidden",
+            padding: "8px 0 24px",
           }}
         >
           {/* ── Board View ──────────────────────────── */}
-          {view === "board" && (
+          {view === "board" && boardMode === "kanban" && (
             boardLoading ? (
-              <div style={{ display: "flex", gap: "16px" }}>
-                {BOARD_COLUMNS.map((col) => (
-                  <div key={col} style={{ flex: "1 1 0", minWidth: "260px", maxWidth: "340px", background: "linear-gradient(180deg, rgba(255,255,255,0.76), rgba(255,254,252,0.62))", border: "1px solid rgba(128,102,64,0.075)", borderRadius: "16px", padding: "14px" }}>
-                    <div style={{ height: "16px", width: "80px", background: "rgba(235,231,224,0.55)", borderRadius: "8px", marginBottom: "12px" }} />
-                    <div style={{ height: "80px", background: "rgba(255,255,255,0.64)", borderRadius: "14px", marginBottom: "8px" }} />
-                    <div style={{ height: "80px", background: "rgba(255,255,255,0.64)", borderRadius: "14px" }} />
+              <div className="task-board-grid task-board-grid--loading">
+                {displayedBoardColumns.map((col) => (
+                  <div key={col} className="task-board-skeleton-column">
+                    <div className="task-board-skeleton-title" />
+                    <div className="task-board-skeleton-card" />
+                    <div className="task-board-skeleton-card" />
                   </div>
                 ))}
               </div>
             ) : board ? (
-              <div style={{ display: "flex", gap: "16px", width: "100%", minWidth: 0, height: "100%", paddingBottom: "16px", alignItems: "stretch" }}>
-                {BOARD_COLUMNS.map((colKey) => {
+              statusFilter === "done" ? (
+                <div className="task-board-completed-view">
+                  <div className="task-board-completed-heading">
+                    <div>
+                      <h2>{COLUMN_META.done.label}</h2>
+                      <p>{t("page.tasks.done_recent_window").replace("{days}", String(DONE_RECENT_WINDOW_DAYS))}</p>
+                    </div>
+                    <span>{completedTasks.length}</span>
+                  </div>
+                  <div className="task-board-completed-list">
+                    {completedTasks.length > 0 ? completedTasks.map((task) => (
+                      <BoardTaskCard
+                        key={task.id}
+                        task={task}
+                        agents={agentsList as any[]}
+                        onClick={() => handleCardClick(task)}
+                        onOpenFull={() => navigate(`/tasks/${task.id}`)}
+                        dimmed
+                        compact
+                        wsName={task.workspace_id ? wsMap[task.workspace_id] : undefined}
+                        workspaceScoped={Boolean(apiWorkspaceFilter)}
+                      />
+                    )) : (
+                      <EmptyState title={t("page.tasks.no_tasks_found")} description={t("page.tasks.no_recent_done")} />
+                    )}
+                  </div>
+                </div>
+              ) : (
+              <div className="task-board-grid">
+                {displayedBoardColumns.map((colKey) => {
                   const colMeta = COLUMN_META[colKey];
                   // Merge tasks from all statuses in this column group
                   let tasks = (colMeta.statuses.flatMap((s) => (board[s] ?? []) as Task[]));
@@ -2552,18 +3387,56 @@ export default function Tasks() {
                     workspaceScoped={Boolean(apiWorkspaceFilter)}
                     agents={agentsList as any[]}
                     wsMap={wsMap}
+                    workspaceById={workspaceById}
                     onDrop={(taskId) => handleDrop(taskId, dropStatus)}
+                    onColumnDragStart={(key) => setDraggingBoardColumn(key)}
+                    onColumnDragOver={(key) => setDragOverBoardColumn(key)}
+                    onColumnDragEnd={() => {
+                      setDraggingBoardColumn(null);
+                      setDragOverBoardColumn(null);
+                    }}
+                    onColumnDrop={reorderBoardColumn}
                     onCardClick={handleCardClick}
                     onOpenTask={(task) => navigate(`/tasks/${task.id}`)}
                     dragOver={dragOverCol === colKey}
+                    columnDragOver={dragOverBoardColumn === colKey && draggingBoardColumn !== colKey}
                     onDragEnter={() => setDragOverCol(colKey)}
                     onDragLeave={() => setDragOverCol((prev) => (prev === colKey ? null : prev))}
                   />
                   );
                 })}
               </div>
+              )
             ) : (
               <EmptyState title={t("page.tasks.no_tasks_found")} description={t("page.tasks.create_to_get_started")} />
+            )
+          )}
+
+          {/* ── List View ───────────────────────────── */}
+          {view === "board" && boardMode === "list" && (
+            taskListLoading ? (
+              <div className="task-list-view">
+                <div className="task-list-table is-loading">
+                  <div className="task-list-skeleton-row" />
+                  <div className="task-list-skeleton-row" />
+                  <div className="task-list-skeleton-row" />
+                  <div className="task-list-skeleton-row" />
+                </div>
+              </div>
+            ) : (
+              <TaskListView
+                tasks={filteredListTasks}
+                totalCount={hasTaskFilters ? filteredListTasks.length : totalBoardTasks || allTasks.length}
+                sort={taskListSort}
+                onSortChange={handleTaskListSortChange}
+                currentUser={currentUser}
+                agentById={agentById}
+                wsMap={wsMap}
+                onOpenTask={(task) => {
+                  setSelectedTask(task);
+                  navigate(`/tasks/${task.id}`);
+                }}
+              />
             )
           )}
 
@@ -2592,11 +3465,6 @@ export default function Tasks() {
                 }}
               />
             </div>
-          )}
-
-          {/* ── Automations View (Scheduled Jobs) ── */}
-          {view === "automations" && (
-            <ScheduledJobsEmbed headerTabs={taskViewTabs} />
           )}
 
         </div>

@@ -128,6 +128,14 @@ async def test_yt_get_channel_requires_a_selector(yt_http):
     assert not yt_http.calls
 
 
+async def test_yt_list_captions(yt_http):
+    yt_http.response = _FakeResp(200, {"items": []})
+    await yt.call_tool("list_captions", {"video_id": "v1"}, _TOKEN)
+    path, q = _split(_last(yt_http)["url"])
+    assert path.endswith("/captions")
+    assert q == {"part": "snippet", "videoId": "v1"}
+
+
 # ── YouTube: publish / engagement ────────────────────────────────────────────
 
 

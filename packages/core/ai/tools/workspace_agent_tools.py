@@ -25,6 +25,7 @@ from packages.core.ai.runtime import (
     runtime_workspace_update_task_runtime_action,
     runtime_workspace_update_knowledge_policy_action,
 )
+from packages.core.constants.pending_actions import PendingActionKind
 
 
 WORKSPACE_AGENT_SCHEMA = {
@@ -59,6 +60,8 @@ WORKSPACE_AGENT_SCHEMA = {
                     "description": (
                         "Action-specific parameters. For delegate_service include "
                         "service_key or agent_subscription_id, prompt, and optional max_rounds. "
+                        "For add_rule include description; add explicit rule_type plus action_patterns "
+                        "or capability_patterns when runtime enforcement is required. "
                         "For get_goal_status pass optional goal_id; the current workspace_id "
                         "is applied automatically. For update_goal_value pass goal_id, value, "
                         "and optional note to append a verified manual goal_measurements row."
@@ -378,8 +381,10 @@ WORKSPACE_ADD_RULE_SCHEMA = {
     "function": {
         "name": "workspace_add_rule",
         "description": (
-            "Add a persistent workspace-level operating rule/guardrail from "
-            "natural language and enrich it with action_patterns. By default "
+            "Add a persistent workspace-level operating rule/guardrail. Natural-language "
+            "description is agent-visible guidance only. For runtime enforcement, explicitly "
+            "supply rule_type plus action_patterns or capability_patterns; no keyword inference "
+            "is performed. By default "
             "this creates an operation draft and asks the user to approve before "
             "syncing runtime governance. Use only when the user clearly wants "
             "the rule to apply to the workspace beyond a single task. Do not "
@@ -411,12 +416,17 @@ WORKSPACE_ADD_RULE_SCHEMA = {
                         "allow",
                         "exception",
                     ],
-                    "description": "Optional enforcement type. Natural language is inferred when omitted.",
+                    "description": "Explicit enforcement type. Omit for non-runtime operating guidance.",
                 },
                 "action_patterns": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional explicit governance action-key patterns.",
+                },
+                "capability_patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional explicit Manor Runtime BusinessCapability patterns.",
                 },
                 "severity": {"type": "string", "description": "Optional severity label."},
                 "notes": {"type": "string", "description": "Optional operator notes."},
@@ -444,7 +454,14 @@ WORKSPACE_REQUEST_STRATEGIST_REVIEW_SCHEMA = {
             "or reassess workspace goals/rules/knowledge after new context. Do not "
             "use merely because the user appended task-local roles or review stages; "
             "persist those with workspace_update_task_runtime unless the user explicitly "
-            "asks to replan or create follow-up tasks now."
+            "asks to replan or create follow-up tasks now.\n\n"
+            "TWO-STEP CONTRACT: if proposals from an earlier review are still "
+            "awaiting the user's decision, this returns "
+            "{\"needs_decision\": true, \"conflict\": {...}} and does NOT start a "
+            "review. Do not retry blindly. Tell the user how many proposals are "
+            "open, name them, and ask whether to start a fresh review and reject "
+            "the open ones. Only if they say yes, call this tool again with "
+            "supersede=true — that rejects the open proposals and runs the review."
         ),
         "parameters": {
             "type": "object",
@@ -453,6 +470,15 @@ WORKSPACE_REQUEST_STRATEGIST_REVIEW_SCHEMA = {
                 "countdown_seconds": {
                     "type": "integer",
                     "description": "Delay before dispatch, 0-300 seconds. Default 1.",
+                },
+                "supersede": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true ONLY after the user confirmed, in this "
+                        "conversation, that the still-open proposals from the "
+                        "previous review may be rejected and replaced. Never set "
+                        "it on the first call."
+                    ),
                 },
             },
             "required": [],
@@ -639,8 +665,6 @@ async def _workspace_agent_handler(
         "operation": _workspace_operation_handler,
         "request_strategist_review": _workspace_request_strategist_review_handler,
         "delegate_service": _workspace_delegate_service_handler,
-        "get_goal_status": _workspace_get_goal_status_handler,
-        "update_goal_value": _workspace_update_goal_value_handler,
     }
     handler = handlers.get(action)
     if not handler:
@@ -836,7 +860,7 @@ async def _workspace_resolve_hitl_handler(
         candidates = [
             row for row in rows
             if isinstance(row.pending_action, dict)
-            and row.pending_action.get("kind") == "workspace_operation_review"
+            and row.pending_action.get("kind") == PendingActionKind.WORKSPACE_OPERATION_REVIEW
         ]
         if not candidates:
             return _dumps({"resolved": False, "reason": "no_open_workspace_operation_review"})
@@ -910,7 +934,7 @@ async def _workspace_resolve_hitl_handler(
         await db.commit()
         return _dumps({
             "resolved": True,
-            "kind": "workspace_operation_review",
+            "kind": PendingActionKind.WORKSPACE_OPERATION_REVIEW.value,
             "action": resolution["choice"],
             "draft_id": result.get("draft_id") or primary_hitl_id,
             "message_ids": resolved_message_ids,

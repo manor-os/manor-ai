@@ -11,7 +11,13 @@ from sqlalchemy import String, and_, func, not_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
-from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember, VectorStatus
+from packages.core.models.document import (
+    Document,
+    DocumentFolder,
+    DocumentGroup,
+    DocumentGroupMember,
+    VectorStatus,
+)
 from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.entity_fs import SYSTEM_DIRS, SYSTEM_FILES
 from packages.core.services.knowledge_visibility import HIDDEN_PREFIXES, is_user_visible_path, normalize_rel_path
@@ -209,6 +215,33 @@ async def get_document(db: AsyncSession, doc_id: str, entity_id: str) -> Optiona
     return result.scalar_one_or_none()
 
 
+async def _folder_default_visibility(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    folder_id: str,
+    owner_id: str | None,
+) -> str:
+    """Visibility a new document should take from the folder it lands in.
+
+    A ``private`` folder is only meaningful if what you put in it is private
+    too, so the folder's own band is inherited as-is. A missing folder falls
+    back to the loose-document rule rather than silently widening to the whole
+    entity.
+    """
+    folder_visibility = (
+        await db.execute(
+            select(DocumentFolder.visibility).where(
+                DocumentFolder.id == folder_id,
+                DocumentFolder.entity_id == entity_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if folder_visibility:
+        return str(folder_visibility)
+    return "private" if owner_id is not None else "entity"
+
+
 async def create_document(
     db: AsyncSession, entity_id: str, *,
     name: str, fs_path: str | None = None, file_url: str | None = None,
@@ -245,10 +278,18 @@ async def create_document(
         created_by=created_by,
         folder_id=folder_id,
     )
-    if visibility is None and owner_id is not None and folder_id is None:
-        doc.visibility = "private"
     if visibility is not None:
         doc.visibility = visibility
+    elif folder_id:
+        # Inherit the folder's visibility. Filing a document used to make it
+        # *more* public than leaving it loose — a document dropped at the root
+        # became private, but the same document moved into a folder defaulted
+        # to entity-wide, regardless of how restricted that folder was.
+        doc.visibility = await _folder_default_visibility(
+            db, entity_id=entity_id, folder_id=folder_id, owner_id=owner_id,
+        )
+    elif owner_id is not None:
+        doc.visibility = "private"
     if classification is not None:
         doc.classification = classification
     if client_visible is not None:
@@ -337,8 +378,24 @@ async def rename_document(db: AsyncSession, doc_id: str, entity_id: str, new_nam
     return doc
 
 
-async def delete_document(db: AsyncSession, doc_id: str, entity_id: str) -> bool:
-    doc = await get_document(db, doc_id, entity_id)
+async def delete_document(
+    db: AsyncSession,
+    doc_id: str,
+    entity_id: str,
+    *,
+    include_trashed: bool = False,
+) -> bool:
+    if include_trashed:
+        result = await db.execute(
+            select(Document).where(
+                Document.id == doc_id,
+                Document.entity_id == entity_id,
+                Document.is_trashed.is_(True),
+            )
+        )
+        doc = result.scalar_one_or_none()
+    else:
+        doc = await get_document(db, doc_id, entity_id)
     if not doc:
         return False
     await db.delete(doc)

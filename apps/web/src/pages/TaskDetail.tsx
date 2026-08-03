@@ -1,12 +1,13 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams, useNavigate, useLocation } from "react-router-dom";
-import { api } from "../lib/api";
-import type { Task, Agent } from "../lib/types";
+import { api, type ProvenanceStep } from "../lib/api";
+import type { Task, Agent, UserSummary } from "../lib/types";
 import { relativeTime, formatDateFull, formatDateLong, isDeadlineOverdue } from "../lib/format";
 import { useAuthStore } from "../stores/auth";
 import { useToastStore } from "../stores/toast";
-import { MANOR_AGENT_ID, MANOR_AGENT_TYPE, MANOR_AGENT_NAME, isMasterAgent } from "../lib/constants";
+import { MANOR_AGENT_ID, MANOR_AGENT_TYPE, MANOR_AGENT_NAME, isMasterAgent, isLegacyAgentAuthorPlaceholder } from "../lib/constants";
+import { getAgentDescription } from "../lib/localizedContent";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import Select from "../components/ui/Select";
@@ -15,8 +16,10 @@ import UserAvatar from "../components/ui/UserAvatar";
 import InlineTips from "../components/ui/InlineTips";
 import Modal from "../components/ui/Modal";
 import Button from "../components/ui/Button";
+import PageHeader from "../components/ui/PageHeader";
 import ChatMarkdown from "../components/ChatMarkdown";
 import WorkspaceChat from "../components/WorkspaceChat";
+import Chip from "../components/ui/Chip";
 import StatusPill from "../components/ui/StatusPill";
 import PriorityPill from "../components/ui/PriorityPill";
 import { STATUS_CONFIG } from "../components/ui/StatusPill";
@@ -27,9 +30,8 @@ import TaskPropertiesPanel from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
 import TaskRecoveryPanel from "../components/task/TaskRecoveryPanel";
 import TaskExecutionTimeline from "../components/task/TaskExecutionTimeline";
+import ChatInputFooter, { type AttachedItem, type MentionOption } from "../components/ChatInputFooter";
 import { t } from "../lib/i18n";
-import { getAgentDescription } from "../lib/localizedContent";
-import ChatInputFooter, { type MentionOption, type AttachedItem } from "../components/ChatInputFooter";
 import { inferRuntimeRuleFromText, shouldFallbackToWildcardRule } from "../lib/runtimeRules";
 import { formatTaskDescriptionForDisplay, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
 import {
@@ -78,6 +80,11 @@ function getTaskReturnTo(state: unknown): string | null {
     : null;
 }
 const HITL_RESUMABLE_PLAN_STATUSES = new Set(["running", "paused", "needs_attention"]);
+
+type TaskCommentPayload = {
+  text?: string;
+  attachments?: AttachedItem[];
+};
 
 function hasLiveTaskStatus(task: unknown): boolean {
   return LIVE_TASK_STATUSES.has(String((task as any)?.status || ""));
@@ -918,6 +925,84 @@ function ExecutionLog({ logs }: { logs: any[] }) {
 
 
 
+/* ── M14 execution provenance breadcrumb ──────────────────────────────
+   A single line above the execution timeline answering "where did this
+   task come from?": Review rv_… → Proposal item pi_… → this task, or
+   Automation "Daily video" → this task, plus the config revisions the
+   run was stamped with. Manual tasks get one neutral chip instead of a
+   chain, so ad-hoc work stays quiet. */
+
+const PROVENANCE_KIND_LABEL: Record<string, string> = {
+  review: "page.task_detail.provenance_review",
+  proposal_item: "page.task_detail.provenance_proposal_item",
+  scheduled_job: "page.task_detail.provenance_automation",
+  chat: "page.task_detail.provenance_chat",
+  task: "page.task_detail.provenance_this_task",
+};
+
+function _provenanceShortId(id?: string | null): string {
+  const value = String(id || "");
+  return value.length > 14 ? `${value.slice(0, 10)}…` : value;
+}
+
+function TaskProvenanceBreadcrumb({
+  provenance,
+}: {
+  provenance?: { trigger?: ProvenanceStep; causation_chain?: ProvenanceStep[]; config_versions?: Record<string, number | string> } | null;
+}) {
+  if (!provenance) return null;
+  const chain = provenance.causation_chain || [];
+  const versions = Object.entries(provenance.config_versions || {}).filter(
+    ([, value]) => value !== null && value !== undefined && value !== "",
+  );
+  const manual = (provenance.trigger?.kind || "manual") === "manual";
+  if (manual && versions.length === 0) {
+    return (
+      <div className="task-provenance" style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 4px" }}>
+        <Chip variant="slate" size="sm">{t("page.task_detail.provenance_manual")}</Chip>
+      </div>
+    );
+  }
+  if (chain.length <= 1 && versions.length === 0) return null;
+
+  const steps = manual ? [] : chain;
+  return (
+    <div
+      className="task-provenance"
+      style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "0 4px" }}
+    >
+      {manual && <Chip variant="slate" size="sm">{t("page.task_detail.provenance_manual")}</Chip>}
+      {steps.map((step, i) => {
+        const kindKey = PROVENANCE_KIND_LABEL[step.kind];
+        const kindLabel = kindKey ? t(kindKey) : formatUserFacingLabel(step.kind);
+        const isTask = step.kind === "task";
+        const named = !isTask && step.kind !== "review" && step.label ? `“${step.label}”` : "";
+        return (
+          <span key={`${step.kind}-${step.id || i}`} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            {i > 0 && <span style={{ fontSize: 12, color: "#d6d3d1" }}>→</span>}
+            <span style={{ fontSize: 12, fontWeight: 650, color: isTask ? "#44403c" : "#78716c" }}>
+              {kindLabel}
+            </span>
+            {named && <span style={{ fontSize: 12, color: "#57534e" }}>{named}</span>}
+            {!isTask && step.id && (
+              <span className="mono" style={{ fontSize: 11, color: "#a8a29e" }}>{_provenanceShortId(step.id)}</span>
+            )}
+          </span>
+        );
+      })}
+      {versions.map(([key, value]) => (
+        <Chip key={key} variant="slate" size="sm">
+          <span className="mono">
+            {t("page.task_detail.provenance_revision")
+              .replace("{name}", key.replace(/_revision$/, ""))
+              .replace("{value}", String(value))}
+          </span>
+        </Chip>
+      ))}
+    </div>
+  );
+}
+
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
@@ -934,9 +1019,9 @@ export default function TaskDetail() {
   const [descDraft, setDescDraft] = useState("");
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [newComment, setNewComment] = useState("");
+  const [selectedCommentMentions, setSelectedCommentMentions] = useState<MentionOption[]>([]);
   const [hitlReply, setHitlReply] = useState("");
   const [approvalNote, setApprovalNote] = useState("");
-  const [selectedMentions, setSelectedMentions] = useState<MentionOption[]>([]);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [slaAdminOpen, setSlaAdminOpen] = useState(false);
   const [showMoreProperties, setShowMoreProperties] = useState(false);
@@ -961,6 +1046,15 @@ export default function TaskDetail() {
     queryFn: () => api.plans.steps(latestPlan!.id),
     enabled: !!latestPlan?.id,
     refetchInterval: (query) => hasLivePlanStatus([latestPlan]) || hasLiveStepStatus(query.state.data) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
+  });
+  // M14 execution provenance — lazy, workspace-scoped, and silent on 404
+  // (entity-level tasks have no workspace ledger to trace).
+  const { data: taskProvenance } = useQuery({
+    queryKey: ["task-provenance", task?.workspace_id, taskId],
+    queryFn: () => api.workspaces.observability.taskProvenance(task!.workspace_id!, taskId!),
+    enabled: !!taskId && !!task?.workspace_id,
+    retry: false,
+    staleTime: 60_000,
   });
   const { data: agents = [] } = useQuery({ queryKey: ["agents"], queryFn: () => api.agents.list() });
   const { data: logs = [] } = useQuery({
@@ -997,16 +1091,6 @@ export default function TaskDetail() {
       }));
     return [...agentOptions, ...staffOptions];
   }, [agents, staffList]);
-
-  // Comments allow mentioning MULTIPLE agents (unlike FloatingChat's single-agent routing)
-  const handleCommentMentionSelect = (m: MentionOption) => {
-    setSelectedMentions((prev) =>
-      prev.some((x) => x.id === m.id && x.type === m.type) ? prev : [...prev, m]);
-  };
-  const handleCommentMentionRemove = (m: MentionOption) => {
-    setSelectedMentions((prev) =>
-      prev.filter((x) => !(x.id === m.id && x.type === m.type)));
-  };
 
   const { data: parentTask } = useQuery({
     queryKey: ["task", task?.parent_task_id],
@@ -1232,22 +1316,24 @@ export default function TaskDetail() {
     },
   });
 
-  const sendComment = async (text: string, footerAttachments: AttachedItem[]) => {
-    // Upload any file attachments from the footer
+  const sendComment = async (payload?: TaskCommentPayload) => {
+    const text = (payload?.text ?? newComment).trim();
+    const attachmentsToUpload = (payload?.attachments || []).filter((item) => item.file);
+    if (!text && attachmentsToUpload.length === 0) return;
+    // Upload pending files first
     const attachments: any[] = [];
     const failedUploads: string[] = [];
-    for (const item of footerAttachments) {
-      if (item.file) {
-        try {
-          const result = await api.tasks.uploadAttachment(taskId!, item.file);
-          attachments.push(result);
-        } catch (e: any) {
-          failedUploads.push(item.name);
-          console.error("Upload failed:", item.name, e);
-        }
+    for (const item of attachmentsToUpload) {
+      if (!item.file) continue;
+      try {
+        const result = await api.tasks.uploadAttachment(taskId!, item.file);
+        attachments.push(result);
+      } catch (e: any) {
+        failedUploads.push(item.file.name);
+        console.error("Upload failed:", item.file.name, e);
       }
     }
-    let content = text.trim();
+    let content = text;
     if (!content && attachments.length > 0) {
       content = `${t("page.tasks.attached")} ${attachments.length} ${attachments.length > 1 ? t("page.tasks.files") : t("page.tasks.file")}`;
     }
@@ -1255,19 +1341,19 @@ export default function TaskDetail() {
       content += (content ? "\n" : "") + `(Failed to upload: ${failedUploads.join(", ")})`;
     }
     if (!content && attachments.length === 0) return; // nothing to send
-    const mentions = selectedMentions.map((m) => ({ type: m.type, id: m.id }));
+    const mentions = selectedCommentMentions.map((m) => ({ type: m.type, id: m.id }));
     await api.tasks.addLog(
       taskId!, content, "comment",
       attachments.length > 0 ? attachments : undefined,
       mentions.length > 0 ? mentions : undefined,
     );
     setNewComment("");
-    setSelectedMentions([]);
+    setSelectedCommentMentions([]);
     queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
   };
 
   const addLogMutation = useMutation({
-    mutationFn: ({ text, footerAttachments }: { text: string; footerAttachments: AttachedItem[] }) => sendComment(text, footerAttachments),
+    mutationFn: (payload: TaskCommentPayload) => sendComment(payload),
     onError: (err: any) => {
       toast.error(t("page.task_detail.comment_send_failed"), err?.message || t("page.task_detail.try_again"));
     },
@@ -1281,7 +1367,7 @@ export default function TaskDetail() {
   }, [task?.id, task?.title, task?.description]);
   useEffect(() => { setDescriptionExpanded(false); }, [task?.id]);
   useEffect(() => { setHitlReply(""); }, [task?.id]);
-  useEffect(() => { setSelectedMentions([]); }, [task?.id]);
+  useEffect(() => { setSelectedCommentMentions([]); }, [task?.id]);
 
   const taskOutput = (task?.actual_output || null) as Record<string, any> | null;
   const taskOutputFiles = useMemo(
@@ -1546,35 +1632,32 @@ export default function TaskDetail() {
   ).length;
   const hasWorkspaceAgentActivity = workspaceAgentActivityCount > 0;
   return (
-    <div className="task-detail-page" style={{ height: "100%", overflowY: "auto", padding: "1.5rem 2rem 3rem" }}>
+    <div className="task-detail-page" style={{ height: "100%", overflowY: "auto", padding: 0 }}>
       {/* ── Breadcrumb ── */}
       <button onClick={goBack} className="btn-manor-ghost"
         style={{ padding: "4px 10px", fontSize: 13, marginBottom: 20, gap: 4 }}>
         <IconArrowLeft size={14} /> {t("page.task_detail.back_to_tasks")}
       </button>
 
-      {/* ══════════════════════════════════════════════════════════
-          HEADER CARD — title + status pill + action buttons
-          ══════════════════════════════════════════════════════════ */}
-      <div className="glass-panel task-detail-hero">
-        <div className="task-detail-hero-main">
-          {editingTitle ? (
+      <PageHeader
+        title={editingTitle ? (
             <input autoFocus value={titleDraft} onChange={(e) => setTitleDraft(e.target.value)}
               onBlur={() => { if (titleDraft.trim() && titleDraft !== task.title) updateMutation.mutate({ title: titleDraft.trim() }); setEditingTitle(false); }}
               onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") { setTitleDraft(task.title || ""); setEditingTitle(false); } }}
-              className="manor-input task-detail-title-input" />
+              className="manor-input w-full text-[inherit] font-[inherit]" />
           ) : (
-            <h1 onClick={() => setEditingTitle(true)}
-              className="task-detail-title"
+            <button
+              type="button"
+              onClick={() => setEditingTitle(true)}
+              className="flex min-w-0 cursor-pointer items-baseline gap-2 border-0 bg-transparent p-0 text-left font-[inherit] leading-[inherit] tracking-[inherit] text-[inherit]"
               title={t("page.task_detail.click_to_edit_title")}>
-              <span>{task.title}</span>
+              <span className="min-w-0 flex-1">{task.title}</span>
               <span className="task-detail-title-id">
                 #{task.id.slice(-6)}
               </span>
-            </h1>
+            </button>
           )}
-
-          {/* Status chips */}
+        meta={(
           <div className="task-detail-chip-row">
             <StatusPill status={task.status} />
             {pendingInputRequest && (
@@ -1628,26 +1711,27 @@ export default function TaskDetail() {
               </span>
             )}
           </div>
-        </div>
-
-        <div className="task-detail-hero-actions">
-          <TaskSiblingSwitcher
-            task={task}
-            tasks={siblingTasks}
-            columnLabel={siblingStatusLabel}
-            isLoading={siblingTasksLoading}
-            onOpenTask={(id) => navigate(`/tasks/${id}`)}
-          />
-          <button
-            onClick={() => setShowDeleteConfirm(true)}
-            title={t("page.task_detail.delete_task")}
-            className="task-detail-delete-btn"
-          >
-            <IconTrash size={13} />
-            {t("action.delete")}
-          </button>
-        </div>
-      </div>
+        )}
+        actions={(
+          <div className="task-detail-hero-actions">
+            <TaskSiblingSwitcher
+              task={task}
+              tasks={siblingTasks}
+              columnLabel={siblingStatusLabel}
+              isLoading={siblingTasksLoading}
+              onOpenTask={(id) => navigate(`/tasks/${id}`)}
+            />
+            <button
+              onClick={() => setShowDeleteConfirm(true)}
+              title={t("page.task_detail.delete_task")}
+              className="task-detail-delete-btn"
+            >
+              <IconTrash size={13} />
+              {t("action.delete")}
+            </button>
+          </div>
+        )}
+      />
 
       {/* ══════════════════════════════════════════════════════════
           TWO-COLUMN LAYOUT
@@ -1867,7 +1951,7 @@ export default function TaskDetail() {
 
           {/* Task runtime requirements */}
           <details
-            className="glass-card"
+            className="glass-card task-detail-section-card task-detail-runtime-card"
             style={{ padding: 0, overflow: "hidden", borderColor: "rgba(231,229,228,0.72)" }}
           >
             <summary style={{
@@ -2166,6 +2250,8 @@ export default function TaskDetail() {
             </div>
           )}
 
+          <TaskProvenanceBreadcrumb provenance={taskProvenance} />
+
           <TaskExecutionTimeline
             plan={latestPlan}
             steps={planSteps}
@@ -2230,7 +2316,13 @@ export default function TaskDetail() {
           {/* Attachments card */}
           {(() => {
             const allAttachments = (logs as any[]).flatMap((l: any) =>
-              (l.attachments || []).map((a: any) => ({ ...a, from: l.created_by, at: l.created_at }))
+              (l.attachments || []).map((a: any) => ({
+                ...a,
+                // ``created_by`` may be the unattributed-agent sentinel rather
+                // than a name — "workspace-agent" is not who uploaded this.
+                from: isLegacyAgentAuthorPlaceholder(l.created_by) ? MANOR_AGENT_NAME : l.created_by,
+                at: l.created_at,
+              }))
             );
             return (
               <div className="glass-card task-detail-section-card task-detail-attachments-card" style={{ padding: 0, overflow: "hidden" }}>
@@ -2293,7 +2385,7 @@ export default function TaskDetail() {
             );
           })()}
 
-          {task.workspace_id && (
+          {task.workspace_id && taskWorkspace && (
             <details
               className="glass-card task-detail-section-card task-detail-agent-thread-card"
               open={hasWorkspaceAgentActivity ? true : undefined}
@@ -2395,32 +2487,44 @@ export default function TaskDetail() {
               <span className="manor-label" style={{ margin: 0 }}>{t("page.tasks.comments")}</span>
               <span style={{ fontSize: 11, color: "#a8a29e", fontWeight: 500 }}>({comments.length})</span>
             </div>
-            <div className="task-detail-section-body" style={{ padding: "16px 20px 20px" }}>
-              <div style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: comments.length > 0 ? 12 : 0 }}>
+            <div style={{ padding: "16px 20px 20px" }}>
+              <div className="task-comment-composer-row" style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: comments.length > 0 ? 12 : 0 }}>
                 <UserAvatar
                   type="user"
                   name={currentUser?.display_name || currentUser?.email || t("component.workspace_chat.you")}
                   avatarUrl={currentUser?.avatar_url}
                   size={32}
                 />
-                <div className="task-detail-comment-chatfooter" style={{ flex: 1, minWidth: 0 }}>
-                  <ChatInputFooter
-                    value={newComment}
-                    onChange={setNewComment}
-                    streaming={addLogMutation.isPending}
-                    showStopButton={false}
-                    onStop={() => {}}
-                    placeholder={t("page.tasks.write_comment")}
-                    mentions={commentMentionOptions}
-                    selectedMentions={selectedMentions}
-                    onMentionSelect={handleCommentMentionSelect}
-                    onMentionRemove={handleCommentMentionRemove}
-                    onSend={(text, footerAttachments) => {
-                      if (!text.trim() && footerAttachments.length === 0) return;
-                      addLogMutation.mutate({ text, footerAttachments });
-                    }}
-                  />
-                </div>
+                <ChatInputFooter
+                  value={newComment}
+                  onChange={(next) => {
+                    setNewComment(next);
+                    setSelectedCommentMentions((prev) =>
+                      prev.filter((mention) => next.includes(`@${mention.name}`)),
+                    );
+                  }}
+                  streaming={addLogMutation.isPending}
+                  disabled={addLogMutation.isPending}
+                  showStopButton={false}
+                  placeholder={t("page.tasks.write_comment")}
+                  mentions={commentMentionOptions}
+                  selectedMentions={selectedCommentMentions}
+                  onMentionSelect={(mention) => {
+                    setSelectedCommentMentions((prev) => {
+                      if (prev.some((item) => item.id === mention.id && item.type === mention.type)) return prev;
+                      return [...prev, mention];
+                    });
+                  }}
+                  onMentionRemove={(mention) => {
+                    setSelectedCommentMentions((prev) =>
+                      prev.filter((item) => !(item.id === mention.id && item.type === mention.type)),
+                    );
+                  }}
+                  onSend={(text, attachments) => addLogMutation.mutate({ text, attachments })}
+                  onStop={() => {}}
+                  attachmentButtonIcon="paperclip"
+                  className="task-comment-composer"
+                />
               </div>
 
               {/* Comment thread — shared TaskLogItem (same as drawer) */}
@@ -2569,7 +2673,7 @@ export default function TaskDetail() {
                   <div className="task-detail-meta-row">
                     <span className="task-detail-meta-label">{t("page.task_detail.from_chat")}</span>
                     <button
-                      onClick={() => navigate(`/chat?conversation=${task.conversation_id}`)}
+                      onClick={() => navigate(`/chat?conversation=${encodeURIComponent(task.conversation_id || "")}`)}
                       style={{
                         background: "none", border: "none", cursor: "pointer", padding: 0,
                       }}

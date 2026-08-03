@@ -13,6 +13,9 @@ from typing import Any, Iterable
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    WorkerStatus,
+)
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.goal import Goal
 from packages.core.models.workspace import AgentSubscription, Workspace
@@ -82,7 +85,10 @@ WORKSPACE_READINESS_PARTS: tuple[WorkspaceReadinessPartSpec, ...] = (
         key="agents",
         name="Agents and services",
         role="Execution capacity: maps workspace service keys to agents or humans that can own tasks.",
-        check="At least one active AgentSubscription scoped to this workspace.",
+        check=(
+            "Every declared service has an active AgentSubscription and each "
+            "subscription is bound to an active execution worker."
+        ),
     ),
     WorkspaceReadinessPartSpec(
         key="goals",
@@ -95,8 +101,8 @@ WORKSPACE_READINESS_PARTS: tuple[WorkspaceReadinessPartSpec, ...] = (
         name="External integrations",
         role="Credentialed external systems such as Twitter/X, Gmail, or browser-backed platforms.",
         check=(
-            "Workspace-declared provider needs from goals, channel declarations, flagged integrations, "
-            "and workspace text intersect active entity/OAuth providers."
+            "Typed provider declarations from goals, channels, and flagged integrations "
+            "are each checked against active entity/OAuth connections."
         ),
     ),
     WorkspaceReadinessPartSpec(
@@ -298,7 +304,15 @@ async def check_workspace_readiness(
     knowledge_nets: list[dict[str, Any]] | None = None,
     governance_policy: dict[str, Any] | None = None,
     operating_memory: str = "",
+    runtime_bound_subscription_ids: set[str] | None = None,
 ) -> WorkspaceReadinessReport:
+    subscription_rows = list(subscriptions or [])
+    if runtime_bound_subscription_ids is None:
+        runtime_bound_subscription_ids = await _runtime_bound_subscription_ids(
+            db,
+            workspace,
+            subscription_rows,
+        )
     channels = (
         configured_channels
         if configured_channels is not None
@@ -306,7 +320,7 @@ async def check_workspace_readiness(
     )
     return build_workspace_readiness_report(
         operating_model=workspace.operating_model or {},
-        subscriptions=list(subscriptions or []),
+        subscriptions=subscription_rows,
         goals=list(goals or []),
         declared_provider_keys=declared_provider_keys or set(),
         active_provider_keys=active_provider_keys or set(),
@@ -315,6 +329,7 @@ async def check_workspace_readiness(
         knowledge_nets=knowledge_nets or [],
         governance_policy=governance_policy,
         operating_memory=operating_memory,
+        runtime_bound_subscription_ids=runtime_bound_subscription_ids,
     )
 
 
@@ -330,20 +345,58 @@ def build_workspace_readiness_report(
     knowledge_nets: list[dict[str, Any]],
     governance_policy: dict[str, Any] | None,
     operating_memory: str,
+    runtime_bound_subscription_ids: set[str] | None = None,
 ) -> WorkspaceReadinessReport:
     spec_by_key = {spec.key: spec for spec in WORKSPACE_READINESS_PARTS}
     missing_channels = missing_required_channels(configured_channels, operating_model)
+    declared_service_keys = {
+        str(service.get("service_key") or "").strip()
+        for service in (operating_model.get("services") or [])
+        if isinstance(service, dict) and str(service.get("service_key") or "").strip()
+    }
+    subscribed_service_keys = {
+        str(getattr(subscription, "service_key", "") or "").strip()
+        for subscription in subscriptions
+        if str(getattr(subscription, "service_key", "") or "").strip()
+    }
+    missing_service_keys = sorted(declared_service_keys - subscribed_service_keys)
+    subscription_ids = {
+        str(getattr(subscription, "id", "") or "").strip()
+        for subscription in subscriptions
+        if str(getattr(subscription, "id", "") or "").strip()
+    }
+    bound_ids = (
+        set(runtime_bound_subscription_ids)
+        if runtime_bound_subscription_ids is not None
+        else set(subscription_ids)
+    )
+    unbound_subscription_ids = sorted(subscription_ids - bound_ids)
+    agents_ready = bool(subscriptions) and not missing_service_keys and not unbound_subscription_ids
+    agent_status = "ready" if agents_ready else "partial" if subscriptions else "missing"
+    agent_summary_bits: list[str] = [f"{len(subscriptions)} active service subscription(s)."]
+    if missing_service_keys:
+        agent_summary_bits.append("Missing services: " + ", ".join(missing_service_keys) + ".")
+    if unbound_subscription_ids:
+        agent_summary_bits.append(
+            f"{len(unbound_subscription_ids)} subscription(s) have no active worker binding."
+        )
+    if not subscriptions:
+        agent_summary_bits = ["No active service subscriptions; Strategist has no valid task owner."]
+
     parts = [
         _part_status(
             spec_by_key["agents"],
-            status="ready" if subscriptions else "missing",
-            summary=(
-                f"{len(subscriptions)} active service subscription(s)."
-                if subscriptions
-                else "No active service subscriptions; Strategist has no valid task owner."
-            ),
-            missing_setup_key="" if subscriptions else "no_agents",
-            details={"count": len(subscriptions)},
+            status=agent_status,
+            summary=" ".join(agent_summary_bits),
+            missing_setup_key="" if agents_ready else "no_agents",
+            details={
+                "count": len(subscriptions),
+                "declared_service_keys": sorted(declared_service_keys),
+                "subscribed_service_keys": sorted(subscribed_service_keys),
+                "missing_service_keys": missing_service_keys,
+                "runtime_bound_subscription_ids": sorted(bound_ids),
+                "unbound_subscription_ids": unbound_subscription_ids,
+            },
         ),
         _part_status(
             spec_by_key["goals"],
@@ -450,7 +503,7 @@ def _integration_status(
             if not missing
             else f"Configured providers: {', '.join(configured)}; missing: {', '.join(missing)}."
         )
-        missing_key = ""
+        missing_key = "no_integrations" if missing else ""
     else:
         status = "missing"
         summary = f"Declared providers missing credentials: {', '.join(missing)}."
@@ -468,6 +521,33 @@ def _integration_status(
             "missing": missing,
         },
     )
+
+
+async def _runtime_bound_subscription_ids(
+    db: AsyncSession,
+    workspace: Workspace,
+    subscriptions: list[AgentSubscription],
+) -> set[str]:
+    subscription_ids = {
+        str(subscription.id)
+        for subscription in subscriptions
+        if getattr(subscription, "id", None)
+    }
+    if not subscription_ids:
+        return set()
+
+    from packages.core.models.worker import SubscriptionWorker, Worker
+
+    rows = list((await db.execute(
+        select(SubscriptionWorker.subscription_id)
+        .join(Worker, Worker.id == SubscriptionWorker.worker_id)
+        .where(
+            SubscriptionWorker.subscription_id.in_(subscription_ids),
+            Worker.entity_id == workspace.entity_id,
+            Worker.status == WorkerStatus.ACTIVE,
+        )
+    )).scalars().all())
+    return {str(subscription_id) for subscription_id in rows}
 
 
 def _channel_status(

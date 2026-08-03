@@ -6,6 +6,11 @@ from datetime import date, datetime, timezone
 from sqlalchemy import Date, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskStatus
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
 from packages.core.models.task import Conversation, Task
 from packages.core.models.document import Document, VectorStatus
 from packages.core.models.workspace import Agent, AgentSubscription
@@ -35,13 +40,13 @@ async def get_dashboard_stats(
     # ── Tasks ──
     task_q = select(
         func.count().label("total"),
-        func.count().filter(Task.status == "pending").label("pending"),
-        func.count().filter(Task.status == "proposed").label("proposed"),
-        func.count().filter(Task.status == "in_progress").label("in_progress"),
-        func.count().filter(Task.status == "completed").label("completed"),
-        func.count().filter(Task.status == "failed").label("failed"),
-        func.count().filter(Task.status == "cancelled").label("cancelled"),
-        func.count().filter(Task.status == "waiting_on_customer").label("waiting_on_customer"),
+        func.count().filter(Task.status == TaskStatus.PENDING).label("pending"),
+        func.count().filter(Task.status == TaskStatus.PROPOSED).label("proposed"),
+        func.count().filter(Task.status == TaskStatus.IN_PROGRESS).label("in_progress"),
+        func.count().filter(Task.status == TaskStatus.COMPLETED).label("completed"),
+        func.count().filter(Task.status == TaskStatus.FAILED).label("failed"),
+        func.count().filter(Task.status == TaskStatus.CANCELLED).label("cancelled"),
+        func.count().filter(Task.status == TaskStatus.WAITING_ON_CUSTOMER).label("waiting_on_customer"),
         func.count().filter(
             task_deadline_overdue_expr(
                 Task.deadline,
@@ -254,9 +259,7 @@ async def get_active_plans(
         select(ExecutionPlan)
         .where(
             ExecutionPlan.entity_id == entity_id,
-            ExecutionPlan.status.in_(
-                ["running", "pending_approval", "paused", "draft"]
-            ),
+            ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.PENDING_APPROVAL, ExecutionPlanStatus.PAUSED, ExecutionPlanStatus.DRAFT,)),
         )
         .order_by(ExecutionPlan.updated_at.desc().nullslast())
         .limit(limit)
@@ -276,7 +279,7 @@ async def get_active_plans(
             ExecutionStep.plan_id,
             func.count().label("total"),
             func.sum(
-                sa_case((ExecutionStep.step_status == "done", 1), else_=0)
+                sa_case((ExecutionStep.step_status == ExecutionStepStatus.DONE, 1), else_=0)
             ).label("done"),
         )
         .where(ExecutionStep.plan_id.in_(plan_ids))
@@ -345,11 +348,11 @@ async def get_recent_activity(
         return value
 
     def activity_timestamp(task: Task) -> datetime | None:
-        if task.status == "completed":
+        if task.status == TaskStatus.COMPLETED:
             return aware(task.completed_at or task.updated_at or task.started_at or task.created_at)
-        if task.status == "in_progress":
+        if task.status == TaskStatus.IN_PROGRESS:
             return aware(task.started_at or task.updated_at or task.created_at)
-        if task.status in {"proposed", "waiting_on_customer", "failed"}:
+        if task.status in {TaskStatus.PROPOSED, TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.FAILED}:
             return aware(task.updated_at or task.completed_at or task.started_at or task.created_at)
         return aware(task.created_at or task.updated_at)
 
@@ -394,11 +397,11 @@ async def get_recent_activity(
         }.get(t.status, t.status)
         try:
             output = t.actual_output if hasattr(t, "actual_output") else None
-            if t.status == "pending":
+            if t.status == TaskStatus.PENDING:
                 desc = "Task created"
-            elif t.status == "proposed":
+            elif t.status == TaskStatus.PROPOSED:
                 desc = "Proposal ready for review"
-            elif t.status == "completed" and output and isinstance(output, dict):
+            elif t.status == TaskStatus.COMPLETED and output and isinstance(output, dict):
                 steps = output.get("steps") or []
                 done = sum(1 for s in steps if s.get("status") == "done")
                 files = output.get("files") or []
@@ -406,7 +409,7 @@ async def get_recent_activity(
                 if files:
                     parts.append(f"{len(files)} file{'s' if len(files) != 1 else ''} generated")
                 desc = " · ".join(parts)
-            elif t.status == "failed" and output and isinstance(output, dict):
+            elif t.status == TaskStatus.FAILED and output and isinstance(output, dict):
                 steps = output.get("steps") or []
                 failed = [s for s in steps if s.get("status") == "failed"]
                 if failed:
@@ -414,9 +417,9 @@ async def get_recent_activity(
                     desc = f"Failed: {err.get('message', 'unknown')[:120]}"
                 else:
                     desc = "Execution failed"
-            elif t.status == "waiting_on_customer":
+            elif t.status == TaskStatus.WAITING_ON_CUSTOMER:
                 desc = "Needs your input to continue"
-            elif t.status == "in_progress":
+            elif t.status == TaskStatus.IN_PROGRESS:
                 desc = "Currently running"
         except Exception:
             pass

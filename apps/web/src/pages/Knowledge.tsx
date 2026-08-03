@@ -2032,7 +2032,12 @@ export default function Knowledge() {
       setCreatingFolder(false);
       setNewFolderName("");
     },
-    onError: () => { toast.error(t("page.knowledge.failed_to_create_folder")); },
+    onError: (err: unknown) => {
+      const detail = err instanceof Error && err.message ? err.message : null;
+      toast.error(detail || t("page.knowledge.failed_to_create_folder"));
+      setCreatingFolder(false);
+      setNewFolderName("");
+    },
   });
 
   const deleteFolderMutation = useMutation({
@@ -2158,6 +2163,7 @@ export default function Knowledge() {
     onSuccess: () => {
       invalidateDocumentBrowseAndFolderTree();
       queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
+      queryClient.invalidateQueries({ queryKey: ["documents-trash"] });
       toast.success(t("page.knowledge.document_deleted"));
     },
   });
@@ -2548,9 +2554,8 @@ export default function Knowledge() {
     Array.isArray((wikiIndex as any)?.missing_links) ? (wikiIndex as any).missing_links : []
   ), [wikiIndex]);
 
-  // Storage total — use the backend's recursive total (files in this location
-  // plus every nested subfolder), falling back to summing the current page for
-  // older API responses that don't return it.
+  // Summarize every visible file below the current location, including files
+  // nested in descendant folders.
   const totalStorage = useMemo(
     () =>
       data?.total_size ??
@@ -2715,6 +2720,10 @@ export default function Knowledge() {
   };
 
   const commitCreateFolder = () => {
+    // Enter and blur both land here; the pending guard keeps a keydown+blur
+    // pair (or an IME-confirm Enter followed by a real Enter) from posting
+    // the same folder twice — the second POST 409s on the duplicate name.
+    if (createFolderMutation.isPending) return;
     if (!canUploadKnowledge || !canWriteFolderId(currentFolderId)) {
       setCreatingFolder(false);
       setNewFolderName("");
@@ -3137,12 +3146,14 @@ export default function Knowledge() {
       )}
 
       {/* ── Main Content ─────────────────────────── */}
-      <div className="flex-1 min-w-0 flex flex-col px-4 py-0 overflow-hidden">
+      <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
         {/* Header */}
         <PageHeader
           title={t("page.knowledge.knowledge_base")}
-          subtitle={data ? `${totalFiles} files · ${formatFileSize(totalStorage)}` : undefined}
-          compactControls={false}
+          subtitle={t("page.knowledge.subtitle")}
+          meta={data
+            ? `${totalFiles} ${totalFiles === 1 ? t("page.knowledge.file") : t("page.knowledge.files").toLocaleLowerCase()} · ${formatFileSize(totalStorage)}`
+            : undefined}
           toolbar={librarySection !== "trash" ? (
               <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:justify-end">
                 <SmartToolbar
@@ -3248,7 +3259,7 @@ export default function Knowledge() {
         />
 
         {librarySection !== "trash" && (
-          <div className="flex min-w-0 flex-wrap items-center gap-1 px-4 pb-2 text-[13px]">
+            <div className="flex min-w-0 flex-wrap items-center gap-1 pb-2 text-[13px]">
             {breadcrumbs.map((crumb, i) => {
               const isLast = i === breadcrumbs.length - 1;
               const crumbFolderId = i === 0 ? null : folderPath[i - 1]?.id ?? null;
@@ -3390,7 +3401,7 @@ export default function Knowledge() {
         {/* ── Files View ─────────────────────────── */}
         <>
             {/* File count display */}
-            <div className="flex items-center gap-2 px-4 pb-2 text-xs text-stone-400">
+            <div className="flex items-center gap-2 pb-2 text-xs text-stone-400">
               {folderCount > 0 && <span>{folderCount} {t("page.knowledge.folder")}{folderCount !== 1 ? "s" : ""}</span>}
               {folderCount > 0 && fileCount > 0 && <span className="w-[3px] h-[3px] rounded-full bg-stone-300" />}
               {fileCount > 0 && <span>{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>}
@@ -3583,7 +3594,7 @@ export default function Knowledge() {
                                 value={newFolderName}
                                 onChange={(e) => setNewFolderName(e.target.value)}
                                 onKeyDown={(e) => {
-                                  if (e.key === "Enter") commitCreateFolder();
+                                  if (e.key === "Enter" && !e.nativeEvent.isComposing) commitCreateFolder();
                                   if (e.key === "Escape") { setCreatingFolder(false); setNewFolderName(""); }
                                 }}
                                 onBlur={commitCreateFolder}
@@ -3694,10 +3705,18 @@ export default function Knowledge() {
                       const docCanManageMetadata = canManageDocMetadata(doc);
                       const docManage = docCanManageMetadata || canDeleteDoc(doc);
                       const folderPathLabel = isSearching ? folderPathLabelForDocument(doc) : "";
+                      const selectionSourcePath = isViewable(doc)
+                        ? `/viewer/${doc.id}`
+                        : isEditable(doc) && canEditDoc(doc)
+                          ? `/editor/${doc.id}`
+                          : `${location.pathname}${location.search}`;
                       return (
                         <div
                           key={doc.id}
                           className={`kb-file-card${draggingItem?.id === doc.id ? " dragging" : ""}${selectMode && selectedIds.has(doc.id) ? " !border-manor-500" : ""}${statusCls ? ` ${statusCls}` : ""}`}
+                          data-selection-context="knowledge"
+                          data-selection-source-label={doc.name}
+                          data-selection-source-path={selectionSourcePath}
                           draggable={!selectMode && !statusCls && docCanManageMetadata}
                           onDragStart={(e) => { if (!selectMode && docCanManageMetadata) handleDragStartItem(e, { id: doc.id, type: "file", name: doc.name }); }}
                           onDragEnd={handleDragEndItem}
@@ -3809,7 +3828,7 @@ export default function Knowledge() {
                                     value={newFolderName}
                                     onChange={(e) => setNewFolderName(e.target.value)}
                                     onKeyDown={(e) => {
-                                      if (e.key === "Enter") commitCreateFolder();
+                                      if (e.key === "Enter" && !e.nativeEvent.isComposing) commitCreateFolder();
                                       if (e.key === "Escape") { setCreatingFolder(false); setNewFolderName(""); }
                                     }}
                                     onBlur={commitCreateFolder}
@@ -4726,6 +4745,16 @@ function FolderShareDialogContainer({
       externalShareNeedsApproval={folder.classification === "confidential"}
       internalGrants={(grantsQuery.data || []).map(_folderGrantToInternal)}
       externalShares={(sharesQuery.data || []).map(_folderShareToExternal)}
+      onChangeVisibility={async (v) => {
+        // Same endpoint as FolderPropertiesDialog (manage_metadata-gated
+        // server-side). No cascade: children keep their own visibility,
+        // but the folder acts as read-path gate + ceiling regardless.
+        await api.folderPermissions.setProperties(folder.id, { visibility: v });
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["documents-browse"] }),
+          queryClient.invalidateQueries({ queryKey: ["folder-tree"] }),
+        ]);
+      }}
       onAddInternal={async (pick, role, opts) => {
         // Resolve to a user_id either via staff.user_id (preferred) or
         // via /users/lookup-by-email (fallback for external invites).
@@ -4930,6 +4959,12 @@ function DocShareDialogContainer({
       internalGrants={(grantsQuery.data || []).map((g) => _docGrantToInternal(g, userById))}
       externalShares={(sharesQuery.data || []).map(_docShareToExternal)}
       entityDomain={_entityDomainFromEmail(currentUser?.email)}
+      onChangeVisibility={async (v) => {
+        // Same endpoint DocumentPropertiesDialog uses (manage_metadata-
+        // gated server-side; 403 surfaces in the dialog's error row).
+        await api.permissionsV1.setVisibility(doc.id, v);
+        await queryClient.invalidateQueries({ queryKey: ["documents-browse"] });
+      }}
       onAddInternal={async (pick, role, opts) => {
         // Same staff_id → user_id resolution as FileViewer (preferred:
         // staff.user_id; fallback: email lookup; surfaces a friendly error

@@ -39,6 +39,10 @@ import ChatMessageActions, {
   displayContentForAssistantMessage,
   isRetryableAssistantMessage,
 } from "./chat/ChatMessageActions";
+import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
+import ChatScrollRail, {
+  type ChatScrollRailMarker,
+} from "./chat/ChatScrollRail";
 import ManorAvatar from "./ui/ManorAvatar";
 import UserAvatar from "./ui/UserAvatar";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
@@ -46,7 +50,9 @@ import ApprovalActionBar from "./ui/ApprovalActionBar";
 import InlineTips from "./ui/InlineTips";
 import { DEFAULT_APPROVAL_OPTIONS } from "../lib/approvalOptions";
 import ToolCallList from "./ui/ToolCallList";
+import { ChatMessagesSkeleton } from "./ui/Skeleton";
 import CreditLimitNotice from "./ui/CreditLimitNotice";
+import Button from "./ui/Button";
 import ChatInputFooter, {
   createChatMessageAttachmentSnapshot,
   manualSkillLabel,
@@ -77,6 +83,10 @@ import {
   savePendingChatRetry,
   type PendingChatRetry,
 } from "../lib/chatRetry";
+import {
+  INSERT_CHAT_COMPOSER_EVENT,
+  type InsertChatComposerDetail,
+} from "../lib/selectionActions";
 
 function maybeLocalCodingRunNoticeForTools(_tools: ToolCall[]): string | null {
   return null;
@@ -84,6 +94,7 @@ function maybeLocalCodingRunNoticeForTools(_tools: ToolCall[]): string | null {
 import {
   IconAgent,
   IconCalendar,
+  IconChevronRight,
   IconDocument,
   IconDownload,
   IconFlow,
@@ -97,6 +108,12 @@ import {
 } from "./icons";
 import { t } from "../lib/i18n";
 import { isCodeLikeFile } from "../lib/codeFiles";
+import {
+  pickRandomSoloBusinessIdeas,
+  soloBusinessIdeaExecutionKey,
+  soloBusinessIdeaKey,
+  type SoloBusinessIdeaDefinition,
+} from "../lib/soloBusinessIdeas";
 
 
 interface AgentInfo {
@@ -107,6 +124,8 @@ interface AgentInfo {
 }
 
 type ChatRetryRequest = Omit<PendingChatRetry, "createdAt">;
+
+const CHAT_MESSAGE_PAGE_SIZE = 75;
 
 function hasVisibleUserContent(message: ChatMessage | undefined): boolean {
   return Boolean(
@@ -192,6 +211,107 @@ type WorkspaceCapabilityConfig = {
     previewContent?: WorkspaceSamplePreviewContent;
   }>;
 };
+
+type IdeaQuickAction = {
+  id: "new-idea" | "validate-idea";
+  title: string;
+  description: string;
+  icon: (props: IconProps) => JSX.Element;
+  accent: string;
+};
+
+type IdeaQuickActionRequest = {
+  message: string;
+  skill: ManualSkillItem;
+};
+
+const IDEA_BUILT_IN_SKILLS: Record<IdeaQuickAction["id"], ManualSkillItem> = {
+  "new-idea": {
+    id: "solo-business-idea-finder",
+    name: "solo-business-idea-finder",
+    slug: "solo-business-idea-finder",
+  },
+  "validate-idea": {
+    id: "solo-business-idea-review",
+    name: "solo-business-idea-review",
+    slug: "solo-business-idea-review",
+  },
+};
+
+function ideaField(
+  idea: SoloBusinessIdeaDefinition,
+  field: Parameters<typeof soloBusinessIdeaKey>[1],
+) {
+  return t(soloBusinessIdeaKey(idea, field));
+}
+
+function ideaCandidateRequest(
+  action: IdeaQuickAction,
+  idea: SoloBusinessIdeaDefinition,
+): IdeaQuickActionRequest {
+  const context = t("component.embedded_chat.idea_library.selected_context", {
+    title: ideaField(idea, "title"),
+    buyer: ideaField(idea, "buyer"),
+    promise: ideaField(idea, "promise"),
+    revenue: ideaField(idea, "revenue"),
+    signal: ideaField(idea, "signal"),
+    test: ideaField(idea, "test"),
+    execution: t(soloBusinessIdeaExecutionKey(idea.manorExecution)),
+    manorPath: ideaField(idea, "manorPath"),
+  });
+  const instruction = t(
+    action.id === "new-idea"
+      ? "component.embedded_chat.idea_library.explore_instruction"
+      : "component.embedded_chat.idea_library.validate_instruction",
+  );
+  return {
+    message: `${context}\n\n${instruction}`,
+    skill: IDEA_BUILT_IN_SKILLS[action.id],
+  };
+}
+
+function freshIdeaRequest(): IdeaQuickActionRequest {
+  return {
+    message: t("component.embedded_chat.new_idea_today_prompt"),
+    skill: IDEA_BUILT_IN_SKILLS["new-idea"],
+  };
+}
+
+type WorkspaceRailKey = WorkspaceCapability | IdeaQuickAction["id"];
+
+const WORKSPACE_RAIL_ORDER: WorkspaceRailKey[] = [
+  "research",
+  "agents",
+  "automations",
+  "new-idea",
+  "validate-idea",
+  "workspace",
+  "slides",
+  "docs",
+  "sheets",
+  "website",
+  "image",
+  "video",
+];
+
+function ideaQuickActions(): IdeaQuickAction[] {
+  return [
+    {
+      id: "new-idea",
+      title: t("component.embedded_chat.new_idea_today"),
+      description: t("component.embedded_chat.new_idea_today_desc"),
+      icon: IconSparkles,
+      accent: "var(--accent)",
+    },
+    {
+      id: "validate-idea",
+      title: t("component.embedded_chat.validate_my_idea"),
+      description: t("component.embedded_chat.validate_my_idea_desc"),
+      icon: IconReport,
+      accent: "var(--text-muted)",
+    },
+  ];
+}
 
 const BASE_WORKSPACE_CAPABILITIES: WorkspaceCapabilityConfig[] = [
   {
@@ -1323,53 +1443,55 @@ function UserMessageContent({
   return (
     <>
       {parts.length > 0 && (
-        <div className="chat-user-rich-text">
-          {parts.map((part) => {
-            if (part.kind === "text")
-              return <span key={part.key}>{part.text}</span>;
-            if (part.kind === "mention") {
+        <CollapsibleSentMessage text={contentText}>
+          <div className="chat-user-rich-text">
+            {parts.map((part) => {
+              if (part.kind === "text")
+                return <span key={part.key}>{part.text}</span>;
+              if (part.kind === "mention") {
+                return (
+                  <span
+                    key={part.key}
+                    className={`chat-message-inline-token chat-message-inline-token--${part.mention.type}`}
+                  >
+                    <span className="chat-message-inline-avatar">
+                      {part.mention.name.charAt(0).toUpperCase()}
+                    </span>
+                    <span className="chat-message-inline-main">
+                      <strong>@{part.mention.name}</strong>
+                      <small>{part.mention.type}</small>
+                    </span>
+                  </span>
+                );
+              }
+              const label = (
+                part.attachment.fileType ||
+                part.attachment.mimeType ||
+                part.attachment.name.split(".").pop() ||
+                "file"
+              )
+                .toUpperCase()
+                .slice(0, 5);
               return (
                 <span
                   key={part.key}
-                  className={`chat-message-inline-token chat-message-inline-token--${part.mention.type}`}
+                  className="chat-message-inline-token chat-message-inline-token--attachment"
                 >
-                  <span className="chat-message-inline-avatar">
-                    {part.mention.name.charAt(0).toUpperCase()}
-                  </span>
+                  <span className="chat-message-inline-file">{label}</span>
                   <span className="chat-message-inline-main">
-                    <strong>@{part.mention.name}</strong>
-                    <small>{part.mention.type}</small>
+                    <strong>#{part.attachment.name}</strong>
+                    <small>
+                      {part.attachment.mimeType ||
+                        part.attachment.fileType ||
+                        part.attachment.type ||
+                        t("page.knowledge.file")}
+                    </small>
                   </span>
                 </span>
               );
-            }
-            const label = (
-              part.attachment.fileType ||
-              part.attachment.mimeType ||
-              part.attachment.name.split(".").pop() ||
-              "file"
-            )
-              .toUpperCase()
-              .slice(0, 5);
-          return (
-            <span
-              key={part.key}
-              className="chat-message-inline-token chat-message-inline-token--attachment"
-            >
-              <span className="chat-message-inline-file">{label}</span>
-              <span className="chat-message-inline-main">
-                <strong>#{part.attachment.name}</strong>
-                <small>
-                  {part.attachment.mimeType ||
-                    part.attachment.fileType ||
-                    part.attachment.type ||
-                    t("page.knowledge.file")}
-                </small>
-              </span>
-            </span>
-          );
-          })}
-        </div>
+            })}
+          </div>
+        </CollapsibleSentMessage>
       )}
       <ChatMessageReferenceStrip
         references={references}
@@ -1931,43 +2053,132 @@ function WorkspaceWelcome({
   activeCapability,
   onCapabilityChange,
   onSampleSelect,
+  onIdeaQuickAction,
+  onIdeaModeChange,
+  onValidationStart,
 }: {
   activeCapability: WorkspaceCapability;
   onCapabilityChange: (capability: WorkspaceCapability) => void;
   onSampleSelect: (prompt: string) => void;
+  onIdeaQuickAction: (request: IdeaQuickActionRequest) => void;
+  onIdeaModeChange: (mode: IdeaQuickAction["id"] | null) => void;
+  onValidationStart: () => void;
 }) {
   const selected =
     WORKSPACE_CAPABILITIES.find((item) => item.key === activeCapability) ||
     WORKSPACE_CAPABILITIES[0];
-  const activeIndex = WORKSPACE_CAPABILITIES.findIndex(
-    (item) => item.key === selected.key,
+  const quickActions = ideaQuickActions();
+  const [railFocusKey, setRailFocusKey] =
+    useState<WorkspaceRailKey>("new-idea");
+  const [ideaCandidates, setIdeaCandidates] = useState(() =>
+    pickRandomSoloBusinessIdeas(),
   );
+  const focusedIdea = quickActions.find((action) => action.id === railFocusKey);
+  const activeIndex = WORKSPACE_RAIL_ORDER.indexOf(railFocusKey);
   const modeRailRef = useRef<HTMLDivElement | null>(null);
   const activePillRef = useRef<HTMLButtonElement | null>(null);
   const wheelSwitchLockedRef = useRef(false);
   const dockDragStartXRef = useRef<number | null>(null);
   const dockDragLastXRef = useRef<number | null>(null);
-  const dockClickCapabilityRef = useRef<WorkspaceCapability | null>(null);
+  const dockClickRailKeyRef = useRef<WorkspaceRailKey | null>(null);
+
+  const refreshIdeaCandidates = useCallback(() => {
+    setIdeaCandidates((current) =>
+      pickRandomSoloBusinessIdeas(
+        3,
+        current.map((idea) => idea.id),
+      ),
+    );
+  }, []);
 
   useEffect(() => {
-    activePillRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-      inline: "center",
-    });
-  }, [selected.key]);
+    const rail = modeRailRef.current;
+    if (!rail) return;
 
-  const switchCapabilityByStep = useCallback(
+    const centerFocusedItems = (behavior: ScrollBehavior) => {
+      if (railFocusKey === "new-idea") {
+        const newIdea = rail.querySelector<HTMLElement>(
+          '[data-rail-key="new-idea"]',
+        );
+        const validateIdea = rail.querySelector<HTMLElement>(
+          '[data-rail-key="validate-idea"]',
+        );
+        if (newIdea && validateIdea) {
+          const pairCenter =
+            (newIdea.offsetLeft +
+              newIdea.offsetWidth / 2 +
+              validateIdea.offsetLeft +
+              validateIdea.offsetWidth / 2) /
+            2;
+          rail.scrollTo({
+            left: pairCenter - rail.clientWidth / 2,
+            behavior,
+          });
+          return;
+        }
+      }
+      activePillRef.current?.scrollIntoView({
+        behavior,
+        block: "nearest",
+        inline: "center",
+      });
+    };
+
+    centerFocusedItems("smooth");
+    const resizeObserver = new ResizeObserver(() => {
+      centerFocusedItems("auto");
+    });
+    resizeObserver.observe(rail);
+    return () => resizeObserver.disconnect();
+  }, [railFocusKey]);
+
+  const focusRailByStep = useCallback(
     (step: number) => {
       if (step === 0) return;
       const nextIndex = Math.max(
         0,
-        Math.min(WORKSPACE_CAPABILITIES.length - 1, activeIndex + step),
+        Math.min(WORKSPACE_RAIL_ORDER.length - 1, activeIndex + step),
       );
-      if (nextIndex !== activeIndex)
-        onCapabilityChange(WORKSPACE_CAPABILITIES[nextIndex].key);
+      if (nextIndex === activeIndex) return;
+      const nextKey = WORKSPACE_RAIL_ORDER[nextIndex];
+      setRailFocusKey(nextKey);
+      if (nextKey === "new-idea" || nextKey === "validate-idea") {
+        onIdeaModeChange(nextKey);
+        if (nextKey === "new-idea") refreshIdeaCandidates();
+      } else {
+        onIdeaModeChange(null);
+        onCapabilityChange(nextKey);
+      }
     },
-    [activeIndex, onCapabilityChange],
+    [
+      activeIndex,
+      onCapabilityChange,
+      onIdeaModeChange,
+      refreshIdeaCandidates,
+    ],
+  );
+
+  const handleRailItemClick = useCallback(
+    (key: WorkspaceRailKey) => {
+      setRailFocusKey(key);
+      if (key === "new-idea" || key === "validate-idea") {
+        onIdeaModeChange(key);
+        if (key === "new-idea") {
+          refreshIdeaCandidates();
+        } else {
+          onValidationStart();
+        }
+        return;
+      }
+      onIdeaModeChange(null);
+      onCapabilityChange(key);
+    },
+    [
+      onCapabilityChange,
+      onIdeaModeChange,
+      onValidationStart,
+      refreshIdeaCandidates,
+    ],
   );
 
   useEffect(() => {
@@ -1982,19 +2193,23 @@ function WorkspaceWelcome({
       event.preventDefault();
       if (wheelSwitchLockedRef.current) return;
       wheelSwitchLockedRef.current = true;
-      switchCapabilityByStep(delta > 0 ? 1 : -1);
+      focusRailByStep(delta > 0 ? 1 : -1);
       window.setTimeout(() => {
         wheelSwitchLockedRef.current = false;
       }, 180);
     };
     rail.addEventListener("wheel", handleWheel, { passive: false });
     return () => rail.removeEventListener("wheel", handleWheel);
-  }, [switchCapabilityByStep]);
+  }, [focusRailByStep]);
 
   return (
     <div
       className="workspace-welcome"
-      style={{ "--capability-accent": selected.accent } as CSSProperties}
+      style={
+        {
+          "--capability-accent": focusedIdea?.accent || selected.accent,
+        } as CSSProperties
+      }
     >
       <div className="workspace-welcome-kicker">{t("component.embedded_chat.manor_ai_workspace")}</div>
       <h1>{t("component.embedded_chat.start_with_sample_or_prompt")}</h1>
@@ -2002,20 +2217,19 @@ function WorkspaceWelcome({
       <div
         ref={modeRailRef}
         className="workspace-mode-rail"
-        role="tablist"
+        role="group"
+        data-pair-focused={railFocusKey === "new-idea" ? "true" : undefined}
         aria-label={t("component.embedded_chat.workspace_capability_selector")}
         onPointerDown={(event) => {
           const targetPill = (event.target as HTMLElement).closest<HTMLElement>(
             ".workspace-mode-pill",
           );
-          const targetCapability = targetPill?.dataset
-            .capability as WorkspaceCapability | undefined;
-          dockClickCapabilityRef.current =
-            targetCapability &&
-            WORKSPACE_CAPABILITIES.some(
-              (capability) => capability.key === targetCapability,
-            )
-              ? targetCapability
+          const targetKey = targetPill?.dataset.railKey as
+            | WorkspaceRailKey
+            | undefined;
+          dockClickRailKeyRef.current =
+            targetKey && WORKSPACE_RAIL_ORDER.includes(targetKey)
+              ? targetKey
               : null;
           dockDragStartXRef.current = event.clientX;
           dockDragLastXRef.current = event.clientX;
@@ -2028,52 +2242,65 @@ function WorkspaceWelcome({
         onPointerUp={(event) => {
           const startX = dockDragStartXRef.current;
           const lastX = dockDragLastXRef.current;
+          const clickedKey = dockClickRailKeyRef.current;
           dockDragStartXRef.current = null;
           dockDragLastXRef.current = null;
+          dockClickRailKeyRef.current = null;
           event.currentTarget.releasePointerCapture?.(event.pointerId);
           if (startX == null || lastX == null) return;
           const diff = lastX - startX;
           if (Math.abs(diff) < 34) {
-            const clickedCapability = dockClickCapabilityRef.current;
-            dockClickCapabilityRef.current = null;
-            if (clickedCapability) onCapabilityChange(clickedCapability);
+            if (clickedKey) handleRailItemClick(clickedKey);
             return;
           }
-          dockClickCapabilityRef.current = null;
-          switchCapabilityByStep(diff < 0 ? 1 : -1);
+          focusRailByStep(diff < 0 ? 1 : -1);
         }}
         onPointerCancel={() => {
           dockDragStartXRef.current = null;
           dockDragLastXRef.current = null;
-          dockClickCapabilityRef.current = null;
+          dockClickRailKeyRef.current = null;
         }}
       >
-        {WORKSPACE_CAPABILITIES.map((capability, index) => {
+        {WORKSPACE_RAIL_ORDER.map((railKey, index) => {
+          const action = quickActions.find((candidate) => candidate.id === railKey);
+          const capability = WORKSPACE_CAPABILITIES.find(
+            (candidate) => candidate.key === railKey,
+          );
+          if (!action && !capability) return null;
           const distance = Math.abs(index - activeIndex);
           const direction =
             index === activeIndex ? 0 : index < activeIndex ? -1 : 1;
-          const CapabilityIcon = CAPABILITY_ICON[capability.key];
-          const isActive = capability.key === selected.key;
+          const RailIcon = action?.icon || CAPABILITY_ICON[capability!.key];
+          const label = action?.title || capability!.label;
+          const description = action?.description || capability!.description;
+          const accent = action?.accent || capability!.accent;
+          const isActive = railKey === railFocusKey;
           return (
             <button
-              key={capability.key}
+              key={railKey}
               ref={isActive ? activePillRef : undefined}
               type="button"
-              role="tab"
-              aria-selected={isActive}
-              className={`workspace-mode-pill ${isActive ? "workspace-mode-pill--active" : ""}`}
+              aria-current={isActive ? "true" : undefined}
+              aria-label={action ? `${label}. ${description}` : label}
+              title={description}
+              className={`workspace-mode-pill ${action ? "workspace-mode-pill--idea" : ""} ${isActive ? "workspace-mode-pill--active" : ""}`}
               data-distance={Math.min(distance, 3)}
               data-direction={direction}
-              data-capability={capability.key}
-              style={
-                { "--capability-accent": capability.accent } as CSSProperties
-              }
-              onClick={() => onCapabilityChange(capability.key)}
+              data-rail-key={railKey}
+              style={{ "--capability-accent": accent } as CSSProperties}
+              onClick={(event) => {
+                if (event.detail === 0) handleRailItemClick(railKey);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                handleRailItemClick(railKey);
+              }}
             >
               <span>
-                <CapabilityIcon size={18} />
+                <RailIcon size={18} />
               </span>
-              <strong>{capability.label}</strong>
+              <strong>{label}</strong>
             </button>
           );
         })}
@@ -2081,32 +2308,136 @@ function WorkspaceWelcome({
 
       <p className="workspace-mode-summary">
         <span>
-          {selected.label} {t("component.embedded_chat.mode")}
+          {focusedIdea
+            ? focusedIdea.title
+            : `${selected.label} ${t("component.embedded_chat.mode")}`}
         </span>
-        {selected.description}
+        {focusedIdea?.description || selected.description}
       </p>
 
-      <div className="workspace-sample-grid">
-        {selected.samples.map((sample, index) => (
-          <article
-            key={`${selected.key}-sample-${index}-${sample.title}`}
-            className="workspace-sample-card"
+      {focusedIdea?.id === "new-idea" ? (
+        <>
+          <div
+            className="workspace-sample-grid workspace-idea-grid"
+            aria-label={t(
+              "component.embedded_chat.idea_library.candidates_label",
+            )}
+            aria-live="polite"
           >
-            <strong>{sample.title}</strong>
-            <WorkspaceSamplePreview
-              kind={sample.preview || selected.key}
-              content={sample.previewContent}
-            />
-            <button
-              type="button"
-              className="workspace-sample-apply"
-              onClick={() => onSampleSelect(sample.prompt)}
+            {ideaCandidates.map((idea) => {
+              return (
+                <article
+                  key={`${focusedIdea.id}-${idea.id}`}
+                  role="button"
+                  tabIndex={0}
+                  className="workspace-sample-card workspace-idea-card"
+                  onClick={() =>
+                    onIdeaQuickAction(ideaCandidateRequest(focusedIdea, idea))
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    onIdeaQuickAction(ideaCandidateRequest(focusedIdea, idea));
+                  }}
+                >
+                  <span className="workspace-sample-mode">
+                    {t(soloBusinessIdeaExecutionKey(idea.manorExecution))}
+                  </span>
+                  <strong>{ideaField(idea, "title")}</strong>
+                  <dl className="workspace-idea-summary">
+                    <div>
+                      <dt>{t("component.embedded_chat.idea_library.customer_label")}</dt>
+                      <dd>{ideaField(idea, "buyer")}</dd>
+                    </div>
+                    <div>
+                      <dt>{t("component.embedded_chat.idea_library.offer_label")}</dt>
+                      <dd>{ideaField(idea, "promise")}</dd>
+                    </div>
+                    <div>
+                      <dt>{t("component.embedded_chat.idea_library.revenue_label")}</dt>
+                      <dd>{ideaField(idea, "revenue")}</dd>
+                    </div>
+                  </dl>
+                  <span className="workspace-sample-apply">
+                    {t("component.embedded_chat.idea_library.explore_cta")}
+                    <IconChevronRight size={13} />
+                  </span>
+                </article>
+              );
+            })}
+          </div>
+          <div className="workspace-idea-actions">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="workspace-idea-refresh"
+              onClick={refreshIdeaCandidates}
             >
-              {t("component.embedded_chat.use_sample")}
-            </button>
-          </article>
-        ))}
-      </div>
+              {t("component.embedded_chat.idea_library.show_more")}
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => onIdeaQuickAction(freshIdeaRequest())}
+            >
+              <IconSparkles size={14} />
+              {t("component.embedded_chat.idea_library.generate_fresh")}
+            </Button>
+          </div>
+        </>
+      ) : focusedIdea?.id === "validate-idea" ? (
+        <section
+          className="workspace-idea-validation-intake"
+          aria-labelledby="workspace-idea-validation-title"
+        >
+          <div className="workspace-idea-validation-heading">
+            <span className="workspace-idea-validation-icon">
+              <IconReport size={20} />
+            </span>
+            <div>
+              <h2 id="workspace-idea-validation-title">
+                {t("component.embedded_chat.idea_validation.title")}
+              </h2>
+              <p>{t("component.embedded_chat.idea_validation.description")}</p>
+            </div>
+          </div>
+          <div className="workspace-idea-validation-checklist">
+            {[
+              "customer",
+              "problem",
+              "offer",
+              "evidence",
+            ].map((item, index) => (
+              <span key={item}>
+                <strong>{index + 1}</strong>
+                {t(`component.embedded_chat.idea_validation.${item}`)}
+              </span>
+            ))}
+          </div>
+        </section>
+      ) : (
+        <div className="workspace-sample-grid">
+          {selected.samples.map((sample, index) => (
+            <article
+              key={`${selected.key}-sample-${index}-${sample.title}`}
+              className="workspace-sample-card"
+            >
+              <strong>{sample.title}</strong>
+              <WorkspaceSamplePreview
+                kind={sample.preview || selected.key}
+                content={sample.previewContent}
+              />
+              <button
+                type="button"
+                className="workspace-sample-apply"
+                onClick={() => onSampleSelect(sample.prompt)}
+              >
+                {t("component.embedded_chat.use_sample")}
+              </button>
+            </article>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -2707,163 +3038,38 @@ function toDisplayText(value: unknown): string | undefined {
   }
 }
 
-type ConversationMarker = {
-  index: number;
-  position: number;
-};
-
-function sameConversationMarkers(
-  previous: ConversationMarker[],
-  next: ConversationMarker[],
-): boolean {
-  return (
-    previous.length === next.length &&
-    previous.every(
-      (marker, index) =>
-        marker.index === next[index]?.index &&
-        Math.abs(marker.position - next[index].position) < 0.002,
-    )
-  );
-}
-
-function sampleConversationMarkers(
-  markers: ConversationMarker[],
-  activeIndex: number,
-  maximum = 72,
-): ConversationMarker[] {
-  if (markers.length <= maximum) return markers;
-  const step = Math.ceil(markers.length / Math.max(1, maximum - 2));
-  return markers.filter(
-    (marker, index) =>
-      index === 0 ||
-      index === markers.length - 1 ||
-      index % step === 0 ||
-      marker.index === activeIndex,
-  );
-}
-
-function cleanConversationPreview(value: unknown): string {
-  return (toDisplayText(value) || "")
-    .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1")
-    .replace(/[`*_>#~-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function conversationPreviewContent(message: ChatMessage | undefined) {
-  const fallback = t(
-    message?.role === "user"
-      ? "component.embedded_chat.user_message"
-      : "component.embedded_chat.assistant_message",
-  );
-  const source = toDisplayText(message?.content) || "";
-  const lines = source
-    .split(/\r?\n/)
-    .map(cleanConversationPreview)
-    .filter(Boolean);
-  const body = cleanConversationPreview(source) || fallback;
-  const firstLine = lines[0] || fallback;
-  const title = trimText(firstLine, 56) || fallback;
-  const attachment = message?.attachments?.[0];
-  const extension = attachment?.name.split(".").pop()?.toUpperCase() || "FILE";
-  return {
-    fallback,
-    title,
-    body: trimText(body, 240) || fallback,
-    attachment,
-    extension: extension.slice(0, 4),
-  };
-}
-
-function ConversationMinimap({
-  messages,
-  markers,
-  activeIndex,
-  onSelect,
-}: {
-  messages: ChatMessage[];
-  markers: ConversationMarker[];
-  activeIndex: number;
-  onSelect: (index: number) => void;
-}) {
-  const visibleMarkers = useMemo(
-    () => sampleConversationMarkers(markers, activeIndex),
-    [activeIndex, markers],
-  );
-  const highlightedIndex = visibleMarkers.reduce(
-    (closest, marker) =>
-      Math.abs(marker.index - activeIndex) < Math.abs(closest - activeIndex)
-        ? marker.index
-        : closest,
-    visibleMarkers[0]?.index ?? activeIndex,
-  );
-  const compactLayout = visibleMarkers.length <= 32;
-  const compactGap =
-    visibleMarkers.length > 1
-      ? Math.min(18, 520 / (visibleMarkers.length - 1))
-      : 0;
-  const markerTop = (marker: ConversationMarker, visualIndex: number) =>
-    compactLayout
-      ? `calc(50% + ${(visualIndex - (visibleMarkers.length - 1) / 2) * compactGap}px)`
-      : `${marker.position * 100}%`;
-
-  return (
-    <nav
-      aria-label={t("component.embedded_chat.conversation_navigation")}
-      className="embedded-chat-conversation-minimap"
-    >
-      {visibleMarkers.map((marker, visualIndex) => {
-        const message = messages[marker.index];
-        const content = conversationPreviewContent(message);
-        const preview = trimText(content.body, 72) || content.fallback;
-        const isActive = marker.index === highlightedIndex;
-        const previewId = `conversation-minimap-preview-${marker.index}`;
-        return (
-          <div
-            key={marker.index}
-            className="embedded-chat-conversation-minimap-item"
-            style={{ top: markerTop(marker, visualIndex) }}
-          >
-            <button
-              aria-current={isActive ? "location" : undefined}
-              aria-describedby={previewId}
-              aria-label={t("component.embedded_chat.jump_to_message", {
-                number: String(marker.index + 1),
-                preview,
-              })}
-              className={isActive ? "is-active" : undefined}
-              data-chat-minimap-index={marker.index}
-              type="button"
-              onClick={() => onSelect(marker.index)}
-            >
-              <span aria-hidden="true" />
-            </button>
-            <aside
-              id={previewId}
-              className="embedded-chat-conversation-preview"
-              role="tooltip"
-            >
-              <strong>{content.title}</strong>
-              <p>{content.body}</p>
-              {content.attachment && (
-                <div className="embedded-chat-conversation-preview-file">
-                  <span>{content.extension}</span>
-                  <b>{content.attachment.name}</b>
-                </div>
-              )}
-            </aside>
-          </div>
-        );
-      })}
-    </nav>
-  );
-}
-
 function trimText(value?: unknown, max = 360) {
   const text = toDisplayText(value);
   if (!text) return undefined;
   const compact = text.trim();
   return compact.length > max ? `${compact.slice(0, max)}...` : compact;
+}
+
+function compactChatRailText(value: unknown) {
+  return (toDisplayText(value) || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[#>*_~]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function chatRailPreviewFromText(value: unknown, fallbackTitle: string) {
+  const compact = compactChatRailText(value);
+  if (!compact) return { title: fallbackTitle, excerpt: "" };
+  const titleLength = compact.length > 58 ? 58 : compact.length;
+  const title =
+    compact.length > titleLength
+      ? `${compact.slice(0, titleLength).trim()}...`
+      : compact;
+  const excerptSource =
+    compact.length > titleLength ? compact.slice(titleLength).trim() : compact;
+  const excerpt =
+    excerptSource.length > 150
+      ? `${excerptSource.slice(0, 150).trim()}...`
+      : excerptSource;
+  return { title, excerpt };
 }
 
 function statusLabel(status: ExecutionStatus) {
@@ -4914,6 +5120,8 @@ export default function EmbeddedChat({
   const isAgentConversation = Boolean(agentId && !isMasterAgent(agentId));
 
   const [input, setInput] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerEditorRef = useRef<HTMLDivElement>(null);
   const [selectedAgent, setSelectedAgent] = useState<AgentInfo | null>(null);
   const [mentionedAgent, setMentionedAgent] = useState<AgentInfo | null>(null);
   const [selectedMentions, setSelectedMentions] = useState<MentionOption[]>([]);
@@ -4936,6 +5144,8 @@ export default function EmbeddedChat({
   );
   const [activeCapability, setActiveCapability] =
     useState<WorkspaceCapability>("workspace");
+  const [ideaComposerMode, setIdeaComposerMode] =
+    useState<IdeaQuickAction["id"] | null>("new-idea");
   const [chatMode, setChatMode] = useState<ChatBoxMode>("auto");
   const [chatModePayload, setChatModePayload] = useState<ChatModePayload>(() =>
     getDefaultChatModePayload("auto"),
@@ -4961,6 +5171,11 @@ export default function EmbeddedChat({
     : initialStreamState.latestSessionKey
       ? initialStreamState.sessions[initialStreamState.latestSessionKey]
       : undefined;
+  const shouldLoadInitialConversation =
+    !initialSession?.messages?.length &&
+    (Boolean(initialPropConvId) ||
+      conversationId === "manor-ai" ||
+      (isVirtualAgentConversationId(conversationId) && Boolean(agentId)));
   const [currentConvId, setCurrentConvId] = useState<string | undefined>(
     initialPropConvId || initialSession?.convId,
   );
@@ -4980,6 +5195,11 @@ export default function EmbeddedChat({
   const [messageFeedback, setMessageFeedback] = useState<
     Record<string, ChatMessageFeedbackRating>
   >({});
+  const [messageHistoryState, setMessageHistoryState] = useState<
+    Record<string, { hasMore: boolean; nextCursor: string | null }>
+  >({});
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [conversationLoading, setConversationLoading] = useState(shouldLoadInitialConversation);
   const setSessionMessages = useChatStreamStore((s) => s.setSessionMessages);
   const createDraftSession = useChatStreamStore((s) => s.createDraftSession);
   const startStream = useChatStreamStore((s) => s.startStream);
@@ -4992,7 +5212,9 @@ export default function EmbeddedChat({
   useEffect(() => {
     currentSessionKeyRef.current = currentSessionKey;
   }, [currentSessionKey]);
+  const showConversationSkeleton = conversationLoading && messages.length === 0;
   const didInitialScrollRef = useRef(false);
+  const suppressNextAutoScrollRef = useRef(false);
   const streamScrollFrameRef = useRef<number | null>(null);
   const lastStreamScrollAtRef = useRef(0);
   useEffect(() => {
@@ -5100,6 +5322,30 @@ export default function EmbeddedChat({
     );
   }, []);
 
+  useEffect(() => {
+    const handleInsertChatPrompt = (event: Event) => {
+      const detail =
+        (event as CustomEvent<InsertChatComposerDetail>).detail || {};
+      const prompt = (detail.prompt || "").trim();
+      if (!prompt) return;
+      setInput((prev) => {
+        const current = prev.trim();
+        return current ? `${prev.trimEnd()}\n\n${prompt}` : prompt;
+      });
+      window.setTimeout(() => textareaRef.current?.focus(), 0);
+    };
+
+    window.addEventListener(
+      INSERT_CHAT_COMPOSER_EVENT,
+      handleInsertChatPrompt as EventListener,
+    );
+    return () =>
+      window.removeEventListener(
+        INSERT_CHAT_COMPOSER_EVENT,
+        handleInsertChatPrompt as EventListener,
+      );
+  }, []);
+
   const handleMentionRemove = useCallback((mention: MentionOption) => {
     setSelectedMentions((prev) =>
       prev.filter(
@@ -5120,6 +5366,7 @@ export default function EmbeddedChat({
   const requestChatMode = chatMode === "auto" ? undefined : chatMode;
 
   const handleChatModeChange = useCallback((mode: ChatBoxMode) => {
+    setIdeaComposerMode(null);
     setChatMode(mode);
     setChatModePayload(getDefaultChatModePayload(mode));
     if (mode === "auto") {
@@ -5140,12 +5387,14 @@ export default function EmbeddedChat({
   }, []);
 
   const resetChatModeAfterTurn = useCallback(() => {
+    setIdeaComposerMode(null);
     setChatMode("auto");
     setChatModePayload(getDefaultChatModePayload("auto"));
     setActiveCapability("workspace");
   }, []);
 
   const handleSampleSelect = useCallback((prompt: string) => {
+    setIdeaComposerMode(null);
     setInput(prompt);
   }, []);
 
@@ -5154,13 +5403,6 @@ export default function EmbeddedChat({
 
   const chatBodyRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const conversationMapFrameRef = useRef<number | null>(null);
-  const [conversationMarkers, setConversationMarkers] = useState<
-    ConversationMarker[]
-  >([]);
-  const [activeMessageIndex, setActiveMessageIndex] = useState(0);
-  const [conversationMinimapVisible, setConversationMinimapVisible] =
-    useState(false);
   const resumedRef = useRef(false);
   const selectedArtifactReturnTo = useMemo(() => {
     const base = `${location.pathname}${location.search}`;
@@ -5187,128 +5429,46 @@ export default function EmbeddedChat({
     return () => window.clearTimeout(timer);
   }, [location.hash, messages.length]);
 
-  const updateConversationMinimap = useCallback(() => {
-    const body = chatBodyRef.current;
-    if (!body) return;
-    const rows = Array.from(
-      body.querySelectorAll<HTMLElement>("[data-chat-message-index]"),
-    );
-    const canNavigate =
-      rows.length > 2 && body.scrollHeight > body.clientHeight + 24;
-    setConversationMinimapVisible(canNavigate);
-    if (!rows.length) {
-      setConversationMarkers([]);
-      setActiveMessageIndex(0);
-      return;
-    }
-
-    const bodyRect = body.getBoundingClientRect();
-    const scrollRange = Math.max(1, body.scrollHeight - body.clientHeight);
-    const nextMarkers = rows.map((row, fallbackIndex) => {
-      const parsedIndex = Number(row.dataset.chatMessageIndex);
-      const index = Number.isFinite(parsedIndex) ? parsedIndex : fallbackIndex;
-      const contentTop =
-        row.getBoundingClientRect().top - bodyRect.top + body.scrollTop;
-      return {
-        index,
-        position: Math.min(1, Math.max(0, contentTop / scrollRange)),
-      };
-    });
-    setConversationMarkers((previous) =>
-      sameConversationMarkers(previous, nextMarkers) ? previous : nextMarkers,
-    );
-
-    let nextActive = nextMarkers[0].index;
-    if (body.scrollTop <= 4) {
-      nextActive = nextMarkers[0].index;
-    } else if (
-      body.scrollTop + body.clientHeight >=
-      body.scrollHeight - 4
-    ) {
-      nextActive = nextMarkers[nextMarkers.length - 1].index;
-    } else {
-      const focusY = bodyRect.top + body.clientHeight * 0.44;
-      let closestDistance = Number.POSITIVE_INFINITY;
-      let closestCenterDistance = Number.POSITIVE_INFINITY;
-      rows.forEach((row, fallbackIndex) => {
-        const rect = row.getBoundingClientRect();
-        const distance =
-          focusY < rect.top
-            ? rect.top - focusY
-            : focusY > rect.bottom
-              ? focusY - rect.bottom
-              : 0;
-        const centerDistance = Math.abs((rect.top + rect.bottom) / 2 - focusY);
-        if (
-          distance < closestDistance ||
-          (distance === closestDistance && centerDistance < closestCenterDistance)
-        ) {
-          const parsedIndex = Number(row.dataset.chatMessageIndex);
-          nextActive = Number.isFinite(parsedIndex)
-            ? parsedIndex
-            : fallbackIndex;
-          closestDistance = distance;
-          closestCenterDistance = centerDistance;
-        }
-      });
-    }
-    setActiveMessageIndex((current) =>
-      current === nextActive ? current : nextActive,
-    );
-  }, []);
-
-  const scheduleConversationMinimapUpdate = useCallback(() => {
-    if (conversationMapFrameRef.current !== null) return;
-    conversationMapFrameRef.current = window.requestAnimationFrame(() => {
-      conversationMapFrameRef.current = null;
-      updateConversationMinimap();
-    });
-  }, [updateConversationMinimap]);
-
-  useLayoutEffect(() => {
-    const body = chatBodyRef.current;
-    if (!body) return undefined;
-    const rows = Array.from(
-      body.querySelectorAll<HTMLElement>("[data-chat-message-index]"),
-    );
-    body.addEventListener("scroll", scheduleConversationMinimapUpdate, {
-      passive: true,
-    });
-    const resizeObserver =
-      typeof ResizeObserver === "undefined"
-        ? null
-        : new ResizeObserver(scheduleConversationMinimapUpdate);
-    resizeObserver?.observe(body);
-    rows.forEach((row) => resizeObserver?.observe(row));
-    scheduleConversationMinimapUpdate();
-
-    return () => {
-      body.removeEventListener("scroll", scheduleConversationMinimapUpdate);
-      resizeObserver?.disconnect();
-      if (conversationMapFrameRef.current !== null) {
-        window.cancelAnimationFrame(conversationMapFrameRef.current);
-        conversationMapFrameRef.current = null;
-      }
-    };
-  }, [currentSessionKey, messages.length, scheduleConversationMinimapUpdate]);
-
-  const handleConversationMarkerSelect = useCallback((index: number) => {
-    const body = chatBodyRef.current;
-    const row = body?.querySelector<HTMLElement>(
-      `[data-chat-message-index="${index}"]`,
-    );
-    if (!body || !row) return;
-    const bodyRect = body.getBoundingClientRect();
-    const rowRect = row.getBoundingClientRect();
-    const rowTop = rowRect.top - bodyRect.top + body.scrollTop;
-    const targetTop =
-      rowTop - Math.max(24, (body.clientHeight - rowRect.height) / 2);
-    setActiveMessageIndex(index);
-    body.scrollTo({
-      top: Math.max(0, Math.min(targetTop, body.scrollHeight - body.clientHeight)),
-      behavior: "smooth",
-    });
-  }, []);
+  const chatScrollRailMarkers = useMemo<ChatScrollRailMarker[]>(
+    () =>
+      messages.map((msg, index) => {
+        const fallbackTitle =
+          msg.role === "user" ? currentUserName || "You" : title || "Manor AI";
+        const rawContent =
+          msg.role === "assistant"
+            ? displayContentForAssistantMessage(msg, toDisplayText(msg.content) || "")
+            : stripAttachedLine(msg.content);
+        const preview = chatRailPreviewFromText(rawContent, fallbackTitle);
+        const artifact = messageArtifacts[index]?.[0];
+        const attachment =
+          Array.isArray(msg.attachments) && msg.attachments.length > 0
+            ? msg.attachments[0]
+            : null;
+        const attachmentRecord = attachment as Record<string, unknown> | null;
+        const fileLabel =
+          artifact?.title ||
+          String(
+            attachmentRecord?.name ||
+              attachmentRecord?.filename ||
+              attachmentRecord?.title ||
+              "",
+          ) ||
+          "";
+        const fileKindSource =
+          artifact?.kind ||
+          (fileLabel.includes(".") ? fileLabel.split(".").pop() : "") ||
+          "file";
+        return {
+          id: msg.id || `${msg.role}-${msg.timestamp || index}`,
+          tone: msg.role === "user" ? "user" : "assistant",
+          title: preview.title,
+          excerpt: preview.excerpt,
+          fileKind: String(fileKindSource).slice(0, 4).toUpperCase(),
+          fileLabel,
+        };
+      }),
+    [currentUserName, messageArtifacts, messages, title],
+  );
 
   const closeOutputPanel = useCallback(() => {
     setOutputOpen(false);
@@ -5338,6 +5498,24 @@ export default function EmbeddedChat({
     [],
   );
 
+  const mergeOlderMessages = useCallback(
+    (olderMessages: ChatMessage[], existingMessages: ChatMessage[]) => {
+      const seen = new Set(
+        existingMessages
+          .map((message, index) => message.id || `${message.role}:${message.timestamp || index}:${message.content}`)
+          .filter(Boolean),
+      );
+      const older = olderMessages.filter((message, index) => {
+        const key = message.id || `${message.role}:${message.timestamp || index}:${message.content}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      return [...older, ...existingMessages];
+    },
+    [],
+  );
+
   const resolveLatestAgentConversationId = useCallback(async () => {
     if (!agentId) return undefined;
     const convs = await api.chat.listConversations();
@@ -5349,10 +5527,21 @@ export default function EmbeddedChat({
 
   const loadConversationMessages = useCallback(
     async (convId: string, options: { fallbackToAgent?: boolean } = {}) => {
+      setConversationLoading(true);
       try {
-        const msgs = await api.chat.getMessages(convId, { silent: true });
+        const page = await api.chat.getMessagesPage(convId, {
+          silent: true,
+          limit: CHAT_MESSAGE_PAGE_SIZE,
+        });
         if (streamingRef.current) return;
-        setSessionMessages(convId, mapMessages(msgs));
+        setSessionMessages(convId, mapMessages(page.items || []));
+        setMessageHistoryState((prev) => ({
+          ...prev,
+          [convId]: {
+            hasMore: Boolean(page.has_more),
+            nextCursor: page.next_cursor || null,
+          },
+        }));
         setCurrentConvId(convId);
         setDraftSessionKey(undefined);
       } catch (err) {
@@ -5363,11 +5552,19 @@ export default function EmbeddedChat({
           );
           if (fallbackConvId && fallbackConvId !== convId) {
             try {
-              const msgs = await api.chat.getMessages(fallbackConvId, {
+              const page = await api.chat.getMessagesPage(fallbackConvId, {
                 silent: true,
+                limit: CHAT_MESSAGE_PAGE_SIZE,
               });
               if (streamingRef.current) return;
-              setSessionMessages(fallbackConvId, mapMessages(msgs));
+              setSessionMessages(fallbackConvId, mapMessages(page.items || []));
+              setMessageHistoryState((prev) => ({
+                ...prev,
+                [fallbackConvId]: {
+                  hasMore: Boolean(page.has_more),
+                  nextCursor: page.next_cursor || null,
+                },
+              }));
               setCurrentConvId(fallbackConvId);
               setDraftSessionKey(undefined);
               window.dispatchEvent(
@@ -5384,6 +5581,10 @@ export default function EmbeddedChat({
         if (streamingRef.current) return;
         setCurrentConvId(undefined);
         setDraftSessionKey(undefined);
+        setMessageHistoryState((prev) => ({
+          ...prev,
+          [convId]: { hasMore: false, nextCursor: null },
+        }));
         if (isMissing && agentId) {
           window.dispatchEvent(
             new CustomEvent("manor:dm-conversation-resolved", {
@@ -5391,6 +5592,8 @@ export default function EmbeddedChat({
             }),
           );
         }
+      } finally {
+        setConversationLoading(false);
       }
     },
     [
@@ -5398,8 +5601,68 @@ export default function EmbeddedChat({
       mapMessages,
       resolveLatestAgentConversationId,
       setSessionMessages,
+      setMessageHistoryState,
     ],
   );
+
+  const currentHistoryState = currentConvId
+    ? messageHistoryState[currentConvId]
+    : undefined;
+
+  const handleLoadOlderMessages = useCallback(async () => {
+    if (
+      !currentConvId ||
+      !currentHistoryState?.hasMore ||
+      !currentHistoryState.nextCursor ||
+      loadingOlderMessages ||
+      streamingRef.current
+    ) {
+      return;
+    }
+    const container = chatBodyRef.current;
+    const previousHeight = container?.scrollHeight || 0;
+    const previousTop = container?.scrollTop || 0;
+    setLoadingOlderMessages(true);
+    try {
+      const page = await api.chat.getMessagesPage(currentConvId, {
+        silent: true,
+        limit: CHAT_MESSAGE_PAGE_SIZE,
+        before: currentHistoryState.nextCursor,
+      });
+      const olderMessages = mapMessages(page.items || []);
+      suppressNextAutoScrollRef.current = true;
+      setSessionMessages(currentConvId, (prev) =>
+        mergeOlderMessages(olderMessages, prev),
+      );
+      setMessageHistoryState((prev) => ({
+        ...prev,
+        [currentConvId]: {
+          hasMore: Boolean(page.has_more),
+          nextCursor: page.next_cursor || null,
+        },
+      }));
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          const nextContainer = chatBodyRef.current;
+          if (!nextContainer) return;
+          const heightDelta = nextContainer.scrollHeight - previousHeight;
+          nextContainer.scrollTop = previousTop + heightDelta;
+        });
+      });
+    } catch {
+      // Existing request() handling surfaces API errors; keep the chat usable.
+    } finally {
+      setLoadingOlderMessages(false);
+    }
+  }, [
+    currentConvId,
+    currentHistoryState?.hasMore,
+    currentHistoryState?.nextCursor,
+    loadingOlderMessages,
+    mapMessages,
+    mergeOlderMessages,
+    setSessionMessages,
+  ]);
 
   /* Reset when conversation changes */
   useEffect(() => {
@@ -5421,13 +5684,16 @@ export default function EmbeddedChat({
       return;
     }
     if (isVirtualAgentConversationId(conversationId) && agentId) {
+      setConversationLoading(true);
       resolveLatestAgentConversationId()
         .then((latestId) => {
           if (latestId) {
-            loadConversationMessages(latestId, { fallbackToAgent: false });
+            return loadConversationMessages(latestId, { fallbackToAgent: false });
           }
+          setConversationLoading(false);
+          return undefined;
         })
-        .catch(() => {});
+        .catch(() => setConversationLoading(false));
     }
   }, [
     agentId,
@@ -5443,15 +5709,20 @@ export default function EmbeddedChat({
     if (resumedRef.current || currentConvId) return;
     if (streamingRef.current) return;
     resumedRef.current = true;
-    api.chat.listConversations().then((convs) => {
-      const latest = (convs || []).find(
-        (conv: any) => !conv.agent_id && !conv.workspace_id,
-      );
-      if (latest) {
+    setConversationLoading(true);
+    api.chat.listConversations()
+      .then((convs) => {
+        const latest = (convs || []).find(
+          (conv: any) => !conv.agent_id && !conv.workspace_id,
+        );
+        if (!latest) {
+          setConversationLoading(false);
+          return undefined;
+        }
         setCurrentConvId(latest.id);
-        loadConversationMessages(latest.id, { fallbackToAgent: false });
-      }
-    });
+        return loadConversationMessages(latest.id, { fallbackToAgent: false });
+      })
+      .catch(() => setConversationLoading(false));
   }, [conversationId, currentConvId, loadConversationMessages]);
 
   /* Auto-scroll: land at the latest message immediately, then avoid smooth-scroll churn while streaming. */
@@ -5463,6 +5734,11 @@ export default function EmbeddedChat({
         block: "end",
       });
     };
+
+    if (suppressNextAutoScrollRef.current) {
+      suppressNextAutoScrollRef.current = false;
+      return;
+    }
 
     if (!didInitialScrollRef.current) {
       didInitialScrollRef.current = true;
@@ -5496,6 +5772,7 @@ export default function EmbeddedChat({
     setSessionMessages(convId, []);
     setMentionedAgent(null);
     setSelectedMentions([]);
+    setIdeaComposerMode(null);
     loadConversationMessages(convId, { fallbackToAgent: Boolean(agentId) });
   };
 
@@ -5505,9 +5782,23 @@ export default function EmbeddedChat({
       rawText: string,
       attachments: AttachedItem[],
       manualSkills: ManualSkillItem[] = [],
+      options: { forceAutoMode?: boolean } = {},
     ) => {
-      const text = stripManualSkillTokens(rawText, manualSkills);
-      if (!text && attachments.length === 0 && manualSkills.length === 0)
+      const automaticIdeaSkill = ideaComposerMode
+        ? IDEA_BUILT_IN_SKILLS[ideaComposerMode]
+        : undefined;
+      const effectiveManualSkills =
+        manualSkills.length > 0
+          ? manualSkills
+          : automaticIdeaSkill
+            ? [automaticIdeaSkill]
+            : [];
+      const text = stripManualSkillTokens(rawText, effectiveManualSkills);
+      if (
+        !text &&
+        attachments.length === 0 &&
+        effectiveManualSkills.length === 0
+      )
         return;
       let sessionKey = currentSessionKeyRef.current;
       if (!sessionKey) {
@@ -5539,6 +5830,7 @@ export default function EmbeddedChat({
       setInput("");
       setSelectedMentions([]);
       setMentionedAgent(null);
+      setIdeaComposerMode(null);
 
       const displayContent = text;
 
@@ -5549,16 +5841,17 @@ export default function EmbeddedChat({
       const documentIds = attachments
         .filter((a) => a.type === "knowledge" && a.id)
         .map((a) => a.id!);
+      const turnChatMode = options.forceAutoMode ? undefined : requestChatMode;
       const retryRequest: ChatRetryRequest = {
         message: streamText || text,
         conversationId: currentConvId,
         documentIds: documentIds.length > 0 ? documentIds : undefined,
         agentId: resolvedAgentId,
-        chatMode: requestChatMode,
-        chatModePayload: requestChatMode ? chatModePayload : undefined,
+        chatMode: turnChatMode,
+        chatModePayload: turnChatMode ? chatModePayload : undefined,
         manualSkillIds:
-          manualSkills.length > 0
-            ? manualSkills.map((skill) => skill.id)
+          effectiveManualSkills.length > 0
+            ? effectiveManualSkills.map((skill) => skill.id)
             : undefined,
       };
       savePendingChatRetry(retryRequest);
@@ -5579,15 +5872,15 @@ export default function EmbeddedChat({
               : undefined,
           mentions: mentionMeta.length > 0 ? mentionMeta : undefined,
           manualSkills:
-            manualSkills.length > 0
-              ? manualSkills.map((skill) => ({
+            effectiveManualSkills.length > 0
+              ? effectiveManualSkills.map((skill) => ({
                   id: skill.id,
                   name: manualSkillLabel(skill),
                   slug: skill.slug || undefined,
                 }))
               : undefined,
-          chatMode: requestChatMode,
-          chatModePayload: requestChatMode ? chatModePayload : undefined,
+          chatMode: turnChatMode,
+          chatModePayload: turnChatMode ? chatModePayload : undefined,
         },
         {
           role: "assistant" as const,
@@ -5603,11 +5896,11 @@ export default function EmbeddedChat({
             files: localFiles.length > 0 ? localFiles : undefined,
             documentIds: documentIds.length > 0 ? documentIds : undefined,
             agentId: resolvedAgentId,
-            chatMode: requestChatMode,
-            chatModePayload: requestChatMode ? chatModePayload : undefined,
+            chatMode: turnChatMode,
+            chatModePayload: turnChatMode ? chatModePayload : undefined,
             manualSkillIds:
-              manualSkills.length > 0
-                ? manualSkills.map((skill) => skill.id)
+              effectiveManualSkills.length > 0
+                ? effectiveManualSkills.map((skill) => skill.id)
                 : undefined,
           }),
         currentConvId,
@@ -5635,8 +5928,38 @@ export default function EmbeddedChat({
       requestChatMode,
       chatModePayload,
       resetChatModeAfterTurn,
+      ideaComposerMode,
     ],
   );
+
+  const handleIdeaQuickAction = useCallback(
+    (request: IdeaQuickActionRequest) => {
+      setChatMode("auto");
+      setChatModePayload(getDefaultChatModePayload("auto"));
+      setActiveCapability("workspace");
+      void handleSend(request.message, [], [request.skill], {
+        forceAutoMode: true,
+      });
+    },
+    [handleSend],
+  );
+
+  const handleIdeaModeChange = useCallback(
+    (mode: IdeaQuickAction["id"] | null) => {
+      setIdeaComposerMode(mode);
+      if (mode) {
+        setChatMode("auto");
+        setChatModePayload(getDefaultChatModePayload("auto"));
+        setActiveCapability("workspace");
+      }
+    },
+    [],
+  );
+
+  const handleValidationStart = useCallback(() => {
+    setIdeaComposerMode("validate-idea");
+    window.setTimeout(() => composerEditorRef.current?.focus(), 0);
+  }, []);
 
   const handleStopRequest = useCallback(() => {
     const convId = currentConvId || streamingConvId;
@@ -5871,6 +6194,8 @@ export default function EmbeddedChat({
     setSelectedAgent(null);
     setMentionedAgent(null);
     setSelectedMentions([]);
+    setIdeaComposerMode("new-idea");
+    setConversationLoading(false);
   };
 
   /* ================================================================ */
@@ -6006,35 +6331,47 @@ export default function EmbeddedChat({
       >
         <div className="embedded-chat-column">
           {/* ---- Chat Body ---- */}
-          <div className="embedded-chat-scroll-shell">
-            {conversationMinimapVisible && (
-              <ConversationMinimap
-                activeIndex={activeMessageIndex}
-                markers={conversationMarkers}
-                messages={messages}
-                onSelect={handleConversationMarkerSelect}
-              />
-            )}
+          <div className="embedded-chat-body-wrap">
             <div
               ref={chatBodyRef}
               className={`embedded-chat-body ${
                 messages.length === 0 ? "embedded-chat-body--empty" : ""
               }`}
             >
-            {messages.length === 0 && (
-              <WorkspaceWelcome
-                activeCapability={activeCapability}
-                onCapabilityChange={(capability) => {
-                  setActiveCapability(capability);
-                  const nextMode = chatModeFromCapability(capability);
-                  setChatMode(nextMode);
-                  setChatModePayload(getDefaultChatModePayload(nextMode));
-                }}
-                onSampleSelect={handleSampleSelect}
-              />
-            )}
+              {showConversationSkeleton ? (
+                <ChatMessagesSkeleton rows={5} />
+              ) : messages.length === 0 && (
+                <WorkspaceWelcome
+                  activeCapability={activeCapability}
+                  onCapabilityChange={(capability) => {
+                    setIdeaComposerMode(null);
+                    setActiveCapability(capability);
+                    const nextMode = chatModeFromCapability(capability);
+                    setChatMode(nextMode);
+                    setChatModePayload(getDefaultChatModePayload(nextMode));
+                  }}
+                  onSampleSelect={handleSampleSelect}
+                  onIdeaQuickAction={handleIdeaQuickAction}
+                  onIdeaModeChange={handleIdeaModeChange}
+                  onValidationStart={handleValidationStart}
+                />
+              )}
 
-            {messages.map((msg, i) => {
+              {messages.length > 0 && currentHistoryState?.hasMore && (
+                <div className="chat-history-load-more">
+                  <button
+                    type="button"
+                    className="chat-history-load-more-button"
+                    disabled={loadingOlderMessages}
+                    onClick={handleLoadOlderMessages}
+                  >
+                    {loadingOlderMessages && <span className="chat-tool-spinner" />}
+                    {t("page.chat_history.load_earlier_messages")}
+                  </button>
+                </div>
+              )}
+
+            {!showConversationSkeleton && messages.map((msg, i) => {
               const content = toDisplayText(msg.content) || "";
               const visibleTools = visibleToolCallsForApprovalMessage(msg);
               const hasAssistantBlocks =
@@ -6359,8 +6696,12 @@ export default function EmbeddedChat({
                         </div>
                       )}
 
-                    {/* Streaming cursor when content empty */}
+                    {/* Streaming cursor when content empty. Tool-only turns already
+                      render their processing state above, so do not add a second
+                      empty assistant bubble. */}
                     {!content &&
+                      visibleTools.length === 0 &&
+                      !hasAssistantBlocks &&
                       streaming &&
                       i === messages.length - 1 &&
                       msg.role === "assistant" && (
@@ -6430,8 +6771,12 @@ export default function EmbeddedChat({
               );
             })}
 
-            <div ref={messagesEndRef} />
+              <div ref={messagesEndRef} />
             </div>
+            <ChatScrollRail
+              containerRef={chatBodyRef}
+              markers={chatScrollRailMarkers}
+            />
           </div>
 
           {/* Sticky approval bar — surfaces the oldest unresolved
@@ -6458,7 +6803,11 @@ export default function EmbeddedChat({
             onSend={handleSend}
             onStop={handleStopRequest}
             placeholder={
-              requestChatMode
+              messages.length === 0 && ideaComposerMode === "validate-idea"
+                ? t("component.embedded_chat.idea_validation.placeholder")
+                : messages.length === 0 && ideaComposerMode === "new-idea"
+                  ? t("component.embedded_chat.idea_generation.placeholder")
+              : requestChatMode
                 ? getChatModeInputPlaceholder(chatMode, chatModePayload)
                 : messages.length === 0
                 ? activeCapabilityConfig.placeholder
@@ -6481,6 +6830,8 @@ export default function EmbeddedChat({
             onMentionSelect={handleMentionSelect}
             onMentionRemove={handleMentionRemove}
             className={`embedded-chat-footer ${outputOpen ? "embedded-chat-footer--output-open" : ""}`}
+            textareaRef={textareaRef}
+            editorRef={composerEditorRef}
           />
         </div>
 

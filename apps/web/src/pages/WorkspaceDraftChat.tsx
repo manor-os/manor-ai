@@ -19,6 +19,7 @@ import PageHeader from "../components/ui/PageHeader";
 import GlassCard from "../components/ui/GlassCard";
 import Button from "../components/ui/Button";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
+import { ChatMessagesSkeleton } from "../components/ui/Skeleton";
 import StatusBadge from "../components/ui/StatusBadge";
 import Chip from "../components/ui/Chip";
 import Toggle from "../components/ui/Toggle";
@@ -788,7 +789,7 @@ export default function WorkspaceDraftChat() {
   // start a new draft, plus what to do about it.
   if (planLimit) {
     return (
-      <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "1rem", overflow: "hidden", gap: 16 }}>
+      <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: 0, overflow: "hidden", gap: 16 }}>
         <style>{CHAT_STYLES}</style>
         <PageHeader title={t("page.workspaces.create_workspace")} subtitle={t("page.workspace_draft_chat.plan_limit_reached")} />
         <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
@@ -870,7 +871,7 @@ export default function WorkspaceDraftChat() {
   }
 
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "1rem", overflow: "hidden", gap: 16 }}>
+    <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: 0, overflow: "hidden", gap: 16 }}>
       <style>{CHAT_STYLES}</style>
 
       <PageHeader
@@ -896,9 +897,16 @@ export default function WorkspaceDraftChat() {
         <div className="draft-chat" ref={draftChatRef}>
           <div className="draft-msgs" ref={msgsRef}>
             {isStarting ? (
-              <div style={{ display: "flex", alignItems: "center", gap: 12, color: "#a8a29e", padding: 12 }}>
-                <LoadingSpinner size={18} />
-                <span style={{ fontSize: 14 }}>{t("page.workspace_draft_chat.starting_your_workspace_draft")}</span>
+              <div
+                style={{ display: "grid", gap: 14, padding: 12 }}
+                aria-busy="true"
+                aria-live="polite"
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 12, color: "var(--text-muted)" }}>
+                  <LoadingSpinner size={18} />
+                  <span style={{ fontSize: 14 }}>{t("page.workspace_draft_chat.starting_your_workspace_draft")}</span>
+                </div>
+                <ChatMessagesSkeleton rows={3} />
               </div>
             ) : (
               <>
@@ -1418,7 +1426,14 @@ export default function WorkspaceDraftChat() {
                     }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "space-between" }}>
                         <span style={{ ...VALUE, fontSize: 13 }}>{_humanize(f.provider)}</span>
-                        {f.required && <Chip variant="red" size="sm">{t("page.login.required")}</Chip>}
+                        <span style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                          {f.setup_kind === "browser_extension" && (
+                            <Chip variant="blue" size="sm">
+                              {t("page.integrations.local_browser_setup_required")}
+                            </Chip>
+                          )}
+                          {f.required && <Chip variant="red" size="sm">{t("page.login.required")}</Chip>}
+                        </span>
                       </div>
                       {f.purpose && (
                         <div className="draft-muted" style={{ fontSize: 11, color: "#76502c", marginTop: 4, lineHeight: 1.4 }}>

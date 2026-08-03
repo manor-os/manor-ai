@@ -46,6 +46,16 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user, get_current_worker
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+    PLAN_TERMINAL_STATUSES,
+    STEP_TERMINAL_STATUSES,
+    WORKER_UNAVAILABLE_STATUSES,
+    WorkLeaseStatus,
+    WorkerStatus,
+    coerce_step_status,
+)
 from packages.core.database import get_db
 from packages.core.dispatcher import (
     Dispatcher,
@@ -686,7 +696,7 @@ async def pause_worker(
     db: AsyncSession = Depends(get_db),
 ):
     return await _admin_set_status(
-        db, worker_id, user, "paused", block_internal=True,
+        db, worker_id, user, WorkerStatus.PAUSED.value, block_internal=True,
     )
 
 
@@ -762,7 +772,7 @@ async def deregister_self(
     activity log; full deletion is admin-only via revoke."""
     if worker.kind == INTERNAL_WORKER_KIND:
         raise HTTPException(409, "internal workers cannot deregister via HTTP")
-    await update_worker_status(db, worker.id, "offline", reason="self_deregister")
+    await update_worker_status(db, worker.id, WorkerStatus.OFFLINE.value, reason="self_deregister")
     await db.commit()
 
 
@@ -852,9 +862,9 @@ async def _heartbeat_inner(
         )).first()
         if active_row is not None:
             lease_row, step_row = active_row
-            if step_row.step_status in {"cancelled", "canceled"}:
-                if lease_row.status == "active":
-                    lease_row.status = "cancelled"
+            if coerce_step_status(step_row.step_status) == ExecutionStepStatus.CANCELLED:
+                if lease_row.status == WorkLeaseStatus.ACTIVE:
+                    lease_row.status = WorkLeaseStatus.CANCELLED.value
                     lease_row.error = {
                         "type": "LeaseCancelled",
                         "message": "The plan or step was cancelled while the local CLI task was running.",
@@ -882,15 +892,15 @@ async def _heartbeat_inner(
     worker.last_heartbeat_at = now
     if req.version:
         worker.version = req.version
-    if worker.status == "pairing":
-        worker.status = "active"
+    if worker.status == WorkerStatus.PAIRING:
+        worker.status = WorkerStatus.ACTIVE.value
         db.add(WorkerActivityLog(
             worker_id=worker.id,
             event="paired",
             payload_summary={"source": "heartbeat"},
             ip=None,
         ))
-    if hasattr(worker, "consecutive_failures") and worker.status == "active":
+    if hasattr(worker, "consecutive_failures") and worker.status == WorkerStatus.ACTIVE:
         # Workers that successfully heartbeat have not failed catastrophically.
         # Don't reset counter here — leave that to explicit operator action.
         pass
@@ -916,7 +926,7 @@ async def _heartbeat_inner(
     # Phase 4 — checkout new leases.
     new_leases: list[LeaseDTO] = []
     if (
-        worker.status == "active"
+        worker.status == WorkerStatus.ACTIVE
         and req.state != "shutting_down"
         and req.capacity.can_accept_leases > 0
     ):
@@ -929,11 +939,11 @@ async def _heartbeat_inner(
     # Phase 5 — out-of-band instructions.
     # "pause"    → worker should stop accepting leases but may be resumed later.
     # "shutdown" → worker should terminate completely (deregistered / offline).
-    if worker.status == "paused":
+    if worker.status == WorkerStatus.PAUSED:
         instructions.append(HeartbeatInstruction(
             type="pause", payload={"reason": "paused"},
         ))
-    elif worker.status in ("offline", "quarantined"):
+    elif worker.status in WORKER_UNAVAILABLE_STATUSES:
         instructions.append(HeartbeatInstruction(
             type="shutdown", payload={"reason": worker.status},
         ))

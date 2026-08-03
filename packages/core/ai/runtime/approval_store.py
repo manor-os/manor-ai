@@ -11,7 +11,6 @@ __all__ = [
     "load_runtime_approval_conversation",
     "mark_runtime_hitl_request_resolved",
     "mark_runtime_hitl_requests_resolved",
-    "runtime_approval_exists",
     "runtime_approval_now_iso",
     "runtime_approval_workspace_context",
     "runtime_approvals",
@@ -81,21 +80,6 @@ async def runtime_approval_workspace_context(db: Any, conv: Any) -> dict[str, st
         "id": workspace_id,
         "name": name or workspace_id,
     }
-
-
-async def runtime_approval_exists(
-    db: Any,
-    *,
-    conversation_id: str | None,
-    entity_id: str,
-    hitl_id: str,
-) -> bool:
-    if not conversation_id or not hitl_id:
-        return False
-    conv = await load_runtime_approval_conversation(db, conversation_id, entity_id)
-    if not conv:
-        return False
-    return hitl_id in runtime_approvals(conv)
 
 
 async def mark_runtime_hitl_request_resolved(

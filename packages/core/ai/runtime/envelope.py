@@ -16,7 +16,7 @@ class RuntimeEnvelope:
     surface: ChatSurface
     principal: RuntimePrincipal
     profile: RuntimeProfile
-    legacy_runtime_profile: str | None = None
+    tool_profile: str | None = None
     entity_id: str | None = None
     user_id: str | None = None
     agent_id: str | None = None
@@ -54,7 +54,7 @@ class RuntimeEnvelope:
             if key in {
                 "legacy_path",
                 "disable_tools",
-                "legacy_tool_surface",
+                "tool_surface_policy",
                 "runtime_events",
                 "runtime_attachment_context",
                 "runtime_file_context_mounts",

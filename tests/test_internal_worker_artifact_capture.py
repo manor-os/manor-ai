@@ -125,6 +125,17 @@ def test_agentic_loop_max_rounds_with_content_is_usable() -> None:
     internal._raise_if_agentic_loop_failed(result)
 
 
+def test_agentic_loop_submit_result_is_successful() -> None:
+    result = SimpleNamespace(
+        stop_reason="submit_result",
+        error=None,
+        error_detail=None,
+        content="Result submitted.",
+    )
+
+    internal._raise_if_agentic_loop_failed(result)
+
+
 def test_merge_artifact_refs_preserves_text_and_adds_image_url() -> None:
     result = internal._merge_artifact_refs(
         {"text": "Generated the concept image."},

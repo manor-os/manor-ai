@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class RuntimeResolver:
-    """Build a trace-only Manor runtime envelope from legacy resolution facts."""
+    """Build a trace-only Manor runtime envelope from runtime resolution facts."""
 
     def __init__(
         self,
@@ -41,7 +41,7 @@ class RuntimeResolver:
         self,
         request: AIRuntimeRequest,
         *,
-        legacy_runtime_profile: str | None = None,
+        tool_profile: str | None = None,
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
@@ -49,7 +49,7 @@ class RuntimeResolver:
     ) -> "ResolvedRuntimeToolSurface":
         context = self._resolve_context(
             request,
-            legacy_runtime_profile=legacy_runtime_profile,
+            tool_profile=tool_profile,
             tool_schemas=tool_schemas,
             allowed_tool_names=allowed_tool_names,
             blocked_tool_names=blocked_tool_names,
@@ -67,7 +67,7 @@ class RuntimeResolver:
         self,
         request: AIRuntimeRequest,
         *,
-        legacy_runtime_profile: str | None = None,
+        tool_profile: str | None = None,
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
@@ -76,7 +76,7 @@ class RuntimeResolver:
         return self._envelope_from_context(
             self._resolve_context(
                 request,
-                legacy_runtime_profile=legacy_runtime_profile,
+                tool_profile=tool_profile,
                 tool_schemas=tool_schemas,
                 allowed_tool_names=allowed_tool_names,
                 blocked_tool_names=blocked_tool_names,
@@ -88,7 +88,7 @@ class RuntimeResolver:
         self,
         request: AIRuntimeRequest,
         *,
-        legacy_runtime_profile: str | None = None,
+        tool_profile: str | None = None,
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
@@ -96,7 +96,7 @@ class RuntimeResolver:
     ) -> RuntimeResolverContext:
         context = RuntimeResolverContext.from_inputs(
             request,
-            legacy_runtime_profile=legacy_runtime_profile,
+            tool_profile=tool_profile,
             tool_schemas=tool_schemas,
             allowed_tool_names=allowed_tool_names,
             blocked_tool_names=blocked_tool_names,

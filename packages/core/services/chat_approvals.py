@@ -24,6 +24,29 @@ def parse_hitl_action(message: str) -> tuple[str, str] | None:
     return hitl_id, action
 
 
+async def register_chat_provider_approval(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    entity_id: str,
+    user_id: str,
+    request: dict,
+) -> dict | None:
+    """Register a normalized provider approval through the chat adapter."""
+
+    from packages.core.ai.runtime.approval_service import (
+        register_provider_runtime_approval,
+    )
+
+    return await register_provider_runtime_approval(
+        db,
+        conversation_id=conversation_id,
+        entity_id=entity_id,
+        user_id=user_id,
+        request=request,
+    )
+
+
 async def resolve_chat_approval_turn(
     db: AsyncSession,
     *,
@@ -31,12 +54,12 @@ async def resolve_chat_approval_turn(
     entity_id: str,
     user_id: str,
     message: str,
-) -> tuple[str | None, str | None, bool]:
-    """Return (replacement_llm_message, saved_text, save_user_message)."""
+) -> tuple[str | None, str | None, bool, dict | None]:
+    """Return replacement text, saved text, save flag, and runtime metadata."""
 
     from packages.core.ai.runtime.approval_service import (
-        resolve_pending_runtime_approval_from_reply,
-        resolve_runtime_approval_message,
+        resolve_pending_runtime_approval_turn_from_reply,
+        resolve_runtime_approval_turn,
     )
     from packages.core.services.ai_file_permissions import (
         resolve_file_approval_message,
@@ -57,8 +80,8 @@ async def resolve_chat_approval_turn(
             action=hitl_action,
         )
         if replacement:
-            return replacement, user_visible_hitl_action_text(hitl_action), True
-        replacement = await resolve_runtime_approval_message(
+            return replacement, user_visible_hitl_action_text(hitl_action), True, None
+        runtime_resolution = await resolve_runtime_approval_turn(
             db,
             conversation_id=conversation_id,
             entity_id=entity_id,
@@ -66,8 +89,13 @@ async def resolve_chat_approval_turn(
             hitl_id=hitl_id,
             action=hitl_action,
         )
-        if replacement:
-            return replacement, user_visible_hitl_action_text(hitl_action), True
+        if runtime_resolution:
+            return (
+                runtime_resolution.message,
+                user_visible_hitl_action_text(hitl_action),
+                True,
+                runtime_resolution.runtime_metadata,
+            )
         replacement = await resolve_workspace_operation_review_message(
             db,
             conversation_id=conversation_id,
@@ -77,7 +105,7 @@ async def resolve_chat_approval_turn(
             action=hitl_action,
         )
         if replacement:
-            return replacement, user_visible_hitl_action_text(hitl_action), True
+            return replacement, user_visible_hitl_action_text(hitl_action), True, None
 
     replacement = await resolve_pending_file_approval_from_reply(
         db,
@@ -87,17 +115,22 @@ async def resolve_chat_approval_turn(
         message=message,
     )
     if replacement:
-        return replacement, None, True
-    replacement = await resolve_pending_runtime_approval_from_reply(
+        return replacement, None, True, None
+    runtime_resolution = await resolve_pending_runtime_approval_turn_from_reply(
         db,
         conversation_id=conversation_id,
         entity_id=entity_id,
         user_id=user_id,
         message=message,
     )
-    if replacement:
-        return replacement, None, True
-    return None, None, True
+    if runtime_resolution:
+        return (
+            runtime_resolution.message,
+            None,
+            True,
+            runtime_resolution.runtime_metadata,
+        )
+    return None, None, True, None
 
 
 async def cancel_chat_approvals(

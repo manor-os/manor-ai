@@ -44,6 +44,20 @@ const CHAT_BOX_MODE_KEYS = new Set<ChatBoxMode>([
   "research",
 ]);
 
+const PRODUCT_CAPABILITY_SKILL_IDS = new Set([
+  "solo-business-idea-finder",
+  "solo-business-idea-review",
+]);
+
+function isProductCapabilitySkill(value: string | null | undefined) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return PRODUCT_CAPABILITY_SKILL_IDS.has(normalized);
+}
+
 function normalizeMode(value: string | undefined): ChatBoxMode | undefined {
   const normalized = String(value || "")
     .trim()
@@ -389,7 +403,7 @@ export function parseUserMessageDisplay(msg: ChatMessage): ParsedUserMessageDisp
     if (skillMatch) {
       for (const label of skillMatch[1].split(",")) {
         const clean = label.trim();
-        if (clean) {
+        if (clean && !isProductCapabilitySkill(clean)) {
           pushUnique(chips, {
             key: `skill-${clean}`,
             kind: "skill",
@@ -429,7 +443,14 @@ export function parseUserMessageDisplay(msg: ChatMessage): ParsedUserMessageDisp
   }
 
   for (const skill of msg.manualSkills || []) {
-    if (!skill?.name) continue;
+    if (
+      !skill?.name ||
+      isProductCapabilitySkill(skill.id) ||
+      isProductCapabilitySkill(skill.slug) ||
+      isProductCapabilitySkill(skill.name)
+    ) {
+      continue;
+    }
     pushUnique(chips, {
       key: `skill-${skill.id || skill.name}`,
       kind: "skill",

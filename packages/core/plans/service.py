@@ -17,6 +17,14 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import (
+    TaskLogType,
+    TaskStatus,
+)
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.plans.schema import Plan, PlanStep
@@ -83,6 +91,7 @@ async def _surface_pending_plan_approval(db: AsyncSession, plan_row: ExecutionPl
     if not plan_row.task_id:
         return
     from packages.core.models.task import Task
+    from packages.core.constants.task_actors import TaskActor
     from packages.core.services.task_service import add_task_log
     from packages.core.services.task_state_machine import (
         TaskStatusTransitionError,
@@ -95,9 +104,9 @@ async def _surface_pending_plan_approval(db: AsyncSession, plan_row: ExecutionPl
     if not task:
         return
 
-    if task.status != "waiting_on_customer":
+    if task.status != TaskStatus.WAITING_ON_CUSTOMER:
         try:
-            apply_task_status_transition(task, "waiting_on_customer")
+            await apply_task_status_transition(task, "waiting_on_customer", db=db)
         except TaskStatusTransitionError:
             # Approval visibility should not make plan creation fail for
             # uncommon task states; the log still gives operators a path.
@@ -116,12 +125,13 @@ async def _surface_pending_plan_approval(db: AsyncSession, plan_row: ExecutionPl
     await add_task_log(
         db,
         plan_row.task_id,
-        "ai_hitl_requested",
+        TaskLogType.AI_HITL_REQUESTED,
         (
             "This execution plan is waiting for approval before it can start.\n\n"
             f"Approval-gated step(s): {', '.join(step_labels)}.\n\n"
             "Approve the plan to dispatch execution, or revise the task/runtime rules."
         ),
+        actor=TaskActor.SYSTEM,
         created_by="system",
         metadata={
             "plan_id": plan_row.id,
@@ -237,6 +247,29 @@ def _resolve_output_shapes(steps: list[PlanStep]) -> dict[str, str]:
     return {s["key"]: s["output_shape"] for s in repaired if s.get("output_shape")}
 
 
+# Platform-receipt fields the Planner keeps demanding from free-form steps.
+# The ID-trap: an llm/subagent execution may legitimately have no such value
+# (nothing was published, or the id lives in a tool response the model never
+# echoes), so requiring one guarantees OutputSchemaError — receipts come from
+# runtime evidence, not the model. Stripped from "required" only; the
+# properties stay so a value that does surface still validates its type.
+_RECEIPT_FIELDS = frozenset({
+    "tweet_id", "urn", "post_urn", "tweet_url", "post_url", "share_url",
+    "url", "published_at", "platform", "post_id", "message_id",
+})
+
+
+def _strip_receipt_required_fields(schema: dict | None) -> dict | None:
+    if not isinstance(schema, dict) or not isinstance(schema.get("required"), list):
+        return schema
+    kept = [f for f in schema["required"] if str(f) not in _RECEIPT_FIELDS]
+    if len(kept) == len(schema["required"]):
+        return schema
+    out = dict(schema)
+    out["required"] = kept
+    return out
+
+
 def _step_from_pydantic(
     plan_row: ExecutionPlan,
     ps: PlanStep,
@@ -252,6 +285,7 @@ def _step_from_pydantic(
     # OutputSchemaError source. Structured kinds keep an explicit schema: it's a
     # real contract with an external system, not a guess.
     expected_output_schema = ps.expected_output_schema
+    shape_schema_applied = False
     if output_shape:
         from packages.core.contracts.shapes import get_shape
         try:
@@ -262,6 +296,11 @@ def _step_from_pydantic(
             expected_output_schema is None or ps.kind in ("llm", "subagent")
         ):
             expected_output_schema = shape_schema
+            shape_schema_applied = True
+    if not shape_schema_applied and ps.kind in ("llm", "subagent"):
+        # A planner-authored custom schema survived (no shape resolved):
+        # de-fang its receipt requirements before it can OutputSchemaError.
+        expected_output_schema = _strip_receipt_required_fields(expected_output_schema)
     return ExecutionStep(
         id=generate_ulid(),
         plan_id=plan_row.id,
@@ -278,7 +317,7 @@ def _step_from_pydantic(
         expected_input_schema=ps.expected_input_schema,
         expected_output_schema=expected_output_schema,
         depends_on=list(ps.depends_on),
-        step_status="pending",
+        step_status=ExecutionStepStatus.PENDING.value,
         risk_level=ps.risk_level,
         requires_approval=ps.requires_approval,
         max_attempts=max_attempts or ps.max_attempts,
@@ -322,11 +361,11 @@ async def cancel_plan(
     plan = (await db.execute(
         select(ExecutionPlan).where(ExecutionPlan.id == plan_id)
     )).scalar_one_or_none()
-    if not plan or plan.status in ("completed", "cancelled", "failed"):
+    if not plan or plan.status in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.CANCELLED, ExecutionPlanStatus.FAILED,):
         return plan
 
     now = datetime.now(timezone.utc)
-    plan.status = "cancelled"
+    plan.status = ExecutionPlanStatus.CANCELLED.value
     plan.completed_at = now
     if reason:
         plan.last_error = {"cancelled": reason}
@@ -334,8 +373,8 @@ async def cancel_plan(
     # Mark any non-terminal steps as cancelled too.
     steps = await list_plan_steps(db, plan_id)
     for s in steps:
-        if s.step_status in ("pending", "running", "waiting_human"):
-            s.step_status = "cancelled"
+        if s.step_status in (ExecutionStepStatus.PENDING, ExecutionStepStatus.RUNNING, ExecutionStepStatus.WAITING_HUMAN,):
+            s.step_status = ExecutionStepStatus.CANCELLED.value
             s.finished_at = now
 
     await db.flush()

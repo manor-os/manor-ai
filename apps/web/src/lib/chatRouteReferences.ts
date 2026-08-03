@@ -4,6 +4,10 @@ const ROUTE_REF_RE = new RegExp(
   String.raw`(^|[\s([{<'"“‘，。；：、])((?:https?:\/\/[^\s)\]}>'"“”’]+|\/(?:tasks|viewer)\/${ULID_PATTERN}[^\s)\]}>'"“”’]*))(?=$|[\s)\]}>'"“”’。，、；:：!?！？|])`,
   "giu",
 );
+const TASK_ID_FIELD_RE = new RegExp(
+  String.raw`((?:任务\s*(?:ID|编号)|task(?:[\s_-]*id)?)\s*(?:[:：#=]|is)?\s*)` + "`?" + String.raw`(${ULID_PATTERN})` + "`?",
+  "giu",
+);
 const MARKDOWN_LINK_OR_IMAGE_RE = /!?\[[^\]]*\]\([^)]*\)/g;
 const FENCED_CODE_RE = /(```[\s\S]*?```|~~~[\s\S]*?~~~)/g;
 const INLINE_CODE_RE = /(`[^`\n]+`)/g;
@@ -80,8 +84,17 @@ function linkifyPlainRouteReferencesSegment(segment: string): string {
   });
 }
 
+function linkifyStructuredTaskReferencesSegment(segment: string): string {
+  return segment.replace(TASK_ID_FIELD_RE, (full, prefix: string, taskId: string) => {
+    const reference = `/tasks/${taskId}`;
+    const route = parseChatRouteReference(reference);
+    if (!route) return full;
+    return `${prefix}[${escapeMarkdownLabel(chatRouteReferenceLabel(route))}](${routeReferenceHref(reference)})`;
+  });
+}
+
 function processOutsideInlineCode(segment: string): string {
-  return segment
+  return linkifyStructuredTaskReferencesSegment(segment)
     .split(INLINE_CODE_RE)
     .map((part) => (part.startsWith("`") && part.endsWith("`") ? part : linkifyPlainRouteReferencesSegment(part)))
     .join("");
@@ -101,7 +114,7 @@ function processOutsideMarkdownLinks(segment: string): string {
 }
 
 export function linkifyChatRouteReferencesInMarkdown(source: string): string {
-  if (!source || !/(\/tasks\/|\/viewer\/)/i.test(source)) return source;
+  if (!source || !/(\/tasks\/|\/viewer\/|任务\s*(?:ID|编号)|task(?:[\s_-]*id)?)/i.test(source)) return source;
   return source
     .split(FENCED_CODE_RE)
     .map((part) => {

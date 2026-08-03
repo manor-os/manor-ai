@@ -34,23 +34,23 @@ def test_task_state_machine_rejects_unknown_or_invalid_transitions():
         assert_valid_transition("completed", "failed")
 
 
-def test_apply_task_status_transition_updates_lifecycle_timestamps():
+async def test_apply_task_status_transition_updates_lifecycle_timestamps():
     now = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
     task = _task("pending")
 
-    apply_task_status_transition(task, "in_progress", now=now)
+    await apply_task_status_transition(task, "in_progress", now=now)
     assert task.status == "in_progress"
     assert task.started_at == now
     assert task.updated_at == now
     assert task.completed_at is None
 
     done_at = datetime(2026, 5, 1, 13, 0, tzinfo=timezone.utc)
-    apply_task_status_transition(task, "completed", now=done_at)
+    await apply_task_status_transition(task, "completed", now=done_at)
     assert task.status == "completed"
     assert task.completed_at == done_at
 
     reopened_at = datetime(2026, 5, 1, 14, 0, tzinfo=timezone.utc)
-    apply_task_status_transition(task, "pending", now=reopened_at)
+    await apply_task_status_transition(task, "pending", now=reopened_at)
     assert task.status == "pending"
     assert task.completed_at is None
     assert task.updated_at == reopened_at

@@ -22,7 +22,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NPM_CONFIG_PREFIX=/home/sandbox/.npm-global \
     PATH="/home/sandbox/.npm-global/bin:${PATH}"
 
-# Install base tools + Node.js 20.x (LTS) via NodeSource
+# Install base tools + Node.js from Debian.
+#
+# This used to add the NodeSource repo via `curl setup_20.x | bash -`. That
+# script exits 0 even when it fails: on 2026-07-27 its signing-key download
+# started returning 403, so the repo was never added, `apt-get install nodejs`
+# quietly took Debian's own package — which does NOT ship npm — and the build
+# died three steps later on `npm: not found`. Debian trixie ships Node 20.19,
+# exactly the major this image wants, so the third-party repo bought nothing
+# and cost us every deploy.
+#
+# `node --version` and `npm --version` at the end are the guard: if a future
+# base image stops providing either, THIS layer fails instead of something
+# downstream.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     bash \
@@ -31,10 +43,11 @@ RUN apt-get update \
     git \
     jq \
     ripgrep \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g npm@10.9.4 \
-    && rm -rf /var/lib/apt/lists/*
+    nodejs \
+    npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version \
+    && npm --version
 
 RUN useradd --create-home --shell /bin/bash sandbox
 USER sandbox

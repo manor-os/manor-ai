@@ -25,11 +25,29 @@ from packages.core.governance.service import (
     check_step_policy,
     get_policy,
     list_revisions,
+    remove_auto_approve_action,
+    remove_auto_approve_capability,
     update_policy,
     workspace_policy_auto_approves,
 )
 
+
+from packages.core.governance.approvals import (
+    ApprovalDecision,
+    ApprovalOrigin,
+    ApprovalSubject,
+    consume_approval,
+    count_open_requests,
+    deny_approval,
+    grant_approval,
+    resolve_approval,
+    resolve_origin_requests,
+)
+
 __all__ = [
+    "ApprovalDecision", "ApprovalOrigin", "ApprovalSubject",
+    "resolve_approval", "grant_approval", "deny_approval", "consume_approval",
+    "resolve_origin_requests", "count_open_requests",
     "DEFAULT_POLICY",
     "PolicyDecision",
     "PolicyError",
@@ -39,6 +57,8 @@ __all__ = [
     "policy_auto_approves",
     "add_auto_approve_action",
     "add_auto_approve_capability",
+    "remove_auto_approve_action",
+    "remove_auto_approve_capability",
     "check_step_policy",
     "get_policy",
     "list_revisions",

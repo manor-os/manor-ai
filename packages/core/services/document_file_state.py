@@ -35,7 +35,7 @@ def mark_document_file_available(doc: Any, *, source: str) -> bool:
     return True
 
 
-def mark_document_file_missing(doc: Any, *, source: str, trash: bool = True) -> bool:
+def mark_document_file_missing(doc: Any, *, source: str, trash: bool = False) -> bool:
     now = datetime.now(timezone.utc)
     meta = doc.metadata_ if isinstance(getattr(doc, "metadata_", None), dict) else {}
     updated_meta = dict(meta)

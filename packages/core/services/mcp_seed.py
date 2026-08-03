@@ -366,6 +366,46 @@ async def seed_mcp_catalog(engine: Engine) -> int:
 
         cli_spec_count = 0
 
+        for (key, name, desc, transport, endpoint, auth_type, scopes) in _MCP_CATALOG:
+            result = await conn.execute(
+                text("""
+                    INSERT INTO mcp_servers
+                      (id, server_key, name, description, transport, endpoint,
+                       auth_type, scopes, status, created_at)
+                    VALUES
+                      (:id, :server_key, :name, :description, :transport, :endpoint,
+                       :auth_type, :scopes, 'active', now())
+                    ON CONFLICT (server_key) DO NOTHING
+                """),
+                {
+                    "id": f"mcp_{key}".ljust(26, "_")[:26],
+                    "server_key": key,
+                    "name": name,
+                    "description": desc,
+                    "transport": transport,
+                    "endpoint": endpoint,
+                    "auth_type": auth_type,
+                    "scopes": scopes,
+                },
+            )
+            if result.rowcount and result.rowcount > 0:
+                inserted += 1
+
+        await conn.execute(text("""
+            UPDATE mcp_servers
+            SET scopes = 'tweet.read,tweet.write,users.read,like.read,like.write,follows.read,follows.write,offline.access',
+                description = 'X API v2 — tweets, timeline, users, likes, follows.',
+                updated_at = now()
+            WHERE server_key = 'twitter_x'
+              AND (
+                scopes IS DISTINCT FROM 'tweet.read,tweet.write,users.read,like.read,like.write,follows.read,follows.write,offline.access'
+                OR description IS DISTINCT FROM 'X API v2 — tweets, timeline, users, likes, follows.'
+              )
+        """))
+
+        # Side-table specs for cli_worker auth types.
+        # ON CONFLICT on the unique mcp_server_id keeps re-runs idempotent.
+
         for key, spec in _BROWSER_SPECS.items():
             await conn.execute(
                 text("""

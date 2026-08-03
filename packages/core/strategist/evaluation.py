@@ -30,6 +30,7 @@ from typing import Any, Optional
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskStatus
 from packages.core.memory.service import record_memory
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
 from packages.core.models.task import Task
@@ -92,7 +93,7 @@ async def evaluate_workspace_outcomes(
     candidates = list((await db.execute(
         select(Task).where(
             Task.workspace_id == workspace_id,
-            Task.status == "completed",
+            Task.status == TaskStatus.COMPLETED,
             Task.details["strategist_review_id"].astext.isnot(None),
             Task.details["outcome_label"].astext.is_(None),
         ).order_by(desc(Task.completed_at)).limit(200)

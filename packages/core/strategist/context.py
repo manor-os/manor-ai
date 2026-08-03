@@ -7,7 +7,6 @@ formats into the LLM message.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -15,6 +14,7 @@ from typing import Any, Optional
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskStatus
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.goal import Goal
 from packages.core.models.task import Task
@@ -335,7 +335,7 @@ _GENERIC_CHANNEL_KEYS = {
 
 
 def _workspace_declared_provider_keys(workspace: Workspace, goals: list[Goal]) -> set[str]:
-    """Infer provider requirements from workspace design, not recent task drift."""
+    """Read provider requirements from typed workspace design fields."""
     out: set[str] = set()
     settings = workspace.settings or {}
     operating_model = workspace.operating_model or {}
@@ -361,58 +361,6 @@ def _workspace_declared_provider_keys(workspace: Workspace, goals: list[Goal]) -
             if key and key not in _GENERIC_CHANNEL_KEYS:
                 out.add(key)
 
-    text_parts = [
-        workspace.name,
-        workspace.description,
-        workspace.kind,
-        workspace.operating_context,
-        workspace.primary_work,
-    ]
-    for service in operating_model.get("services") or []:
-        if not isinstance(service, dict):
-            continue
-        text_parts.extend([
-            service.get("key"),
-            service.get("name"),
-            service.get("title"),
-            service.get("description"),
-            service.get("rationale"),
-            service.get("owner_role"),
-        ])
-    for _, block in iter_workspace_channel_blocks(operating_model):
-        text_parts.extend([
-            block.get("name"),
-            block.get("purpose"),
-            block.get("notes"),
-            block.get("provider"),
-            block.get("channel_type"),
-        ])
-    out.update(_social_provider_keys_from_text(" \n".join(str(part or "") for part in text_parts)))
-    return out
-
-
-def _social_provider_keys_from_text(text: str) -> set[str]:
-    lowered = f" {(text or '').lower()} "
-    out: set[str] = set()
-    social_context = bool(re.search(
-        r"\b(post|posts|posting|publish|tweet|tweets|follower|followers|"
-        r"engagement|mentions|replies|dm|audience|social|campaign|content|"
-        r"growth|analytics)\b",
-        lowered,
-    ))
-    if re.search(r"\b(linkedin|linked-in|linked in)\b", lowered):
-        out.add("linkedin")
-    if re.search(r"\b(facebook|fb)\b", lowered):
-        out.add("facebook")
-    if (
-        re.search(r"\b(twitter|tweet|tweets|tweeting|retweet|retweets)\b", lowered)
-        or re.search(r"\bx\.com\b", lowered)
-        or re.search(r"\bx\s*/\s*twitter\b", lowered)
-        or re.search(r"\bx\s*\(\s*twitter\s*\)", lowered)
-        or re.search(r"\b(x post|x posts|x thread|x threads|x account|x growth)\b", lowered)
-        or (social_context and re.search(r"\bx\b", lowered))
-    ):
-        out.add("twitter_x")
     return out
 
 
@@ -528,7 +476,7 @@ async def _open_proposed_tasks(
     return list((await db.execute(
         select(Task).where(
             Task.workspace_id == workspace_id,
-            Task.status == "proposed",
+            Task.status == TaskStatus.PROPOSED,
         ).order_by(desc(Task.created_at))
     )).scalars().all())
 
@@ -552,7 +500,7 @@ async def _recent_proposal_outcomes(
             Task.workspace_id == workspace_id,
             Task.created_at >= cutoff,
             Task.details["strategist_review_id"].astext.isnot(None),
-            Task.status != "proposed",
+            Task.status != TaskStatus.PROPOSED,
         ).order_by(desc(Task.created_at)).limit(60)
     )).scalars().all())
 
@@ -561,9 +509,9 @@ async def _recent_proposal_outcomes(
     }
     for t in rows:
         details = t.details or {}
-        if t.status == "completed":
+        if t.status == TaskStatus.COMPLETED:
             buckets["completed"].append(t)
-        elif t.status == "cancelled":
+        elif t.status == TaskStatus.CANCELLED:
             if details.get("rejection_reason"):
                 buckets["rejected"].append(t)
             else:

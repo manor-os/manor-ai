@@ -24,7 +24,9 @@ from packages.core.governance.policy import (
     policy_from_dict,
     policy_to_dict,
 )
-from packages.core.services.hitl_options import approval_options
+from packages.core.constants.approvals import HitlType
+from packages.core.constants.pending_actions import PendingActionKind
+from packages.core.services.hitl_options import approval_options, error_card_options
 from packages.core.models.governance import (
     GovernancePolicy,
     GovernanceRevision,
@@ -197,6 +199,83 @@ async def add_auto_approve_capability(
     return True
 
 
+async def remove_auto_approve_action(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    action_key: str,
+    changed_by: Optional[str] = None,
+) -> bool:
+    """Remove ``action_key`` from a workspace's ``auto_approve_actions``.
+
+    Backs the standing-grant revoke surface (Settings → Approval
+    automation). Returns True if the action was present and removed (a
+    policy revision was written), False if it was not granted or inputs
+    were missing. Caller commits.
+    """
+    if not workspace_id or not action_key:
+        return False
+    from dataclasses import replace
+
+    policy = await get_policy(db, workspace_id)
+    if action_key not in policy.auto_approve_actions:
+        return False
+    new_policy = replace(
+        policy,
+        auto_approve_actions=[
+            key for key in policy.auto_approve_actions if key != action_key
+        ],
+    )
+    await update_policy(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        policy=new_policy,
+        changed_by=changed_by,
+        change_summary=f"revoke always-approve action: {action_key}",
+    )
+    return True
+
+
+async def remove_auto_approve_capability(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    capability_id: str,
+    changed_by: Optional[str] = None,
+) -> bool:
+    """Remove ``capability_id`` from workspace ``auto_approve_capabilities``.
+
+    Mirror of ``remove_auto_approve_action`` for capability-scoped
+    standing grants. Returns True if removed, False otherwise. Caller
+    commits.
+    """
+    if not workspace_id or not capability_id:
+        return False
+    from dataclasses import replace
+
+    policy = await get_policy(db, workspace_id)
+    if capability_id not in policy.auto_approve_capabilities:
+        return False
+    new_policy = replace(
+        policy,
+        auto_approve_capabilities=[
+            cid for cid in policy.auto_approve_capabilities if cid != capability_id
+        ],
+    )
+    await update_policy(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        policy=new_policy,
+        changed_by=changed_by,
+        change_summary=f"revoke always-approve capability: {capability_id}",
+    )
+    return True
+
+
 # ── Dispatcher hook ───────────────────────────────────────────────────
 
 async def check_step_policy(
@@ -329,42 +408,115 @@ async def post_hitl_card(
     matched_rule: Optional[str],
     reason: Optional[str] = None,
     capability_id: Optional[str] = None,
+    approval_request_id: Optional[str] = None,
+    hitl_type: str = HitlType.AUTHORIZE.value,
+    payload: Optional[dict] = None,
+    task_id: Optional[str] = None,
+    db: Optional[AsyncSession] = None,
 ) -> None:
-    """Best-effort structured chat card prompting approve/reject.
+    """Best-effort structured chat card for a paused step.
 
-    Posted by the Dispatcher when policy requires HITL. The pending_action is
-    the durable resolver; the body is just the human-readable prompt.
+    Posted by the Dispatcher when the approval gate answers needs_human. The
+    pending_action is the durable resolver; the body is just the
+    human-readable prompt.
+
+    ``approval_request_id`` links the card to the unified ``HitlRequest``
+    so the resolver grants THAT request (which the dispatcher consumes when
+    the lease goes out). One card per open request: if an unresolved card for
+    the same request already exists, no duplicate is posted.
+
+    ``hitl_type``/``payload`` are the request row's own values, carried onto
+    the card so the client can render by type instead of guessing from a
+    prose prompt. They are the reason this function exists in its current
+    shape: the record layer has known since ``hitl_type`` shipped that a
+    re-gated failed step is an ``error``, not a fresh "may I?", but nothing
+    put that on the card — so the operator kept seeing "this step needs your
+    approval" while the real failure (their local worker was offline) stayed
+    invisible. An ``error`` card therefore renders the failure and offers
+    retry/cancel, never approve/always/reject.
+
+    ``task_id`` is what the card deep-links to. The step and plan ids alone
+    are not addressable in the web app; ``/tasks/{task_id}`` is.
+
+    Pass ``db`` to post the card INSIDE the caller's transaction (caller
+    commits): the card, the HitlRequest, and the step's waiting_human
+    transition then land atomically. Without it (own session + commit), a
+    caller crash after the post strands a card whose request id was never
+    committed — an unresolvable orphan.
     """
     try:
         from packages.core.database import async_session
         from packages.core.workspace_chat import service as chat_service
 
-        body = (
-            f"⛔ **Approval needed** — step `{step_key}` "
-            f"({kind}/{action_key or capability_id or '—'}) was paused by your governance "
-            f"policy (rule: `{matched_rule}`)."
-        )
-        prompt = reason or (
-            f"Approve this step once? {kind}/{action_key or capability_id or 'unknown action'} "
-            f"matched governance rule {matched_rule or 'unknown'}."
-        )
+        if approval_request_id:
+            from packages.core.models.task import Message
+
+            dedup_stmt = select(Message.id).where(
+                Message.pending_action["approval_request_id"].as_string()
+                == approval_request_id,
+                Message.resolved_at.is_(None),
+            ).limit(1)
+            if db is not None:
+                existing = (await db.execute(dedup_stmt)).scalar_one_or_none()
+            else:
+                async with async_session() as check_db:
+                    existing = (await check_db.execute(dedup_stmt)).scalar_one_or_none()
+            if existing is not None:
+                return
+
+        card_payload = dict(payload or {})
+        if hitl_type == HitlType.ERROR.value:
+            # The step already ran and failed. Say what broke and what to do
+            # about it — never "approval needed", which is what buried the
+            # real cause during the incident.
+            what_happened = (
+                str(card_payload.get("what_happened") or "").strip()
+                or "The step failed."
+            )
+            action_to_take = str(card_payload.get("action_to_take") or "").strip()
+            body = f"⚠️ **Action needed** — {what_happened}"
+            if action_to_take:
+                body = f"{body} {action_to_take}"
+            prompt = what_happened
+            # Retry / cancel, not approve / always / reject: see
+            # error_card_options().
+            options = error_card_options()
+        else:
+            body = (
+                f"⛔ **Approval needed** — step `{step_key}` "
+                f"({kind}/{action_key or capability_id or '—'}) was paused by your governance "
+                f"policy (rule: `{matched_rule}`)."
+            )
+            prompt = reason or (
+                f"Approve this step once? {kind}/{action_key or capability_id or 'unknown action'} "
+                f"matched governance rule {matched_rule or 'unknown'}."
+            )
+            # "always_approve" lets the operator persist this approval at the
+            # workspace layer. Prefer a concrete action_key when available;
+            # otherwise persist the capability_id (for subagent/file.write
+            # style steps that do not have a provider action).
+            options = approval_options()
         pending_action = {
-            "kind": "governance_approval",
+            "kind": PendingActionKind.GOVERNANCE_APPROVAL.value,
             "step_id": step_id,
             "plan_id": plan_id,
+            "task_id": task_id,
             "step_key": step_key,
             "prompt": prompt,
             "action": action_key,
             "capability_id": capability_id,
             "tool": kind,
             "matched_rule": matched_rule,
-            # "always_approve" lets the operator persist this approval at the
-            # workspace layer. Prefer a concrete action_key when available;
-            # otherwise persist the capability_id (for subagent/file.write
-            # style steps that do not have a provider action).
-            "options": approval_options(),
+            "approval_request_id": approval_request_id,
+            # What kind of human involvement this is, and the copy that
+            # answers what / why / what-to-do. Straight off the
+            # HitlRequest row — the card must not re-derive them, or the
+            # row and the screen can disagree again.
+            "hitl_type": hitl_type,
+            "payload": card_payload,
+            "options": options,
         }
-        async with async_session() as db:
+        if db is not None:
             await chat_service.post_message(
                 db,
                 entity_id=entity_id,
@@ -380,6 +532,75 @@ async def post_hitl_card(
                 ],
                 pending_action=pending_action,
             )
-            await db.commit()
+            await db.flush()
+        else:
+            async with async_session() as own_db:
+                await chat_service.post_message(
+                    own_db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    body=body,
+                    message_kind="hitl_request",
+                    author_kind="system",
+                    thread_ref_kind="plan",
+                    thread_ref_id=plan_id,
+                    refs=[
+                        {"type": "plan", "id": plan_id},
+                        {"type": "step", "id": step_id},
+                    ],
+                    pending_action=pending_action,
+                )
+                await own_db.commit()
     except Exception:
         logger.warning("HITL card post failed", exc_info=True)
+
+
+async def resolve_stale_hitl_cards(
+    db: AsyncSession,
+    *,
+    plan_id: Optional[str] = None,
+    step_ids: Optional[list[str]] = None,
+    reason: str = "origin_terminal",
+) -> int:
+    """Mark unresolved governance-approval chat cards resolved when their
+    origin is gone.
+
+    The companion of ``approvals.resolve_origin_requests``: when a plan/step
+    reaches a terminal state, the HitlRequest is expired there and the
+    card that rendered it is closed here — otherwise the card lingers
+    unresolved forever ("no longer attached to a waiting step") and inflates
+    the sidebar pending-action badge. Returns how many cards were closed.
+    """
+    if not plan_id and not step_ids:
+        return 0
+    from datetime import datetime, timezone
+
+    from sqlalchemy import or_
+
+    from packages.core.models.task import Message
+
+    conds = []
+    if plan_id:
+        conds.append(Message.pending_action["plan_id"].as_string() == plan_id)
+    if step_ids:
+        conds.append(Message.pending_action["step_id"].as_string().in_(list(step_ids)))
+    rows = (
+        await db.execute(
+            select(Message).where(
+                Message.pending_action.isnot(None),
+                Message.pending_action["kind"].as_string()
+                == PendingActionKind.GOVERNANCE_APPROVAL.value,
+                Message.resolved_at.is_(None),
+                or_(*conds),
+            )
+        )
+    ).scalars().all()
+    now = datetime.now(timezone.utc)
+    for msg in rows:
+        msg.resolved_at = now
+        msg.resolution = {"choice": "expired", "reason": reason}
+    if rows:
+        logger.info(
+            "governance: resolved %d stale approval card(s) (%s)", len(rows), reason,
+        )
+    return len(rows)

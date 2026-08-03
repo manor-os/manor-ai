@@ -132,6 +132,47 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("MCP catalog auto-seed skipped: %s", e)
 
+    # Register built-in runtime Skills before the first Agent turn. This also
+    # selects the edition-specific public product guide: cloud-intro in the
+    # Cloud source tree, or intro in the OSS export.
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.builtin_skill_loader import seed_builtin_skills
+        async with async_session() as _db:
+            await seed_builtin_skills(_db)
+            await _db.commit()
+    except Exception as e:
+        logger.warning("Built-in Skill auto-seed skipped: %s", e)
+
+    # Publish the platform's own blueprints into the marketplace table, so
+    # they are ordinary published rows — reviewed, versioned and identified
+    # by id like any contributor's — rather than a parallel code path. A
+    # redeploy of unchanged configs writes nothing; a corrected one bumps its
+    # version, which is what tells installed workspaces an update exists.
+    try:
+        from packages.core.blueprints.seed import seed_platform_blueprints
+        from packages.core.database import async_session
+        async with async_session() as _db:
+            await seed_platform_blueprints(_db)
+            await _db.commit()
+    except Exception as e:
+        logger.warning("Platform blueprint auto-seed skipped: %s", e)
+
+    # Register the platform feature flags the code gates on, so they show
+    # up in the admin Flags page at their safe default instead of ops
+    # having to guess the exact key. Only creates missing rows — an
+    # ops-set default or an archived flag is never overwritten.
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.feature_flags import seed_known_flags
+        async with async_session() as _db:
+            _flags_created = await seed_known_flags(_db)
+            await _db.commit()
+        if _flags_created:
+            logger.info("Registered %d missing platform feature flag(s)", _flags_created)
+    except Exception as e:
+        logger.warning("Known feature flag auto-seed skipped: %s", e)
+
     # Refresh optional plan metadata when the deployment provides it.
     # OSS builds keep the local OSS plan and return immediately.
     try:
@@ -545,7 +586,7 @@ def create_app() -> FastAPI:
     # /staff/roles, /staff/invite paths would otherwise be shadowed by
     # people.router's /staff/{staff_id} catch-all.
     app.include_router(permissions_router.router)  # /permissions, /staff/roles, /staff/invite
-    app.include_router(permissions_v1.router)      # /permissions/v1 — classify/legal-hold/access-requests (RFC §13)
+    app.include_router(permissions_v1.router)      # /permissions/v1 — classify/visibility/access-requests (RFC §13)
     app.include_router(people.router)
     app.include_router(usage.router)
     app.include_router(goals.router)
@@ -595,11 +636,15 @@ def create_app() -> FastAPI:
         channel_pairing as channel_pairing_router,
         goal_templates as goal_templates_router,
         governance as governance_router,
+        humans as humans_router,
         integration_sessions as integration_sessions_router,
+        observability as observability_router,
     )
     app.include_router(goal_templates_router.router)
     app.include_router(goal_templates_router.apply_router)
     app.include_router(governance_router.router)
+    app.include_router(humans_router.router)
+    app.include_router(observability_router.router)
     app.include_router(channel_pairing_router.router)
     app.include_router(integration_sessions_router.router)
     # ── M12.1 Workspace Blueprints / Marketplace ──

@@ -5,11 +5,19 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskLogType
+from packages.core.constants.agents import (
+    MANOR_AGENT_NAME,
+    is_legacy_agent_author_placeholder,
+    is_master_agent,
+)
+from packages.core.constants.task_actors import TaskActor, task_actor_meta
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Task, TaskLog, TaskCategory, TaskSlaPolicy
+from packages.core.models.workspace import Workspace
 from packages.core.services.task_dependencies import dependency_ids_from_details, details_with_dependency_state
 from packages.core.services.task_state_machine import (
     TERMINAL_STATUSES,
@@ -18,6 +26,21 @@ from packages.core.services.task_state_machine import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _exclude_trashed_workspace_tasks(query):
+    """Hide tasks whose workspace is soft-deleted (in the trash grace
+    window). NULL-safe NOT EXISTS so tasks with no workspace_id are
+    unaffected. The tasks aren't touched — if the workspace is restored
+    before the nightly purge job hard-deletes it, they reappear on
+    their own."""
+    trashed = exists(
+        select(Workspace.id).where(
+            Workspace.id == Task.workspace_id,
+            Workspace.deleted_at.is_not(None),
+        )
+    )
+    return query.where(~trashed)
 
 
 # ── Tasks ──
@@ -34,6 +57,7 @@ async def list_tasks(
     limit: int = 50,
     offset: int = 0,
     include_automations: bool = False,
+    readable_workspace_ids: set[str] | None = None,
 ) -> tuple[list[Task], int]:
     """List tasks for the Tasks page.
 
@@ -50,6 +74,8 @@ async def list_tasks(
     """
     q = select(Task).where(Task.entity_id == entity_id)
     count_q = select(func.count()).select_from(Task).where(Task.entity_id == entity_id)
+    q = _exclude_trashed_workspace_tasks(q)
+    count_q = _exclude_trashed_workspace_tasks(count_q)
 
     if status:
         q = q.where(Task.status == status)
@@ -78,6 +104,15 @@ async def list_tasks(
         automation_filter = Task.details["scheduled_job_id"].astext.is_(None)
         q = q.where(automation_filter)
         count_q = count_q.where(automation_filter)
+    if readable_workspace_ids is not None:
+        # Restrict to workspaces the caller may read, plus workspace-less
+        # (entity-level) tasks. ``None`` means "unrestricted" (entity admin).
+        ws_scope = or_(
+            Task.workspace_id.is_(None),
+            Task.workspace_id.in_(readable_workspace_ids),
+        )
+        q = q.where(ws_scope)
+        count_q = count_q.where(ws_scope)
 
     q = q.order_by(Task.created_at.desc()).limit(limit).offset(offset)
 
@@ -137,6 +172,7 @@ async def create_task(
     agent_id: str | None = None,
     agent_type: str | None = None,
     creator_id: str | None = None,
+    creator_agent_id: str | None = None,
     conversation_id: str | None = None,
     details: dict | None = None,
     deadline: str | None = None,
@@ -169,8 +205,22 @@ async def create_task(
     db.add(task)
     await db.flush()
 
-    # Log creation
-    await add_task_log(db, task.id, "create", f"Task created: {title}", created_by=creator_id or "system")
+    # Log creation. An agent-made task carries ``creator_agent_id``: the agent
+    # that ran the create action, which the runtime always knows. ``creator_id``
+    # stays a *user* id — the UI resolves creator_name from it — so the agent's
+    # identity goes in the log rather than overwriting the person's.
+    if creator_agent_id:
+        creator_display, creator_meta, creator_actor = await agent_log_authorship(
+            db, creator_agent_id,
+        )
+    elif creator_id:
+        creator_display, creator_meta, creator_actor = creator_id, None, TaskActor.USER
+    else:
+        creator_display, creator_meta, creator_actor = "system", None, TaskActor.SYSTEM
+    await add_task_log(
+        db, task.id, TaskLogType.CREATE, f"Task created: {title}",
+        actor=creator_actor, created_by=creator_display, metadata=creator_meta,
+    )
 
     from packages.core.services.event_emitter import emit
     emit(entity_id, "task.created", source="task_service", payload={
@@ -217,7 +267,28 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
     new_status = fields.get("status")
     if new_status is not None and new_status != old_status:
         await _enforce_dependency_gate_for_start(db, task, fields)
-        apply_task_status_transition(task, new_status)
+        await apply_task_status_transition(
+            task, new_status, db=db,
+            actor_kind="user" if user_id else "system", actor_id=user_id,
+        )
+
+    # M9.4 — human edit of an AI-generated task: capture WHICH content
+    # fields the user is about to change (field names + size deltas only,
+    # never values — privacy boundary). Recorded after the write below.
+    _CONTRIBUTION_FIELDS = ("title", "description", "expected_output", "priority")
+    _contribution_diff: dict[str, dict] = {}
+    if user_id and task.task_type == "ai_generated" and task.workspace_id:
+        for k in _CONTRIBUTION_FIELDS:
+            if k not in fields or fields[k] is None:
+                continue
+            old_val = getattr(task, k, None)
+            new_val = fields[k]
+            if old_val == new_val:
+                continue
+            _contribution_diff[k] = {
+                "changed": True,
+                "len_delta": len(str(new_val or "")) - len(str(old_val or "")),
+            }
 
     for k, v in fields.items():
         if not hasattr(task, k):
@@ -231,9 +302,37 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
             v = _coerce_datetime(v)
         setattr(task, k, v)
 
+    if _contribution_diff:
+        # Best-effort — a contribution-recording bug must never break the
+        # task update itself.
+        try:
+            from packages.core.humans import get_or_create_profile, record_contribution
+            profile = await get_or_create_profile(
+                db, entity_id=entity_id, user_id=user_id,
+                workspace_id=task.workspace_id,
+            )
+            await record_contribution(
+                db,
+                entity_id=entity_id,
+                workspace_id=task.workspace_id,
+                participant_id=profile.id,
+                kind="edit",
+                target_kind="task",
+                target_id=task.id,
+                diff_summary=_contribution_diff,
+            )
+        except Exception:
+            logger.warning(
+                "human contribution record failed for task %s (ignored)",
+                task_id, exc_info=True,
+            )
+
     # Track status transitions
     if new_status is not None and new_status != old_status:
-        await add_task_log(db, task_id, "status_change", f"Status: {old_status} → {fields['status']}")
+        await add_task_log(
+            db, task_id, TaskLogType.STATUS_CHANGE, f"Status: {old_status} → {fields['status']}",
+            actor=TaskActor.SYSTEM,
+        )
 
         from packages.core.services.event_emitter import emit
         emit(entity_id, "task.status_changed", source="task_service", payload={
@@ -284,8 +383,9 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
         await add_task_log(
             db,
             task_id,
-            "assignment_change",
+            TaskLogType.ASSIGNMENT_CHANGE,
             f"Assigned to {new_assignee_id}",
+            actor=TaskActor.USER if user_id else TaskActor.SYSTEM,
             created_by=user_id or "system",
         )
         from packages.core.services.event_emitter import emit
@@ -325,16 +425,28 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
 # ── Task Logs ──
 
 async def add_task_log(
-    db: AsyncSession, task_id: str, log_type: str, content: str,
-    *, created_by: str = "system", metadata: dict | None = None,
+    db: AsyncSession, task_id: str, log_type: TaskLogType | str, content: str,
+    *, actor: TaskActor, created_by: str = "system", metadata: dict | None = None,
 ) -> TaskLog:
+    """Record something that happened on a task.
+
+    ``actor`` says what kind of thing acted (see TaskActor); ``created_by``
+    says what to call it. They are separate because a display name cannot be
+    classified after the fact — that guesswork is what put "workspace-agent"
+    in the UI's person slot. Every call site declares its own actor: the
+    default would always be wrong for someone.
+
+    ``log_type`` is a ``TaskLogType`` member; the column stores its value, so
+    a member never reaches the database as "TaskLogType.COMMENT". Plain
+    strings still pass (API-supplied types are validated at the router).
+    """
     log = TaskLog(
         id=generate_ulid(),
         task_id=task_id,
-        log_type=log_type,
+        log_type=getattr(log_type, "value", log_type),
         content=content,
         created_by=created_by,
-        meta=metadata or {},
+        meta=task_actor_meta(actor, metadata=metadata),
     )
     db.add(log)
     await db.flush()
@@ -346,20 +458,27 @@ async def agent_log_authorship(
     agent_id: str | None,
     *,
     fallback: str | None = None,
-) -> tuple[str, dict | None]:
-    """Resolve ``(created_by, metadata)`` for a task log/comment authored by
-    an agent.
+) -> tuple[str, dict | None, TaskActor]:
+    """Resolve ``(created_by, metadata, actor)`` for a task log/comment
+    authored by an agent.
 
     Stamps the running agent's id (and display name, best-effort) into the
     log metadata so the activity UI renders the specific agent persona
-    instead of a generic ``workspace-agent`` label. The task-log serializer
+    instead of a placeholder. The task-log serializer
     reads ``author_agent_id``/``author_agent_name`` back out of this metadata,
     and the frontend resolves the id against the workspace's agent list.
     """
     resolved = (agent_id or "").strip() or None
     if not resolved:
-        return (fallback or "workspace-agent"), None
+        # No agent id. Either a person drove the action (``fallback`` is their
+        # user id), or the master agent did — work does not run un-owned. The
+        # old placeholder strings were written here, and they were never a
+        # third case: they were this case, unrecorded.
+        if fallback and not is_legacy_agent_author_placeholder(fallback):
+            return fallback, None, TaskActor.USER
+        return MANOR_AGENT_NAME, None, TaskActor.MANOR
     meta: dict = {"agent_id": resolved}
+    agent_type = None
     try:
         from packages.core.services.agent_service import get_agent
 
@@ -367,10 +486,45 @@ async def agent_log_authorship(
         if agent.get("name"):
             meta["agent_name"] = agent["name"]
         if agent.get("agent_type"):
-            meta["agent_type"] = agent["agent_type"]
+            agent_type = agent["agent_type"]
+            meta["agent_type"] = agent_type
     except Exception:  # pragma: no cover - name is a display nicety, never fatal
         pass
-    return resolved, meta
+    actor = TaskActor.MANOR if is_master_agent(resolved, agent_type) else TaskActor.AGENT
+    return resolved, meta, actor
+
+
+async def task_executing_agent_id(db: AsyncSession, task: Task) -> str | None:
+    """Which agent should answer for this task's work.
+
+    A task's own ``agent_id`` is often null: plan-driven work resolves an
+    agent per step, and nothing copies it back up. A reply to such a task
+    used to fall straight through to the master agent — so "check why and
+    try again" was answered by a generalist with none of the skills that
+    produced the work, which then improvised a different result.
+
+    The step already records who ran it. Prefer the task's own agent, then
+    the agent that most recently executed a step for it. ``None`` means the
+    master agent, which is a real answer and not an absence — see
+    packages/core/constants/task_actors.py.
+    """
+    assigned = (getattr(task, "agent_id", None) or "").strip()
+    if assigned:
+        return assigned
+
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+
+    row = (await db.execute(
+        select(ExecutionStep.resolved_agent_id)
+        .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
+        .where(
+            ExecutionPlan.task_id == task.id,
+            ExecutionStep.resolved_agent_id.isnot(None),
+        )
+        .order_by(ExecutionStep.updated_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    return (row or "").strip() or None
 
 
 async def get_task_logs(db: AsyncSession, task_id: str) -> list[TaskLog]:
@@ -425,6 +579,7 @@ async def get_tasks_by_status(
     workspace_id: str | None = None,
     include_automations: bool = False,
     limit_per_status: int = 50,
+    readable_workspace_ids: set[str] | None = None,
 ) -> dict[str, list]:
     """Get tasks grouped by status for Kanban board.
 
@@ -439,10 +594,16 @@ async def get_tasks_by_status(
     Returns: ``{"pending": [...], "in_progress": [...], ...}``
     """
     q = select(Task).where(Task.entity_id == entity_id)
+    q = _exclude_trashed_workspace_tasks(q)
     if workspace_id:
         q = q.where(Task.workspace_id == workspace_id)
     if not include_automations:
         q = q.where(Task.details["scheduled_job_id"].astext.is_(None))
+    if readable_workspace_ids is not None:
+        q = q.where(or_(
+            Task.workspace_id.is_(None),
+            Task.workspace_id.in_(readable_workspace_ids),
+        ))
     q = q.order_by(Task.priority.desc(), Task.created_at.desc())
     result = await db.execute(q)
     tasks = list(result.scalars().all())
@@ -473,7 +634,7 @@ async def move_task(db: AsyncSession, task_id: str, entity_id: str, new_status: 
         await _enforce_dependency_gate_for_start(db, task, fields)
         if "details" in fields:
             task.details = fields["details"]
-    apply_task_status_transition(task, new_status)
+    await apply_task_status_transition(task, new_status, db=db)
 
     await db.flush()
     if new_status in TERMINAL_STATUSES:

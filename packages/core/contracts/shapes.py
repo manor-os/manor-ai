@@ -11,6 +11,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from packages.core.contracts.envelope import (
+    build_step_result_envelope,
+    step_result_envelope_schema,
+)
+
 
 class Shape:
     name: str = "Shape"
@@ -258,12 +263,28 @@ class DraftPack(Shape):
         return out
 
 
+class StepResult(Shape):
+    """The default envelope for llm/subagent steps — see contracts/envelope.py.
+
+    normalize() can never fail and always yields a schema-valid envelope, so
+    steps bound to this shape are immune to OutputSchemaError by construction.
+    """
+
+    name = "StepResult"
+
+    def json_schema(self) -> dict:
+        return step_result_envelope_schema()
+
+    def normalize(self, raw: Any) -> Any:
+        return build_step_result_envelope(raw)
+
+
 _REGISTRY: dict[str, Shape] = {
     s.name: s
     for s in (
         ArtifactResult(), TextResult(), DocumentResult(),
         ListResult(), PublishResult(), CountResult(), EmptyResult(),
-        DraftPack(),
+        DraftPack(), StepResult(),
     )
 }
 

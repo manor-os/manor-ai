@@ -70,6 +70,10 @@ async def test_video_download_reuses_existing_knowledge_document_for_same_fs_pat
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document
     from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_artifacts import (
+        ensure_workspace_artifact_folder,
+        workspace_artifact_storage_base,
+    )
     from packages.core.tasks import media_tasks
 
     settings = get_settings()
@@ -108,9 +112,12 @@ async def test_video_download_reuses_existing_knowledge_document_for_same_fs_pat
         document_id = generate_ulid()
         entity_root = tmp_path / entity_id
         entity_root.mkdir()
-        expected_path = "Workspaces/Video Workspace/videos/launch.mp4"
 
-        db_session.add(Workspace(id=workspace_id, entity_id=entity_id, name="Video Workspace"))
+        workspace = Workspace(id=workspace_id, entity_id=entity_id, name="Video Workspace")
+        db_session.add(workspace)
+        await db_session.flush()
+        artifact_folder = await ensure_workspace_artifact_folder(db_session, workspace)
+        expected_path = f"{workspace_artifact_storage_base(artifact_folder.id)}/videos/launch.mp4"
         db_session.add(
             Document(
                 id=document_id,

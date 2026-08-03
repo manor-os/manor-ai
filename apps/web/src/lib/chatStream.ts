@@ -73,10 +73,35 @@ export type AssistantBlock = AssistantTextBlock | AssistantProcessBlock;
 export const WRAPPER_TOOLS = new Set(["invoke_skill", "manor", "code"]);
 
 export interface SubAgentEvent {
+  run_id?: string;
+  agent_id?: string;
+  agent_subscription_id?: string;
   agent_name: string;
   agent_avatar?: string;
+  service_key?: string;
+  objective?: string;
   content: string;
   event_type?: string;
+  status?: "running" | "completed" | "blocked" | "failed" | string;
+  updated_at?: string;
+  rounds?: number;
+  tool_calls_made?: string[];
+  tools?: {
+    seq?: number;
+    name: string;
+    status?: "running" | "completed" | "error" | string;
+    duration_ms?: number;
+    arguments?: unknown;
+  }[];
+  tool?: {
+    seq?: number;
+    name: string;
+    status?: "running" | "completed" | "error" | string;
+    duration_ms?: number;
+    arguments?: unknown;
+  };
+  stop_reason?: string;
+  error?: string;
   timestamp?: string;
 }
 
@@ -131,6 +156,54 @@ export interface ChatMessage {
   stream_error?: boolean;
   stop_reason?: string;
   limit_detail?: PlanLimitDetail;
+}
+
+export function mergeSubAgentEvents(
+  existing: SubAgentEvent[],
+  rawEvent: Record<string, any>,
+): SubAgentEvent[] {
+  const incoming: SubAgentEvent = {
+    ...rawEvent,
+    agent_name: String(rawEvent.agent_name || rawEvent.name || "Sub-Agent"),
+    content: String(rawEvent.content || ""),
+  };
+  const runId = String(incoming.run_id || "").trim();
+  if (!runId) return [...existing, incoming];
+
+  const index = existing.findIndex((event) => event.run_id === runId);
+  const current: SubAgentEvent =
+    index >= 0
+      ? { ...existing[index] }
+      : {
+          run_id: runId,
+          agent_name: incoming.agent_name,
+          content: "",
+          tools: [],
+        };
+  const tools = [...(current.tools || [])];
+  if (incoming.tool?.name) {
+    const toolIndex = tools.findIndex(
+      (tool) =>
+        incoming.tool?.seq != null &&
+        tool.seq === incoming.tool.seq,
+    );
+    if (toolIndex >= 0) {
+      tools[toolIndex] = { ...tools[toolIndex], ...incoming.tool };
+    } else {
+      tools.push(incoming.tool);
+    }
+  }
+
+  const merged: SubAgentEvent = {
+    ...current,
+    ...incoming,
+    tools: tools.slice(-20),
+  };
+  delete merged.tool;
+  const next = [...existing];
+  if (index >= 0) next[index] = merged;
+  else next.push(merged);
+  return next;
 }
 
 /* ── Helpers ── */
@@ -298,18 +371,26 @@ function formatCreditLimitMessage(detail: PlanLimitDetail): string {
   return detail.message || t("component.upgrade_prompt.default_message");
 }
 
-const TYPEWRITER_TICK_MS = 18;
+// Paint interval. Combined with the slice sizes below this lands around
+// 55-150 chars/sec — brisk enough that a long answer never feels stuck,
+// slow enough to read along. It used to be 18ms with slices that GREW with
+// the backlog, so a long reply painted at ~1300 chars/sec: the answers that
+// most need reading arrived fastest.
+const TYPEWRITER_TICK_MS = 36;
 const TOOL_START_DISPLAY_DELAY_MS = 180;
 
 function nextTypewriterSlice(text: string): [string, string] {
   const chars = Array.from(text);
   if (chars.length === 0) return ["", ""];
 
+  // The backlog still nudges the pace — a burst should not take minutes to
+  // drain — but gently, and the ceiling stays inside reading speed rather
+  // than dumping the screen.
   const count =
-    chars.length > 1000 ? 24 :
-      chars.length > 400 ? 14 :
-        chars.length > 160 ? 8 :
-          3;
+    chars.length > 1000 ? 6 :
+      chars.length > 400 ? 4 :
+        chars.length > 160 ? 3 :
+          2;
   let end = Math.min(count, chars.length);
 
   // Keep a trailing run of spaces/newlines with the same paint so markdown
@@ -912,15 +993,17 @@ export async function processSSEStream(
               const existing = last.sub_agent_events || [];
               updated[updated.length - 1] = {
                 ...last,
-                sub_agent_events: [
-                  ...existing,
-                  {
-                    agent_name: parsed.sub_agent.name || "Sub-Agent",
-                    content: parsed.sub_agent.content || "",
-                    event_type: parsed.sub_agent.event_type,
-                    timestamp: parsed.sub_agent.timestamp || new Date().toISOString(),
-                  },
-                ],
+                sub_agent_events: mergeSubAgentEvents(existing, {
+                  ...parsed.sub_agent,
+                  agent_name:
+                    parsed.sub_agent.agent_name ||
+                    parsed.sub_agent.name ||
+                    "Sub-Agent",
+                  timestamp:
+                    parsed.sub_agent.updated_at ||
+                    parsed.sub_agent.timestamp ||
+                    new Date().toISOString(),
+                }),
               };
             }
             return updated;

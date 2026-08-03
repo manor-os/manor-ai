@@ -3,30 +3,37 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
-import type { Workspace } from "../lib/types";
+import type { Workspace, WorkspaceStaff } from "../lib/types";
+import { useAuthStore } from "../stores/auth";
+import { canManageWorkspace } from "../lib/permissions";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
 import Dropdown from "../components/ui/Dropdown";
 import StatusBadge from "../components/ui/StatusBadge";
-import GlassCard from "../components/ui/GlassCard";
+import WorkspaceAppCard, {
+  WORKSPACE_APP_CARD_MIN_WIDTH,
+  workspaceAppCardGridStyle,
+} from "../components/ui/WorkspaceAppCard";
 import SmartToolbar from "../components/ui/SmartToolbar";
 import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
-import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import Chip from "../components/ui/Chip";
+import { CardGridSkeleton, ListRowsSkeleton, PageLoading } from "../components/ui/Skeleton";
 import FilterPills from "../components/ui/FilterPills";
 import ItemCard from "../components/ui/ItemCard";
 import WorkspaceIconTile, { getWorkspacePresentation } from "../components/ui/WorkspaceIcon";
 import {
   IconAgent,
+  IconBuilding,
   IconChat,
   IconChecklist,
   IconDocument,
   IconEdit,
+  IconLock,
   IconPlus,
   IconTrash,
   IconUpload,
@@ -235,6 +242,85 @@ function metadataStat(label: string, value: string) {
   );
 }
 
+/**
+ * Access summary inside the edit modal.
+ *
+ * Workspace access lives on the detail page (Configure → Staff → Share
+ * workspace). That is three levels deep, so people editing a workspace here
+ * had no idea who could open it. This surfaces the current scope in one line
+ * and links to the real control — deliberately read-only, so the access mode
+ * and member list keep a single source of truth.
+ */
+function WorkspaceAccessRow({
+  workspace,
+  staffRows,
+  currentUser,
+  onManage,
+}: {
+  workspace: Workspace;
+  staffRows: WorkspaceStaff[] | undefined;
+  currentUser: Parameters<typeof canManageWorkspace>[0];
+  onManage: () => void;
+}) {
+  const entityVisible = (workspace.settings as any)?.access_mode === "entity_visible";
+  const memberCount = (staffRows || []).filter(
+    (row) => (row.status ?? "active") === "active",
+  ).length;
+  const canManage = canManageWorkspace(currentUser, staffRows || []);
+
+  const hairline = "1px solid rgba(28,25,23,0.06)";
+  const detail = entityVisible
+    ? t("page.workspaces.access_entity_visible_hint")
+    : memberCount === 1
+      ? t("page.workspaces.access_member_hint_one")
+      : memberCount > 1
+        ? t("page.workspaces.access_members_hint").replace("{count}", String(memberCount))
+        : t("page.workspaces.access_members_only_hint");
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 11,
+        padding: "13px 2px",
+        borderTop: hairline,
+        borderBottom: hairline,
+      }}
+    >
+      <span style={{ color: "#a8a29e", display: "flex", flex: "none" }} aria-hidden="true">
+        {entityVisible ? <IconBuilding size={17} /> : <IconLock size={17} />}
+      </span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 600, color: "#1c1917" }}>
+          {entityVisible
+            ? t("page.workspaces.access_entity_visible")
+            : t("page.workspaces.access_members_only")}
+        </div>
+        <div style={{ fontSize: 11.5, color: "#a8a29e", marginTop: 2 }}>{detail}</div>
+      </div>
+      {canManage && (
+        <button
+          type="button"
+          onClick={onManage}
+          style={{
+            fontSize: 12.5,
+            fontWeight: 600,
+            color: "var(--accent)",
+            background: "transparent",
+            border: "none",
+            cursor: "pointer",
+            padding: "4px 2px",
+            flex: "none",
+          }}
+        >
+          {t("page.workspaces.access_manage")}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function parseWorkspaceView(value: string | null, includeMarketplace = true): WorkspaceView {
   const parsed = WORKSPACE_VIEW_KEYS.includes(value as WorkspaceView)
     ? (value as WorkspaceView)
@@ -419,7 +505,17 @@ export default function Workspaces() {
   const [showModal, setShowModal] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
   const [editing, setEditing] = useState<Workspace | null>(null);
+  const currentUser = useAuthStore((s) => s.user);
+  // Workspace membership for the row being edited — powers the access summary
+  // in the edit modal. Only fetched while that modal is open so the list page
+  // doesn't issue a staff query per workspace.
+  const { data: editingStaff } = useQuery({
+    queryKey: ["workspace-staff", editing?.id],
+    queryFn: () => api.workspaces.staff.list(editing!.id),
+    enabled: showModal && !!editing?.id,
+  });
   const [form, setForm] = useState<WorkspaceForm>(emptyForm);
+  const [upgrading, setUpgrading] = useState<Workspace | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [confirmDraftDelete, setConfirmDraftDelete] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -432,7 +528,7 @@ export default function Workspaces() {
     queryFn: () => api.workspaces.list(),
   });
 
-  const { data: activeDrafts } = useQuery({
+  const { data: activeDrafts, isLoading: draftsLoading } = useQuery({
     queryKey: ["workspace-drafts", "active"],
     queryFn: async () => {
       const [a, r] = await Promise.all([
@@ -470,7 +566,7 @@ export default function Workspaces() {
     },
   });
 
-  const { data: trashedWorkspaces } = useQuery({
+  const { data: trashedWorkspaces, isLoading: trashLoading } = useQuery({
     queryKey: ["workspaces-trash"],
     queryFn: () => api.workspaces.trash(),
   });
@@ -553,16 +649,6 @@ export default function Workspaces() {
     );
   });
 
-  if (isLoading
-  ) {
-    return (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", gap: 12, color: "#a8a29e" }}>
-        <LoadingSpinner size={20} />
-        <span style={{ fontSize: 14 }}>{t("page.workspaces.loading")}</span>
-      </div>
-    );
-  }
-
   const viewTabs = [
     { key: "workspaces", label: t("page.workspaces.tab_workspaces") },
     { key: "goals", label: t("nav.goals"), badge: t("page.workspaces.beta") },
@@ -575,15 +661,17 @@ export default function Workspaces() {
     false;
 
   const filterOptions = [
-    { key: "all", label: t("page.workspaces.filter_all"), count: allWs.length },
-    { key: "active", label: t("page.workspaces.filter_active"), count: activeCount },
-    { key: "paused", label: t("page.workspaces.filter_paused"), count: pausedCount },
+    { key: "all", label: t("page.workspaces.filter_all"), count: isLoading ? undefined : allWs.length },
+    { key: "active", label: t("page.workspaces.filter_active"), count: isLoading ? undefined : activeCount },
+    { key: "paused", label: t("page.workspaces.filter_paused"), count: isLoading ? undefined : pausedCount },
   ];
 
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "clamp(0.5rem, 2.5vw, 1rem)", overflow: "hidden", position: "relative", zIndex: 10 }}>
+    <div className="workspaces-page relative z-10 flex h-full min-h-0 flex-col overflow-hidden">
       <PageHeader
-        title={t("page.workspaces.title")}
+        title={
+          t("page.workspaces.title")
+        }
         subtitle={isOffice ? t("page.workspaces.office_view") : isGoals ? t("page.workspaces.goals_across") :
           t("page.workspaces.focused_operating_rooms_for_agents_knowledge_tasks_cha")}
         tabs={(
@@ -591,7 +679,6 @@ export default function Workspaces() {
             tabs={viewTabs}
             value={view}
             onChange={handleViewChange}
-            wrap
           />
         )}
         toolbar={!isOffice && !isGoals && !isMarketplace ? (
@@ -620,14 +707,16 @@ export default function Workspaces() {
 
       {isOffice ? (
         <div style={{ flex: 1, overflow: "hidden" }}>
-          <Suspense fallback={<LoadingSpinner size={20} />}>
+          <Suspense fallback={<PageLoading label={t("page.workspaces.loading")} minHeight={180} />}>
             <ManorOffice />
           </Suspense>
         </div>
       ) : isGoals ? (
-        <div className="workspaces-goals-view" style={{ flex: 1, overflowY: "auto", padding: "0 clamp(0px, 2vw, 24px) 24px" }}>
-          <Suspense fallback={<LoadingSpinner size={20} />}>
-            {allWs.length === 0 ? (
+        <div className="workspaces-goals-view" style={{ flex: 1, overflowY: "auto", padding: "0 0 24px" }}>
+          <Suspense fallback={<PageLoading label={t("page.workspaces.loading")} minHeight={180} />}>
+            {isLoading ? (
+              <PageLoading label={t("page.workspaces.loading")} minHeight={220} />
+            ) : allWs.length === 0 ? (
               <EmptyState title={t("page.workspaces.no_workspaces")} description={t("page.workspaces.no_workspaces_goals_desc")} />
             ) : (
               <div className="workspaces-goals-list" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
@@ -672,6 +761,15 @@ export default function Workspaces() {
           <Input label={t("page.workspaces.name")} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder={t("page.workspaces.workspace_name")} />
           <Textarea label={t("page.workspaces.description")} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} rows={3} placeholder={t("page.task_collections.optional_description")} />
           <Input label={t("page.workspaces.category")} value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} placeholder={t("page.workspaces.category_placeholder")} />
+          {editing && <WorkspaceAccessRow
+            workspace={editing}
+            staffRows={editingStaff}
+            currentUser={currentUser}
+            onManage={() => {
+              closeModal();
+              navigate(`/workspaces/${editing.id}?tab=staff`);
+            }}
+          />}
           {editing && (
             <div
               style={{
@@ -694,6 +792,14 @@ export default function Workspaces() {
         </div>
       </Modal>
 
+      {upgrading && (
+        <BlueprintUpgradeDialog
+          open
+          onClose={() => setUpgrading(null)}
+          workspaceId={upgrading.id}
+          workspaceName={upgrading.name}
+        />
+      )}
       <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={() => { if (confirmDelete) deleteMutation.mutate(confirmDelete); }} title={t("page.workspaces.delete_workspace")} message={t("page.workspaces.delete_workspace_msg").replace("{days}", String(graceDays))} confirmLabel={t("page.workspaces.move_to_trash")} danger />
       <ConfirmDialog open={!!confirmDraftDelete} onClose={() => setConfirmDraftDelete(null)} onConfirm={() => { if (confirmDraftDelete) deleteDraftMutation.mutate(confirmDraftDelete); }} title={t("page.workspaces.delete_draft")} message={t("page.workspaces.delete_draft_msg")} confirmLabel={t("action.delete")} danger />
       <ImportWorkspaceDialog
@@ -706,11 +812,18 @@ export default function Workspaces() {
       />
 
       {/* Scrollable content */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "4px 0 24px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "0 0 24px" }}>
         <WorkspaceIntroPanel />
 
         {/* In-progress drafts */}
-        {activeDrafts && activeDrafts.length > 0 && (
+        {draftsLoading ? (
+          <div style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", marginBottom: 8, paddingLeft: 4 }}>
+              {t("page.workspaces.drafts")}
+            </div>
+            <ListRowsSkeleton rows={2} avatar={false} action />
+          </div>
+        ) : activeDrafts && activeDrafts.length > 0 && (
           <div style={{ marginBottom: 18 }}>
             <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", marginBottom: 8, paddingLeft: 4 }}>
               {t("page.workspaces.drafts")}
@@ -777,9 +890,13 @@ export default function Workspaces() {
         </div>
 
         {/* Workspace Cards Grid */}
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 300px), 1fr))", gap: 14 }}>
+        <div style={workspaceAppCardGridStyle}>
           {/* Workspace Cards */}
-          {filtered.map((ws: Workspace) => {
+          {isLoading ? (
+            <div style={{ gridColumn: "1 / -1" }}>
+              <CardGridSkeleton count={6} minWidth={WORKSPACE_APP_CARD_MIN_WIDTH} />
+            </div>
+          ) : filtered.map((ws: Workspace) => {
             const presentation = getWorkspacePresentation(ws);
             const stats = (ws as any).stats || {};
             const taskCount = Number(stats.tasks || 0);
@@ -796,19 +913,12 @@ export default function Workspaces() {
                 ? t("page.workspaces.filter_paused")
                 : ws.status;
             return (
-              <GlassCard
+              <WorkspaceAppCard
                 key={ws.id}
                 onClick={() => navigate(`/workspaces/${ws.id}`)}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   openEdit(ws);
-                }}
-                style={{
-                  height: 252,
-                  display: "flex",
-                  flexDirection: "column",
-                  justifyContent: "space-between",
-                  overflow: "hidden",
                 }}
                 footer={
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -904,9 +1014,32 @@ export default function Workspaces() {
                         <div style={{ fontSize: 10, color: "#a8a29e", fontWeight: 850, textTransform: "uppercase", letterSpacing: "0.07em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {presentation.label}
                         </div>
-                        <StatusBadge type="gray" dot={ws.status === "active"} pulse={false}>
-                          {statusText}
-                        </StatusBadge>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                          <StatusBadge type="gray" dot={ws.status === "active"} pulse={false}>
+                            {statusText}
+                          </StatusBadge>
+                          {ws.blueprint_update?.status === "update_available" && (
+                            <button
+                              type="button"
+                              title={t("page.workspaces.blueprint_update_title")}
+                              onClick={(e) => { e.stopPropagation(); setUpgrading(ws); }}
+                              style={{
+                                display: "inline-flex", alignItems: "center", gap: 4,
+                                fontSize: 9.5, fontWeight: 850, letterSpacing: "0.04em",
+                                textTransform: "uppercase", color: "#3f6f68",
+                                background: "#eaf1ef", borderRadius: 999, padding: "2px 7px",
+                                whiteSpace: "nowrap", border: "none", cursor: "pointer",
+                              }}
+                            >
+                              <svg width="9" height="9" viewBox="0 0 24 24" fill="none"
+                                   stroke="currentColor" strokeWidth={3}>
+                                <path strokeLinecap="round" strokeLinejoin="round"
+                                      d="M12 19V5M5 12l7-7 7 7" />
+                              </svg>
+                              {t("page.workspaces.blueprint_update_available")}
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -946,12 +1079,12 @@ export default function Workspaces() {
                     )}
                   </div>
                 </div>
-              </GlassCard>
+              </WorkspaceAppCard>
             );
           })}
 
           {/* Empty search state */}
-          {filtered.length === 0 && search && (
+          {!isLoading && filtered.length === 0 && search && (
             <div style={{ gridColumn: "1 / -1" }}>
               <EmptyState
                 icon={
@@ -967,7 +1100,11 @@ export default function Workspaces() {
         </div>
 
         {/* Trash — soft-deleted workspaces in the grace window */}
-        {trashedWorkspaces && trashedWorkspaces.length > 0 && (
+        {trashLoading ? (
+          <div style={{ marginTop: 32, paddingTop: 16 }}>
+            <ListRowsSkeleton rows={2} avatar={false} action />
+          </div>
+        ) : trashedWorkspaces && trashedWorkspaces.length > 0 && (
           <div style={{ marginTop: 32, borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 16 }}>
             <button
               onClick={() => setShowTrash((v) => !v)}
@@ -999,7 +1136,7 @@ export default function Workspaces() {
                           size="sm"
                           variant="outline"
                           onClick={(e: any) => { e.stopPropagation(); restoreMutation.mutate(ws.id); }}
-                          disabled={restoreMutation.isPending}
+                          loading={restoreMutation.isPending}
                         >
                           {t("page.workspaces.restore")}
                         </Button>

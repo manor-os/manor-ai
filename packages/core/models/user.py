@@ -91,6 +91,16 @@ class UserMembership(Base, TimestampMixin, SoftDeleteMixin):
 class OAuthAccount(Base, TimestampMixin):
     """Third-party OAuth accounts (Google, GitHub, etc.)."""
     __tablename__ = "oauth_accounts"
+    __table_args__ = (
+        Index("ix_oauth_accounts_user_provider", "user_id", "provider"),
+        Index(
+            "uq_oauth_accounts_user_provider_external",
+            "user_id",
+            "provider",
+            "provider_user_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     user_id: Mapped[str] = mapped_column(String(26), nullable=False)

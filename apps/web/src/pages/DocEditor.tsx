@@ -13,6 +13,7 @@ import LoadingSpinner from "../components/ui/LoadingSpinner";
 import Select from "../components/ui/Select";
 import Dropdown from "../components/ui/Dropdown";
 import AiEditButton from "../components/ui/AiEditButton";
+import { PageHeaderTitle } from "../components/ui/PageHeader";
 import EditorLiveInlineDiff from "../components/EditorLiveInlineDiff";
 import {
   IconArrowLeft,
@@ -58,6 +59,7 @@ import {
 import { getAuthToken } from "../lib/authToken";
 import { codeLanguageForFile, codeLanguageLabel, isCodeLikeFile } from "../lib/codeFiles";
 import { useAuthStore } from "../stores/auth";
+import { useToastStore } from "../stores/toast";
 import { canCommentDocument, canEditDocument } from "../lib/permissions";
 import type { Comment, CommentAnchor } from "../lib/types";
 
@@ -194,6 +196,39 @@ function textLineAnchor(text: string, start: number, end: number, mode: string):
     start: normalizedStart,
     end: normalizedEnd,
     quote: quote || undefined,
+  };
+}
+
+function surfaceSelectionAnchor(
+  surface: HTMLElement | null,
+  mode: string,
+  source?: string,
+): CommentAnchor | null {
+  const selection = window.getSelection();
+  if (!surface || !selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+
+  const range = selection.getRangeAt(0);
+  return rangeSelectionAnchor(surface, range, mode, source);
+}
+
+function rangeSelectionAnchor(
+  surface: HTMLElement | null,
+  range: Range | null,
+  mode: string,
+  source?: string,
+): CommentAnchor | null {
+  if (!surface || !range || range.collapsed) return null;
+  if (!surface.contains(range.commonAncestorContainer)) return null;
+
+  const quote = trimCommentQuote(range.toString());
+  if (!quote) return null;
+
+  return {
+    type: "rendered_text_selection",
+    mode,
+    source,
+    label: t("component.comment_thread.selected_text"),
+    quote,
   };
 }
 
@@ -4077,96 +4112,98 @@ function PresentationEditor({
       {/* Slide thumbnails */}
       <div className="presentation-editor-sidebar" style={{
         width: 180, flexShrink: 0, borderRight: "1px solid rgba(28,25,23,0.06)",
-        background: "rgba(250,250,249,0.8)", overflowY: "auto", padding: 12,
-        display: "flex", flexDirection: "column", gap: 8,
+        background: "rgba(250,250,249,0.8)", overflow: "hidden",
+        display: "flex", flexDirection: "column", minHeight: 0,
       }}>
-        {slides.map((slide, idx) => {
-          const hasThumbServer = useServerBg && serverSlideUrls && serverSlideUrls.length > idx;
-          const thumbBg: React.CSSProperties = { backgroundColor: slide.bg || "#ffffff" };
-          if (slide.bgGrad) thumbBg.backgroundImage = pptxGradToCss(slide.bgGrad);
-          if (slide.bgImgUrl) {
-            thumbBg.backgroundImage = `url(${slide.bgImgUrl})`;
-            thumbBg.backgroundSize = "cover";
-            thumbBg.backgroundRepeat = "no-repeat";
-          }
-          return (
-            <div
-              key={slide.id}
-              className={`presentation-editor-thumb${idx === activeIdx ? " is-active" : ""}${dragOverIdx === idx ? " is-drag-over" : ""}`}
-              draggable
-              onClick={() => { setActiveIdx(idx); setSelectedShapeId(null); setEditingText(null); setEditingTableCell(null); }}
-              onDragStart={() => handleThumbDragStart(idx)}
-              onDragOver={(e) => handleThumbDragOver(e, idx)}
-              onDrop={() => handleThumbDrop(idx)}
-              onDragEnd={() => { setDragThumbIdx(null); setDragOverIdx(null); }}
-              style={{
-                cursor: "grab",
-                borderRadius: 8,
-                border: idx === activeIdx ? "2px solid #4f7d75" : dragOverIdx === idx ? "2px solid #8aa9d1" : "2px solid transparent",
-                overflow: "hidden",
-                opacity: dragThumbIdx === idx ? 0.5 : 1,
-                transition: "border-color 0.15s, opacity 0.15s",
-              }}
-            >
-              <div style={{
-                aspectRatio: slide.aspectRatio || "16/9", position: "relative", ...thumbBg,
-                borderRadius: 6, overflow: "hidden",
-              }}>
-                {hasThumbServer && (
-                  <img src={serverSlideUrls![idx]} alt="" style={{
-                    position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
-                    objectFit: "contain", zIndex: 0,
-                  }} />
-                )}
-                {!hasThumbServer && slide.shapes.map((shape) => {
-                  const sBg: React.CSSProperties = {};
-                  if (shape.gradFill) sBg.background = pptxGradToCss(shape.gradFill);
-                  else if (shape.fill) sBg.background = shape.fill;
-                  let tBr: string | number | undefined = shape.borderRadius ? `${shape.borderRadius}%` : undefined;
-                  if (shape.presetGeom === "ellipse" || shape.presetGeom === "oval") tBr = "50%";
-                  return (
-                    <div key={shape.id} style={{
-                      position: "absolute",
-                      left: `${shape.x}%`, top: `${shape.y}%`,
-                      width: `${shape.w}%`, height: `${shape.h}%`,
-                      overflow: "hidden",
-                      ...sBg,
-                      borderRadius: tBr,
-                      opacity: shape.opacity,
-                      border: shape.stroke ? `1px solid ${shape.stroke}` : undefined,
-                      transform: shape.rotation ? `rotate(${shape.rotation}deg)` : undefined,
-                    }}>
-                      {shape.imgUrl && <img src={shape.imgUrl} alt="" style={{ width: "100%", height: "100%", objectFit: shape.imageFit || "cover", position: "absolute", top: 0, left: 0, zIndex: 0 }} />}
-                      {shape.type === "table" && shape.tableRows && (
-                        <div style={{ width: "100%", height: "100%", background: "#fafaf9", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                          <span style={{ fontSize: 4, color: "#a8a29e" }}>{t("page.doc_editor.table")}</span>
-                        </div>
-                      )}
-                      {shape.texts.map((t, ti) => (
-                        <div key={ti} style={{
-                          position: "relative",
-                          fontSize: Math.max(4, (t.fontSize || 16) * 0.2),
-                          fontWeight: t.bold ? 700 : 400,
-                          color: t.color || "#000",
-                          textAlign: (t.align as any) || "left",
-                          lineHeight: 1.2,
-                          overflow: "hidden",
-                          whiteSpace: "nowrap",
-                          textOverflow: "ellipsis",
-                        }}>
-                          {t.text}
-                        </div>
-                      ))}
-                    </div>
-                  );
-                })}
+        <div className="presentation-editor-slide-strip" aria-label={t("page.doc_editor.slides")}>
+          {slides.map((slide, idx) => {
+            const hasThumbServer = useServerBg && serverSlideUrls && serverSlideUrls.length > idx;
+            const thumbBg: React.CSSProperties = { backgroundColor: slide.bg || "#ffffff" };
+            if (slide.bgGrad) thumbBg.backgroundImage = pptxGradToCss(slide.bgGrad);
+            if (slide.bgImgUrl) {
+              thumbBg.backgroundImage = `url(${slide.bgImgUrl})`;
+              thumbBg.backgroundSize = "cover";
+              thumbBg.backgroundRepeat = "no-repeat";
+            }
+            return (
+              <div
+                key={slide.id}
+                className={`presentation-editor-thumb${idx === activeIdx ? " is-active" : ""}${dragOverIdx === idx ? " is-drag-over" : ""}`}
+                draggable
+                onClick={() => { setActiveIdx(idx); setSelectedShapeId(null); setEditingText(null); setEditingTableCell(null); }}
+                onDragStart={() => handleThumbDragStart(idx)}
+                onDragOver={(e) => handleThumbDragOver(e, idx)}
+                onDrop={() => handleThumbDrop(idx)}
+                onDragEnd={() => { setDragThumbIdx(null); setDragOverIdx(null); }}
+                style={{
+                  cursor: "grab",
+                  borderRadius: 8,
+                  border: idx === activeIdx ? "2px solid #4f7d75" : dragOverIdx === idx ? "2px solid #8aa9d1" : "2px solid transparent",
+                  overflow: "hidden",
+                  opacity: dragThumbIdx === idx ? 0.5 : 1,
+                  transition: "border-color 0.15s, opacity 0.15s",
+                }}
+              >
+                <div style={{
+                  aspectRatio: slide.aspectRatio || "16/9", position: "relative", ...thumbBg,
+                  borderRadius: 6, overflow: "hidden",
+                }}>
+                  {hasThumbServer && (
+                    <img src={serverSlideUrls![idx]} alt="" style={{
+                      position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+                      objectFit: "contain", zIndex: 0,
+                    }} />
+                  )}
+                  {!hasThumbServer && slide.shapes.map((shape) => {
+                    const sBg: React.CSSProperties = {};
+                    if (shape.gradFill) sBg.background = pptxGradToCss(shape.gradFill);
+                    else if (shape.fill) sBg.background = shape.fill;
+                    let tBr: string | number | undefined = shape.borderRadius ? `${shape.borderRadius}%` : undefined;
+                    if (shape.presetGeom === "ellipse" || shape.presetGeom === "oval") tBr = "50%";
+                    return (
+                      <div key={shape.id} style={{
+                        position: "absolute",
+                        left: `${shape.x}%`, top: `${shape.y}%`,
+                        width: `${shape.w}%`, height: `${shape.h}%`,
+                        overflow: "hidden",
+                        ...sBg,
+                        borderRadius: tBr,
+                        opacity: shape.opacity,
+                        border: shape.stroke ? `1px solid ${shape.stroke}` : undefined,
+                        transform: shape.rotation ? `rotate(${shape.rotation}deg)` : undefined,
+                      }}>
+                        {shape.imgUrl && <img src={shape.imgUrl} alt="" style={{ width: "100%", height: "100%", objectFit: shape.imageFit || "cover", position: "absolute", top: 0, left: 0, zIndex: 0 }} />}
+                        {shape.type === "table" && shape.tableRows && (
+                          <div style={{ width: "100%", height: "100%", background: "#fafaf9", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <span style={{ fontSize: 4, color: "#a8a29e" }}>{t("page.doc_editor.table")}</span>
+                          </div>
+                        )}
+                        {shape.texts.map((t, ti) => (
+                          <div key={ti} style={{
+                            position: "relative",
+                            fontSize: Math.max(4, (t.fontSize || 16) * 0.2),
+                            fontWeight: t.bold ? 700 : 400,
+                            color: t.color || "#000",
+                            textAlign: (t.align as any) || "left",
+                            lineHeight: 1.2,
+                            overflow: "hidden",
+                            whiteSpace: "nowrap",
+                            textOverflow: "ellipsis",
+                          }}>
+                            {t.text}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="presentation-editor-thumb-label" style={{ fontSize: 10, textAlign: "center", color: "#78716c", padding: "4px 0" }}>
+                  {idx + 1}
+                </div>
               </div>
-              <div className="presentation-editor-thumb-label" style={{ fontSize: 10, textAlign: "center", color: "#78716c", padding: "4px 0" }}>
-                {idx + 1}
-              </div>
-            </div>
-          );
-        })}
+            );
+          })}
+        </div>
         <div className="presentation-editor-add-slide-controls">
           <button type="button" onClick={() => addSlide("title-body")} className="presentation-editor-add-slide">
             {t("page.doc_editor.plus_add_slide")}
@@ -4951,6 +4988,8 @@ export default function DocEditor() {
   const location = useLocation();
   const currentUser = useAuthStore((s) => s.user);
   const queryClient = useQueryClient();
+  const showSaveSuccess = useToastStore((s) => s.success);
+  const showSaveError = useToastStore((s) => s.error);
   const [content, setContent] = useState("");
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "unsaved">("saved");
   const [showPreview, setShowPreview] = useState(true);
@@ -4987,6 +5026,9 @@ export default function DocEditor() {
   const editorRef = useRef<HTMLDivElement>(null);
   const richSelectionRef = useRef<Range | null>(null);
   const markdownRef = useRef<HTMLTextAreaElement>(null);
+  const markdownPreviewRef = useRef<HTMLDivElement>(null);
+  const markdownPreviewSelectionRef = useRef<Range | null>(null);
+  const commentSelectionSurfaceRef = useRef<"editor" | "markdown-preview">("editor");
   const textRef = useRef<HTMLTextAreaElement>(null);
   const codeRef = useRef<HTMLTextAreaElement>(null);
   const codeGutterRef = useRef<HTMLDivElement>(null);
@@ -5136,6 +5178,15 @@ export default function DocEditor() {
       return false;
     }
   }, [content, doc?.name, docId, presentationSaveMutation, saveMutation, saveStatus]);
+
+  const handleManualSave = useCallback(async () => {
+    const saved = await flushSave(content);
+    if (saved) {
+      showSaveSuccess(t("page.blueprint_detail.saved"));
+      return;
+    }
+    showSaveError(t("page.blueprint_detail.save_failed"));
+  }, [content, flushSave, showSaveError, showSaveSuccess]);
 
   const goBackToKnowledge = useCallback(async () => {
     const saved = await flushSave(content);
@@ -6348,6 +6399,13 @@ export default function DocEditor() {
   }, [mode]);
 
   const buildCurrentCommentAnchor = useCallback((): CommentAnchor | null => {
+    if (mode === "markdown" && commentSelectionSurfaceRef.current === "markdown-preview") {
+      const previewAnchor = surfaceSelectionAnchor(markdownPreviewRef.current, mode, docName);
+      if (previewAnchor) return previewAnchor;
+      const cachedPreviewAnchor = rangeSelectionAnchor(markdownPreviewRef.current, markdownPreviewSelectionRef.current, mode, docName);
+      if (cachedPreviewAnchor) return cachedPreviewAnchor;
+    }
+
     const textarea = textareaForAnchorMode(mode);
     if (textarea) {
       return textLineAnchor(content, textarea.selectionStart, textarea.selectionEnd, mode);
@@ -6367,6 +6425,67 @@ export default function DocEditor() {
   const refreshCommentAnchor = useCallback(() => {
     setCommentAnchor(buildCurrentCommentAnchor());
   }, [buildCurrentCommentAnchor]);
+
+  const refreshEditorCommentAnchor = useCallback(() => {
+    commentSelectionSurfaceRef.current = "editor";
+    markdownPreviewSelectionRef.current = null;
+    refreshCommentAnchor();
+  }, [refreshCommentAnchor]);
+
+  const refreshMarkdownPreviewCommentAnchor = useCallback(() => {
+    const selection = window.getSelection();
+    let previewRange: Range | null = null;
+    let previewText = "";
+    try {
+      if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+        const range = selection.getRangeAt(0);
+        if (markdownPreviewRef.current?.contains(range.commonAncestorContainer)) {
+          previewRange = range.cloneRange();
+          previewText = selection.toString().trim();
+        }
+      }
+    } catch {
+      previewRange = null;
+      previewText = "";
+    }
+
+    commentSelectionSurfaceRef.current = "markdown-preview";
+    markdownPreviewSelectionRef.current = previewRange;
+    const previewAnchor = rangeSelectionAnchor(markdownPreviewRef.current, previewRange, mode, docName);
+    setCommentAnchor(previewAnchor);
+
+    if (!previewRange || !previewText) return;
+    requestAnimationFrame(() => {
+      try {
+        const nextSelection = window.getSelection();
+        if (!nextSelection || nextSelection.toString().trim()) return;
+        if (!markdownPreviewRef.current?.contains(previewRange.commonAncestorContainer)) return;
+        nextSelection.removeAllRanges();
+        nextSelection.addRange(previewRange);
+      } catch {
+        // Preview selections are best-effort UI affordances; stale ranges should not break editing.
+      }
+    });
+  }, [docName, mode]);
+
+  const preserveCommentSelection = useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+    // Keep the active textarea/contentEditable/preview selection intact until
+    // buildCurrentCommentAnchor has captured the exact user-selected text.
+    event.preventDefault();
+    refreshCommentAnchor();
+    const cachedPreviewRange = markdownPreviewSelectionRef.current;
+    if (!cachedPreviewRange || commentSelectionSurfaceRef.current !== "markdown-preview") return;
+    requestAnimationFrame(() => {
+      try {
+        const selection = window.getSelection();
+        if (!selection || !markdownPreviewRef.current?.contains(cachedPreviewRange.commonAncestorContainer)) return;
+        selection.removeAllRanges();
+        selection.addRange(cachedPreviewRange);
+      } catch {
+        // Selection restore is visual only; comments still keep the cached quote.
+      }
+    });
+  }, [refreshCommentAnchor]);
 
   const handleCommentsLoaded = useCallback((comments: Comment[]) => {
     setDocumentComments(comments);
@@ -6468,6 +6587,7 @@ export default function DocEditor() {
     unsaved: { label: t("page.doc_editor.unsaved_changes"), type: "orange" },
   };
   const statusInfo = statusConfig[saveStatus];
+  const visibleLiveEditNotice = liveEditNotice && liveEditNotice !== statusInfo.label ? liveEditNotice : null;
   const modeBadgeType = mode === "richtext" ? "purple" : mode === "markdown" ? "blue" : mode === "text" ? "gray" : mode === "spreadsheet" ? "green" : mode === "presentation" ? "orange" : mode === "diagram" ? "teal" : "teal";
   const modeLabel = isDocx ? "Word" : isPptx ? "Presentation" : mode === "richtext" ? "Rich Text" : mode === "markdown" ? "Markdown" : mode === "text" ? "Text" : mode === "spreadsheet" ? "Spreadsheet" : mode === "presentation" ? "Presentation" : mode === "diagram" ? "Diagram" : "Code";
   const usesInlineLiveDiff = mode === "text" || mode === "markdown" || mode === "code";
@@ -6579,9 +6699,6 @@ export default function DocEditor() {
   }, [applyEditorLiveContent, doc?.file_type, doc?.mime_type, docId, docName, getEditorLiveContent, modeLabel]);
 
   const isLoadingContent = contentLoading || docxLoading || xlsxLoading || pptxLoading;
-  const markdownEditorLayoutMode = liveDiff && markdownViewMode === "preview"
-    ? "split"
-    : markdownViewMode;
 
   // ---------------------------------------------------------------------------
   // Render
@@ -6601,14 +6718,12 @@ export default function DocEditor() {
         </button>
 
         <div className="manor-editor-header-main">
-          <h1 className="manor-editor-title">
-            {docName}
-          </h1>
+          <PageHeaderTitle>{docName}</PageHeaderTitle>
           <StatusBadge type="gray">{extLabel(docName)}</StatusBadge>
           <StatusBadge type={modeBadgeType}>{modeLabel}</StatusBadge>
         </div>
 
-        {liveEditNotice && <StatusBadge type="teal" dot>{liveEditNotice}</StatusBadge>}
+        {visibleLiveEditNotice && <StatusBadge type="teal" dot>{visibleLiveEditNotice}</StatusBadge>}
 
         <StatusBadge type={statusInfo.type} dot>{statusInfo.label}</StatusBadge>
 
@@ -6616,16 +6731,19 @@ export default function DocEditor() {
 
         {doc && (
           <button
+            onMouseDown={preserveCommentSelection}
             onClick={() => {
-              setCommentAnchor(buildCurrentCommentAnchor());
+              refreshCommentAnchor();
               setShowComments((open) => {
                 const next = !open;
                 if (next) setShowVersions(false);
                 return next;
               });
             }}
-            className={showComments ? "btn-manor-neutral-light" : "btn-manor-ghost"}
+            className={showComments ? "btn-manor-teal-light" : "btn-manor-ghost"}
             title={t("page.tasks.comments")}
+            aria-label={t("page.tasks.comments")}
+            aria-pressed={showComments}
             style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
           >
             <IconComment size={18} />
@@ -6643,7 +6761,7 @@ export default function DocEditor() {
         )}
 
         <button
-          onClick={() => void flushSave(content)}
+          onClick={() => void handleManualSave()}
           disabled={saveMutation.isPending || presentationSaveMutation.isPending || !canEditCurrentDoc}
           className="btn-manor"
           style={{ fontSize: 12, padding: "6px 16px" }}
@@ -6661,6 +6779,8 @@ export default function DocEditor() {
           }}
           className={showVersions ? "btn-manor-teal-light" : "btn-manor-ghost"}
           title={t("page.doc_editor.version_history")}
+          aria-label={t("page.doc_editor.version_history")}
+          aria-pressed={showVersions}
           style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
         >
           <IconClock size={18} />
@@ -6906,6 +7026,7 @@ export default function DocEditor() {
                 type="button"
                 className={markdownViewMode === viewMode ? "is-active" : ""}
                 onClick={() => setMarkdownViewMode(viewMode)}
+                aria-pressed={markdownViewMode === viewMode}
               >
                 {viewMode === "source" ? "Edit" : viewMode === "split" ? "Split" : "Preview"}
               </button>
@@ -7013,9 +7134,9 @@ export default function DocEditor() {
                   value={content}
                   onChange={(e) => handleContentChange(e.target.value)}
                   onKeyDown={handlePlainTextKeyDown}
-                  onSelect={refreshCommentAnchor}
-                  onClick={refreshCommentAnchor}
-                  onKeyUp={refreshCommentAnchor}
+                  onSelect={refreshEditorCommentAnchor}
+                  onClick={refreshEditorCommentAnchor}
+                  onKeyUp={refreshEditorCommentAnchor}
                   rows={Math.max(30, content.split("\n").length + 6)}
                   spellCheck
                   placeholder="Start typing..."
@@ -7036,15 +7157,15 @@ export default function DocEditor() {
               onKeyDown={handleRichTextKeyDown}
               onMouseUp={() => {
                 saveRichSelection();
-                refreshCommentAnchor();
+                refreshEditorCommentAnchor();
               }}
               onKeyUp={() => {
                 saveRichSelection();
-                refreshCommentAnchor();
+                refreshEditorCommentAnchor();
               }}
               onFocus={() => {
                 saveRichSelection();
-                refreshCommentAnchor();
+                refreshEditorCommentAnchor();
               }}
               onBlur={saveRichSelection}
               spellCheck
@@ -7054,8 +7175,8 @@ export default function DocEditor() {
           </div>
         ) : mode === "markdown" ? (
           /* Markdown editor */
-          <div className={`markdown-editor-layout markdown-editor-layout--${markdownEditorLayoutMode}`}>
-            {markdownEditorLayoutMode !== "preview" && (
+          <div className={`markdown-editor-layout markdown-editor-layout--${markdownViewMode}`}>
+            {markdownViewMode !== "preview" && (
               <div className="markdown-source-pane">
                 <div className="markdown-pane-header">
                   <span>Markdown</span>
@@ -7093,9 +7214,9 @@ export default function DocEditor() {
                     value={content}
                     onChange={(e) => handleContentChange(e.target.value)}
                     onKeyDown={(e) => handlePlainTextKeyDown(e, { markdown: true })}
-                    onSelect={refreshCommentAnchor}
-                    onClick={refreshCommentAnchor}
-                    onKeyUp={refreshCommentAnchor}
+                    onSelect={refreshEditorCommentAnchor}
+                    onClick={refreshEditorCommentAnchor}
+                    onKeyUp={refreshEditorCommentAnchor}
                     className="manor-editor-codearea markdown-codearea"
                     placeholder={t("page.doc_editor.write_your_markdown_here")}
                     spellCheck
@@ -7104,7 +7225,7 @@ export default function DocEditor() {
                 {renderCommentAnchorRail(markdownStats.lines)}
               </div>
             )}
-            {markdownEditorLayoutMode !== "source" && (
+            {markdownViewMode !== "source" && (
               <div className="markdown-preview-pane">
                 <div className="markdown-pane-header">
                   <span>Preview</span>
@@ -7134,7 +7255,13 @@ export default function DocEditor() {
                       ))}
                     </aside>
                   )}
-                  <div className="md-preview prose prose-slate prose-sm">
+                  <div
+                    ref={markdownPreviewRef}
+                    className="md-preview prose prose-slate prose-sm"
+                    onMouseUp={refreshMarkdownPreviewCommentAnchor}
+                    onPointerUp={refreshMarkdownPreviewCommentAnchor}
+                    onKeyUp={refreshMarkdownPreviewCommentAnchor}
+                  >
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm, remarkBreaks]}
                       components={{
@@ -7271,9 +7398,9 @@ export default function DocEditor() {
                           syncCodeScrollLayers(scrollTop, scrollLeft);
                         }}
                         onKeyDown={handlePlainTextKeyDown}
-                        onSelect={refreshCommentAnchor}
-                        onClick={refreshCommentAnchor}
-                        onKeyUp={refreshCommentAnchor}
+                        onSelect={refreshEditorCommentAnchor}
+                        onClick={refreshEditorCommentAnchor}
+                        onKeyUp={refreshEditorCommentAnchor}
                         className="manor-editor-codearea doc-editor-ide-textarea"
                         placeholder={t("page.doc_editor.start_coding")}
                         spellCheck={false}
@@ -7454,15 +7581,6 @@ export default function DocEditor() {
           color: white;
           border-color: #44403c;
         }
-        .btn-manor-neutral-light {
-          background: #f5f5f4;
-          border: 1px solid #d6d3d1;
-          color: #44403c;
-        }
-        .btn-manor-neutral-light:hover {
-          background: #e7e5e4;
-          border-color: #a8a29e;
-        }
         .md-preview h1 { font-size: 1.75em; font-weight: 700; margin: 0.8em 0 0.4em; }
         .md-preview h2 { font-size: 1.4em; font-weight: 700; margin: 0.7em 0 0.35em; }
         .md-preview h3 { font-size: 1.15em; font-weight: 600; margin: 0.6em 0 0.3em; }
@@ -7471,8 +7589,32 @@ export default function DocEditor() {
         .md-preview ol { list-style: decimal; padding-left: 1.5em; margin: 0.5em 0; }
         .md-preview blockquote { border-left: 3px solid #d6d3d1; padding-left: 1em; color: #78716c; margin: 0.5em 0; }
         .md-preview hr { border: none; border-top: 1px solid #e7e5e4; margin: 1em 0; }
-        .md-code-block { background: #f5f5f4; border-radius: 10px; padding: 1em; overflow-x: auto; font-size: 0.85em; margin: 0.5em 0; }
-        .md-inline-code { background: #f5f5f4; padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.9em; }
+        .md-code-block {
+          background: #1c1917;
+          border: 1px solid rgba(28, 25, 23, 0.08);
+          border-radius: 10px;
+          color: #f5f5f4;
+          font-size: 0.85em;
+          line-height: 1.65;
+          margin: 0.5em 0;
+          overflow-x: auto;
+          padding: 1em;
+        }
+        .md-code-block code {
+          background: transparent;
+          color: inherit;
+          font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+          text-shadow: none;
+          white-space: pre;
+        }
+        .md-inline-code {
+          background: #f5f5f4;
+          border: 1px solid rgba(28, 25, 23, 0.06);
+          border-radius: 4px;
+          color: #1c1917;
+          font-size: 0.9em;
+          padding: 0.15em 0.4em;
+        }
         .md-link { color: #436b65; text-decoration: underline; }
         .md-wiki-link {
           display: inline-flex;
@@ -7603,7 +7745,6 @@ export default function DocEditor() {
           }
           .doc-editor-header .btn-manor,
           .doc-editor-header .btn-manor-ghost,
-          .doc-editor-header .btn-manor-neutral-light,
           .doc-editor-header .btn-manor-teal-light {
             flex: 0 0 auto;
           }

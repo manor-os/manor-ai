@@ -1,0 +1,34 @@
+{
+  "id": "skill-creator",
+  "name": "skill-creator",
+  "type": "runtime_guidance",
+  "description": "Creates, updates, reviews, and evaluates reusable Manor Skills with progressive disclosure, semantic trigger design, representative testing, and safe lifecycle tools.",
+  "category": "skill-development",
+  "output_format": "guidance",
+  "tags": [
+    "skill-creator",
+    "skill-development",
+    "evaluation",
+    "progressive-disclosure",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "draft_skill",
+    "create_skill",
+    "get_skill_details",
+    "update_skill",
+    "invoke_skill",
+    "list_skills",
+    "read_file",
+    "list_files"
+  ],
+  "bundle_roots": [
+    "references"
+  ],
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the user asks to create, design, update, improve, review, test, benchmark, or troubleshoot a Manor Skill, or asks to turn a repeatable workflow into a reusable Skill, regardless of language",
+    "result_authority": "primary_source"
+  }
+}

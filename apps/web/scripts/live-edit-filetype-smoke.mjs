@@ -136,6 +136,51 @@ function assertStrictPatchProtocolSchema() {
     0,
     "space-separated patch tag is not part of the schema",
   );
+  assert.equal(
+    stripEditorLiveEditBlocks(nonCanonicalWrapped),
+    "已更新资产表：\n\n完成",
+    "legacy protocol output is hidden without becoming executable",
+  );
+
+  const streamingFragments = [
+    "Visible answer<manor-live-pa",
+    "Visible answer</manor-live-pa",
+    "Visible answer<manor live pa",
+    "Visible answer</manor live pa",
+    `Visible answer<manor-live-patch>${patch}`,
+    `Visible answer<manor live patch>${patch}`,
+  ];
+  for (const fragment of streamingFragments) {
+    assert.equal(
+      stripEditorLiveEditBlocks(fragment),
+      "Visible answer",
+      "partial streaming protocol output stays hidden",
+    );
+  }
+  assert.equal(
+    stripEditorLiveEditBlocks("Visible answer <strong"),
+    "Visible answer <strong",
+    "ordinary partial HTML-like text is not mistaken for the internal protocol",
+  );
+
+  assert.equal(
+    stripEditorLiveEditBlocks("Visible answer</manor live patch>"),
+    "Visible answer",
+    "standalone legacy closing tag stays hidden",
+  );
+
+  const screenshotLikeLegacyFragment =
+    '<manor live patch> [ { "op": "replace", "find": "17. [Design Collaborative Editing 协同编辑系统](#17-design collaborative editing-协同编辑系统)\\n18. [Pinterest / Adobe 针对性准备重点](#18-pinterest--adobe-针对性准备重点)", "replace": "17. [Design Collaborative Editing 协同编辑系统](#17-design collaborative';
+  assert.equal(
+    stripEditorLiveEditBlocks(screenshotLikeLegacyFragment),
+    "",
+    "screenshot-like legacy live patch fragments stay hidden",
+  );
+  assert.equal(
+    stripEditorLiveEditBlocks(`已更新目录。\n${screenshotLikeLegacyFragment}`),
+    "已更新目录。",
+    "prose before a legacy live patch fragment remains visible",
+  );
 
   const invalidPatch = JSON.stringify([
     {

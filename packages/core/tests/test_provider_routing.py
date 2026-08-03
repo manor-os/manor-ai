@@ -7,6 +7,8 @@ resolve_provider_base_url, normalize_model_for_provider.
 import pytest
 
 from packages.core.ai.llm_client import (
+    _validate_llm_key_model_compatibility,
+    _resolve_vision_model_if_needed,
     _route_metadata_for_resolved_model,
     detect_provider_from_key,
     detect_provider_from_model,
@@ -14,7 +16,9 @@ from packages.core.ai.llm_client import (
     resolve_llm_routing_for_model,
     resolve_provider_base_url,
 )
+from packages.core.services.model_provider_handlers import provider_from_base_url
 from packages.core.services.platform_model_provider_keys import OfficialProviderCredential
+from packages.core.services.voice.whisper import WhisperError, transcribe_blob
 
 
 # ── detect_provider_from_key ──────────────────────────────────────────
@@ -124,13 +128,467 @@ class TestResolveProviderBaseUrl:
         url = resolve_provider_base_url("qwen/qwen3.6-plus", "sk-abc123", None)
         assert url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-    def test_generic_sk_uses_moonshot_model_provider(self):
-        url = resolve_provider_base_url("moonshotai/kimi-k2.6", "sk-abc123", None)
+    @pytest.mark.parametrize("model", ["moonshotai/kimi-k2.6", "moonshotai/kimi-k3"])
+    def test_generic_sk_uses_moonshot_model_provider(self, model):
+        url = resolve_provider_base_url(model, "sk-abc123", None)
         assert url == "https://api.moonshot.ai/v1"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        ["https://api.moonshot.ai/v1", "https://api.moonshot.cn/v1"],
+    )
+    def test_moonshot_official_regions_are_recognized(self, base_url):
+        assert provider_from_base_url(base_url) == "moonshotai"
+        _validate_llm_key_model_compatibility(
+            "sk-" + "m" * 32,
+            base_url,
+            "moonshotai/kimi-k3",
+        )
 
     def test_unknown_zyphra_key_uses_zyphra_model_provider(self):
         url = resolve_provider_base_url("zyphra/zonos-v0.1-hybrid", "zyphra-test-key", None)
         assert url == "https://api.zyphra.com/v1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolved_model", "api_key", "expected_url", "expected_wire_model"),
+    [
+        (
+            "openai/whisper-1",
+            "sk-openai-user",
+            "https://api.openai.com/v1/audio/transcriptions",
+            "whisper-1",
+        ),
+        (
+            "groq/whisper-large-v3",
+            "gsk_groq_user",
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            "whisper-large-v3",
+        ),
+    ],
+)
+async def test_native_stt_byok_routes_request_verbose_segment_timestamps(
+    monkeypatch,
+    resolved_model,
+    api_key,
+    expected_url,
+    expected_wire_model,
+):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "text": "Measured narration.",
+                "duration": 2.5,
+                "segments": [
+                    {"start": 0.2, "end": 2.3, "text": "Measured narration."}
+                ],
+                "words": [
+                    {"start": 0.2, "end": 1.1, "word": "Measured"},
+                    {"start": 1.2, "end": 2.3, "word": "narration."},
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "packages.core.services.voice.whisper.httpx.AsyncClient",
+        FakeClient,
+    )
+
+    result = await transcribe_blob(
+        b"RIFF-audio",
+        mime="audio/wav",
+        filename="narration.wav",
+        user_api_key=api_key,
+        resolved_model=resolved_model,
+        require_timestamps=True,
+    )
+
+    assert captured["url"] == expected_url
+    assert captured["data"] == {
+        "model": expected_wire_model,
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": ["word", "segment"],
+    }
+    assert result.segments == [
+        {"start": 0.2, "end": 2.3, "text": "Measured narration."}
+    ]
+    assert result.words == [
+        {"start": 0.2, "end": 1.1, "text": "Measured"},
+        {"start": 1.2, "end": 2.3, "text": "narration."},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_stt_ordinary_transcription_keeps_legacy_http_payload(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"text": "Ordinary transcript.", "duration": 1.5}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "packages.core.services.voice.whisper.httpx.AsyncClient",
+        FakeClient,
+    )
+
+    result = await transcribe_blob(
+        b"RIFF-audio",
+        mime="audio/wav",
+        filename="attachment.wav",
+        user_api_key="sk-openai-user",
+        resolved_model="openai/whisper-1",
+        require_timestamps=False,
+    )
+
+    assert captured["url"] == "https://api.openai.com/v1/audio/transcriptions"
+    assert captured["data"] == {
+        "model": "whisper-1",
+        "response_format": "verbose_json",
+    }
+    assert result.text == "Ordinary transcript."
+    assert result.segments is None
+    assert result.words is None
+
+
+@pytest.mark.asyncio
+async def test_native_stt_byok_uses_only_custom_openai_compatible_base_url(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "text": "Measured narration.",
+                "duration": 1.0,
+                "segments": [
+                    {"start": 0.1, "end": 0.9, "text": "Measured narration."}
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "packages.core.services.voice.whisper.httpx.AsyncClient",
+        FakeClient,
+    )
+
+    await transcribe_blob(
+        b"RIFF-audio",
+        mime="audio/wav",
+        user_api_key="sk-custom-endpoint-key",
+        user_base_url="https://stt.example.test/v1/",
+        resolved_model="openai/whisper-1",
+        require_timestamps=True,
+    )
+
+    assert captured["url"] == "https://stt.example.test/v1/audio/transcriptions"
+    assert captured["headers"]["Authorization"] == "Bearer sk-custom-endpoint-key"
+    assert captured["data"]["model"] == "whisper-1"
+
+
+@pytest.mark.asyncio
+async def test_native_stt_byok_rejects_known_base_url_provider_mismatch(monkeypatch):
+    class UnexpectedClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("provider mismatch must fail before network")
+
+    monkeypatch.setattr(
+        "packages.core.services.voice.whisper.httpx.AsyncClient",
+        UnexpectedClient,
+    )
+
+    with pytest.raises(WhisperError, match="base URL routes to openai"):
+        await transcribe_blob(
+            b"RIFF-audio",
+            mime="audio/wav",
+            user_api_key="gsk_groq_user",
+            user_base_url="https://api.openai.com/v1",
+            resolved_model="groq/whisper-large-v3",
+            require_timestamps=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_chat_audio_stt_rejects_timestamp_required_alignment_before_network(monkeypatch):
+    class UnexpectedClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("timestamp-less chat audio must be blocked before network")
+
+    monkeypatch.setattr(
+        "packages.core.services.voice.whisper.httpx.AsyncClient",
+        UnexpectedClient,
+    )
+
+    with pytest.raises(WhisperError, match="timestamp-capable STT"):
+        await transcribe_blob(
+            b"RIFF-audio",
+            mime="audio/wav",
+            user_api_key="sk-or-user",
+            resolved_model="openai/gpt-4o-audio-preview",
+            require_timestamps=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resolved_model",
+    ["openai/whisper-1", "openai/gpt-4o-audio-preview"],
+)
+async def test_platform_openrouter_fallback_returns_reference_aligned_timestamps(
+    monkeypatch,
+    resolved_model,
+):
+    captured = {}
+
+    for key in (
+        "WHISPER_API_KEY",
+        "WHISPER_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "GROQ_API_KEY",
+        "OPENROUTER_AUDIO_TRANSCRIPTION_MODEL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-platform")
+
+    async def no_official_credential(provider, **_kwargs):
+        if resolved_model == "openai/gpt-4o-audio-preview" and provider == "openrouter":
+            return OfficialProviderCredential(
+                provider="openrouter",
+                api_key="sk-or-official",
+                base_url="https://openrouter.ai/api/v1",
+                source="env",
+            )
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.model_gateway.resolve_gateway_credential",
+        no_official_credential,
+    )
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"segments":['
+                                '{"start":0.2,"end":1.8,"text":"First sentence."},'
+                                '{"start":2.0,"end":3.9,"text":"Second sentence."}'
+                                "]}"
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "packages.core.services.voice.whisper.httpx.AsyncClient",
+        FakeClient,
+    )
+
+    result = await transcribe_blob(
+        b"RIFF-audio",
+        mime="audio/wav",
+        filename="narration.wav",
+        resolved_model=resolved_model,
+        require_timestamps=True,
+        reference_transcript="First sentence. Second sentence.",
+    )
+
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert captured["json"]["model"] == "google/gemini-3.1-flash-lite"
+    assert "First sentence. Second sentence." in captured["json"]["messages"][0]["content"][1]["text"]
+    assert result.model == "google/gemini-3.1-flash-lite"
+    assert result.text == "First sentence. Second sentence."
+    assert result.duration_seconds == 3.9
+    assert result.segments == [
+        {
+            "start": 0.2,
+            "end": 1.8,
+            "text": "First sentence.",
+            "timing_source": "measured_openrouter_audio_segments",
+        },
+        {
+            "start": 2.0,
+            "end": 3.9,
+            "text": "Second sentence.",
+            "timing_source": "measured_openrouter_audio_segments",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolved_model", "env", "expected_url", "expected_wire_model"),
+    [
+        (
+            "openai/whisper-1",
+            {
+                "WHISPER_API_KEY": "sk-platform-whisper",
+                "WHISPER_BASE_URL": "https://api.openai.com/v1",
+            },
+            "https://api.openai.com/v1/audio/transcriptions",
+            "whisper-1",
+        ),
+        (
+            "groq/whisper-large-v3",
+            {"GROQ_API_KEY": "gsk_platform_groq"},
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            "whisper-large-v3",
+        ),
+    ],
+)
+async def test_native_stt_platform_env_routes_without_byok(
+    monkeypatch,
+    resolved_model,
+    env,
+    expected_url,
+    expected_wire_model,
+):
+    captured = {}
+
+    for key in (
+        "WHISPER_API_KEY",
+        "WHISPER_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    async def no_official_credential(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.model_gateway.resolve_gateway_credential",
+        no_official_credential,
+    )
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "text": "Measured narration.",
+                "duration": 1.0,
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": "Measured narration."}
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "packages.core.services.voice.whisper.httpx.AsyncClient",
+        FakeClient,
+    )
+
+    await transcribe_blob(
+        b"RIFF-audio",
+        mime="audio/wav",
+        resolved_model=resolved_model,
+        require_timestamps=True,
+    )
+
+    assert captured["url"] == expected_url
+    assert captured["data"]["model"] == expected_wire_model
 
 
 # ── normalize_model_for_provider ──────────────────────────────────────
@@ -141,9 +599,25 @@ class TestNormalizeModelForProvider:
         result = normalize_model_for_provider("anthropic/claude-sonnet-4.6", "https://openrouter.ai/api/v1")
         assert result == "anthropic/claude-sonnet-4.6"
 
+    def test_vercel_gateway_keeps_full_id(self):
+        result = normalize_model_for_provider(
+            "anthropic/claude-sonnet-4.6",
+            "https://ai-gateway.vercel.sh/v1",
+        )
+        assert result == "anthropic/claude-sonnet-4.6"
+        assert provider_from_base_url("https://ai-gateway.vercel.sh/v1") == "vercel"
+
     def test_direct_openai_strips_prefix(self):
         result = normalize_model_for_provider("openai/gpt-4.1", "https://api.openai.com/v1")
         assert result == "gpt-4.1"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        ["https://api.moonshot.ai/v1", "https://api.moonshot.cn/v1"],
+    )
+    def test_direct_kimi_strips_catalog_prefix(self, base_url):
+        result = normalize_model_for_provider("moonshotai/kimi-k3", base_url)
+        assert result == "kimi-k3"
 
     def test_direct_google_strips_prefix(self):
         result = normalize_model_for_provider(
@@ -168,6 +642,80 @@ class TestNormalizeModelForProvider:
 
 
 class TestVisionFallbackRoutingMetadata:
+    @staticmethod
+    def _image_messages():
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                    }
+                ],
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        ("requested_model", "expected_model"),
+        [
+            ("gpt-5.6", "openai/gpt-5.6-sol"),
+            ("openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+            ("gpt-5.6-terra", "openai/gpt-5.6-terra"),
+            ("openai/gpt-5.6-luna", "openai/gpt-5.6-luna"),
+            ("gpt-5.5", "openai/gpt-5.5"),
+            ("openai/gpt-5.5", "openai/gpt-5.5"),
+            ("gpt-5.5-pro", "openai/gpt-5.5-pro"),
+            ("openai/gpt-5.5-pro", "openai/gpt-5.5-pro"),
+        ],
+    )
+    def test_gpt55_image_input_keeps_canonical_openai_model(self, requested_model, expected_model):
+        assert _resolve_vision_model_if_needed(requested_model, self._image_messages()) == expected_model
+
+    def test_unknown_image_model_does_not_silently_switch_provider(self):
+        assert (
+            _resolve_vision_model_if_needed(
+                "custom/acme-multimodal-preview",
+                self._image_messages(),
+            )
+            == "custom/acme-multimodal-preview"
+        )
+
+    def test_model_input_modalities_are_centralized(self):
+        from packages.core.constants import models
+
+        assert models.model_input_modalities("openai/gpt-4") == frozenset({"text"})
+        assert models.model_input_modalities("openai/gpt-5.6-sol") == frozenset({"text", "image"})
+        assert models.model_input_modalities("openai/gpt-5.6-terra") == frozenset({"text", "image"})
+        assert models.model_input_modalities("openai/gpt-5.6-luna") == frozenset({"text", "image"})
+        assert models.model_input_modalities("openai/gpt-5.5") == frozenset({"text", "image"})
+        assert models.model_input_modalities("openai/gpt-5.5-pro") == frozenset({"text", "image"})
+        assert models.model_input_modalities("moonshotai/kimi-k3") == frozenset({"text", "image"})
+        assert models.model_input_modalities("custom/unknown") is None
+
+    def test_explicit_text_only_model_uses_configured_vision_fallback(self, monkeypatch):
+        monkeypatch.setenv("LLM_VISION_MODEL", "openai/gpt-4o")
+
+        assert (
+            _resolve_vision_model_if_needed(
+                "deepseek/deepseek-v4-pro",
+                self._image_messages(),
+            )
+            == "openai/gpt-4o"
+        )
+
+    def test_gpt55_image_routing_keeps_openai_byok_metadata(self):
+        metadata = {
+            "llm_api_key": "sk-" + "o" * 32,
+            "llm_base_url": "https://api.openai.com/v1",
+            "trace_id": "keep-me",
+        }
+
+        resolved_model = _resolve_vision_model_if_needed("gpt-5.5", self._image_messages())
+        routed = _route_metadata_for_resolved_model(metadata, resolved_model, resolved_model)
+
+        assert routed == {**metadata, "_resolved_model": "openai/gpt-5.5"}
+
     def test_drops_incompatible_deepseek_byok_after_vision_model_switch(self):
         metadata = {
             "llm_api_key": "sk-" + "d" * 32,
@@ -206,17 +754,17 @@ class TestVisionFallbackRoutingMetadata:
 
 class TestOfficialProviderRouting:
     @pytest.mark.asyncio
-    async def test_official_provider_token_routes_catalog_model_native(self, monkeypatch):
+    async def test_official_route_uses_vercel_gateway_first(self, monkeypatch):
         monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
         import packages.core.services.platform_model_provider_keys as provider_keys
         from packages.core.ai import llm_client
 
         async def fake_resolve(provider: str, *, reason: str = ""):
-            assert provider == "anthropic"
+            assert provider == "vercel"
             return OfficialProviderCredential(
-                provider="anthropic",
-                api_key="sk-ant-official-provider-key-1234567890",
-                base_url="https://api.anthropic.com/v1",
+                provider="vercel",
+                api_key="vck_official-provider-key-1234567890",
+                base_url="https://ai-gateway.vercel.sh/v1",
                 source="official",
                 source_detail="test",
             )
@@ -228,9 +776,9 @@ class TestOfficialProviderRouting:
         finally:
             llm_client._is_byok_call.reset(token)
 
-        assert routing.api_key == "sk-ant-official-provider-key-1234567890"
-        assert routing.base_url == "https://api.anthropic.com/v1"
-        assert routing.provider == "anthropic"
+        assert routing.api_key == "vck_official-provider-key-1234567890"
+        assert routing.base_url == "https://ai-gateway.vercel.sh/v1"
+        assert routing.provider == "vercel"
         assert routing.source == "official"
         assert llm_client._is_byok_call.get(False) is False
 
@@ -258,13 +806,13 @@ class TestOfficialProviderRouting:
         assert routing.source == "byok"
 
     @pytest.mark.asyncio
-    async def test_openrouter_fallback_when_native_official_missing(self, monkeypatch):
+    async def test_openrouter_fallback_when_vercel_gateway_missing(self, monkeypatch):
         monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
         import packages.core.services.platform_model_provider_keys as provider_keys
         from packages.core.ai import llm_client
 
         async def fake_resolve(provider: str, *, reason: str = ""):
-            if provider == "anthropic":
+            if provider == "vercel":
                 return None
             assert provider == "openrouter"
             return OfficialProviderCredential(

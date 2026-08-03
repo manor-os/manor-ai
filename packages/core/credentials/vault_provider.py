@@ -22,17 +22,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from typing import Optional, TYPE_CHECKING
-
-# ``hvac`` is only imported lazily inside ``VaultKeyProvider.__init__``.
-# The credentials factory imports this module unconditionally, so a dev
-# / test environment without hvac installed should still be importable
-# as long as the active CREDENTIAL_BACKEND isn't "vault".
-if TYPE_CHECKING:
-    import hvac  # type: ignore[import-untyped]
+from typing import Optional
 
 from packages.core.credentials.audit import AuditEvent, AuditSink, NullAuditSink
 from packages.core.credentials.base import (
+    CredentialError,
     CredentialDecryptError,
     CredentialNotFound,
     HealthResult,
@@ -103,9 +97,23 @@ class VaultKeyProvider:
     def _ensure_transit_key(self) -> None:
         if self._key_ensured:
             return
-        # The transit secret engine itself must be enabled. In dev mode
-        # we enable it on demand; in production this is part of the
-        # deploy-time Vault bootstrap.
+        try:
+            # Production runtime tokens should only need transit access. Avoid
+            # sys/mounts unless the key is missing and we're bootstrapping a
+            # local/dev Vault.
+            self._client.secrets.transit.read_key(
+                name=self._key, mount_point=self._mount,
+            )
+            self._key_ensured = True
+            return
+        except self._hvac_exceptions["InvalidPath"]:
+            pass
+        except self._hvac_exceptions["VaultError"] as exc:
+            raise CredentialError(f"vault transit key check failed: {exc}") from exc
+
+        # The transit secret engine itself must be enabled. In dev mode we
+        # enable it on demand; in production this belongs to deploy-time Vault
+        # bootstrap and should not be reached for a healthy runtime token.
         try:
             self._client.sys.enable_secrets_engine(
                 backend_type="transit", path=self._mount,
@@ -113,19 +121,26 @@ class VaultKeyProvider:
         except self._hvac_exceptions["InvalidRequest"]:
             # Already mounted — fine.
             pass
+        except self._hvac_exceptions["VaultError"] as exc:
+            raise CredentialError(f"vault transit mount unavailable: {exc}") from exc
 
         try:
             self._client.secrets.transit.read_key(
                 name=self._key, mount_point=self._mount,
             )
         except self._hvac_exceptions["InvalidPath"]:
-            self._client.secrets.transit.create_key(
-                name=self._key,
-                key_type="aes256-gcm96",
-                derived=True,
-                exportable=False,
-                mount_point=self._mount,
-            )
+            try:
+                self._client.secrets.transit.create_key(
+                    name=self._key,
+                    key_type="aes256-gcm96",
+                    derived=True,
+                    exportable=False,
+                    mount_point=self._mount,
+                )
+            except self._hvac_exceptions["VaultError"] as exc:
+                raise CredentialError(f"vault transit key create failed: {exc}") from exc
+        except self._hvac_exceptions["VaultError"] as exc:
+            raise CredentialError(f"vault transit key check failed: {exc}") from exc
         self._key_ensured = True
 
     # ── KeyProvider API ──
@@ -136,12 +151,15 @@ class VaultKeyProvider:
             # Empty round-trip — store an empty ciphertext sentinel so
             # the decrypt path can short-circuit without calling Vault.
             return "vault:empty:"
-        resp = self._client.secrets.transit.encrypt_data(
-            name=self._key,
-            plaintext=base64.b64encode(plaintext).decode("ascii"),
-            context=_ctx_b64(context),
-            mount_point=self._mount,
-        )
+        try:
+            resp = self._client.secrets.transit.encrypt_data(
+                name=self._key,
+                plaintext=base64.b64encode(plaintext).decode("ascii"),
+                context=_ctx_b64(context),
+                mount_point=self._mount,
+            )
+        except self._hvac_exceptions["VaultError"] as exc:
+            raise CredentialError(f"vault transit encrypt failed: {exc}") from exc
         ref = resp["data"]["ciphertext"]
         self._audit.log(AuditEvent(
             credential_ref=ref,
@@ -204,9 +222,32 @@ class VaultKeyProvider:
 
     def health(self) -> HealthResult:
         try:
+            is_authenticated = getattr(self._client, "is_authenticated", None)
+            if callable(is_authenticated) and not is_authenticated():
+                return HealthResult(ok=False, detail="vault token is invalid or unauthorized")
             sealed = self._client.sys.is_sealed()
             if sealed:
                 return HealthResult(ok=False, detail="vault is sealed")
+            try:
+                self._client.secrets.transit.read_key(
+                    name=self._key, mount_point=self._mount,
+                )
+            except self._hvac_exceptions["InvalidPath"]:
+                return HealthResult(
+                    ok=False,
+                    detail=f"vault transit key {self._key!r} is missing",
+                )
+            except self._hvac_exceptions["VaultError"] as exc:
+                return HealthResult(ok=False, detail=f"vault transit key check failed: {exc}")
+            try:
+                self._client.secrets.transit.encrypt_data(
+                    name=self._key,
+                    plaintext=base64.b64encode(b"health").decode("ascii"),
+                    context=_ctx_b64({"purpose": "credential_health"}),
+                    mount_point=self._mount,
+                )
+            except self._hvac_exceptions["VaultError"] as exc:
+                return HealthResult(ok=False, detail=f"vault transit encrypt failed: {exc}")
             return HealthResult(ok=True, detail=f"key={self._key}")
         except Exception as exc:  # noqa: BLE001
             return HealthResult(ok=False, detail=str(exc))

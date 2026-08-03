@@ -216,6 +216,109 @@ def error_with_retry_policy(
     return enriched, next_retry_at
 
 
+# ── Transient failures ─────────────────────────────────────────────────
+#
+# A transient failure is one where nothing Manor asked for actually ran —
+# the user's local worker was offline, Chrome never answered. Charging it an
+# attempt and re-posting an approval card is how an operator ends up
+# approving the same step fifteen times without ever learning the cause.
+#
+# So: back off, don't spend the attempt budget, don't re-ask. That trade is
+# only safe because it is bounded — past the bound the step escalates to a
+# normal error card that requires the user. The bound is deliberately NOT
+# operator-tunable: it is a safety valve on an automatic loop, not a policy.
+#
+# The counter lives inside ``step.last_execution_error`` (JSONB) rather than
+# in a new column. It is metadata ABOUT that failure — it has no meaning
+# apart from it, it is overwritten in the same write, and it is dead the
+# moment the streak breaks. A column would need a migration to carry a value
+# whose lifetime is strictly shorter than the field it annotates.
+
+#: Consecutive transient retries before a human must get involved.
+TRANSIENT_MAX_RETRIES = 6
+#: ...or this much wall-clock since the streak started, whichever comes first.
+#: A paused/backed-up queue can stretch six retries over hours; this caps it.
+TRANSIENT_MAX_WINDOW_SECONDS = 30 * 60
+TRANSIENT_BASE_DELAY_SECONDS = 15
+TRANSIENT_MAX_DELAY_SECONDS = 300
+
+
+@dataclass(frozen=True)
+class TransientRetry:
+    """One consecutive-transient-failure streak."""
+
+    count: int
+    first_failed_at: datetime
+    exhausted: bool
+
+    def as_marker(self) -> dict[str, Any]:
+        return {
+            "count": self.count,
+            "first_failed_at": self.first_failed_at.isoformat(),
+            "exhausted": self.exhausted,
+        }
+
+
+def read_transient_retry(error: dict[str, Any] | None) -> tuple[int, datetime | None, bool]:
+    """(count, streak start, already-escalated) from a stored error dict."""
+    marker = _as_dict(_as_dict(error).get("transient_retry"))
+    try:
+        count = max(0, int(marker.get("count") or 0))
+    except (TypeError, ValueError):
+        count = 0
+    started: datetime | None = None
+    raw_started = marker.get("first_failed_at")
+    if isinstance(raw_started, str) and raw_started:
+        try:
+            parsed = datetime.fromisoformat(raw_started.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            started = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return count, started, _bool(marker.get("exhausted"), default=False)
+
+
+def advance_transient_retry(
+    prior_error: dict[str, Any] | None, *, now: datetime,
+) -> TransientRetry:
+    """Extend the streak recorded on ``prior_error`` by one failure.
+
+    An already-``exhausted`` streak starts over: escalating to the user IS
+    the boundary between streaks. Otherwise a step that a human just
+    unblocked would inherit a spent budget and re-escalate immediately —
+    and every restart still costs a human decision, so this can never
+    become a silent infinite loop.
+    """
+    count, started, was_exhausted = read_transient_retry(prior_error)
+    if was_exhausted:
+        count, started = 0, None
+    started = started or now
+    count += 1
+    exhausted = (
+        count > TRANSIENT_MAX_RETRIES
+        or (now - started).total_seconds() >= TRANSIENT_MAX_WINDOW_SECONDS
+    )
+    return TransientRetry(count=count, first_failed_at=started, exhausted=exhausted)
+
+
+def transient_backoff_seconds(count: int) -> int:
+    return min(
+        TRANSIENT_MAX_DELAY_SECONDS,
+        TRANSIENT_BASE_DELAY_SECONDS * (2 ** max(0, int(count) - 1)),
+    )
+
+
+def apply_transient_backoff(
+    error: dict[str, Any], *, streak: TransientRetry, now: datetime,
+) -> tuple[dict[str, Any], datetime]:
+    """Stamp the streak + its exponential ``next_retry_at`` onto an error."""
+    next_retry_at = now + timedelta(seconds=transient_backoff_seconds(streak.count))
+    enriched = dict(error or {})
+    enriched["transient_retry"] = streak.as_marker()
+    enriched["next_retry_at"] = next_retry_at.isoformat()
+    return enriched, next_retry_at
+
+
 def human_prompt_for_exhausted_step(step: ExecutionStep, error: dict[str, Any], policy: RetryPolicy) -> str:
     if policy.human_prompt:
         return policy.human_prompt

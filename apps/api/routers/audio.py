@@ -119,7 +119,7 @@ async def transcribe_audio(
             entity_id=user.entity_id,
             kind="whisper",
             model=result.model,
-            cost_usd=whisper_cost_usd(result.duration_seconds),
+            cost_usd=whisper_cost_usd(result.duration_seconds, result.model),
             units=int(result.duration_seconds),
             user_id=user.id,
             source=RUNTIME_FLOATING_CHAT_VOICE_SOURCE,

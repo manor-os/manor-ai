@@ -39,10 +39,16 @@ test("dashboard customization persists widgets and generated modules", () => {
   );
   assert.match(
     dashboardSource,
-    /api\.dashboard\s*\n\s*\.suggestLayout\(prompt, widgets, modules, \{/,
+    /api\.dashboard\.suggestLayoutJobStart\(\s*\n?\s*prompt,/,
   );
+  assert.match(dashboardSource, /api\.dashboard\.suggestLayoutJobStatus\(/);
+  assert.match(dashboardSource, /api\.dashboard\s*\n?\s*\.suggestLayoutJobCancel\(/);
   assert.match(dashboardSource, /signal: controller\.signal/);
   assert.match(dashboardSource, /DASHBOARD_AI_REQUEST_TIMEOUT_MS/);
+  assert.match(dashboardSource, /DASHBOARD_AI_MAX_CONCURRENT/);
+  assert.match(dashboardSource, /applyGeneratedModuleChanges/);
+  assert.match(dashboardSource, /page\.dashboard\.ai_concurrency_limit/);
+  assert.match(apiSource, /"\/dashboard\/layout\/suggest\/jobs"/);
   assert.match(dashboardSource, /showInlineGeneratingPlaceholder/);
   assert.match(dashboardSource, /page\.dashboard\.ai_generating_inline/);
   assert.match(dashboardSource, /page\.dashboard\.stop_generation/);

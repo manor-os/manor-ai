@@ -28,6 +28,13 @@ def test_storage_only_media_files_are_documents_but_not_folders():
     assert not is_user_visible_folder_path("videos")
 
 
+def test_workspace_id_storage_is_projected_as_documents_not_physical_folders():
+    path = "Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR/images/hero.png"
+    assert is_user_visible_path(path)
+    assert is_storage_only_path(path)
+    assert not is_user_visible_folder_path("Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR/images")
+
+
 def test_hidden_system_and_memory_paths():
     assert not is_user_visible_path("MANOR.md")
     assert not is_user_visible_path("index.md")

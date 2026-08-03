@@ -19,6 +19,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    WorkerStatus,
+)
 from packages.core.ai.runtime.capability_bindings import (
     normalize_workspace_custom_agent_tool_bindings,
 )
@@ -50,6 +53,10 @@ from packages.core.services.workspace_access import (
 logger = logging.getLogger(__name__)
 
 _PUBLIC_TEMPLATE_AGENT_SOURCE = "template"
+
+
+class WorkspaceProvisioningError(ValueError):
+    """A ready draft could not be materialized into an executable workspace."""
 
 # ---------------------------------------------------------------------------
 # Required fields before a workspace can be finalized
@@ -379,6 +386,25 @@ def _coerce_goal_number(value: Any) -> float:
     return float(match.group(0).replace(",", ""))
 
 
+def _custom_agent_design_cache_key(mapping: Dict[str, Any]) -> str:
+    """Reuse a custom Agent only when its full reusable design is identical."""
+    draft = dict(mapping.get("create_agent_draft") or {})
+    design = {
+        "agent_name": str(draft.get("agent_name") or "").strip(),
+        "agent_slug": str(draft.get("agent_slug") or "").strip(),
+        "agent_description": str(draft.get("agent_description") or "").strip(),
+        "system_prompt": str(
+            draft.get("system_prompt") or draft.get("system_prompt_seed") or ""
+        ).strip(),
+        "tool_bindings": sorted(_unique_strings(draft.get("tool_bindings"))),
+        "business_capabilities": sorted(_unique_strings(draft.get("business_capabilities"))),
+        "skill_bindings": sorted(_unique_strings(draft.get("skill_bindings"))),
+        "mcp_bindings": sorted(_unique_strings(draft.get("mcp_bindings"))),
+        "missing_skill_specs": draft.get("missing_skill_specs") or [],
+    }
+    return json.dumps(design, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def _coerce_positive_int(value: Any) -> int | None:
     """Convert loose numeric input into a positive integer, or None."""
     if value is None or value == "":
@@ -595,6 +621,36 @@ async def _install_workspace_draft_automations(
         service_key = str(raw.get("service_key") or "").strip()
         matched_sub = sub_by_service.get(service_key) if service_key else None
         agent_id = (matched_sub or {}).get("agent_id") or fallback_agent_id
+
+        if raw.get("source") == "blueprint":
+            execution_target = dict(raw.get("execution_target") or {})
+            for nonportable_key in ("agent_id", "subscription_id", "workspace_id"):
+                execution_target.pop(nonportable_key, None)
+            if service_key:
+                execution_target["service_key"] = service_key
+            job = await create_scheduled_job(
+                db,
+                entity_id,
+                job_id,
+                str(raw.get("name") or _automation_display_name(raw, idx)),
+                job_type=str(raw.get("job_type") or "cron"),
+                schedule_kind=raw.get("schedule_kind"),
+                cron_expr=raw.get("cron_expr"),
+                every_seconds=raw.get("every_seconds"),
+                run_at=raw.get("run_at"),
+                timezone_str=str(raw.get("timezone") or "UTC"),
+                payload_message=raw.get("payload_message"),
+                agent_id=agent_id,
+                execution_type=raw.get("execution_type") or "agent",
+                execution_target=execution_target,
+                default_delivery_mode=raw.get("default_delivery_mode"),
+                workspace_id=workspace_id,
+                user_id=user_id,
+            )
+            job.execution_script = raw.get("execution_script")
+            created += 1
+            continue
+
         job_type, schedule_kind, cron_expr, every_seconds = _automation_schedule(raw)
         name = _automation_display_name(raw, idx)
         trigger = str(raw.get("trigger") or raw.get("schedule") or "").strip()
@@ -644,12 +700,6 @@ def _should_generate_starter_doc(attachment: dict[str, Any], mode: str) -> bool:
     return mode == "create_new"
 
 
-_EXTERNAL_PUBLISH_ACTIONS = [
-    "social_post.publish",
-    "email.send",
-    "external_message.send",
-]
-_DESTRUCTIVE_EXTERNAL_ACTIONS = ["social_post.delete", "email.delete"]
 _GOVERNANCE_POLICY_KEYS = {
     "never_allow_actions",
     "hitl_required_actions",
@@ -682,13 +732,6 @@ def _unique_strings(values: Any) -> list[str]:
     return out
 
 
-def _rule_text(rule: dict[str, Any]) -> str:
-    return " ".join(
-        str(rule.get(key) or "")
-        for key in ("description", "rule_key", "scope", "notes")
-    ).strip()
-
-
 def _explicit_rule_patterns(rule: dict[str, Any]) -> list[str]:
     for key in ("action_patterns", "actions", "patterns"):
         patterns = _unique_strings(rule.get(key))
@@ -716,110 +759,15 @@ def _capability_patterns_for_action_patterns(patterns: list[str]) -> list[str]:
     return _unique_strings(capability_patterns)
 
 
-def _infer_rule_patterns(text: str) -> list[str]:
-    lower = text.lower()
-    patterns: list[str] = []
-    fileish = bool(re.search(r"workspace.*file|file|document|doc|knowledge|知识库|文件|文档|资料", lower))
-    create_only = bool(re.search(r"只能.*(添加|新增|创建)|只.*(添加|新增|创建)|only\s+(add|create)|add[- ]?only|create[- ]?only", lower))
-    if fileish:
-        if create_only:
-            patterns.extend(["workspace.file.modify", "workspace.file.delete", "workspace.file.write"])
-        else:
-            if re.search(r"改|修改|编辑|更新|覆盖|写入|变更|modify|edit|update|overwrite|write|change", lower):
-                patterns.append("workspace.file.modify")
-            if re.search(r"删除|移除|delete|remove|destroy", lower):
-                patterns.append("workspace.file.delete")
-            if re.search(r"添加|新增|创建|add|create", lower):
-                patterns.append("workspace.file.create")
-    if re.search(r"post|发帖|发\s*post|社媒|social|linkedin|twitter|tweet|\bx\b|xhs|小红书|facebook|instagram|发布", lower):
-        patterns.append("social_post.publish")
-    if re.search(r"email|e-mail|邮件|gmail|outlook", lower):
-        patterns.append("email.send")
-    if re.search(r"message|消息|wechat|微信|messenger|\bdm\b|私信", lower):
-        patterns.append("external_message.send")
-    if re.search(r"对外|external|public|公开|发送|send|publish|发布", lower) and not patterns:
-        patterns.extend(_EXTERNAL_PUBLISH_ACTIONS)
-    if re.search(r"删除|delete|remove|destroy", lower) and (
-        not fileish
-        or re.search(r"post|发帖|发\s*post|社媒|social|linkedin|twitter|tweet|\bx\b|xhs|小红书|facebook|instagram|发布", lower)
-        or re.search(r"email|e-mail|邮件|gmail|outlook", lower)
-        or re.search(r"message|消息|wechat|微信|messenger|\bdm\b|私信", lower)
-        or re.search(r"对外|external|public|公开|发送|send|publish|发布", lower)
-    ):
-        patterns.extend(_DESTRUCTIVE_EXTERNAL_ACTIONS)
-    return _unique_strings(patterns)
-
-
-def _is_conditional_rule(text: str) -> bool:
-    """The simple policy matcher has no conditional language runtime.
-
-    Keep conditional rules agent-visible, but avoid turning "never post on
-    Sundays" into an unconditional block of every social post.
-    """
-    lower = text.lower()
-    return bool(re.search(
-        r"\b(if|when|unless|except|only when|only if|on sunday|on monday|"
-        r"on tuesday|on wednesday|on thursday|on friday|on saturday|"
-        r"weekend|weekday)\b|如果|当|除非|超过|大于|少于|小于|周[一二三四五六日天末]|星期|礼拜",
-        lower,
-    ))
-
-
-def _is_platform_specific_social_deny(text: str, patterns: list[str]) -> bool:
-    """Avoid turning a platform-specific publish rule into a global ban.
-
-    The policy matcher currently sees only normalized action keys such as
-    ``social_post.publish``; it cannot distinguish X from Xiaohongshu. When the
-    user names one platform without explicit action patterns, enforcing
-    ``social_post.publish`` would also block unrelated social publishing. Keep
-    those rules agent-visible until provider-scoped policy matching exists.
-    """
-    if not any(pattern.startswith("social_post.") for pattern in patterns):
-        return False
-    lower = text.lower()
-    has_platform = bool(re.search(
-        r"\b(xhs|xiaohongshu|rednote|twitter|tweet|linkedin|facebook|instagram)\b|"
-        r"小红书|推特|领英|微博|抖音|微信",
-        lower,
-    ))
-    if not has_platform:
-        return False
-    has_broad_scope = bool(re.search(
-        r"\b(all|any|every|social|social media|all platforms|public social)\b|"
-        r"所有|全部|任意|任何|社媒|全平台|公开社交",
-        lower,
-    ))
-    return not has_broad_scope
-
-
 def _infer_rule_enforcement(rule: dict[str, Any]) -> dict[str, Any] | None:
-    text = _rule_text(rule)
     explicit_capability_patterns = _explicit_rule_capability_patterns(rule)
     explicit_patterns = _explicit_rule_patterns(rule)
-    if not text and not explicit_patterns and not explicit_capability_patterns:
+    if not explicit_patterns and not explicit_capability_patterns:
         return None
 
-    patterns = explicit_patterns or _infer_rule_patterns(text)
+    patterns = explicit_patterns
     capability_patterns = explicit_capability_patterns or _capability_patterns_for_action_patterns(patterns)
-    if not patterns and not capability_patterns:
-        return None
-
-    lower = text.lower()
     rule_type = str(rule.get("rule_type") or "").strip().lower()
-    severity = str(rule.get("severity") or "").strip().lower()
-    approvalish = bool(re.search(
-        r"审核|审批|批准|同意|确认|给用户|用户同意|人工|human|review|approve|approval|"
-        r"consent|confirm|permission",
-        lower,
-    ))
-    create_only = bool(re.search(
-        r"只能.*(添加|新增|创建)|只.*(添加|新增|创建)|only\s+(add|create)|add[- ]?only|create[- ]?only",
-        lower,
-    ))
-    denyish = bool(re.search(
-        r"禁止|不要|不得|不准|不允许|不能|只生成草稿|草稿|never|deny|block|don't|do not|draft[- ]?only",
-        lower,
-    )) or create_only
 
     def _result(field: str, rule_type_value: str) -> dict[str, Any]:
         return {
@@ -830,34 +778,12 @@ def _infer_rule_enforcement(rule: dict[str, Any]) -> dict[str, Any] | None:
             "capability_patterns": capability_patterns,
         }
 
-    inferred_social_publish_only = (
-        not explicit_patterns
-        and patterns == ["social_post.publish"]
-        and capability_patterns == ["external.social"]
-    )
-
     if rule_type in {"auto_approve", "allow", "exception"}:
         return _result("auto_approve_actions", "auto_approve")
     if rule_type in {"approval_required", "hitl_required", "require_approval", "review_required"}:
         return _result("hitl_required_actions", "approval_required")
     if rule_type in {"deny", "never_allow", "block", "draft_only"}:
-        if not explicit_patterns and _is_platform_specific_social_deny(text, patterns):
-            return None
-        if inferred_social_publish_only:
-            return _result("hitl_required_actions", "approval_required")
         return _result("never_allow_actions", rule_type)
-
-    # Approval language wins over deny words such as "不得发布未经审核内容".
-    if approvalish:
-        return _result("hitl_required_actions", "approval_required")
-    if denyish or severity in {"block", "deny"}:
-        if not explicit_patterns and _is_conditional_rule(text):
-            return None
-        if not explicit_patterns and _is_platform_specific_social_deny(text, patterns):
-            return None
-        if inferred_social_publish_only:
-            return _result("hitl_required_actions", "approval_required")
-        return _result("never_allow_actions", "deny")
     return None
 
 
@@ -1012,8 +938,16 @@ async def finalize_setup(
         "notes": raw_budget_policy.get("notes", "") or "",
     }
 
+    # Blueprint application may carry operating semantics that are not yet
+    # editable as first-class Draft fields (for example strategist priors).
+    # Normalized Draft fields below remain authoritative.
+    blueprint_operating_model = fields.get("_blueprint_operating_model")
+    if not isinstance(blueprint_operating_model, dict):
+        blueprint_operating_model = {}
+
     # Build operating model
     operating_model: Dict[str, Any] = {
+        **copy.deepcopy(blueprint_operating_model),
         "services": fields.get("services", []),
         "goals": fields.get("goals", []),
         "rules": operating_rules,
@@ -1034,7 +968,7 @@ async def finalize_setup(
         operating_context=fields.get("operating_context"),
         primary_work=fields.get("primary_work"),
         operating_model=operating_model,
-        status="active",
+        status="provisioning",
         monthly_budget_usd=monthly_budget_usd,
         auto_pause_on_budget=auto_pause_on_budget,
         budget_alert_state="normal",
@@ -1044,6 +978,8 @@ async def finalize_setup(
     )
     db.add(workspace)
     await db.flush()
+    from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+    await ensure_workspace_artifact_folder(db, workspace)
     await ensure_workspace_owner_membership(
         db,
         entity_id=session.entity_id,
@@ -1066,10 +1002,11 @@ async def finalize_setup(
     # custom agent ships with everything it needs to do real work the
     # moment the user clicks Create Workspace.
     agent_mappings = fields.get("agent_mappings", [])
-    created_subs: list[dict] = []  # for greeting dispatch
-    # Dedupe: track custom agents by name so we don't create duplicates
-    # when multiple services map to the same recommended_agent_name
-    custom_agent_cache: dict[str, tuple[str, str]] = {}  # name → (agent_id, agent_name)
+    created_subs: list[dict] = []  # materialized service/subscription summary
+    # Reuse only identical reusable Agent designs. Name-only dedupe can merge
+    # two services that happen to choose the same display name but need
+    # different tools, skills, MCP servers, or instructions.
+    custom_agent_cache: dict[str, tuple[str, str]] = {}
     total_agents = len(agent_mappings)
     custom_count = sum(1 for m in agent_mappings if m.get("strategy") == "create_custom")
     _report("provisioning_agents_started", total=total_agents, custom=custom_count)
@@ -1080,11 +1017,11 @@ async def finalize_setup(
         )
         agent_name = mapping.get("agent_name") or mapping.get("recommended_agent_name") or "Agent"
 
-        # Dedupe custom agents: if same name was already created, reuse it
+        design_cache_key = ""
         if not agent_id and mapping.get("strategy") == "create_custom":
-            cache_key = agent_name.strip().lower()
-            if cache_key in custom_agent_cache:
-                agent_id, agent_name = custom_agent_cache[cache_key]
+            design_cache_key = _custom_agent_design_cache_key(mapping)
+            if design_cache_key in custom_agent_cache:
+                agent_id, agent_name = custom_agent_cache[design_cache_key]
 
         if not agent_id and mapping.get("strategy") == "create_custom":
             try:
@@ -1097,17 +1034,38 @@ async def finalize_setup(
                     primary_work=fields.get("primary_work") or "",
                     mapping=mapping,
                 )
-                # Cache so duplicate names reuse the same agent
-                custom_agent_cache[agent_name.strip().lower()] = (agent_id, agent_name)
-            except Exception:
+                custom_agent_cache[design_cache_key] = (agent_id, agent_name)
+            except Exception as exc:
                 logger.exception(
                     "Failed to provision custom agent for service %s",
                     mapping.get("service_key"),
                 )
-                continue
+                raise WorkspaceProvisioningError(
+                    f"Could not provision agent for service {mapping.get('service_key')!r}: {exc}"
+                ) from exc
 
         if not agent_id:
-            continue
+            raise WorkspaceProvisioningError(
+                f"Service {mapping.get('service_key')!r} has no materializable agent"
+            )
+
+        # The draft can sit ready while an Agent is deleted or moved out of
+        # scope. Re-check at materialization time instead of creating a dangling
+        # subscription that readiness would mistakenly count as executable.
+        resolved_agent = (await db.execute(
+            select(Agent).where(
+                Agent.id == agent_id,
+                Agent.deleted_at.is_(None),
+                Agent.status == "active",
+            )
+        )).scalar_one_or_none()
+        if resolved_agent is None or (
+            resolved_agent.entity_id not in (None, session.entity_id)
+        ):
+            raise WorkspaceProvisioningError(
+                f"Agent {agent_id!r} for service {mapping.get('service_key')!r} is unavailable"
+            )
+        agent_name = resolved_agent.name
 
         # AgentSubscription carries the workspace-specific framing so
         # the Agent itself stays a general worker. The custom_prompt
@@ -1156,6 +1114,22 @@ async def finalize_setup(
 
     await db.flush()
 
+    declared_service_keys = {
+        str(service.get("service_key") or "").strip()
+        for service in (fields.get("services") or [])
+        if isinstance(service, dict) and str(service.get("service_key") or "").strip()
+    }
+    materialized_service_keys = {
+        str(sub.get("service_key") or "").strip()
+        for sub in created_subs
+        if str(sub.get("service_key") or "").strip()
+    }
+    missing_service_keys = sorted(declared_service_keys - materialized_service_keys)
+    if missing_service_keys:
+        raise WorkspaceProvisioningError(
+            "Workspace services could not be materialized: " + ", ".join(missing_service_keys)
+        )
+
     # Ensure entity has an InternalWorker, then bind all subscriptions to it.
     # Without this, the Dispatcher can't assign plan steps to any executor.
     if created_subs:
@@ -1165,7 +1139,7 @@ async def finalize_setup(
                 select(Worker).where(
                     Worker.entity_id == session.entity_id,
                     Worker.kind == "internal",
-                    Worker.status == "active",
+                    Worker.status == WorkerStatus.ACTIVE,
                 ).limit(1)
             )).scalar_one_or_none()
 
@@ -1197,8 +1171,11 @@ async def finalize_setup(
                     subscription_id=sub_data["subscription_id"],
                 ))
             await db.flush()
-        except Exception:
-            logger.warning("Failed to bind subscriptions to worker for workspace %s", workspace_id, exc_info=True)
+        except Exception as exc:
+            logger.exception("Failed to bind subscriptions to worker for workspace %s", workspace_id)
+            raise WorkspaceProvisioningError(
+                "Could not bind workspace services to an executable worker"
+            ) from exc
 
     _report("agents_done", count=len(created_subs))
 
@@ -1606,8 +1583,11 @@ async def finalize_setup(
             created_subs=created_subs,
             user_id=session.user_id,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to install workspace draft automations for %s", workspace_id)
+        raise WorkspaceProvisioningError(
+            "Could not install the workspace's declared automations"
+        ) from exc
     if automations_created:
         _report("automations_scheduled", count=automations_created)
 
@@ -1669,14 +1649,22 @@ async def finalize_setup(
     goals_data = fields.get("goals") or operating_model.get("goals", [])
     goals_created = 0
     for g in goals_data:
+        if not isinstance(g, dict):
+            raise WorkspaceProvisioningError("Workspace goal must be a structured object")
+        raw_target = g.get("target_value") if g.get("target_value") is not None else g.get("target")
+        measurement_cadence = str(
+            g.get("measurement_cadence") or g.get("cadence") or ""
+        ).strip()
+        if raw_target in (None, "") or not measurement_cadence:
+            raise WorkspaceProvisioningError(
+                "Workspace goals require a user-confirmed target and cadence"
+            )
         title = g.get("title") or g.get("goal_key", "Untitled Goal")
         metric_key = (
             g.get("metric_key")
             or g.get("goal_key", title).lower().replace(" ", "_").replace("-", "_")
         )
-        target_val = _coerce_goal_number(
-            g.get("target_value") if g.get("target_value") is not None else g.get("target")
-        )
+        target_val = _coerce_goal_number(raw_target)
         baseline_val = None
         if g.get("baseline_value") is not None:
             baseline_val = _coerce_goal_number(g["baseline_value"])
@@ -1689,10 +1677,8 @@ async def finalize_setup(
             g.get("measurement_source"),
             workspace_id=workspace_id,
         )
-        measurement_cadence = g.get("measurement_cadence") or g.get("cadence") or "daily"
         if measurement_source and is_workspace_internal_measurement_source(measurement_source):
             baseline_val = baseline_val if baseline_val is not None else Decimal("0")
-            measurement_cadence = measurement_cadence or "daily"
 
         goal = Goal(
             id=generate_ulid(),
@@ -1752,29 +1738,53 @@ async def finalize_setup(
     except Exception:
         logger.exception("Failed to seed workspace state/file caches for %s", workspace_id)
 
-    # ── Enable heartbeat — AI decides cadence, default daily ──────────
-    # The heartbeat wakes the Strategist to propose tasks autonomously.
+    # ── Enable heartbeat only after executable services and goals exist ─
+    # Workspaces created through legacy/direct callers with incomplete runtime
+    # parts stay visible as needs_setup, but cannot run reviews accidentally.
     heartbeat_cadence = (
         fields.get("heartbeat_cadence")
         or operating_model.get("heartbeat_cadence")
         or "0 9 * * *"  # daily at 9am
     )
-    workspace.heartbeat_enabled = True
+    runtime_ready = bool(declared_service_keys and created_subs and goals_created)
+    workspace.status = "active" if runtime_ready else "needs_setup"
+    workspace.heartbeat_enabled = runtime_ready
     workspace.heartbeat_cadence = heartbeat_cadence
+    workspace_settings = dict(workspace.settings or {})
+    workspace_settings["provisioning"] = {
+        "status": "ready" if runtime_ready else "needs_setup",
+        "declared_service_count": len(declared_service_keys),
+        "materialized_service_count": len(materialized_service_keys),
+        "worker_bound_subscription_count": len(created_subs),
+        "goal_count": goals_created,
+        "starter_document_count": len(starter_doc_requests),
+        "post_commit_dispatch": "pending" if runtime_ready else "not_required",
+    }
+    workspace.settings = workspace_settings
 
     # Install built-in runtime schedules. Without this the cadence is
     # set on the Workspace row but the recurring review/evolution loops
     # never actually fire.
-    try:
-        from packages.core.services.workspace_runtime import install_workspace_runtime_schedules
-        await install_workspace_runtime_schedules(db, workspace, cadence=heartbeat_cadence)
-    except Exception:
-        logger.exception(
-            "Failed to install workspace runtime schedules for %s",
-            workspace_id,
-        )
-
-    _report("runtime_scheduled", heartbeat_cadence=heartbeat_cadence)
+    if runtime_ready:
+        try:
+            from packages.core.services.workspace_runtime import install_workspace_runtime_schedules
+            await install_workspace_runtime_schedules(db, workspace, cadence=heartbeat_cadence)
+        except Exception as exc:
+            logger.exception(
+                "Failed to install workspace runtime schedules for %s",
+                workspace_id,
+            )
+            raise WorkspaceProvisioningError(
+                "Could not install the workspace runtime schedules"
+            ) from exc
+        _report("runtime_scheduled", heartbeat_cadence=heartbeat_cadence)
+    else:
+        missing_runtime_parts: list[str] = []
+        if not declared_service_keys or not created_subs:
+            missing_runtime_parts.append("executable_services")
+        if not goals_created:
+            missing_runtime_parts.append("confirmed_goals")
+        _report("runtime_needs_setup", missing=missing_runtime_parts)
 
     # NOTE: previously this seeded a "Review and configure {workspace}"
     # starter task to nudge the user. Removed — the wizard already walks
@@ -1796,62 +1806,230 @@ async def finalize_setup(
             "agent_mappings_count": len(agent_mappings),
             "goals_created": goals_created,
             "heartbeat_cadence": heartbeat_cadence,
+            "status": workspace.status,
         },
     )
     db.add(activity)
     await db.flush()
 
-    # ── Dispatch agent greetings (async, don't block finalization) ─────
-    logger.info(
-        "finalize_setup: workspace=%s agent_mappings=%d created_subs=%d",
-        workspace_id, len(agent_mappings), len(created_subs),
+    # Celery work is intentionally dispatched by the API only after this
+    # transaction commits. Workers must never observe an uncommitted workspace.
+    _report("post_commit_dispatch_pending", workspace_id=workspace_id)
+    return workspace_id
+
+
+async def dispatch_workspace_post_commit(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    entity_id: str,
+    progress: Optional[Any] = None,
+    strategist_countdown_seconds: int = 5,
+) -> dict[str, Any]:
+    """Dispatch workspace startup jobs after the materialization commit.
+
+    This function is deliberately best-effort: the durable workspace already
+    exists. Dispatch failures are recorded in provisioning metadata so repair
+    jobs and the UI can surface them without rolling back committed state.
+    The function commits its idempotency claim before enqueueing. The caller
+    commits the final dispatch metadata update.
+    """
+
+    def _report(step: str, **payload: Any) -> None:
+        if progress is None:
+            return
+        try:
+            progress(step, payload)
+        except Exception:
+            pass
+
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if workspace is None:
+        return {"workspace_id": workspace_id, "dispatched": False, "reason": "not_found"}
+
+    settings = dict(workspace.settings or {})
+    provisioning = dict(settings.get("provisioning") or {})
+    dispatch_status = str(provisioning.get("post_commit_dispatch") or "pending")
+    if dispatch_status in {"dispatching", "dispatched", "partial"}:
+        return {
+            "workspace_id": workspace_id,
+            "dispatched": dispatch_status == "dispatched",
+            "reason": f"already_{dispatch_status}",
+        }
+    if workspace.status != "active":
+        provisioning["post_commit_dispatch"] = "not_required"
+        settings["provisioning"] = provisioning
+        workspace.settings = settings
+        await db.flush()
+        return {
+            "workspace_id": workspace_id,
+            "dispatched": False,
+            "reason": f"workspace_{workspace.status}",
+        }
+
+    # Commit an idempotency claim before touching Celery. Concurrent finalize
+    # requests can now observe `dispatching` and must not enqueue duplicates.
+    provisioning["post_commit_dispatch"] = "dispatching"
+    settings["provisioning"] = provisioning
+    workspace.settings = settings
+    await db.commit()
+
+    warnings: list[str] = []
+    greeting_dispatched = False
+    starter_documents_dispatched = 0
+    strategist_dispatched = False
+    strategist_eta_s = max(0, int(strategist_countdown_seconds))
+
+    from packages.core.models.document import DocumentGroup
+    from packages.core.tasks.ai_tasks import (
+        generate_knowledge_content,
+        run_strategist_review,
+        send_agent_greetings,
     )
-    if created_subs:
+
+    subscriptions = list((await db.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.workspace_id == workspace.id,
+            AgentSubscription.entity_id == workspace.entity_id,
+            AgentSubscription.status == "active",
+        ).order_by(AgentSubscription.created_at.asc())
+    )).scalars().all())
+    agent_ids = [subscription.agent_id for subscription in subscriptions if subscription.agent_id]
+    agents = list((await db.execute(
+        select(Agent).where(Agent.id.in_(agent_ids))
+    )).scalars().all()) if agent_ids else []
+    agents_by_id = {agent.id: agent for agent in agents}
+    greeting_payload = [
+        {
+            "subscription_id": subscription.id,
+            "agent_id": subscription.agent_id,
+            "agent_name": getattr(agents_by_id.get(subscription.agent_id), "name", None) or "Agent",
+            "service_key": subscription.service_key or "general",
+            "system_prompt": getattr(agents_by_id.get(subscription.agent_id), "system_prompt", None) or "",
+        }
+        for subscription in subscriptions
+    ]
+    if greeting_payload:
         try:
-            from packages.core.tasks.ai_tasks import send_agent_greetings
             send_agent_greetings.delay(
-                session.entity_id,
-                workspace_id,
-                fields.get("name", "Unnamed Workspace"),
-                fields.get("kind", ""),
-                created_subs,
+                workspace.entity_id,
+                workspace.id,
+                workspace.name,
+                workspace.kind or "",
+                greeting_payload,
             )
-            logger.info("Dispatched agent greetings for workspace %s (%d agents)", workspace_id, len(created_subs))
-        except Exception:
-            logger.warning("Failed to dispatch agent greetings for %s", workspace_id, exc_info=True)
-    else:
-        logger.warning("No agents subscribed to workspace %s — skipping greetings", workspace_id)
+            greeting_dispatched = True
+            _report("agent_greetings_dispatched", count=len(greeting_payload))
+        except Exception as exc:
+            logger.warning("Failed to dispatch agent greetings for %s", workspace.id, exc_info=True)
+            warnings.append(f"agent_greetings: {exc}")
 
-    # ── Dispatch explicit starter content generation for approved knowledge bases ──
-    if starter_doc_requests:
+    groups = list((await db.execute(
+        select(DocumentGroup).where(
+            DocumentGroup.workspace_id == workspace.id,
+            DocumentGroup.entity_id == workspace.entity_id,
+        )
+    )).scalars().all())
+    for group in groups:
+        starter = dict((group.settings or {}).get("starter_document") or {})
+        if str(starter.get("status") or "").lower() != "scheduled":
+            continue
         try:
-            from packages.core.tasks.ai_tasks import generate_knowledge_content
-            for kg in starter_doc_requests:
-                generate_knowledge_content.delay(
-                    session.entity_id, workspace_id,
-                    kg["group_id"], kg["name"], kg["purpose"],
-                    fields.get("name", "Workspace"),
-                    fields.get("kind", ""),
-                    fields.get("primary_work", ""),
-                    kg.get("task_key"),
-                )
-        except Exception:
-            logger.warning("Failed to dispatch knowledge content generation for %s", workspace_id, exc_info=True)
+            generate_knowledge_content.delay(
+                workspace.entity_id,
+                workspace.id,
+                group.id,
+                group.name,
+                str((group.settings or {}).get("purpose") or ""),
+                workspace.name,
+                workspace.kind or "",
+                workspace.primary_work or "",
+                starter.get("task_key"),
+            )
+            starter_documents_dispatched += 1
+        except Exception as exc:
+            logger.warning(
+                "Failed to dispatch starter knowledge for workspace %s group %s",
+                workspace.id,
+                group.id,
+                exc_info=True,
+            )
+            warnings.append(f"starter_document:{group.id}: {exc}")
+    if starter_documents_dispatched:
+        _report("starter_documents_dispatched", count=starter_documents_dispatched)
 
-    # ── Dispatch first Strategist review (delayed so greetings land first) ──
-    strategist_eta_s = 20
     try:
-        from packages.core.tasks.ai_tasks import run_strategist_review
+        from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
+
         run_strategist_review.apply_async(
-            args=[workspace_id, "workspace_created"],
+            args=[workspace.id],
+            kwargs=ReviewTrigger(
+                kind=ReviewTriggerKind.EVENT, detail="workspace created",
+            ).celery_kwargs(),
             countdown=strategist_eta_s,
         )
-    except Exception:
-        logger.warning("Failed to dispatch first strategist review for %s", workspace_id)
+        strategist_dispatched = True
+        _report("strategist_dispatched", eta_seconds=strategist_eta_s)
+    except Exception as exc:
+        logger.warning("Failed to dispatch first strategist review for %s", workspace.id, exc_info=True)
+        warnings.append(f"strategist_review: {exc}")
 
-    _report("strategist_dispatched", eta_seconds=strategist_eta_s)
-    _report("complete", workspace_id=workspace_id, strategist_eta_seconds=strategist_eta_s)
-    return workspace_id
+    # The idempotency claim above commits ``workspace.settings`` midway through
+    # this function. Rebuild the JSON value from the post-commit ORM state so
+    # SQLAlchemy sees a fresh assignment and persists the terminal status.
+    # Reusing the pre-commit ``settings`` dict can leave the row stuck at
+    # ``dispatching`` even though every Celery task was queued successfully.
+    final_settings = dict(workspace.settings or {})
+    final_provisioning = dict(final_settings.get("provisioning") or {})
+    final_provisioning["post_commit_dispatch"] = "partial" if warnings else "dispatched"
+    final_provisioning["dispatch_warnings"] = warnings
+    final_provisioning["agent_greetings_dispatched"] = greeting_dispatched
+    final_provisioning["starter_documents_dispatched"] = starter_documents_dispatched
+    final_provisioning["strategist_dispatched"] = strategist_dispatched
+    final_settings["provisioning"] = final_provisioning
+    workspace.settings = final_settings
+    await db.flush()
+    return {
+        "workspace_id": workspace.id,
+        "dispatched": not warnings,
+        "warnings": warnings,
+        "agent_greetings_dispatched": greeting_dispatched,
+        "starter_documents_dispatched": starter_documents_dispatched,
+        "strategist_dispatched": strategist_dispatched,
+        "strategist_eta_seconds": strategist_eta_s if strategist_dispatched else None,
+    }
+
+
+async def record_workspace_post_commit_dispatch_failure(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    entity_id: str,
+    error: Exception,
+) -> None:
+    """Record an unexpected dispatcher failure without undoing creation."""
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if workspace is None:
+        return
+    settings = dict(workspace.settings or {})
+    provisioning = dict(settings.get("provisioning") or {})
+    provisioning["post_commit_dispatch"] = "failed"
+    provisioning["dispatch_warnings"] = [f"startup_dispatch: {str(error)[:500]}"]
+    settings["provisioning"] = provisioning
+    workspace.settings = settings
+    await db.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -2083,6 +2261,15 @@ async def _provision_custom_agent_for_mapping(
         service_key=mapping.get("service_key", ""),
     )
     result = await provision_custom_agent(db, entity_id=entity_id, spec=spec)
+    unresolved_bindings = [
+        warning
+        for warning in result.warnings
+        if warning.startswith(("tool not found:", "skill not found:", "mcp server not found:"))
+    ]
+    if unresolved_bindings:
+        raise WorkspaceProvisioningError(
+            "Custom agent references unavailable bindings: " + "; ".join(unresolved_bindings)
+        )
     return result.agent_id, result.agent_name
 
 

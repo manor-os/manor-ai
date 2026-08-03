@@ -125,6 +125,17 @@ async def test_storage_usage_includes_nested_subfolders(client: AsyncClient):
     assert body["total_files"] == 2  # recursive
     assert body["total_size"] == 350  # recursive: 100 + 250
 
+    browse = (
+        await client.get(
+            f"/api/v1/documents/browse?folder_id={root_id}",
+            headers=headers,
+        )
+    ).json()
+    assert browse["total_files"] == 2
+    assert browse["total_size"] == 350
+    assert browse["direct_total_files"] == 1
+    assert browse["direct_total_size"] == 100
+
     # The leaf folder only sees its own file.
     leaf = (
         await client.get(

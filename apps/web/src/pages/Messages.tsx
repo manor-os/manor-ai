@@ -10,6 +10,7 @@ import InlineTips from "../components/ui/InlineTips";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
+import { InlineRowsSkeleton, ListRowsSkeleton, SkeletonLine } from "../components/ui/Skeleton";
 import { IconEdit } from "../components/icons";
 import { t } from "../lib/i18n";
 
@@ -41,18 +42,18 @@ export default function Messages() {
   const [composeMessage, setComposeMessage] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const { data: threads } = useQuery({
+  const { data: threads, isLoading: threadsLoading } = useQuery({
     queryKey: ["message-threads"],
     queryFn: () => api.messages.listThreads(),
   });
 
-  const { data: threadMessages } = useQuery({
+  const { data: threadMessages, isLoading: threadMessagesLoading } = useQuery({
     queryKey: ["message-thread", selectedThread],
     queryFn: () => api.messages.getThread(selectedThread!),
     enabled: !!selectedThread,
   });
 
-  const { data: users } = useQuery({
+  const { data: users, isLoading: usersLoading } = useQuery({
     queryKey: ["users", "directory"],
     queryFn: () => api.users.directory(),
   });
@@ -127,10 +128,14 @@ export default function Messages() {
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "clamp(12px, 3vw, 24px) clamp(12px, 3vw, 24px) 0" }}>
+      <div>
         <PageHeader
           title={t("page.messages.title")}
-          subtitle={`${allThreads.length} ${t("page.messages.conversations_count")}`}
+          meta={
+            threadsLoading
+              ? <SkeletonLine width={130} height={14} />
+              : `${allThreads.length} ${t("page.messages.conversations_count")}`
+          }
           actions={
             <button onClick={() => setShowCompose(true)} className="btn-manor" style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <IconEdit size={16} />
@@ -150,10 +155,11 @@ export default function Messages() {
             <Button variant="outline" onClick={closeCompose}>{t("action.cancel")}</Button>
             <Button
               variant="primary"
-              disabled={!composeRecipient || !composeMessage.trim() || composeMutation.isPending}
+              disabled={!composeRecipient || !composeMessage.trim()}
+              loading={composeMutation.isPending}
               onClick={handleCompose}
             >
-              {composeMutation.isPending ? t("page.messages.sending") : t("page.messages.send")}
+              {t("page.messages.send")}
             </Button>
           </>
         }
@@ -165,6 +171,7 @@ export default function Messages() {
               value={composeRecipient}
               onChange={(e) => setComposeRecipient(e.target.value)}
               className="manor-input"
+              disabled={usersLoading}
             >
               <option value="">{t("page.messages.select_recipient")}</option>
               {(users || []).map((u: UserSummary) => (
@@ -173,6 +180,11 @@ export default function Messages() {
                 </option>
               ))}
             </select>
+            {usersLoading && (
+              <div style={{ marginTop: 8 }}>
+                <InlineRowsSkeleton rows={2} dense />
+              </div>
+            )}
           </div>
           <Textarea
             label={t("page.messages.message")}
@@ -198,7 +210,11 @@ export default function Messages() {
             <SearchInput value={search} onChange={setSearch} placeholder={t("page.messages.search_conversations")} />
           </div>
           <div style={{ flex: 1, overflowY: "auto" }}>
-            {filteredThreads.length > 0 ? (
+            {threadsLoading ? (
+              <div style={{ padding: 12 }}>
+                <ListRowsSkeleton rows={6} />
+              </div>
+            ) : filteredThreads.length > 0 ? (
               filteredThreads.map((thread) => (
                 <button
                   key={thread.id}
@@ -313,7 +329,26 @@ export default function Messages() {
 
               {/* Messages */}
               <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-                {allMessages.length > 0 ? (
+                {threadMessagesLoading ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                    {[0, 1, 2, 3].map((idx) => (
+                      <div
+                        key={idx}
+                        style={{
+                          display: "flex",
+                          justifyContent: idx % 2 === 0 ? "flex-start" : "flex-end",
+                        }}
+                      >
+                        <div style={{ width: idx % 2 === 0 ? "58%" : "46%", maxWidth: 420 }}>
+                          <SkeletonLine height={40} radius={18} />
+                          <div style={{ marginTop: 5 }}>
+                            <SkeletonLine width={62} height={9} />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : allMessages.length > 0 ? (
                   allMessages.map((msg) => (
                     <div
                       key={msg.id}
@@ -374,14 +409,15 @@ export default function Messages() {
                     style={{ flex: 1 }}
                     placeholder={t("page.messages.type_message")}
                   />
-                  <button
+                  <Button
+                    variant="primary"
                     onClick={handleSendReply}
-                    disabled={!messageInput.trim() || sendMutation.isPending}
-                    className="btn-manor"
-                    style={{ flexShrink: 0, opacity: !messageInput.trim() ? 0.5 : 1 }}
+                    disabled={!messageInput.trim()}
+                    loading={sendMutation.isPending}
+                    style={{ flexShrink: 0 }}
                   >
-                    {sendMutation.isPending ? "..." : t("page.messages.send")}
-                  </button>
+                    {t("page.messages.send")}
+                  </Button>
                 </div>
               </div>
             </>

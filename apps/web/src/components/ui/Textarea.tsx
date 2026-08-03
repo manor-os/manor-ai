@@ -8,6 +8,13 @@ interface TextareaProps {
   disabled?: boolean;
   className?: string;
   onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
+  onFocus?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
+  onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  textareaRef?: React.Ref<HTMLTextAreaElement>;
+  ariaLabel?: string;
+  ariaControls?: string;
+  ariaExpanded?: boolean;
+  ariaAutocomplete?: "none" | "inline" | "list" | "both";
 }
 
 export default function Textarea({
@@ -20,6 +27,13 @@ export default function Textarea({
   disabled = false,
   className = "",
   onBlur,
+  onFocus,
+  onKeyDown,
+  textareaRef,
+  ariaLabel,
+  ariaControls,
+  ariaExpanded,
+  ariaAutocomplete,
 }: TextareaProps) {
   return (
     <div className={className}>
@@ -29,12 +43,19 @@ export default function Textarea({
         </label>
       )}
       <textarea
+        ref={textareaRef}
         value={value}
         onChange={onChange}
         placeholder={placeholder}
         rows={rows}
         disabled={disabled}
         onBlur={onBlur}
+        onFocus={onFocus}
+        onKeyDown={onKeyDown}
+        aria-label={ariaLabel}
+        aria-controls={ariaControls}
+        aria-expanded={ariaExpanded}
+        aria-autocomplete={ariaAutocomplete}
         className="manor-textarea"
         style={error ? { background: "var(--surface-panel)", boxShadow: "0 0 0 3px rgba(214,95,89,0.22)" } : undefined}
       />

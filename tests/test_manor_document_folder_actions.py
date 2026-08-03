@@ -69,6 +69,133 @@ async def test_manor_can_create_folder_and_move_documents(client):
 
 
 @pytest.mark.asyncio
+async def test_manor_move_documents_requires_explicit_target_folder(client):
+    """Regression: omitting the target folder must error, never silently
+    'move' documents to the root and report success."""
+    import packages.core.database as db_module
+    from packages.core.ai.tools.manor_tool import _dispatch_action
+    from packages.core.services.document_service import create_document
+
+    entity_id = "ent_move_requires_target"
+
+    async with db_module.async_session() as db:
+        doc = await create_document(
+            db, entity_id, name="notes.md", file_type="md", source="upload",
+        )
+        await db.commit()
+        doc_id = doc.id
+
+    result = json.loads(
+        await _dispatch_action(
+            "move_documents_to_folder",
+            {"document_ids": [doc_id]},
+            entity_id,
+        )
+    )
+    assert "error" in result
+    assert "folder" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_manor_move_documents_enforces_folder_id_contract(client):
+    """The move target is identified by 'folder_id' ONLY (an id from
+    list_document_folders, or 'root'). Misnamed keys and folder names get
+    corrective errors instead of being silently ignored."""
+    import packages.core.database as db_module
+    from packages.core.ai.tools.manor_tool import _dispatch_action
+    from packages.core.services.document_service import create_document, get_document
+
+    entity_id = "ent_move_target_contract"
+
+    async with db_module.async_session() as db:
+        doc = await create_document(
+            db, entity_id, name="prep.md", file_type="md", source="upload",
+        )
+        await db.commit()
+        doc_id = doc.id
+
+    created = json.loads(
+        await _dispatch_action(
+            "create_document_folder",
+            {"name": "Interview Prepare/01_System_Design"},
+            entity_id,
+        )
+    )
+    assert created["created"] is True
+    leaf_id = created["folder"]["id"]
+
+    # A misnamed target key returns a corrective error naming 'folder_id'.
+    result = json.loads(
+        await _dispatch_action(
+            "move_documents_to_folder",
+            {"document_ids": [doc_id], "folder": leaf_id},
+            entity_id,
+        )
+    )
+    assert "folder_id" in result.get("error", ""), result
+
+    # A folder name/path in folder_id errors and returns the matching id.
+    result = json.loads(
+        await _dispatch_action(
+            "move_documents_to_folder",
+            {"document_ids": [doc_id], "folder_id": "Interview Prepare/01_System_Design"},
+            entity_id,
+        )
+    )
+    assert "error" in result, result
+    assert result["candidates"][0]["id"] == leaf_id
+
+    # A misnamed document-ids key returns a corrective error.
+    result = json.loads(
+        await _dispatch_action(
+            "move_documents_to_folder",
+            {"ids": [doc_id], "folder_id": leaf_id},
+            entity_id,
+        )
+    )
+    assert "document_ids" in result.get("error", ""), result
+
+    # The canonical contract works.
+    moved = json.loads(
+        await _dispatch_action(
+            "move_documents_to_folder",
+            {"document_ids": [doc_id], "folder_id": leaf_id},
+            entity_id,
+        )
+    )
+    assert moved.get("moved_count") == 1, moved
+    assert moved["folder_id"] == leaf_id
+
+    async with db_module.async_session() as db:
+        assert (await get_document(db, doc_id, entity_id)).folder_id == leaf_id
+
+    # Unknown folder id errors instead of defaulting to root.
+    result = json.loads(
+        await _dispatch_action(
+            "move_documents_to_folder",
+            {"document_ids": [doc_id], "folder_id": "01KFAKEFAKEFAKEFAKEFAKEFAK"},
+            entity_id,
+        )
+    )
+    assert "error" in result
+
+    # Explicit 'root' moves to the Knowledge root; the single-move action
+    # accepts 'document_id'.
+    moved = json.loads(
+        await _dispatch_action(
+            "move_document_to_folder",
+            {"document_id": doc_id, "folder_id": "root"},
+            entity_id,
+        )
+    )
+    assert moved.get("moved_count") == 1, moved
+    assert moved["folder_id"] is None
+
+    async with db_module.async_session() as db:
+        assert (await get_document(db, doc_id, entity_id)).folder_id is None
+
+
+@pytest.mark.asyncio
 async def test_manor_move_documents_to_folder_moves_filesystem_payload(client, tmp_path):
     import packages.core.database as db_module
     from packages.core.ai.tools.manor_tool import _dispatch_action

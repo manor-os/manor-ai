@@ -13,6 +13,13 @@ from packages.core.contracts.shapes import get_shape
 
 _LLM_KINDS = {"llm", "subagent"}
 
+# Default shape for llm/subagent steps whose shape can't be inferred from
+# downstream refs: the StepResult envelope (contracts/envelope.py). Its
+# top-level fields (status, summary, outputs, progress, failure, next_steps)
+# come from the shape's json_schema, so ``_shape_top_level_keys`` makes refs
+# like ``steps.x.result.outputs.text`` / ``.status`` valid automatically.
+_DEFAULT_LLM_SHAPE = "StepResult"
+
 # field -> shape that canonically provides it (for inferring a missing shape).
 # Only map a field to a shape when the field is a *real top-level key* of that
 # shape. Mapping an alias the shape normalizes away (e.g. `content`/`posts`)
@@ -108,6 +115,11 @@ def repair_plan(steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list
             if shape:
                 s["output_shape"] = shape
                 break
+        else:
+            # No specialized shape inferable — default to the StepResult
+            # envelope so free-form llm/subagent steps are always shaped
+            # (no missing_output_shape gap, no planner-guessed schema).
+            s["output_shape"] = _DEFAULT_LLM_SHAPE
 
     # Re-validate; report what remains unfixed.
     remaining = lint_plan(repaired)

@@ -129,7 +129,8 @@ def validate_sequence(events: list[dict[str, Any]]) -> list[str]:
     latest_read_page: dict[str, Any] | None = None
     last_tool = ""
     last_read_page_fingerprint: tuple[Any, ...] | None = None
-    open_count = 0
+    task_navigation_count = 0
+    saw_name_session = False
     clicked_result_since_last_open = False
 
     for event in events:
@@ -137,17 +138,26 @@ def validate_sequence(events: list[dict[str, Any]]) -> list[str]:
         args = event.get("args") or {}
         result = event.get("result") or {}
 
+        if tool == "name_session":
+            saw_name_session = True
+
         if tool == "open":
-            open_count += 1
+            task_navigation_count += 1
+            violations.append("used_legacy_open_instead_of_open_or_reuse")
+
+        if tool == "open_or_reuse":
+            task_navigation_count += 1
             url = str(args.get("url") or "")
-            if open_count > 1:
+            if not saw_name_session:
+                violations.append("open_or_reuse_before_name_session")
+            if task_navigation_count > 1:
                 violations.append("opened_extra_url_after_entry_page")
             if "zhihu.com/search" in url:
                 violations.append("opened_synthesized_search_url")
             if clicked_result_since_last_open and ("zhuanlan.zhihu.com/p/" in url or "zhihu.com/question/" in url):
                 violations.append("opened_result_url_instead_of_using_click_target_tab")
             if args.get("active") is not False:
-                violations.append("open_should_use_active_false")
+                violations.append("open_or_reuse_should_use_active_false")
 
         if tool == "activate_tab":
             violations.append("activated_tab_without_user_request")
@@ -197,7 +207,8 @@ def main() -> int:
     assert_read_page_payload_is_unambiguous(SEARCH_READ_PAGE)
 
     healthy = [
-        {"tool": "open", "args": {"url": "https://www.zhihu.com/", "active": False}, "result": {"tabId": 1118233892}},
+        {"tool": "name_session", "args": {"name": "🔎 Zhihu Research", "groupTitle": "Zhihu Research"}, "result": {"ok": True}},
+        {"tool": "open_or_reuse", "args": {"url": "https://www.zhihu.com/", "active": False, "groupTitle": "Zhihu Research"}, "result": {"tabId": 1118233892}},
         {"tool": "read_page", "args": {"tabId": 1118233892}, "result": SEARCH_READ_PAGE},
         {"tool": "click_element", "args": {"tabId": 1118233892, "ref": "e65"}, "result": {"acted_tab_id": 1118233892, "target_tab_id": 1118233999, "opened_new_tab": True}},
         {"tool": "read_page", "args": {"tabId": 1118233999}, "expected_tabId": 1118233999, "result": ARTICLE_READ_PAGE},
@@ -219,7 +230,7 @@ def main() -> int:
         {"tool": "click_element", "args": {"ref": "e88"}, "result": {"acted_tab_id": 1118233892, "target_tab_id": 1118233892}},
         {"tool": "click_element", "args": {"tabId": 1118233892, "ref": "e31"}, "result": {"acted_tab_id": 1118233892, "target_tab_id": 1118233892}},
         {"tool": "click_element", "args": {"tabId": 1118233892, "ref": "e65"}, "result": {"acted_tab_id": 1118233892, "target_tab_id": 1118233999, "opened_new_tab": True}},
-        {"tool": "open", "args": {"url": "https://zhuanlan.zhihu.com/p/2006508170676285735"}, "result": {"tabId": 1118234002}},
+        {"tool": "open_or_reuse", "args": {"url": "https://zhuanlan.zhihu.com/p/2006508170676285735"}, "result": {"tabId": 1118234002}},
         {"tool": "read_page", "args": {"tabId": 1118233892}, "expected_tabId": 1118233999, "result": SEARCH_READ_PAGE},
     ]
     bad_violations = validate_sequence(bad)
@@ -231,7 +242,9 @@ def main() -> int:
         "click_element_missing_explicit_tabId",
         "clicked_search_refinement_instead_of_result",
         "clicked_non_result_on_search_page",
-        "open_should_use_active_false",
+        "open_or_reuse_before_name_session",
+        "open_or_reuse_should_use_active_false",
+        "used_legacy_open_instead_of_open_or_reuse",
         "opened_extra_url_after_entry_page",
         "opened_result_url_instead_of_using_click_target_tab",
         "screenshot_without_visual_request",

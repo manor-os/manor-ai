@@ -150,6 +150,20 @@ class WorkLease(Base, TimestampMixin):
     heartbeat_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     progress: Mapped[Optional[float]] = mapped_column(Float)
 
+    # ── execution claim ───────────────────────────────────────────────
+    # Who currently holds the RIGHT TO EXECUTE this lease. Deliberately not
+    # ``worker_id``: that names the logical worker the lease was issued to, and
+    # a broker re-delivery hands the *same* worker_id to a *second* process, so
+    # it cannot tell two deliveries apart. ``execution_claim_id`` is minted per
+    # ``execute_lease_inproc`` invocation and taken with a single conditional
+    # UPDATE, which is what makes "exactly one of them runs" a database fact
+    # rather than a check-then-act race.
+    # See packages/core/workers/execution_claim.py.
+    execution_claim_id: Mapped[Optional[str]] = mapped_column(String(26))
+    execution_claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+    )
+
     result: Mapped[Optional[dict]] = mapped_column(JSONB)
     evidence_refs: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     cost: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")

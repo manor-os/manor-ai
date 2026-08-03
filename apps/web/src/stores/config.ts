@@ -5,6 +5,7 @@ interface AppConfig {
   environment: string;
   email_enabled: boolean;
   fs_enabled: boolean;
+  flows_available: boolean;
   support_tickets_enabled: boolean;
   loaded: boolean;
   load: () => Promise<void>;
@@ -15,6 +16,7 @@ export const useConfigStore = create<AppConfig>((set, get) => ({
   environment: import.meta.env.DEV ? "local" : "prod",
   email_enabled: false,
   fs_enabled: false,
+  flows_available: import.meta.env.DEV,
   support_tickets_enabled: false,
   loaded: false,
 

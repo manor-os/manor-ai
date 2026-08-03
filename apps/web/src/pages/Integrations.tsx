@@ -89,6 +89,7 @@ import {
   IconStore,
   IconBox,
   IconPayPal,
+  IconGoogle,
   IconCloud,
   IconExcelGrid,
   IconGlobe,
@@ -100,6 +101,7 @@ import {
 /* ------------------------------------------------------------------ */
 
 type Tab = "agents" | "channels";
+
 type IntegrationAudience =
   | "all"
   | "cloud"
@@ -211,7 +213,7 @@ export default function Integrations() {
         height: "100%",
         display: "flex",
         flexDirection: "column",
-        padding: "clamp(0.5rem, 2.5vw, 1rem)",
+        padding: 0,
         overflow: "hidden",
         position: "relative",
         zIndex: 10,
@@ -226,6 +228,7 @@ export default function Integrations() {
             tabs={tabs}
             value={tab}
             onChange={(k) => setTab(k as Tab)}
+            className="integrations-view-tabs"
           />
         }
         toolbar={
@@ -1024,9 +1027,15 @@ function MCPAgentsPanel({
     staleTime: 60_000,
   });
 
-  async function startOAuth(serverKey: string, name: string) {
+  async function startOAuth(
+    serverKey: string,
+    name: string,
+    connectionId?: string,
+  ) {
     try {
-      const { authorize_url } = await api.integrations.oauthStart(serverKey);
+      const { authorize_url } = await api.integrations.oauthStart(serverKey, {
+        connectionId,
+      });
       // Full redirect so the provider can set its own cookies and bring
       // the user back to /integrations?connected=<server_key> on success
       window.location.href = authorize_url;
@@ -1109,7 +1118,7 @@ function MCPAgentsPanel({
   ]);
   const filteredRows = (
     googleSubs.length > 0
-      ? [...nonGoogle, buildGoogleGroupRow(googleSubs)]
+      ? [buildGoogleGroupRow(googleSubs), ...nonGoogle]
       : baseRowsRaw
   ).filter((s) => !HIDDEN_INTERNAL_AUTOMATION_KEYS.has(s.server_key));
   let baseRows: McpServerRow[] = filteredRows.filter(
@@ -1174,7 +1183,9 @@ function MCPAgentsPanel({
         key="_google_workspace"
         subs={(s as any)._googleSubs as McpServerRow[]}
         canManage={canManage}
-        onConnect={(serverKey, name) => void startOAuth(serverKey, name)}
+        onConnect={(serverKey, name, connectionId) =>
+          void startOAuth(serverKey, name, connectionId)
+        }
         onConfigureOAuth={(serverKey, name, scopes) =>
           setOAuthConfigFor({ key: serverKey, name, scopes })
         }
@@ -1184,7 +1195,9 @@ function MCPAgentsPanel({
         key={s.server_key}
         server={s}
         canManage={canManage}
-        onConnect={() => void startOAuth(s.server_key, s.name)}
+        onConnect={(connectionId) =>
+          void startOAuth(s.server_key, s.name, connectionId)
+        }
         onConfigureOAuth={() =>
           setOAuthConfigFor({ key: s.server_key, name: s.name, scopes: s.scopes })
         }
@@ -1229,7 +1242,7 @@ function MCPAgentsPanel({
     );
 
   return (
-    <div style={{ flex: 1, overflowY: "auto", padding: "8px" }}>
+    <div style={{ flex: 1, overflowY: "auto", padding: 0 }}>
       {/* Header strip */}
       <div
         style={{
@@ -1598,7 +1611,11 @@ function GoogleWorkspaceCard({
 }: {
   subs: McpServerRow[];
   canManage: boolean;
-  onConnect: (serverKey: string, name: string) => void;
+  onConnect: (
+    serverKey: string,
+    name: string,
+    connectionId?: string,
+  ) => void;
   onConfigureOAuth: (
     serverKey: string,
     name: string,
@@ -1617,6 +1634,49 @@ function GoogleWorkspaceCard({
       s.connections.some((connection) => connection.health?.ok === false) ||
       (s.entity_accounts ?? []).some((account) => account.health?.ok === false),
   );
+  const googleFriendlyName = (key: string) =>
+    key === "gmail"
+      ? t("page.integrations.gmail")
+      : key === "google_calendar"
+        ? t("page.integrations.calendar")
+        : key === "google_drive"
+          ? t("page.integrations.drive")
+          : key;
+  // De-duplicate connected Google identities across the three sub-services.
+  // gmail / calendar / drive share one Google OAuth client, so the same
+  // account (identical provider_user_id / Google `sub`) appears once per
+  // service it powers. Collapse those into one entry that lists the services
+  // and its worst-case health — so N Google accounts read as N rows, not 3N.
+  const connectedGoogleAccounts = (() => {
+    const byIdentity = new Map<
+      string,
+      {
+        key: string;
+        label: string;
+        services: string[];
+        anyFail: boolean;
+        anyOk: boolean;
+      }
+    >();
+    for (const s of subs) {
+      for (const c of s.connections) {
+        const identity = c.provider_user_id || c.display_name || c.id;
+        const entry = byIdentity.get(identity) ?? {
+          key: identity,
+          label: c.display_name || c.provider_user_id || identity,
+          services: [] as string[],
+          anyFail: false,
+          anyOk: false,
+        };
+        const svc = googleFriendlyName(s.server_key);
+        if (!entry.services.includes(svc)) entry.services.push(svc);
+        if (c.health?.ok === false) entry.anyFail = true;
+        if (c.health?.ok === true) entry.anyOk = true;
+        byIdentity.set(identity, entry);
+      }
+    }
+    return Array.from(byIdentity.values());
+  })();
   const statusColor = hasAuthFailure
     ? "#d65f59"
     : hasAnyConnection
@@ -1638,9 +1698,7 @@ function GoogleWorkspaceCard({
     <CompactCard
       icon={
         <IconTile color={logoColor} size={34}>
-          <span style={{ fontWeight: 700, fontSize: 13, color: logoColor }}>
-            {t("page.integrations.g")}
-          </span>
+          <IconGoogle size={18} />
         </IconTile>
       }
       title={t("page.integrations.google_workspace")}
@@ -1663,9 +1721,7 @@ function GoogleWorkspaceCard({
         openDetail({
           icon: (
             <IconTile color={logoColor} size={48}>
-              <span style={{ fontWeight: 700, fontSize: 18, color: logoColor }}>
-                {t("page.integrations.g")}
-              </span>
+              <IconGoogle size={25} />
             </IconTile>
           ),
           title: t("page.integrations.google_workspace"),
@@ -1699,6 +1755,78 @@ function GoogleWorkspaceCard({
           ),
           body: (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {connectedGoogleAccounts.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                    marginBottom: 2,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: "#a8a29e",
+                      textTransform: "uppercase",
+                      letterSpacing: "0.06em",
+                    }}
+                  >
+                    {t("page.integrations.connected_google_accounts")}
+                  </div>
+                  {connectedGoogleAccounts.map((acct) => (
+                    <div
+                      key={`google-acct-${acct.key}`}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "6px 10px",
+                        borderRadius: 8,
+                        background: "rgba(250,250,249,0.7)",
+                        fontSize: 12,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: "50%",
+                          background: acct.anyFail
+                            ? "#d65f59"
+                            : acct.anyOk
+                              ? "#54a176"
+                              : "#a8a29e",
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          color: "#44403c",
+                          fontWeight: 500,
+                          whiteSpace: "nowrap" as const,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {acct.label}
+                      </span>
+                      <div
+                        style={{ display: "flex", gap: 4, flexShrink: 0 }}
+                      >
+                        {acct.services.map((svc) => (
+                          <Chip key={svc} size="sm" variant="slate">
+                            {svc}
+                          </Chip>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
               {subs.map((s) => {
                 const hasConn =
                   s.connections.length > 0 ||
@@ -1832,7 +1960,9 @@ function GoogleWorkspaceCard({
                             connection={connection}
                             serverKey={s.server_key}
                             showActions={canManage}
-                            onReconnect={() => onConnect(s.server_key, s.name)}
+                            onReconnect={() =>
+                              onConnect(s.server_key, s.name, connection.id)
+                            }
                           />
                         ))}
                         {(s.entity_accounts ?? []).map((account) => (
@@ -1844,6 +1974,16 @@ function GoogleWorkspaceCard({
                             showActions={false}
                           />
                         ))}
+                        {s.oauth_configured && !isComingSoon ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => onConnect(s.server_key, s.name)}
+                            style={{ alignSelf: "flex-start" }}
+                          >
+                            {t("page.integrations.plus_add_account")}
+                          </Button>
+                        ) : null}
                       </div>
                     )}
                   </div>
@@ -1869,7 +2009,7 @@ function ServerCard({
 }: {
   server: McpServerRow;
   canManage: boolean;
-  onConnect: () => void;
+  onConnect: (connectionId?: string) => void;
   onConfigureOAuth?: () => void;
   onAddApiKey: () => void;
   onEditAccount: (accountId: string) => void;
@@ -2041,7 +2181,9 @@ function ServerCard({
                     connection={c}
                     serverKey={server.server_key}
                     showActions={canManage}
-                    onReconnect={isOAuth ? onConnect : undefined}
+                    onReconnect={
+                      isOAuth ? () => onConnect(c.id) : undefined
+                    }
                   />
                 ))}
                 {server.entity_accounts.map((account) => (

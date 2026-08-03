@@ -67,7 +67,7 @@ export function FilterBar({
           alignItems: "center",
           gap: 6,
           height: 36,
-          padding: "0 4px",
+          padding: 0,
           color: "#78716c",
           fontSize: 12,
           fontWeight: 750,

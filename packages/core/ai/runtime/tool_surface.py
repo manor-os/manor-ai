@@ -45,7 +45,7 @@ def runtime_public_agent_tool_surface(
 def runtime_prepare_tool_surface_for_turn(
     request: AIRuntimeRequest,
     *,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     tool_schemas: Iterable[dict[str, Any]] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     blocked_tool_names: Iterable[str] | None = None,
@@ -60,7 +60,7 @@ def runtime_prepare_tool_surface_for_turn(
 
     return RuntimeResolver().resolve_tool_surface(
         request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         tool_schemas=tool_schemas,
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
@@ -72,7 +72,7 @@ def runtime_prepare_named_tool_surface_for_turn(
     request: AIRuntimeRequest,
     *,
     tool_names: Iterable[str] | str | None,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     blocked_tool_names: Iterable[str] | None = None,
     skill_refs: Iterable[dict[str, Any]] | None = None,
 ) -> ResolvedRuntimeToolSurface:
@@ -82,7 +82,7 @@ def runtime_prepare_named_tool_surface_for_turn(
     allowed_tool_names = runtime_normalize_tool_name_set(tool_names)
     return runtime_prepare_tool_surface_for_turn(
         request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         tool_schemas=runtime_tool_schemas_for_names(sorted(allowed_tool_names)),
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
@@ -95,7 +95,7 @@ def runtime_prepare_local_tool_surface_for_turn(
     *,
     tool_schemas: Iterable[dict[str, Any]],
     allowed_tool_names: Iterable[str] | str | None = None,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     blocked_tool_names: Iterable[str] | None = None,
     skill_refs: Iterable[dict[str, Any]] | None = None,
 ) -> ResolvedRuntimeToolSurface:
@@ -110,7 +110,7 @@ def runtime_prepare_local_tool_surface_for_turn(
         derived_allowed &= explicit_allowed
     return runtime_prepare_tool_surface_for_turn(
         request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         tool_schemas=local_tools,
         allowed_tool_names=derived_allowed,
         blocked_tool_names=blocked_tool_names,
@@ -125,7 +125,7 @@ def runtime_prepare_agent_tool_surface_for_turn(
     bound_tool_names: set[str] | None = None,
     is_master: bool = False,
     mcp_allowed_names: set[str] | None = None,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     blocked_tool_names: Iterable[str] | None = None,
     skill_refs: Iterable[dict[str, Any]] | None = None,
 ) -> ResolvedRuntimeToolSurface:
@@ -137,7 +137,7 @@ def runtime_prepare_agent_tool_surface_for_turn(
         bound_tool_names=bound_tool_names,
         is_master=is_master,
         mcp_allowed_names=mcp_allowed_names,
-        legacy_tool_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
     )
     public_surface = runtime_public_agent_tool_surface(
         surface=request.surface,
@@ -149,7 +149,7 @@ def runtime_prepare_agent_tool_surface_for_turn(
         tools, allowed_tool_names = public_surface
     return runtime_prepare_tool_surface_for_turn(
         request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         tool_schemas=tools,
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
@@ -160,7 +160,7 @@ def runtime_prepare_agent_tool_surface_for_turn(
 def runtime_prepare_trace_envelope_for_turn(
     request: AIRuntimeRequest,
     *,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     tool_schemas: Iterable[dict[str, Any]] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     blocked_tool_names: Iterable[str] | None = None,
@@ -170,7 +170,7 @@ def runtime_prepare_trace_envelope_for_turn(
 
     return RuntimeResolver().resolve_trace_envelope(
         request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         tool_schemas=tool_schemas,
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,

@@ -7,11 +7,11 @@ import { formatDateOnly as formatDate } from "../lib/format";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
-import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
+import { MetricGridSkeleton, SkeletonLine } from "../components/ui/Skeleton";
 import { IconFolder, IconTrash } from "../components/icons";
 import { t } from "../lib/i18n";
 
@@ -90,7 +90,7 @@ export default function TaskCollections() {
     queryFn: () => api.tasks.categories.list(),
   });
 
-  const { data: tasks = [] } = useQuery({
+  const { data: tasks = [], isLoading: tasksForCollectionsLoading } = useQuery({
     queryKey: ["tasksForCollections"],
     queryFn: loadTasksForCollections,
   });
@@ -158,9 +158,7 @@ export default function TaskCollections() {
       />
 
       {isLoading ? (
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "48px 0" }}>
-          <LoadingSpinner size={28} />
-        </div>
+        <MetricGridSkeleton count={6} minWidth={180} />
       ) : categories.length === 0 ? (
         <EmptyState
           icon={
@@ -235,25 +233,31 @@ export default function TaskCollections() {
                 {/* Card footer */}
                 <div style={{ padding: "12px 20px", borderTop: "1px solid rgba(28,25,23,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                    {pending > 0 && (
+                    {tasksForCollectionsLoading ? (
+                      <>
+                        <SkeletonLine width={28} height={14} radius={999} />
+                        <SkeletonLine width={28} height={14} radius={999} />
+                        <SkeletonLine width={34} height={14} radius={999} />
+                      </>
+                    ) : pending > 0 && (
                       <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#b27c34" }}>
                         <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#cf9b44" }} />
                         {pending}
                       </span>
                     )}
-                    {inProgress > 0 && (
+                    {!tasksForCollectionsLoading && inProgress > 0 && (
                       <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#4869ac" }}>
                         <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#5f84bd" }} />
                         {inProgress}
                       </span>
                     )}
-                    {completed > 0 && (
+                    {!tasksForCollectionsLoading && completed > 0 && (
                       <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#44895f" }}>
                         <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#54a176" }} />
                         {completed}
                       </span>
                     )}
-                    {catTasks.length === 0 && (
+                    {!tasksForCollectionsLoading && catTasks.length === 0 && (
                       <span style={{ fontSize: 12, color: "#a8a29e" }}>{t("page.task_collections.no_tasks")}</span>
                     )}
                   </div>
@@ -290,15 +294,14 @@ export default function TaskCollections() {
         footer={
           <>
             <Button variant="outline" onClick={() => { setModalOpen(false); setEditing(null); }}>{t("action.cancel")}</Button>
-            <button
+            <Button
+              variant="primary"
               type="submit"
               form="collection-form"
-              disabled={createMut.isPending || updateMut.isPending}
-              className="btn-manor"
-              style={{ opacity: createMut.isPending || updateMut.isPending ? 0.5 : 1 }}
+              loading={createMut.isPending || updateMut.isPending}
             >
-              {createMut.isPending || updateMut.isPending ? t("page.task_collections.saving") : editing ? t("page.task_collections.update") : t("action.create")}
-            </button>
+              {editing ? t("page.task_collections.update") : t("action.create")}
+            </Button>
           </>
         }
       >

@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from packages.core.ai.runtime.output_policy import PREVIOUS_TOOL_ACTIVITY_MARKER
+from packages.core.ai.runtime.provider_approvals import normalize_provider_approval
 
 
 RuntimeToolEventRecorder = Callable[[str, dict[str, Any]], None]
+RuntimeSubAgentEventRecorder = Callable[[dict[str, Any]], None]
 RuntimeEventFormatter = Callable[[str, dict[str, Any]], str]
 RuntimeToolArgumentFormatter = Callable[[str, dict[str, Any] | None], Any]
 RuntimeToolResultFormatter = Callable[[str, str], Any]
@@ -34,8 +36,6 @@ _STREAM_TEXT_FLUSH_SUFFIXES = (
 )
 _TOOL_HISTORY_PREVIEW_CHARS = 320
 _TOOL_HISTORY_MAX_ITEMS = 12
-
-
 @dataclass
 class RuntimeToolStreamSink:
     """Runtime-owned bridge for nested tool events.
@@ -47,6 +47,7 @@ class RuntimeToolStreamSink:
 
     event_queue: Any | None = None
     record_tool_event: RuntimeToolEventRecorder | None = None
+    record_sub_agent_event: RuntimeSubAgentEventRecorder | None = None
     format_event: RuntimeEventFormatter | None = None
     format_tool_arguments: RuntimeToolArgumentFormatter | None = None
     format_tool_result: RuntimeToolResultFormatter | None = None
@@ -54,8 +55,12 @@ class RuntimeToolStreamSink:
 
     @property
     def active(self) -> bool:
-        return self.record_tool_event is not None or (
-            self.event_queue is not None and self.format_event is not None
+        return (
+            self.record_tool_event is not None
+            or self.record_sub_agent_event is not None
+            or (
+                self.event_queue is not None and self.format_event is not None
+            )
         )
 
     def _arguments(self, tool_name: str, args: dict[str, Any] | None) -> Any:
@@ -98,63 +103,40 @@ class RuntimeToolStreamSink:
         duration_ms: float = 0,
         args: dict[str, Any] | None = None,
     ) -> None:
+        formatted_arguments = self._arguments(tool_name, args)
+        tool_call = {
+            "name": tool_name,
+            "arguments": formatted_arguments,
+            "result": self._result(tool_name, result),
+            "status": self._status(result),
+            "duration_ms": int(duration_ms),
+        }
         payload = {
-            "tool_call": {
-                "name": tool_name,
-                "arguments": self._arguments(tool_name, args),
-                "result": self._result(tool_name, result),
-                "status": self._status(result),
-                "duration_ms": int(duration_ms),
-            },
+            "tool_call": tool_call,
         }
         if self.record_tool_event is not None:
-            self.record_tool_event("tool_end", payload)
+            recorded_tool_call = dict(tool_call)
+            provider_approval = normalize_provider_approval(
+                tool_name,
+                args,
+                result,
+            )
+            if provider_approval is not None:
+                recorded_tool_call["provider_approval"] = provider_approval
+            self.record_tool_event("tool_end", {"tool_call": recorded_tool_call})
         self._emit("tool_end", payload)
 
-    def emit_delegated_invoke_skill_end(
-        self,
-        *,
-        skill_name: str,
-        invoke_skill_args: dict[str, Any],
-        active_child: str | None = None,
-    ) -> None:
-        result = runtime_delegated_invoke_skill_result(
-            skill_name=skill_name,
-            active_child=active_child,
-        )
-        payload = {
-            "tool_call": {
-                "name": "invoke_skill",
-                "arguments": self._arguments("invoke_skill", invoke_skill_args),
-                "result": self._result("invoke_skill", result),
-                "status": self._status(result),
-                "duration_ms": 0,
-            },
-        }
-        if self.record_tool_event is not None:
-            self.record_tool_event("tool_end", payload)
-        self._emit("tool_end", payload)
+    def emit_sub_agent_event(self, event: dict[str, Any]) -> None:
+        """Emit one delegated Agent lifecycle update to chat consumers."""
 
+        payload = {"sub_agent": dict(event)}
+        if self.record_sub_agent_event is not None:
+            self.record_sub_agent_event(dict(event))
+        self._emit("sub_agent", payload)
 
 runtime_tool_stream_sink_var: contextvars.ContextVar[RuntimeToolStreamSink | None] = (
     contextvars.ContextVar("runtime_tool_stream_sink", default=None)
 )
-
-
-def runtime_delegated_invoke_skill_result(
-    *,
-    skill_name: str,
-    active_child: str | None = None,
-) -> str:
-    return json.dumps({
-        "status": "delegated",
-        "skill": skill_name,
-        "message": (
-            "Skill entered its nested tool workflow; child tool "
-            "events will stream separately."
-        ),
-        "active_child": active_child,
-    }, ensure_ascii=False)
 
 
 def runtime_is_media_tool_name(tool_name: str) -> bool:
@@ -252,6 +234,60 @@ def runtime_record_tool_end_for_chat(
         tool_events[idx] = {**tool_events[idx], **entry}
     else:
         tool_events.append(entry)
+
+
+def runtime_record_sub_agent_event_for_chat(
+    events: list[dict],
+    event: dict[str, Any],
+) -> None:
+    """Merge delegated Agent updates into one durable run record."""
+
+    if not isinstance(event, dict):
+        return
+    run_id = str(event.get("run_id") or "").strip()
+    if not run_id:
+        return
+
+    idx = next(
+        (
+            index
+            for index, existing in enumerate(events)
+            if isinstance(existing, dict) and existing.get("run_id") == run_id
+        ),
+        -1,
+    )
+    current = dict(events[idx]) if idx >= 0 else {"run_id": run_id, "tools": []}
+    incoming_tool = event.get("tool")
+    for key, value in event.items():
+        if key != "tool" and value is not None:
+            current[key] = value
+
+    tools = [
+        dict(tool)
+        for tool in current.get("tools", [])
+        if isinstance(tool, dict)
+    ]
+    if isinstance(incoming_tool, dict):
+        tool = dict(incoming_tool)
+        tool_seq = tool.get("seq")
+        tool_idx = next(
+            (
+                index
+                for index, existing in enumerate(tools)
+                if tool_seq is not None and existing.get("seq") == tool_seq
+            ),
+            -1,
+        )
+        if tool_idx >= 0:
+            tools[tool_idx] = {**tools[tool_idx], **tool}
+        else:
+            tools.append(tool)
+        current["tools"] = tools[-20:]
+
+    if idx >= 0:
+        events[idx] = current
+    else:
+        events.append(current)
 
 
 def _persisted_tool_call_items(raw) -> list[dict]:
@@ -570,6 +606,32 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
         skill = args.get("skill") or args.get("slug") or args.get("name")
         return {"skill": skill} if skill else None
 
+    if name == "workspace_agent" and args.get("action") == "delegate_service":
+        params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        compact_params = {
+            key: _short_arg_value(params[key], max_chars=160)
+            for key in (
+                "service_key",
+                "agent_subscription_id",
+                "agent_id",
+                "max_rounds",
+            )
+            if params.get(key) is not None
+        }
+        objective = (
+            params.get("prompt")
+            or params.get("instructions")
+            or params.get("task")
+            or params.get("message")
+            or params.get("request")
+        )
+        if objective:
+            compact_params["objective"] = _short_arg_value(objective, max_chars=240)
+        return {
+            "action": "delegate_service",
+            "params": compact_params,
+        }
+
     if name == "manor":
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
         compact_params = {
@@ -594,13 +656,38 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
     return compact or None
 
 
+# ── the tool-result error contract ────────────────────────────────
+#
+# A tool result reaching an ``on_tool_end`` callback is always a string, so
+# these two envelopes ARE the contract for "the call blew up". They are
+# declared here, next to the classifiers that decode them, and imported by
+# the code that produces them (``runtime_execute_prepared_tool_handler`` and
+# ``agentic_loop``) so producer and decoder cannot drift apart — the
+# handler wrapper's ``Error: ...`` form used to be invisible to every
+# classifier precisely because the prefix was written out twice.
+RUNTIME_TOOL_ERROR_PREFIX = "Error: "
+"""Prefix ``runtime_execute_prepared_tool_handler`` puts on a raised handler."""
+RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX = "Tool error"
+"""Prefix ``agentic_loop`` puts on a tool executor that raised."""
+
+
+def runtime_tool_error_result(message: str) -> str:
+    """Encode a handler failure in the tool-result error contract."""
+
+    return f"{RUNTIME_TOOL_ERROR_PREFIX}{message}"
+
+
 def runtime_tool_status_for_chat(result: str) -> str:
     """Infer UI status from a structured tool result."""
 
     try:
         parsed = json.loads(result if isinstance(result, str) else str(result))
     except Exception:
-        return "error" if str(result).startswith("Tool error") else "success"
+        return (
+            "error"
+            if str(result).startswith(RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX)
+            else "success"
+        )
     if not isinstance(parsed, dict):
         return "success"
     status = str(parsed.get("status") or "").lower()
@@ -609,6 +696,114 @@ def runtime_tool_status_for_chat(result: str) -> str:
         "rejected", "blocked", "cancelled", "canceled",
     } or parsed.get("error"):
         return "error"
+    return "success"
+
+
+# Approval/HITL outcomes that runtime_tool_status_for_chat collapses into
+# its UI-facing "error" bucket, but that say nothing about whether the
+# TOOL/PATH itself works — a human hasn't decided yet, or declined.
+_APPROVAL_GATE_STATUSES = frozenset({
+    "waiting_human", "rejected", "blocked", "cancelled", "canceled",
+})
+# True execution outcomes (vs. an approval gate) that DO belong in
+# intent-path-memory failure recording.
+_EXECUTION_FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
+
+
+def runtime_tool_path_memory_outcome(result: str) -> str | None:
+    """Classify a raw tool result for intent-path-memory recording (spec
+    §A3) — distinct from runtime_tool_status_for_chat's UI-facing
+    success/error split. Spec §A3 explicitly excludes approval denials,
+    cancellations, and availability blocks from failure recording ("those
+    say nothing about whether the path fits the task"); a `__hitl__`
+    interrupt is not a terminal outcome at all yet (recording it as a
+    'success' would be premature and would double-count once the human
+    actually resolves it). Returns "success", "failure", or None (skip
+    recording entirely for this call).
+    """
+    text = result if isinstance(result, str) else str(result)
+    if text.strip().startswith('{"__hitl__":'):
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return (
+            "failure"
+            if text.startswith(RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX)
+            else "success"
+        )
+    if not isinstance(parsed, dict):
+        return "success"
+    status = str(parsed.get("status") or "").lower()
+    if status in _APPROVAL_GATE_STATUSES:
+        return None
+    if status in _EXECUTION_FAILURE_STATUSES or parsed.get("error"):
+        return "failure"
+    return "success"
+
+
+def runtime_tool_call_error(result: str) -> str | None:
+    """Return the error detail a tool result carries, or ``None``.
+
+    The single decoder of the tool-result error contract for durable
+    failure analysis (``tool_call_logs.success`` / ``.error``). It shares
+    the status vocabulary with ``runtime_tool_path_memory_outcome`` — an
+    approval gate or an un-resolved ``__hitl__`` interrupt is not a tool
+    failure, only a real execution outcome is — and additionally recovers
+    the human-readable detail, which the boolean-only classifiers throw
+    away. Callers must not re-implement this check inline; one decoder is
+    what keeps every consumer of the contract in agreement.
+    """
+    text = result if isinstance(result, str) else str(result)
+    if text.strip().startswith('{"__hitl__":'):
+        return None
+    if text.startswith(RUNTIME_TOOL_ERROR_PREFIX):
+        return text[len(RUNTIME_TOOL_ERROR_PREFIX):].strip() or text
+    if text.startswith(RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX):
+        return text
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    status = str(parsed.get("status") or "").lower()
+    if status in _APPROVAL_GATE_STATUSES:
+        return None
+    if status not in _EXECUTION_FAILURE_STATUSES and not parsed.get("error"):
+        return None
+    detail = parsed.get("error") or parsed.get("message") or parsed.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    if detail is not None and not isinstance(detail, str):
+        return json.dumps(detail, ensure_ascii=False, default=str)
+    return status or text
+
+
+def runtime_tool_call_outcome(tool_name: str, result: str) -> str:
+    """Classify a tool result into ``"success"`` | ``"error"`` | ``"empty_result"``.
+
+    A real failure always wins — even for ``search_tools`` itself raising,
+    which must still count as an error, not get relabeled just because the
+    tool name matches. Only a *clean* zero-match ``search_tools`` result is
+    ``"empty_result"``; every other tool's "found nothing" case isn't
+    representable here and stays ``"success"`` (matches the caller-level
+    ``success`` boolean, which was never about result content). Shares the
+    single decoder (``runtime_tool_call_error``) so the two never drift on
+    what counts as a failure.
+    """
+    if runtime_tool_call_error(result) is not None:
+        return "error"
+    if tool_name == "search_tools":
+        text_ = result if isinstance(result, str) else str(result)
+        try:
+            parsed = json.loads(text_)
+        except Exception:
+            return "success"
+        if isinstance(parsed, dict):
+            matches = parsed.get("matches")
+            if isinstance(matches, list) and not matches:
+                return "empty_result"
     return "success"
 
 
@@ -623,21 +818,7 @@ def runtime_skill_nested_tool_callbacks(
     if sink is None or not sink.active:
         return None, None
 
-    outer_invoke_skill_closed = False
-
-    def close_outer_invoke_skill_once(first_child: str | None = None) -> None:
-        nonlocal outer_invoke_skill_closed
-        if outer_invoke_skill_closed:
-            return
-        outer_invoke_skill_closed = True
-        sink.emit_delegated_invoke_skill_end(
-            skill_name=skill_name,
-            invoke_skill_args=invoke_skill_args,
-            active_child=first_child,
-        )
-
     def on_sub_tool_start(name: str, args: dict[str, Any]) -> None:
-        close_outer_invoke_skill_once(name)
         sink.emit_tool_start(name, args)
 
     def on_sub_tool_end(

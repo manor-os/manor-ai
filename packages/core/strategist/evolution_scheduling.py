@@ -99,17 +99,26 @@ async def _upsert(
     )).scalar_one_or_none()
 
     if existing:
+        updates = {
+            "name": name,
+            "schedule_kind": schedule_kind,
+            "cron_expr": cron_expr,
+            "every_seconds": every_seconds,
+            "execution_type": execution_type,
+            "execution_target": {"workspace_id": workspace.id},
+            "enabled": True,
+            "job_type": "cron" if schedule_kind == "cron" else "interval",
+        }
+        changed = {k: v for k, v in updates.items() if getattr(existing, k) != v}
         existing.entity_id = workspace.entity_id
         existing.workspace_id = workspace.id
-        existing.name = name
-        existing.schedule_kind = schedule_kind
-        existing.cron_expr = cron_expr
-        existing.every_seconds = every_seconds
-        existing.execution_type = execution_type
-        existing.execution_target = {"workspace_id": workspace.id}
-        existing.enabled = True
         existing.consecutive_errors = 0
-        existing.job_type = "cron" if schedule_kind == "cron" else "interval"
+        for key, value in changed.items():
+            setattr(existing, key, value)
+        if changed:
+            # M11: config actually changed — bump the revision + audit.
+            from packages.core.revisions import bump_revision
+            await bump_revision(db, existing, patch=changed)
         await db.flush()
         return existing
 

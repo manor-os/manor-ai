@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Iterable
 
 from packages.core.ai.runtime.capabilities import allowed_tools_for_profile
@@ -44,6 +45,66 @@ _ALWAYS_DENIED_FOR_EXTERNAL = {
 }
 
 
+class RuntimeInjectedTool(str, Enum):
+    """Tools the RUNTIME hands a run, not capabilities a model discovers.
+
+    They exist only when the caller armed them for that specific run (as a
+    dynamic tool handler), so the surface allowlist — which describes which
+    *capabilities* a surface may reach — must not gate them. It used to:
+    ``submit_result`` is the only way a subagent step can hand back its
+    deliverable, and on the ``scheduled_agent_run`` surface the allowlist
+    denied it. The agent produced 14 images, 12 videos and 8 files, called
+    submit_result, was refused, and the step recorded the loop's terminal
+    notice ("Result submitted.") as its entire result.
+
+    A model cannot escalate by naming one of these: if the runtime did not
+    arm it, no handler is registered and the call fails as an unknown tool.
+    """
+
+    SUBMIT_RESULT = "submit_result"
+    SEND_CHANNEL_ATTACHMENT = "send_channel_attachment"
+
+    @classmethod
+    def names(cls) -> frozenset[str]:
+        return frozenset(member.value for member in cls)
+
+
+class RuntimeToolPolicyCode(str, Enum):
+    """Why a tool call was refused. Consumers compare against these members
+    instead of matching on the message text."""
+
+    INVALID_TOOL = "invalid_tool"
+    TOOL_NOT_IN_RUNTIME_SURFACE = "tool_not_in_runtime_surface"
+    EXTERNAL_PRINCIPAL_TOOL_DENIED = "external_principal_tool_denied"
+    FILE_EDITOR_TOOL_DENIED = "file_editor_tool_denied"
+    FILE_CONTEXT_DENIED = "file_context_denied"
+    BLOCKED_BY_RUNTIME_POLICY = "blocked_by_runtime_policy"
+
+    @classmethod
+    def values(cls) -> frozenset[str]:
+        return frozenset(member.value for member in cls)
+
+
+def is_runtime_policy_denial(result: Any) -> bool:
+    """True when a tool result is this module's refusal payload.
+
+    Structural: the payload's ``error`` must be a member of
+    ``RuntimeToolPolicyCode``. Callers use this to tell "the tool ran and
+    reported an error" apart from "the call never happened".
+    """
+    if isinstance(result, str):
+        text = result.strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            return False
+        try:
+            result = json.loads(text)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(result, dict):
+        return False
+    return str(result.get("error") or "") in RuntimeToolPolicyCode.values()
+
+
 @dataclass(frozen=True)
 class RuntimeToolPolicyDecision:
     allowed: bool
@@ -54,7 +115,7 @@ class RuntimeToolPolicyDecision:
     def to_tool_result(self) -> str:
         return json.dumps(
             {
-                "error": self.code or "blocked_by_runtime_policy",
+                "error": self.code or RuntimeToolPolicyCode.BLOCKED_BY_RUNTIME_POLICY.value,
                 "message": self.reason or "This tool call is not allowed in this Manor AI surface.",
                 "tool": self.tool_name,
             },
@@ -146,7 +207,7 @@ def check_runtime_tool_policy(
     if not name:
         return RuntimeToolPolicyDecision(
             False,
-            code="invalid_tool",
+            code=RuntimeToolPolicyCode.INVALID_TOOL.value,
             reason="The model attempted to call an empty tool name.",
             tool_name=tool_name,
         )
@@ -159,16 +220,22 @@ def check_runtime_tool_policy(
     if file_context_decision is not None and not file_context_decision.allowed:
         return RuntimeToolPolicyDecision(
             False,
-            code=file_context_decision.code or "file_context_denied",
+            code=file_context_decision.code or RuntimeToolPolicyCode.FILE_CONTEXT_DENIED.value,
             reason=file_context_decision.reason,
             tool_name=name,
         )
+
+    if name in RuntimeInjectedTool.names():
+        # Runtime-injected, not a discoverable capability — see the enum's
+        # docstring. Gating these on the surface allowlist silently destroyed
+        # the deliverable of every subagent step on some surfaces.
+        return RuntimeToolPolicyDecision(True, tool_name=name)
 
     allowed = set(envelope.allowed_tool_names or ())
     if allowed and name not in allowed:
         return RuntimeToolPolicyDecision(
             False,
-            code="tool_not_in_runtime_surface",
+            code=RuntimeToolPolicyCode.TOOL_NOT_IN_RUNTIME_SURFACE.value,
             reason=(
                 f"`{name}` is not available in the `{envelope.surface.value}` "
                 f"surface with `{envelope.profile.value}` profile."
@@ -183,7 +250,7 @@ def check_runtime_tool_policy(
         if name in _ALWAYS_DENIED_FOR_EXTERNAL or name.startswith("mcp__"):
             return RuntimeToolPolicyDecision(
                 False,
-                code="external_principal_tool_denied",
+                code=RuntimeToolPolicyCode.EXTERNAL_PRINCIPAL_TOOL_DENIED.value,
                 reason=(
                     "External customer/channel conversations cannot execute "
                     "owner-private, internal mutation, file, sandbox, or MCP tools."
@@ -196,7 +263,7 @@ def check_runtime_tool_policy(
         if name not in allowed_file_tools:
             return RuntimeToolPolicyDecision(
                 False,
-                code="file_editor_tool_denied",
+                code=RuntimeToolPolicyCode.FILE_EDITOR_TOOL_DENIED.value,
                 reason=(
                     "File editor chat can only inspect context and propose patches; "
                     "it cannot execute business side-effect, shell, sandbox, or write tools."

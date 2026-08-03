@@ -21,15 +21,9 @@ import os
 # ── Default models ──
 DEFAULTS = {
     "primary":   "anthropic/claude-sonnet-4.6",
-    # ``worker`` is used by TaskRunner for tool-using agent tasks. The
-    # previous default (``deepseek/deepseek-chat``) only had Novita as
-    # a tool-capable provider on OpenRouter, and Novita rejects our
-    # payloads with opaque ``invalid_request_error`` 400s. Once we
-    # exclude Novita (see ``_openrouter_provider_block`` in
-    # llm_client.py) deepseek-chat returns 404 ``no endpoints support
-    # tool use``. ``openai/gpt-4o-mini`` is similarly cheap, multi-
-    # provider, and reliably tool-capable.
-    "worker":    "openai/gpt-4o-mini",
+    # ``worker`` is used by TaskRunner for tool-using agent tasks. Keep the
+    # factory default aligned with the first model shown in the Worker picker.
+    "worker":    "openai/gpt-4",
     # Image default matches the only model currently routed by the
     # generate_image handler (OpenRouter chat/completions image format).
     "image":     "openai/gpt-5-image-mini",
@@ -44,23 +38,59 @@ DEFAULTS = {
     "embedding": "mxbai-embed-large",
 }
 
+
+_MODEL_INPUT_MODALITIES = {
+    "openai/gpt-4": frozenset({"text"}),
+    "openai/gpt-5.6-sol": frozenset({"text", "image"}),
+    "openai/gpt-5.6-terra": frozenset({"text", "image"}),
+    "openai/gpt-5.6-luna": frozenset({"text", "image"}),
+    "openai/gpt-5.5": frozenset({"text", "image"}),
+    "openai/gpt-5.5-pro": frozenset({"text", "image"}),
+    "moonshotai/kimi-k3": frozenset({"text", "image"}),
+    "deepseek/deepseek-v4-pro": frozenset({"text"}),
+    "deepseek/deepseek-v4-flash": frozenset({"text"}),
+}
+_MODEL_INPUT_MODALITY_PREFIXES = (
+    ("openai/gpt-4o", frozenset({"text", "image"})),
+    ("openai/gpt-4.1", frozenset({"text", "image"})),
+    ("google/gemini-", frozenset({"text", "image"})),
+    ("anthropic/claude-", frozenset({"text", "image"})),
+)
+
+
+def model_input_modalities(model_id: str) -> frozenset[str] | None:
+    """Return known input modalities for a canonical model ID.
+
+    ``None`` means the model has not been classified. Callers must not treat
+    an unknown model as text-only and silently switch its provider.
+    """
+
+    canonical = str(model_id or "").strip().lower()
+    exact = _MODEL_INPUT_MODALITIES.get(canonical)
+    if exact is not None:
+        return exact
+    for prefix, modalities in _MODEL_INPUT_MODALITY_PREFIXES:
+        if canonical.startswith(prefix):
+            return modalities
+    return None
+
 # ── Model catalog (shown in user settings) ──
 CATALOG = {
-    # Inclusion rule: only models served by their own lab (Anthropic /
-    # OpenAI / Google). Those go through the lab's own infra on
-    # OpenRouter, so tool-calling is end-to-end consistent and there's
-    # no provider-routing surprise. Third-party-hosted open-weight
-    # models (DeepSeek, Moonshot, Mistral via X, etc.) keep failing
-    # with opaque provider errors — see scripts/validate_models.py if
-    # you want to re-evaluate any of them empirically.
+    # Prefer models that can route through their own lab's native API. Models
+    # from providers with generic ``sk-`` keys must have an explicit provider
+    # handler so BYOK routing does not silently fall back to OpenAI.
     "primary": [
         {"id": "anthropic/claude-sonnet-4.6",  "name": "Claude Sonnet 4.6",  "tier": "balanced", "quality": "high",    "tag": "Recommended"},
         {"id": "anthropic/claude-fable-5",     "name": "Claude Fable 5",     "tier": "premium",  "quality": "highest", "tag": "Most capable"},
         {"id": "anthropic/claude-opus-4.7",    "name": "Claude Opus 4.7",    "tier": "premium",  "quality": "highest", "tag": ""},
+        {"id": "openai/gpt-5.6-sol",           "name": "GPT-5.6 Sol",        "tier": "premium",  "quality": "highest", "tag": "New"},
+        {"id": "openai/gpt-5.6-terra",         "name": "GPT-5.6 Terra",      "tier": "balanced", "quality": "high",    "tag": "Value"},
+        {"id": "openai/gpt-5.6-luna",          "name": "GPT-5.6 Luna",       "tier": "budget",   "quality": "good",    "tag": "Fast"},
         {"id": "openai/gpt-5.5",               "name": "GPT-5.5",            "tier": "premium",  "quality": "highest", "tag": "New"},
         {"id": "openai/gpt-5.5-pro",           "name": "GPT-5.5 Pro",        "tier": "premium",  "quality": "highest", "tag": "Pro"},
         {"id": "anthropic/claude-opus-4.6",    "name": "Claude Opus 4.6",    "tier": "premium",  "quality": "highest", "tag": ""},
         {"id": "anthropic/claude-haiku-4.5",   "name": "Claude Haiku 4.5",   "tier": "budget",   "quality": "good",    "tag": "Fast"},
+        {"id": "moonshotai/kimi-k3",           "name": "Kimi K3",            "tier": "premium",  "quality": "highest", "tag": "New"},
         {"id": "moonshotai/kimi-k2.6",         "name": "Kimi K2.6",          "tier": "premium",  "quality": "highest", "tag": "New"},
         {"id": "qwen/qwen3.6-plus",            "name": "Qwen 3.6 Plus",      "tier": "balanced", "quality": "high",    "tag": "Coding"},
         {"id": "deepseek/deepseek-v4-pro",     "name": "DeepSeek 4 Pro",      "tier": "premium",  "quality": "highest", "tag": "Reasoning"},
@@ -77,7 +107,7 @@ CATALOG = {
         # which always require tools. ``deepseek/deepseek-chat`` is
         # deliberately excluded: only Novita serves it with tools, and
         # Novita rejects our payloads with opaque 400s.
-        {"id": "openai/gpt-4o-mini",          "name": "GPT-4o Mini",        "tier": "cheap",    "quality": "good",    "tag": "Recommended"},
+        {"id": "openai/gpt-4",                "name": "GPT-4",              "tier": "premium",  "quality": "high",    "tag": "Recommended"},
         {"id": "qwen/qwen3.6-plus",            "name": "Qwen 3.6 Plus",      "tier": "cheap",    "quality": "good",    "tag": "Value"},
         {"id": "deepseek/deepseek-v4-flash",   "name": "DeepSeek 4 Flash",    "tier": "cheap",    "quality": "good",    "tag": "Fast"},
         {"id": "anthropic/claude-haiku-4.5",   "name": "Claude Haiku 4.5",   "tier": "budget",   "quality": "good",    "tag": "Reliable"},
@@ -115,11 +145,70 @@ CATALOG = {
         {"id": "openai/gpt-audio-mini",       "name": "GPT Audio Mini","tier": "budget",  "quality": "good", "tag": "Recommended"},
         {"id": "openai/gpt-audio",            "name": "GPT Audio",     "tier": "balanced","quality": "high", "tag": ""},
     ],
-    # STT — only chat-based audio models that work via OpenRouter.
+    # STT — native Whisper routes provide verbose segment timestamps. Chat-audio
+    # remains available through OpenRouter/OpenAI for ordinary transcription but
+    # cannot drive measured subtitle alignment.
     "stt": [
-        {"id": "openai/gpt-4o-audio-preview",   "name": "GPT-4o Audio",    "tier": "balanced", "quality": "highest", "tag": "Recommended"},
-        {"id": "openai/gpt-audio-mini",         "name": "GPT Audio Mini",  "tier": "budget",   "quality": "good",    "tag": "Fast + cheap"},
-        {"id": "openai/gpt-audio",              "name": "GPT Audio",       "tier": "balanced", "quality": "high",    "tag": ""},
+        {
+            "id": "openai/whisper-1",
+            "name": "OpenAI Whisper",
+            "tier": "budget",
+            "quality": "high",
+            "tag": "Timestamped",
+            "capabilities": {
+                "segment_timestamps": True,
+                "alignment_compatible": True,
+                "route": "audio_transcriptions",
+            },
+        },
+        {
+            "id": "groq/whisper-large-v3",
+            "name": "Groq Whisper Large v3",
+            "tier": "budget",
+            "quality": "high",
+            "tag": "Timestamped + fast",
+            "capabilities": {
+                "segment_timestamps": True,
+                "alignment_compatible": True,
+                "route": "audio_transcriptions",
+            },
+        },
+        {
+            "id": "openai/gpt-4o-audio-preview",
+            "name": "GPT-4o Audio",
+            "tier": "balanced",
+            "quality": "highest",
+            "tag": "No timestamps",
+            "capabilities": {
+                "segment_timestamps": False,
+                "alignment_compatible": False,
+                "route": "chat_audio",
+            },
+        },
+        {
+            "id": "openai/gpt-audio-mini",
+            "name": "GPT Audio Mini",
+            "tier": "budget",
+            "quality": "good",
+            "tag": "No timestamps",
+            "capabilities": {
+                "segment_timestamps": False,
+                "alignment_compatible": False,
+                "route": "chat_audio",
+            },
+        },
+        {
+            "id": "openai/gpt-audio",
+            "name": "GPT Audio",
+            "tier": "balanced",
+            "quality": "high",
+            "tag": "No timestamps",
+            "capabilities": {
+                "segment_timestamps": False,
+                "alignment_compatible": False,
+                "route": "chat_audio",
+            },
+        },
     ],
     # Video — OpenRouter keys use /api/v1/videos; native Seedance/Kling
     # keys route to their provider task APIs.

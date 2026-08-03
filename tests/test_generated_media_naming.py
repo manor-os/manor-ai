@@ -100,13 +100,14 @@ def test_media_target_defaults_to_storage_dir_for_plain_filename(tmp_path):
     assert target.rel_path == "images/素材-拉面特写.jpg"
 
 
-def test_workspace_artifact_base_dir_uses_workspace_name():
+def test_workspace_artifact_base_dir_uses_stable_folder_id():
     base = build_workspace_artifact_base_dir(
         workspace_name="桌面耳机支架工业设计项目",
         workspace_id="01KQ9CDDBTNWEZJQC7KW18NYGR",
+        artifact_folder_id="01KQ9FOLDER8WJQC7KW18NYGR",
     )
 
-    assert base == "Workspaces/桌面耳机支架工业设计项目"
+    assert base == "Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR"
 
 
 def test_workspace_artifact_default_dir_nests_storage_folder():
@@ -144,3 +145,21 @@ def test_workspace_artifact_path_uses_default_subdir_for_documents():
     )
 
     assert path == "Workspaces/销售方案/documents/quote.pdf"
+
+
+def test_workspace_artifact_path_rescopes_legacy_workspace_path():
+    path = scope_workspace_artifact_path(
+        "Workspaces/旧名称/documents/quote.pdf",
+        "Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR",
+    )
+
+    assert path == "Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR/documents/quote.pdf"
+
+
+def test_workspace_artifact_path_cannot_escape_to_another_workspace():
+    path = scope_workspace_artifact_path(
+        "Workspaces/_by_id/OTHERFOLDER/images/hero.png",
+        "Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR",
+    )
+
+    assert path == "Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR/images/hero.png"

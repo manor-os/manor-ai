@@ -40,8 +40,32 @@ async def test_create_integration(client: AsyncClient):
     data = resp.json()
     assert data["provider"] == "slack"
     assert data["status"] == "active"
-    assert data["config"] == {"team_id": "T12345"}
+    assert data["config"] == {"team_id": "T12345", "is_default": True}
     assert len(data["id"]) == 26
+
+
+@pytest.mark.asyncio
+async def test_create_integration_reports_credential_backend_failure(client: AsyncClient, monkeypatch):
+    from packages.core.credentials import CredentialError
+    import apps.api.routers.integrations as integrations_router
+
+    async def broken_create_integration(*_args, **_kwargs):
+        raise CredentialError("vault token is invalid")
+
+    monkeypatch.setattr(integrations_router, "create_integration", broken_create_integration)
+
+    headers = await _auth(client, "int_credential_backend_down")
+    resp = await client.post(
+        "/api/v1/integrations",
+        headers=headers,
+        json={
+            "provider": "email",
+            "credentials": {"username": "ops@example.test", "password": "secret"},
+        },
+    )
+
+    assert resp.status_code == 503
+    assert "Credential backend" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -77,7 +101,43 @@ async def test_update_integration(client: AsyncClient):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "disabled"
-    assert resp.json()["config"] == {"updated": True}
+    assert resp.json()["config"] == {"updated": True, "is_default": True}
+
+
+@pytest.mark.asyncio
+async def test_multiple_entity_accounts_keep_one_default(client: AsyncClient):
+    """Email and API-key integrations may connect more than one account."""
+    headers = await _auth(client, "integration_multi_account")
+
+    first = await client.post(
+        "/api/v1/integrations",
+        headers=headers,
+        json={
+            "provider": "email",
+            "config": {"name": "Support", "from_address": "support@example.com"},
+            "credentials": {"username": "support@example.com", "password": "one"},
+        },
+    )
+    second = await client.post(
+        "/api/v1/integrations",
+        headers=headers,
+        json={
+            "provider": "email",
+            "config": {"name": "Sales", "from_address": "sales@example.com"},
+            "credentials": {"username": "sales@example.com", "password": "two"},
+        },
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] != second.json()["id"]
+    assert first.json()["config"]["is_default"] is True
+    assert second.json()["config"]["is_default"] is False
+
+    listed = await client.get("/api/v1/integrations", headers=headers)
+    email_rows = [row for row in listed.json() if row["provider"] == "email"]
+    assert len(email_rows) == 2
+    assert sum(bool(row["config"].get("is_default")) for row in email_rows) == 1
 
 
 @pytest.mark.asyncio

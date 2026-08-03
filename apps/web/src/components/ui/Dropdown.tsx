@@ -1,4 +1,13 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  cloneElement,
+  isValidElement,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactElement,
+} from "react";
 import { createPortal } from "react-dom";
 
 interface DropdownItem {
@@ -29,10 +38,44 @@ export default function Dropdown({
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  function toggleOpen(event?: ReactMouseEvent<HTMLDivElement> | KeyboardEvent<HTMLDivElement>) {
-    event?.stopPropagation();
-    setOpen((v) => !v);
-  }
+  const triggerControl = isValidElement(trigger)
+    ? cloneElement(trigger as ReactElement<any>, {
+      "aria-haspopup": "menu",
+      "aria-expanded": open,
+      onClick: (event: ReactMouseEvent<HTMLElement>) => {
+        (trigger.props as any).onClick?.(event);
+        if (!event.defaultPrevented) {
+          event.stopPropagation();
+          setOpen((value) => !value);
+        }
+      },
+      ...(
+        typeof trigger.type === "string" && !["button", "a", "input"].includes(trigger.type)
+          ? {
+            role: "button",
+            tabIndex: 0,
+            onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
+              (trigger.props as any).onKeyDown?.(event);
+              if (!event.defaultPrevented && (event.key === "Enter" || event.key === " ")) {
+                event.preventDefault();
+                event.stopPropagation();
+                setOpen((value) => !value);
+              }
+            },
+          }
+          : {}
+      ),
+    })
+    : (
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        {trigger}
+      </button>
+    );
 
   useEffect(() => {
     if (!open) return;
@@ -90,24 +133,12 @@ export default function Dropdown({
   }, [open, align, items]);
 
   return (
-    <div ref={ref} style={{ position: "relative", display: "inline-block", ...style }}>
-      <div
-        role="button"
-        tabIndex={0}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onMouseDown={(event) => event.stopPropagation()}
-        onClick={toggleOpen}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            toggleOpen(event);
-          }
-        }}
-        style={{ cursor: "pointer" }}
-      >
-        {trigger}
-      </div>
+    <div
+      ref={ref}
+      onMouseDown={(event) => event.stopPropagation()}
+      style={{ position: "relative", display: "inline-block", ...style }}
+    >
+      {triggerControl}
 
       {open &&
         createPortal(

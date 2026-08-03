@@ -135,12 +135,13 @@ export default function SearchResults() {
     <div>
       <PageHeader
         title={t("page.search.title")}
-        subtitle={
+        subtitle={queryFromUrl ? undefined : t("page.search.across_workspace")}
+        meta={
           queryFromUrl
             ? isFetched
               ? `${totalResults} ${totalResults !== 1 ? t("page.search.results_for") : t("page.search.result_for")} "${queryFromUrl}"`
               : `${t("page.search.searching_for")} "${queryFromUrl}"...`
-            : t("page.search.across_workspace")
+            : undefined
         }
       />
 

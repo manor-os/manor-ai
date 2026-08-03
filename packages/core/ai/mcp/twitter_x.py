@@ -685,11 +685,15 @@ async def _try_inline_refresh(old_token: str) -> Optional[str]:
         from packages.core.tasks.oauth_refresh import refresh_token_via_provider
 
         async with async_session() as db:
+            query = select(OAuthAccount).where(
+                OAuthAccount.user_id == user_id,
+                OAuthAccount.provider.in_(provider_key_aliases("twitter_x")),
+            )
+            integration_account_id = _call_context.get("integration_account_id")
+            if integration_account_id:
+                query = query.where(OAuthAccount.id == integration_account_id)
             row = (await db.execute(
-                select(OAuthAccount).where(
-                    OAuthAccount.user_id == user_id,
-                    OAuthAccount.provider.in_(provider_key_aliases("twitter_x")),
-                ).order_by(OAuthAccount.updated_at.desc()).limit(1)
+                query.order_by(OAuthAccount.updated_at.desc()).limit(1)
             )).scalar_one_or_none()
             if not row or not row.refresh_token or row.access_token != old_token:
                 return None

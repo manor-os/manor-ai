@@ -570,7 +570,8 @@ async def test_strategist_review_records_runtime_evidence(db_session, monkeypatc
     assert len(rows) == 1
     assert rows[0].trace_id == result["review_id"]
     assert rows[0].source == "strategist"
-    assert rows[0].details["trigger"] == "manual"
+    assert rows[0].details["trigger_kind"] == "human_requested"
+    assert rows[0].details["trigger_detail"] == "manual"
     assert rows[0].details["review_id"] == result["review_id"]
     assert rows[0].metrics["task_count"] == 0
 
@@ -723,12 +724,18 @@ async def test_strategist_auto_approves_proposals_when_workspace_pref_enabled(
 
     posted: list[dict] = []
 
-    async def _fake_post_proposal_chat(workspace_arg, proposal, task_ids, *, auto_approved=False):
+    async def _fake_post_proposal_chat(
+        workspace_arg, proposal, task_ids, *,
+        auto_approved=False, policy_denied=False, pending_items=None,
+        auto_approved_action_key=None,
+    ):
         posted.append(
             {
                 "workspace_id": workspace_arg.id,
                 "task_ids": list(task_ids),
                 "auto_approved": auto_approved,
+                # Legacy workspace boolean → no standing-grant key to name.
+                "auto_approved_action_key": auto_approved_action_key,
             }
         )
 
@@ -744,6 +751,7 @@ async def test_strategist_auto_approves_proposals_when_workspace_pref_enabled(
             "workspace_id": workspace.id,
             "task_ids": result["task_ids"],
             "auto_approved": True,
+            "auto_approved_action_key": None,
         }
     ]
     tasks = list((await db_session.execute(select(Task).where(Task.workspace_id == workspace.id))).scalars().all())
@@ -1191,6 +1199,9 @@ async def test_dependency_gate_blocks_manual_retry_before_outputs(db_session) ->
         entity_id=workspace.entity_id,
         display_name="Tester",
         email="tester@example.com",
+        # Retry requires workspace write access; a real caller always carries a
+        # tenant role. owner keeps this test focused on the dependency gate.
+        role="owner",
     )
     with pytest.raises(HTTPException) as exc_info:
         await retry_task_endpoint(task_b_id, None, user, db_session)
@@ -1269,6 +1280,9 @@ async def test_dependency_gate_blocks_retry_before_resetting_plan_steps(db_sessi
         entity_id=workspace.entity_id,
         display_name="Tester",
         email="tester@example.com",
+        # Retry requires workspace write access; a real caller always carries a
+        # tenant role. owner keeps this test focused on the dependency gate.
+        role="owner",
     )
     with pytest.raises(HTTPException) as exc_info:
         await retry_task_endpoint(task_b_id, None, user, db_session)

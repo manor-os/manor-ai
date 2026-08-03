@@ -58,6 +58,7 @@ PRIMARY_BYOK_FALLBACK_LLM_ROLES: frozenset[str] = frozenset({
     "chat_extractor",
     "chat_insight_extraction",
     "conversation_summary",
+    "consolidator_l1",
     "briefing",
     "outcome_evaluation",
     "goal_measurement",
@@ -131,6 +132,27 @@ def normalize_llm_model_for_provider(model: str, base_url: str) -> str:
     from packages.core.ai.llm_client import normalize_model_for_provider
 
     return normalize_model_for_provider(model, base_url)
+
+
+def adapt_llm_chat_payload_for_provider(
+    payload: dict,
+    *,
+    model: str,
+    base_url: str,
+    purpose: str = "runtime",
+) -> None:
+    """Apply the direct provider's native Chat Completions request adapter."""
+
+    from packages.core.services.model_provider_adapters import (
+        adapt_native_chat_completion_payload,
+    )
+
+    adapt_native_chat_completion_payload(
+        payload,
+        model_id=model,
+        base_url=base_url,
+        purpose="probe" if purpose == "probe" else "runtime",
+    )
 
 
 def default_llm_model() -> str:
@@ -213,7 +235,7 @@ async def _load_prefs(
     without a second round-trip."""
     # Imports kept local so this module can be imported during model
     # registration without circular issues.
-    from packages.core.models.user import Entity, User, UserMembership
+    from packages.core.models.user import Entity, User
 
     user_prefs: Optional[dict] = None
     entity_settings: Optional[dict] = None
@@ -279,6 +301,19 @@ def _configured_model(
     return None
 
 
+def _uses_primary_byok_fallback(role: str, settings: dict | None) -> bool:
+    if role not in PRIMARY_BYOK_FALLBACK_LLM_ROLES or role == "primary":
+        return False
+    settings = settings or {}
+    role_keys = settings.get("llm_api_keys") or {}
+    if str(role_keys.get(role) or "").strip():
+        return False
+    return bool(
+        str(role_keys.get("primary") or "").strip()
+        or str(settings.get("llm_api_key") or "").strip()
+    )
+
+
 def _resolve_entity_scoped_model(
     role: str,
     *,
@@ -286,9 +321,25 @@ def _resolve_entity_scoped_model(
     owner_prefs: dict | None,
     platform_settings: dict | None,
 ) -> str:
+    # Text roles that reuse the Primary BYOK credential must inherit its model
+    # unless the same settings source explicitly configures the role. Pairing
+    # a Primary OpenAI-compatible key with the platform worker default can make
+    # background jobs fail even though interactive chat works.
+    entity_fallback_to_primary = _uses_primary_byok_fallback(role, entity_settings)
+    owner_fallback_to_primary = _uses_primary_byok_fallback(role, owner_prefs)
     return (
         _configured_model(role, entity_settings, platform_settings)
+        or (
+            _configured_model("primary", entity_settings, platform_settings)
+            if entity_fallback_to_primary
+            else None
+        )
         or _configured_model(role, owner_prefs, platform_settings)
+        or (
+            _configured_model("primary", owner_prefs, platform_settings)
+            if owner_fallback_to_primary
+            else None
+        )
         or resolve_model_for_role(role, None, None, platform_settings)
         or DEFAULTS.get(role, DEFAULTS["primary"])
     )

@@ -22,16 +22,20 @@ import { api } from "../lib/api";
 import type { Workspace, Agent } from "../lib/types";
 import EmbeddedChat from "../components/EmbeddedChat";
 import FloatingChat from "../components/FloatingChat";
+import TextSelectionToolbar from "../components/TextSelectionToolbar";
 import WorkspaceChat from "../components/WorkspaceChat";
+import AgentEditModal from "../components/AgentEditModal";
 import SupportPanel, {
   useSupportUnreadCount,
 } from "../components/SupportPanel";
 import UserAvatar from "../components/ui/UserAvatar";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
+import { PageHeaderBoundary } from "../components/ui/PageHeader";
 import { useWorkspaceFilter } from "../stores/workspace";
 import OnboardingTour, { isTourSuppressedPath } from "../components/OnboardingTour";
 import { getAgentDescription } from "../lib/localizedContent";
+import { parseAppLayoutChatTarget } from "./appLayoutChatQuery";
 
 type AppMode = "workspace" | "chat";
 
@@ -445,6 +449,7 @@ const IconBell = () => (
   </svg>
 );
 
+
 const IconMoreDots = () => (
   <svg
     width="14"
@@ -631,12 +636,21 @@ const workspaceItems: NavItem[] = [
     label: "Dashboard",
     i18nKey: "nav.dashboard",
     icon: <IconGrid4 />,
+    tourKey: "nav-dashboard",
   },
   {
     path: "/tasks",
     label: "Tasks",
     i18nKey: "nav.tasks",
     icon: <IconChecklist />,
+    tourKey: "nav-tasks",
+  },
+  {
+    path: "/jobs",
+    label: "Automations",
+    i18nKey: "nav.automations",
+    icon: <IconSchedule />,
+    tourKey: "nav-automations",
   },
 ];
 
@@ -657,6 +671,26 @@ const managementItems: NavItem[] = [
   },
 ];
 
+const IconWorkflow = () => (
+  <svg
+    width="16"
+    height="16"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    <circle cx="5" cy="12" r="2.5" />
+    <circle cx="19" cy="6" r="2.5" />
+    <circle cx="19" cy="18" r="2.5" />
+    <path d="M7.5 12h4a2 2 0 002-2l.4-1a2 2 0 012-1.4" />
+    <path d="M7.5 12h4a2 2 0 012 2l.4 1a2 2 0 002 1.4" />
+  </svg>
+);
+
 const baseConfigurationItems: NavItem[] = [
   {
     path: "/agents",
@@ -670,6 +704,7 @@ const baseConfigurationItems: NavItem[] = [
     label: "Integrations",
     i18nKey: "nav.integrations",
     icon: <IconConnection />,
+    tourKey: "nav-integrations",
   },
   // Blueprints — temporarily hidden from nav until the feature is ready
   // for users. Pages, routes, and APIs all stay so deep links keep working.
@@ -681,6 +716,15 @@ const baseConfigurationItems: NavItem[] = [
     tourKey: "nav-skills",
   },
 ];
+
+const flowsConfigurationItem = (enabled: boolean): NavItem => ({
+  path: "/flows",
+  label: "Workflows",
+  i18nKey: "nav.flows",
+  icon: <IconWorkflow />,
+  disabled: !enabled,
+  badge: enabled ? undefined : "Soon",
+});
 
 
 /* ─── Context Switcher (workspace/operation selector) ─── */
@@ -1674,6 +1718,7 @@ export default function AppLayout() {
   }, []);
   const deploymentMode = useConfigStore((s) => s.deployment_mode);
   const configLoaded = useConfigStore((s) => s.loaded);
+  const flowsAvailable = useConfigStore((s) => s.flows_available);
   const supportTicketsEnabled = useConfigStore(
     (s) => s.support_tickets_enabled,
   );
@@ -1681,8 +1726,12 @@ export default function AppLayout() {
     useSupportUnreadCount(supportTicketsEnabled).data?.count || 0;
   const configurationItems = useMemo(() => {
     const items = [...baseConfigurationItems];
+    // Keep Flows directly after Agents; production defaults to a disabled
+    // "Soon" entry until FLOWS_AVAILABLE is explicitly enabled.
+    items.splice(1, 0, flowsConfigurationItem(flowsAvailable));
     return items;
   }, [
+    flowsAvailable,
   ]);
   const { data: workspaceList = EMPTY_WORKSPACES } = useQuery({
     queryKey: ["workspaces"],
@@ -2082,17 +2131,25 @@ export default function AppLayout() {
 
   useEffect(() => {
     if (location.pathname !== "/chat") return;
-    const params = new URLSearchParams(location.search);
-    const workspaceId = params.get("workspace") || params.get("workspaceId");
-    if (!workspaceId) return;
+    const target = parseAppLayoutChatTarget(location.search);
+    if (!target) return;
     setMode("chat");
-    setActiveConvId(workspaceId);
-    setActiveConvType("operation");
+    if (target.type === "conversation") {
+      setActiveConvId(target.conversationId);
+      setActiveConvType("manor");
+    } else {
+      setActiveConvId(target.workspaceId);
+      setActiveConvType("operation");
+    }
     setActiveDmAgentId(null);
     setConvSearchQuery("");
   }, [location.pathname, location.search]);
 
   const isSettingsRoute = location.pathname === "/settings";
+  const isTasksRoute =
+    location.pathname === "/tasks" ||
+    (location.pathname.startsWith("/tasks/") &&
+      !location.pathname.startsWith("/tasks/collections"));
   const sidebarCollapsed = collapsed && !mobileOpen;
 
   const switchMode = useCallback(
@@ -2106,6 +2163,25 @@ export default function AppLayout() {
     },
     [location.pathname, navigate],
   );
+
+  // The onboarding tour highlights targets that only exist in one sidebar
+  // mode; let it switch the app there (see OnboardingTour's "manor:tour-mode").
+  useEffect(() => {
+    const handleTourMode = (event: Event) => {
+      const nextMode = (event as CustomEvent<{ mode?: AppMode }>).detail?.mode;
+      if (nextMode === "chat" || nextMode === "workspace") switchMode(nextMode);
+    };
+    // Agents/Skills/Integrations only mount while the Configure menu is open
+    // in the expanded sidebar; the tour asks for it before highlighting them.
+    const handleTourConfigure = () => setConfigureOpen(true);
+    window.addEventListener("manor:tour-mode", handleTourMode);
+    window.addEventListener("manor:tour-configure", handleTourConfigure);
+    return () => {
+      window.removeEventListener("manor:tour-mode", handleTourMode);
+      window.removeEventListener("manor:tour-configure", handleTourConfigure);
+    };
+  }, [switchMode]);
+
   const sidebarWidth = sidebarCollapsed ? 92 : 260;
   const sectionLabelStyle = {
     display: "flex",
@@ -2407,18 +2483,20 @@ export default function AppLayout() {
               height: "100%",
               display: "flex",
               flexDirection: "column",
-              overflow: "hidden",
+              overflow: sidebarCollapsed ? "visible" : "hidden",
+              position: "relative",
             }}
           >
             {/* ── LOGO AREA ── */}
             <div
               style={{
                 position: "relative",
-                padding: sidebarCollapsed ? "14px 0 12px" : "16px 16px 12px",
+                padding: sidebarCollapsed ? "12px 0 10px" : "16px 16px 12px",
                 display: "flex",
+                flexDirection: sidebarCollapsed ? "column" : undefined,
                 alignItems: "center",
                 justifyContent: sidebarCollapsed ? "center" : undefined,
-                gap: 10,
+                gap: sidebarCollapsed ? 8 : 10,
               }}
             >
               {/* Dark logo box */}
@@ -2454,6 +2532,8 @@ export default function AppLayout() {
               )}
               {!sidebarCollapsed && (
                 <button
+                  aria-label="Collapse sidebar"
+                  title="Collapse sidebar"
                   onClick={() => {
                     if (mobileOpen) {
                       setMobileOpen(false);
@@ -2474,7 +2554,7 @@ export default function AppLayout() {
                     cursor: "pointer",
                     flexShrink: 0,
                     transition: "all 0.2s",
-                    color: "var(--sidebar-nav-text)",
+                    color: "var(--text-muted)",
                   }}
                 >
                   <svg
@@ -2486,13 +2566,45 @@ export default function AppLayout() {
                     strokeWidth={2}
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    style={{ transition: "transform 0.3s" }}
+                    style={{
+                      transition: "transform 0.3s",
+                      transform: "rotate(0deg)",
+                    }}
                   >
                     <polyline points="15 18 9 12 15 6" />
                   </svg>
                 </button>
               )}
             </div>
+
+            {sidebarCollapsed && (
+              <button
+                className="app-sidebar-edge-toggle"
+                aria-label="Expand sidebar"
+                title="Expand sidebar"
+                onClick={() => {
+                  if (mobileOpen) {
+                    setMobileOpen(false);
+                  } else {
+                    setCollapsed(!collapsed);
+                  }
+                }}
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <polyline points="15 18 9 12 15 6" />
+                </svg>
+              </button>
+            )}
 
             {/* ── MODE SWITCHER ── */}
             <div
@@ -2509,13 +2621,13 @@ export default function AppLayout() {
                     display: "grid",
                     gridTemplateColumns: "1fr",
                     gap: 5,
-                    width: 42,
-                    padding: 3,
-                    borderRadius: 14,
-                    background: "var(--sidebar-control-bg)",
-                    border: "1px solid var(--sidebar-control-border)",
-                  }}
-                >
+	                    width: 42,
+	                    padding: 3,
+	                    borderRadius: 14,
+	                    background: "var(--sidebar-mode-bg)",
+	                    border: "1px solid var(--sidebar-mode-border)",
+	                  }}
+	                >
                   {[
                     {
                       key: "chat" as const,
@@ -2543,22 +2655,25 @@ export default function AppLayout() {
                         style={{
                           width: 34,
                           height: 32,
-                          border: "1px solid transparent",
+                          border: active
+                            ? "1px solid var(--sidebar-mode-active-border)"
+                            : "1px solid transparent",
                           borderRadius: 11,
                           background: active
-                            ? "var(--sidebar-control-active-bg)"
+                            ? "var(--sidebar-mode-active-bg)"
                             : "transparent",
                           color: active
-                            ? "var(--sidebar-nav-active-text)"
-                            : "var(--sidebar-nav-text)",
+                            ? "var(--sidebar-mode-active-text)"
+                            : "var(--sidebar-mode-text)",
                           boxShadow: active
-                            ? "var(--sidebar-control-active-shadow)"
+                            ? "var(--sidebar-mode-active-shadow)"
                             : "none",
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
                           cursor: "pointer",
                           transition: "all 0.18s ease",
+                          outline: "none",
                         }}
                       >
                         {item.icon}
@@ -2570,9 +2685,9 @@ export default function AppLayout() {
                 <div
                   style={{
                     position: "relative",
-                    background: "var(--sidebar-control-bg)",
-                    border: "1px solid var(--sidebar-control-border)",
-                    borderRadius: 10,
+                    background: "var(--sidebar-mode-bg)",
+                    border: "1px solid var(--sidebar-mode-border)",
+                    borderRadius: 12,
                     padding: 3,
                     display: "flex",
                   }}
@@ -2585,9 +2700,10 @@ export default function AppLayout() {
                       left: 3,
                       width: "calc(50% - 3px)",
                       height: "calc(100% - 6px)",
-                      background: "var(--sidebar-control-active-bg)",
-                      borderRadius: 8,
-                      boxShadow: "var(--sidebar-control-active-shadow)",
+                      background: "var(--sidebar-mode-active-bg)",
+                      border: "1px solid var(--sidebar-mode-active-border)",
+                      borderRadius: 10,
+                      boxShadow: "var(--sidebar-mode-active-shadow)",
                       transition: "transform 0.25s cubic-bezier(0.4,0,0.2,1)",
                       transform:
                         mode === "workspace"
@@ -2609,10 +2725,11 @@ export default function AppLayout() {
                       fontWeight: mode === "chat" ? 600 : 500,
                       color:
                         mode === "chat"
-                          ? "var(--sidebar-nav-active-text)"
-                          : "var(--sidebar-nav-text)",
+                          ? "var(--sidebar-mode-active-text)"
+                          : "var(--sidebar-mode-text)",
                       background: "transparent",
                       border: "none",
+                      outline: "none",
                       cursor: "pointer",
                       position: "relative",
                       zIndex: 1,
@@ -2636,10 +2753,11 @@ export default function AppLayout() {
                       fontWeight: mode === "workspace" ? 600 : 500,
                       color:
                         mode === "workspace"
-                          ? "var(--sidebar-nav-active-text)"
-                          : "var(--sidebar-nav-text)",
+                          ? "var(--sidebar-mode-active-text)"
+                          : "var(--sidebar-mode-text)",
                       background: "transparent",
                       border: "none",
+                      outline: "none",
                       cursor: "pointer",
                       position: "relative",
                       zIndex: 1,
@@ -3373,7 +3491,8 @@ export default function AppLayout() {
                     </button>
                   </div>
                 )}
-                <div style={{ position: "relative", order: 4 }}>
+                {!sidebarCollapsed && (
+                  <div style={{ position: "relative", order: 4 }}>
                   <button
                     type="button"
                     onClick={() => {
@@ -3398,7 +3517,7 @@ export default function AppLayout() {
                       color:
                         moreOpen || isActive("/chat/history")
                           ? "var(--accent)"
-                          : "var(--text-faint)",
+                          : "var(--text-muted)",
                       fontSize: 11,
                       fontWeight: 500,
                       cursor: "pointer",
@@ -3406,12 +3525,14 @@ export default function AppLayout() {
                     }}
                     onMouseEnter={(e) => {
                       if (!moreOpen && !isActive("/chat/history")) {
-                        e.currentTarget.style.color = "var(--text-muted)";
+                        e.currentTarget.style.color = "var(--text-strong)";
+                        e.currentTarget.style.background = "var(--sidebar-control-bg)";
                       }
                     }}
                     onMouseLeave={(e) => {
                       if (!moreOpen && !isActive("/chat/history")) {
-                        e.currentTarget.style.color = "var(--text-faint)";
+                        e.currentTarget.style.color = "var(--text-muted)";
+                        e.currentTarget.style.background = "transparent";
                       }
                     }}
                   >
@@ -3731,110 +3852,80 @@ export default function AppLayout() {
                               )}
                             </button>
                           );
-                        })}
-                      </div>
-                    </>
-                  )}
-                </div>
+                      })}
+                    </div>
+                  </>
+                )}
+                  </div>
+                )}
+
 
                 {/* Notifications bell */}
-                <Link
-                  to="/notifications"
-                  onClick={() => setMode("workspace")}
-                  title={t("nav.notifications")}
-                  aria-label={t("nav.notifications")}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    order: 1,
-                    padding: 0,
-                    width: 24,
-                    height: 24,
-                    borderRadius: 7,
-                    color: "var(--text-faint)",
-                    textDecoration: "none",
-                    fontSize: 11,
-                    fontWeight: 500,
-                    position: "relative",
-                    transition: "color 0.2s",
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.color = "var(--text-muted)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.color = "var(--text-faint)";
-                  }}
-                >
-                  <span
+                {!sidebarCollapsed && (
+                  <Link
+                    to="/notifications"
+                    onClick={() => setMode("workspace")}
+                    title={t("nav.notifications")}
+                    aria-label={t("nav.notifications")}
                     style={{
-                      position: "relative",
                       display: "flex",
                       alignItems: "center",
+                      justifyContent: "center",
+                      order: 1,
+                      padding: 0,
+                      width: 24,
+                      height: 24,
+                      borderRadius: 7,
+                      color: "var(--text-muted)",
+                      textDecoration: "none",
+                      fontSize: 11,
+                      fontWeight: 500,
+                      position: "relative",
+                      transition: "color 0.2s",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.color = "var(--text-strong)";
+                      e.currentTarget.style.background = "var(--sidebar-control-bg)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.color = "var(--text-muted)";
+                      e.currentTarget.style.background = "transparent";
                     }}
                   >
-                    <IconBell />
-                    {unreadCount > 0 && (
-                      <span
-                        style={{
-                          position: "absolute",
-                          top: 0,
-                          right: 0,
-                          width: 6,
-                          height: 6,
-                          borderRadius: "50%",
-                          background: "#ef4444",
-                        }}
-                      />
-                    )}
-                  </span>
-                </Link>
+                    <span
+                      style={{
+                        position: "relative",
+                        display: "flex",
+                        alignItems: "center",
+                      }}
+                    >
+                      <IconBell />
+                      {unreadCount > 0 && (
+                        <span
+                          style={{
+                            position: "absolute",
+                            top: 0,
+                            right: 0,
+                            width: 6,
+                            height: 6,
+                            borderRadius: "50%",
+                            background: "#ef4444",
+                            boxShadow: "0 0 0 2px var(--chrome-surface)",
+                          }}
+                        />
+                      )}
+                    </span>
+                  </Link>
+                )}
               </div>
             </div>
           </div>
 
-          {/* Collapsed: edge expand button */}
-          {sidebarCollapsed && (
-            <button
-              onClick={() => setCollapsed(false)}
-              style={{
-                position: "absolute",
-                right: -4,
-                top: "50%",
-                transform: "translateY(-50%)",
-                width: 24,
-                height: 56,
-                background: "var(--surface-panel)",
-                border: "1px solid var(--glass-border)",
-                borderRadius: "0 12px 12px 0",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor: "pointer",
-                color: "var(--text-faint)",
-                zIndex: 20,
-                boxShadow: "2px 0 8px rgba(0,0,0,0.04)",
-              }}
-            >
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={2.5}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
-            </button>
-          )}
         </aside>
         )}
 
         <main
-          className={`app-main-shell flex-1 min-w-0 overflow-auto relative z-10 p-3 ${isSettingsRoute ? "pl-3" : "pl-0"}`}
+          className={`app-main-shell flex-1 min-w-0 overflow-auto relative z-10 p-3 ${isSettingsRoute ? "pl-3" : "pl-0"} ${isTasksRoute ? "app-main-shell--flush" : ""}`}
         >
           {/* Mobile hamburger */}
           {!isSettingsRoute && (
@@ -3928,8 +4019,12 @@ export default function AppLayout() {
               )}
             </div>
           ) : (
-            <div className={`app-content-panel glass-panel h-full min-w-0 overflow-auto ${isSettingsRoute ? "app-content-panel--settings p-0" : "p-6"}`}>
-              <Outlet />
+            <div className={`app-content-panel glass-panel flex h-full min-w-0 flex-col overflow-hidden p-0 ${isSettingsRoute ? "app-content-panel--settings" : ""} ${isTasksRoute ? "app-content-panel--flush" : ""}`}>
+              <PageHeaderBoundary>
+                <div className={`app-route-content min-h-0 min-w-0 flex-1 overflow-auto ${isSettingsRoute ? "app-route-content--settings p-0" : "px-6 pb-6 pt-2"}`}>
+                  <Outlet />
+                </div>
+              </PageHeaderBoundary>
             </div>
           )}
         </main>
@@ -3956,6 +4051,14 @@ export default function AppLayout() {
           && (
           <FloatingChat />
         )}
+
+        <TextSelectionToolbar />
+
+        {/* Global agent create/edit modal — opened via openAgentEditModal()
+            from any page (Agents.tsx, WorkspaceDetail.tsx, WorkspaceChat).
+            Mounted here (inside the Router tree, under AppLayout) rather
+            than in main.tsx because it calls useNavigate(). */}
+        <AgentEditModal />
 
 
         {helpOpen && (

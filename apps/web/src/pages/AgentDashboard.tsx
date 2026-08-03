@@ -100,7 +100,7 @@ export default function AgentDashboard() {
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
       <PageHeader
         title={t("nav.agentDashboard")}
-        subtitle={`${t("page.agent_dashboard.monitoring")} ${agentList.length} ${agentList.length !== 1 ? t("page.agent_dashboard.agents_plural") : t("page.agent_dashboard.agent_singular")}`}
+        meta={`${t("page.agent_dashboard.monitoring")} ${agentList.length} ${agentList.length !== 1 ? t("page.agent_dashboard.agents_plural") : t("page.agent_dashboard.agent_singular")}`}
       >
         <button onClick={() => navigate("/agents")} className="btn-manor-outline" style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 8 }}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>

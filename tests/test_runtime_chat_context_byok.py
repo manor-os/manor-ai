@@ -16,7 +16,7 @@ async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch
     async def fake_resolve_workspace_runtime(*_args, **kwargs):
         return SimpleNamespace(
             workspace_id=kwargs.get("workspace_id"),
-            legacy_tool_profile=None,
+            tool_profile=None,
             is_master=False,
             task_id=None,
             thread_ref_kind=None,
@@ -124,6 +124,90 @@ async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_runtime_chat_context_prefers_fixed_agent_config(monkeypatch):
+    from packages.core.ai.runtime.prompt_adapter import ChatContext
+    from packages.core.services import runtime_chat_context as module
+
+    async def fake_resolve_workspace_runtime(*_args, **kwargs):
+        return SimpleNamespace(
+            workspace_id=kwargs.get("workspace_id"),
+            tool_profile=None,
+            is_master=False,
+            task_id=None,
+            thread_ref_kind=None,
+            thread_ref_id=None,
+            bound_tool_names=[],
+            mcp_allowed_names=set(),
+            extra_context=None,
+        )
+
+    async def fake_assemble_prompt(_db, *, request, **_kwargs):
+        ctx = ChatContext(
+            db=_db,
+            entity_id=request.entity_id,
+            user_id=request.user_id,
+            agent_id=request.agent_id,
+        )
+        ctx.agent = SimpleNamespace(
+            config={
+                "model_mode": "fixed",
+                "model": "openai/gpt-5.6-terra",
+                "temperature": 0.15,
+                "max_tokens": 6144,
+            }
+        )
+        return SimpleNamespace(
+            context=ctx,
+            tool_schemas=[],
+            prompt="system prompt",
+        )
+
+    async def fake_resolve_model(*_args, **_kwargs):
+        return "anthropic/claude-sonnet-4.6"
+
+    async def fake_resolve_metadata(*_args, **_kwargs):
+        return {"llm_api_key": "sk-test-owner-key-1234567890"}
+
+    async def fake_auto_skill_forced_tool_calls(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_runtime.resolve_workspace_runtime",
+        fake_resolve_workspace_runtime,
+    )
+    monkeypatch.setattr(module, "runtime_assemble_prompt_for_turn", fake_assemble_prompt)
+    monkeypatch.setattr(
+        module,
+        "runtime_auto_skill_forced_tool_calls",
+        fake_auto_skill_forced_tool_calls,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.model_resolver.resolve_model_for_user",
+        fake_resolve_model,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.model_resolver.resolve_llm_metadata_for_user",
+        fake_resolve_metadata,
+    )
+
+    _prompt, _tools, _history, ctx = await module.resolve_runtime_chat_context(
+        object(),
+        "hello",
+        entity_id="ent_active",
+        user_id="member_user",
+        agent_id="agent_fixed",
+    )
+
+    assert ctx.model == "openai/gpt-5.6-terra"
+    assert ctx.temperature == 0.15
+    assert ctx.max_tokens == 6144
+    assert ctx.llm_metadata == {
+        "llm_api_key": "sk-test-owner-key-1234567890",
+        "_resolved_model": "openai/gpt-5.6-terra",
+    }
+
+
+@pytest.mark.asyncio
 async def test_runtime_chat_context_adds_turn_scoped_extra_tools(monkeypatch):
     from packages.core.ai.runtime.prompt_adapter import ChatContext
     from packages.core.services import runtime_chat_context as module
@@ -141,7 +225,7 @@ async def test_runtime_chat_context_adds_turn_scoped_extra_tools(monkeypatch):
     async def fake_resolve_workspace_runtime(*_args, **kwargs):
         return SimpleNamespace(
             workspace_id=kwargs.get("workspace_id"),
-            legacy_tool_profile=None,
+            tool_profile=None,
             is_master=False,
             task_id=None,
             thread_ref_kind=None,

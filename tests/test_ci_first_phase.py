@@ -38,14 +38,14 @@ def load_docs_deploy() -> dict:
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
-def test_ci_runs_first_phase_on_pull_requests_and_branch_pushes() -> None:
+def test_ci_runs_first_phase_on_pull_requests_and_main_pushes() -> None:
     workflow = load_ci()
     triggers = workflow["on"]
 
     assert triggers["workflow_dispatch"]["inputs"]["test_level"]["default"] == "smoke"
     assert triggers["workflow_dispatch"]["inputs"]["test_level"]["options"] == ["smoke", "regression"]
     assert triggers["pull_request"]["branches"] == ["dev", "main"]
-    assert triggers["push"]["branches"] == ["dev", "main"]
+    assert triggers["push"]["branches"] == ["main"]
 
 
 def test_pull_request_gate_keeps_docker_e2e_out_of_required_jobs() -> None:
@@ -153,9 +153,15 @@ def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None
     job = workflow["jobs"]["build-and-deploy"]
     steps = job["steps"]
 
-    assert triggers["push"]["tags"] == ["v*"]
-    assert "branches" not in triggers["push"]
-    assert "paths" not in triggers["push"]
+    # Docs deploy on dev pushes that touch docs content (the v* tag trigger
+    # was removed: tags were never pushed, and a paths filter alongside a
+    # tags filter would silently skip tag deploys).
+    assert triggers["push"]["branches"] == ["dev"]
+    assert "tags" not in triggers["push"]
+    assert triggers["push"]["paths"] == [
+        "docs-site/**",
+        ".github/workflows/deploy-docs.yml",
+    ]
     assert triggers["workflow_dispatch"]["inputs"]["publish"]["default"] is False
     assert triggers["workflow_dispatch"]["inputs"]["publish"]["type"] == "boolean"
     assert "if" not in job

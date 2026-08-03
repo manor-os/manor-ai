@@ -12,6 +12,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import (
+    HITL_LOG_TYPES,
+    HITL_REQUEST_LOG_TYPES,
+    TaskLogType,
+)
+from packages.core.constants.execution import ExecutionPlanStatus
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import TaskLog
 from packages.core.services.task_state_machine import apply_task_status_transition
@@ -22,16 +28,14 @@ logger = logging.getLogger(__name__)
 _PLAN_COMPLETION_RECONCILABLE_TASK_STATUSES = {"pending", "in_progress", "waiting_on_customer", "completed"}
 
 
-def _step_result_summary(result: Any) -> str:
-    if not isinstance(result, dict):
-        return str(result or "")[:500]
-    return str(result.get("text") or result.get("value") or result.get("summary") or "")[:500]
-
-
 def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -> dict[str, Any]:
     # Keep artifact extraction identical to the executor so task output,
     # dependency handoff, and UI display agree on file references.
-    from packages.core.plans.executor import _artifact_refs_from_result, _dedupe_task_artifact_refs
+    from packages.core.plans.executor import (
+        _artifact_refs_from_result,
+        _dedupe_task_artifact_refs,
+        _step_result_summary,
+    )
 
     step_summaries: list[dict[str, Any]] = []
     all_files: list[dict[str, Any]] = []
@@ -94,7 +98,7 @@ async def _has_open_supervisor_input_request(db: AsyncSession, *, task_id: str, 
     rows = list((await db.execute(
         select(TaskLog).where(
             TaskLog.task_id == task_id,
-            TaskLog.log_type.in_(("ai_hitl_requested", "ai_hitl_reminder", "ai_hitl_resumed")),
+            TaskLog.log_type.in_([m.value for m in HITL_LOG_TYPES]),
         ).order_by(TaskLog.created_at)
     )).scalars().all())
 
@@ -104,10 +108,10 @@ async def _has_open_supervisor_input_request(db: AsyncSession, *, task_id: str, 
         meta_plan_id = str(meta.get("plan_id") or "")
         if meta_plan_id and meta_plan_id != plan_id:
             continue
-        if log.log_type == "ai_hitl_resumed":
+        if log.log_type == TaskLogType.AI_HITL_RESUMED:
             open_request = False
             continue
-        if log.log_type in {"ai_hitl_requested", "ai_hitl_reminder"} and (
+        if log.log_type in HITL_REQUEST_LOG_TYPES and (
             meta.get("verdict") == "needs_human"
             or bool(meta.get("artifact_required"))
         ):
@@ -135,7 +139,7 @@ async def reconcile_task_from_latest_completed_plan(db: AsyncSession, task: Any)
         select(ExecutionPlan).where(
             ExecutionPlan.entity_id == entity_id,
             ExecutionPlan.task_id == task_id,
-            ExecutionPlan.status == "completed",
+            ExecutionPlan.status == ExecutionPlanStatus.COMPLETED,
         ).order_by(ExecutionPlan.completed_at.desc().nullslast(), ExecutionPlan.created_at.desc()).limit(1)
     )).scalar_one_or_none()
     if not plan:
@@ -167,7 +171,7 @@ async def reconcile_task_from_latest_completed_plan(db: AsyncSession, task: Any)
 
     if task_status != "completed":
         try:
-            apply_task_status_transition(task, "completed")
+            await apply_task_status_transition(task, "completed", db=db)
         except Exception:
             logger.debug(
                 "Could not reconcile task %s status %s from completed plan %s",

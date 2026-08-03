@@ -1,0 +1,28 @@
+{
+  "id": "intro",
+  "name": "intro",
+  "type": "runtime_guidance",
+  "category": "platform-help",
+  "output_format": "guidance",
+  "tags": [
+    "manor-ai",
+    "oss",
+    "product-guide",
+    "onboarding",
+    "troubleshooting",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "read_file",
+    "list_files"
+  ],
+  "bundle_roots": [
+    "references"
+  ],
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the user asks for information, explanation, onboarding guidance, product-specific instructions, or troubleshooting about the public self-hosted Manor AI product, including its behavior, features, workflows, or settings, regardless of language",
+    "result_authority": "primary_source"
+  }
+}

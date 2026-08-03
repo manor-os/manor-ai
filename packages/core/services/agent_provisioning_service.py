@@ -50,6 +50,7 @@ class CustomAgentSpec:
 
     agent_name: str
     system_prompt: str
+    agent_slug: Optional[str] = None
     description: str = ""
     category: Optional[str] = None
     tags: List[str] = field(default_factory=list)
@@ -101,44 +102,96 @@ async def provision_custom_agent(
         raise ValueError("system_prompt is required")
 
     warnings: List[str] = []
+    capabilities = sorted({
+        capability.strip()
+        for capability in spec.business_capabilities
+        if isinstance(capability, str) and capability.strip()
+    })
+    portable_slug = str(spec.agent_slug or "").strip() or None
+    agent = None
+    if portable_slug:
+        agent = (await db.execute(
+            select(Agent).where(
+                Agent.entity_id == entity_id,
+                Agent.slug == portable_slug,
+                Agent.deleted_at.is_(None),
+            ).order_by(Agent.created_at.asc()).limit(1)
+        )).scalar_one_or_none()
 
-    # ── Create the Agent row ──
-    agent_id = generate_ulid()
-    from packages.core.services.agent_service import generate_agent_avatar_url
-    agent = Agent(
-        id=agent_id,
-        entity_id=entity_id,
-        name=spec.agent_name.strip(),
-        description=(spec.description or f"Custom agent: {spec.agent_name}").strip(),
-        avatar_url=generate_agent_avatar_url(spec.agent_name.strip()),
-        system_prompt=spec.system_prompt.strip(),
-        category=spec.category,
-        tags=list(spec.tags),
-        is_template=False,
-        is_public=False,
-        source=spec.source,
-        status="active",
-        config={"auto_generated": True},
-    )
-    db.add(agent)
-    await db.flush()
+    if agent is None:
+        agent_id = generate_ulid()
+        from packages.core.services.agent_service import generate_agent_avatar_url
+        agent = Agent(
+            id=agent_id,
+            entity_id=entity_id,
+            name=spec.agent_name.strip(),
+            slug=portable_slug,
+            description=(spec.description or f"Custom agent: {spec.agent_name}").strip(),
+            avatar_url=generate_agent_avatar_url(spec.agent_name.strip()),
+            system_prompt=spec.system_prompt.strip(),
+            category=spec.category,
+            tags=list(spec.tags),
+            is_template=False,
+            is_public=False,
+            source=spec.source,
+            status="active",
+            config={
+                "auto_generated": True,
+                "business_capabilities": capabilities,
+            },
+        )
+        db.add(agent)
+        await db.flush()
+    else:
+        from packages.core.revisions import (
+            AGENT_CONTENT_REVISION_FIELDS,
+            bump_revision,
+            content_patch_for,
+        )
+        agent_id = agent.id
+        config = dict(agent.config or {})
+        config["auto_generated"] = bool(config.get("auto_generated", True))
+        config["business_capabilities"] = sorted(set(
+            config.get("business_capabilities") or []
+        ) | set(capabilities))
+        # M11: re-provisioning an existing agent with the same capability set
+        # is a no-op — only a widened config / reactivation bumps.
+        content_patch = content_patch_for(
+            agent,
+            {"config": config, "status": "active"},
+            AGENT_CONTENT_REVISION_FIELDS,
+        )
+        agent.config = config
+        agent.status = "active"
+        if content_patch:
+            await bump_revision(db, agent, patch=content_patch)
 
     bound_tools = await _bind_tools(db, agent_id=agent_id, tool_names=spec.tool_bindings, warnings=warnings)
     base_skill_binding_config = _base_skill_binding_config(spec=spec, agent_id=agent_id)
-    bound_skills = await _bind_existing_skills(
+    bound_skills, missing_skill_refs = await _bind_existing_skills(
         db,
         agent_id=agent_id,
         entity_id=entity_id,
         refs=spec.skill_bindings,
-        warnings=warnings,
         binding_config=base_skill_binding_config,
     )
-    created_skills, reused_skills = await _create_and_bind_missing_skills(
-        db, agent_id=agent_id, entity_id=entity_id, category=spec.category,
-        specs=spec.missing_skill_specs, warnings=warnings,
-        binding_config=base_skill_binding_config,
+    created_skills, reused_skills, resolved_requested_skill_refs = (
+        await _create_and_bind_missing_skills(
+            db, agent_id=agent_id, entity_id=entity_id, category=spec.category,
+            specs=spec.missing_skill_specs, warnings=warnings,
+            binding_config=base_skill_binding_config,
+        )
     )
     bound_skills.extend(ref for ref in reused_skills if ref not in bound_skills)
+    materialized_skill_refs = (
+        set(bound_skills)
+        | set(created_skills)
+        | set(reused_skills)
+        | set(resolved_requested_skill_refs)
+    )
+    for ref in missing_skill_refs:
+        if ref not in materialized_skill_refs:
+            warnings.append(f"skill not found: {ref}")
     bound_mcp_servers = await _bind_mcp_servers(
         db, agent_id=agent_id, refs=spec.mcp_bindings, warnings=warnings,
     )
@@ -146,7 +199,7 @@ async def provision_custom_agent(
     await db.flush()
     return ProvisionResult(
         agent_id=agent_id,
-        agent_name=spec.agent_name,
+        agent_name=agent.name,
         bound_tools=bound_tools,
         bound_skills=bound_skills,
         created_skills=created_skills,
@@ -221,6 +274,7 @@ def spec_from_create_agent_draft(
     return CustomAgentSpec(
         agent_name=agent_name,
         system_prompt=system_prompt,
+        agent_slug=(draft.get("agent_slug") or draft.get("blueprint_agent_slug")),
         description=draft.get("agent_description") or (
             f"General worker for '{service_key}' capability" if service_key else "Custom agent"
         ),
@@ -264,6 +318,9 @@ async def _bind_tools(
         )
     )).scalars().all()
     by_name = {t.name: t for t in existing}
+    existing_tool_ids = set((await db.execute(
+        select(AgentToolBinding.tool_id).where(AgentToolBinding.agent_id == agent_id)
+    )).scalars().all())
     try:
         from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
 
@@ -287,7 +344,9 @@ async def _bind_tools(
             db.add(td)
             await db.flush()
             by_name[name] = td
-        db.add(AgentToolBinding(agent_id=agent_id, tool_id=td.id))
+        if td.id not in existing_tool_ids:
+            db.add(AgentToolBinding(agent_id=agent_id, tool_id=td.id))
+            existing_tool_ids.add(td.id)
         bound.append(name)
     return bound
 
@@ -324,12 +383,11 @@ async def _bind_existing_skills(
     agent_id: str,
     entity_id: str,
     refs: List[str],
-    warnings: List[str],
     binding_config: dict[str, Any] | None = None,
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
     refs = [s for s in (refs or []) if isinstance(s, str) and s]
     if not refs:
-        return []
+        return [], []
     rows = (await db.execute(
         select(Skill).where(
             Skill.status == "active",
@@ -357,10 +415,8 @@ async def _bind_existing_skills(
         matched_refs.add(s.id)
         if s.slug:
             matched_refs.add(s.slug)
-    for ref in refs:
-        if ref not in matched_refs:
-            warnings.append(f"skill not found: {ref}")
-    return bound
+    missing_refs = [ref for ref in refs if ref not in matched_refs]
+    return bound, missing_refs
 
 
 def _skill_ref(skill: Skill) -> str:
@@ -428,7 +484,6 @@ async def _select_existing_skill_for_missing_spec(
             or_(Skill.entity_id == entity_id, Skill.is_public.is_(True)),
         )
         .order_by(skill_priority.asc(), Skill.created_at.desc())
-        .limit(80)
     )).scalars().all()
     candidates: List[Skill] = [
         row for row in rows
@@ -508,9 +563,10 @@ async def _create_and_bind_missing_skills(
     specs: List[Dict[str, Any]],
     warnings: List[str],
     binding_config: dict[str, Any] | None = None,
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str]]:
     created: List[str] = []
     reused: List[str] = []
+    resolved_requested_refs: List[str] = []
     for ms in specs or []:
         if not isinstance(ms, dict):
             continue
@@ -540,6 +596,10 @@ async def _create_and_bind_missing_skills(
                 },
             )
             reused.append(_skill_ref(existing_skill))
+            resolved_requested_refs.extend(
+                ref for ref in (ms.get("slug"), ms.get("name"))
+                if isinstance(ref, str) and ref.strip()
+            )
             continue
 
         from packages.core.services.skill_service import create_skill
@@ -572,7 +632,11 @@ async def _create_and_bind_missing_skills(
             },
         )
         created.append(_skill_ref(skill_row))
-    return created, reused
+        resolved_requested_refs.extend(
+            ref for ref in (ms.get("slug"), ms.get("name"))
+            if isinstance(ref, str) and ref.strip()
+        )
+    return created, reused, resolved_requested_refs
 
 
 def _merge_agent_skill_binding_config(
@@ -657,15 +721,27 @@ async def _bind_mcp_servers(
             (MCPServer.id.in_(refs)) | (MCPServer.server_key.in_(refs)),
         )
     )).scalars().all()
+    existing_bindings = {
+        binding.mcp_server_id: binding
+        for binding in (await db.execute(
+            select(AgentMCPBinding).where(AgentMCPBinding.agent_id == agent_id)
+        )).scalars().all()
+    }
     bound: List[str] = []
     matched_refs: set[str] = set()
     for srv in servers:
-        db.add(AgentMCPBinding(
-            id=generate_ulid(),
-            agent_id=agent_id,
-            mcp_server_id=srv.id,
-            status="active",
-        ))
+        existing = existing_bindings.get(srv.id)
+        if existing is not None:
+            existing.status = "active"
+        else:
+            binding = AgentMCPBinding(
+                id=generate_ulid(),
+                agent_id=agent_id,
+                mcp_server_id=srv.id,
+                status="active",
+            )
+            db.add(binding)
+            existing_bindings[srv.id] = binding
         bound.append(srv.server_key)
         matched_refs.add(srv.server_key)
         matched_refs.add(srv.id)

@@ -75,13 +75,37 @@ class Document(Base, TimestampMixin):
     # public | internal | confidential | restricted
     owner_id: Mapped[Optional[str]] = mapped_column(String(26))
     client_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    legal_hold_reason: Mapped[Optional[str]] = mapped_column(Text)
-    legal_hold_set_by: Mapped[Optional[str]] = mapped_column(String(26))
-    legal_hold_set_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     pii_detected: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     quarantine_status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="clean")
     # clean | pending_scan | quarantined | rejected
+
+
+class DocumentChunk(Base):
+    """A retrieval-sized slice of one document's extracted text.
+
+    RAG used to embed one whole document into a single averaged vector
+    (see index_document's history), which dilutes a long document into one
+    point — a fact three pages in gets no more representation than the title.
+    Chunks are embedded independently so retrieval finds the paragraph, not
+    just the document.
+
+    ``embedding`` (pgvector) is added via raw SQL in the creating migration,
+    matching ``Document.embedding`` — see the comment there.
+    """
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        Index("ix_document_chunks_document", "document_id", "chunk_index"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+    document_id: Mapped[str] = mapped_column(
+        String(26), nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
 
 
 class DocumentFolder(Base, TimestampMixin):
@@ -132,9 +156,18 @@ class Integration(Base, TimestampMixin):
     include that permission.
     """
     __tablename__ = "integrations"
+    __table_args__ = (
+        Index("ix_integrations_entity_provider", "entity_id", "provider"),
+    )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    # Who connected this integration. Provenance only — an integration stays
+    # shared entity-wide, and this never narrows who may use or edit it.
+    # Deliberately NOT named ``created_by``/``owner_user_id``: those are the
+    # ownership columns ResourceDescriptor.from_row() reads, and picking one
+    # up here would silently turn a shared integration into a personal one.
+    created_by_user_id: Mapped[Optional[str]] = mapped_column(String(26))
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="active")
     config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")

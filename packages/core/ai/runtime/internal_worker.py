@@ -21,12 +21,17 @@ async def runtime_execute_internal_worker_llm_step(
     agent_id: str | None = None,
     workspace_id: str | None = None,
     model: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
     byok: bool = False,
     metadata: dict[str, Any] | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute an InternalWorker LLM step with Runtime-owned defaults."""
 
     user_prompt = runtime_prompt_with_output_schema(prompt, expected_output_schema)
+    runtime_overrides: dict[str, Any] = {}
+    if temperature is not None:
+        runtime_overrides["temperature"] = temperature
     return await runtime_execute_text_completion(
         runtime_one_shot_messages(
             system_prompt=system_prompt,
@@ -38,7 +43,8 @@ async def runtime_execute_internal_worker_llm_step(
         workspace_id=workspace_id,
         source=RUNTIME_WORKER_SOURCE,
         model=model,
-        max_tokens=4096,
+        max_tokens=4096 if max_tokens is None else max_tokens,
         byok=byok,
         metadata=metadata,
+        **runtime_overrides,
     )

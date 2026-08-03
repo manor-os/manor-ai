@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type ReactNode } from "react";
+import { useState, useRef, useEffect, useId, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { t } from "../../lib/i18n";
 
@@ -24,6 +24,7 @@ interface SelectProps {
   selectedOptionColor?: string;
   selectedOptionCheckColor?: string;
   disabled?: boolean;
+  ariaLabel?: string;
 }
 
 function nonPositionalDropdownStyle(style?: React.CSSProperties): React.CSSProperties {
@@ -56,6 +57,7 @@ export default function Select({
   selectedOptionColor = "#436b65",
   selectedOptionCheckColor = "#436b65",
   disabled = false,
+  ariaLabel,
 }: SelectProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -63,9 +65,15 @@ export default function Select({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const menuId = useId();
   // The menu is portaled to <body> with fixed positioning so it's never clipped
   // by a parent's overflow (e.g. inside a modal). Position tracks the trigger.
-  const [coords, setCoords] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [coords, setCoords] = useState<{
+    top: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+  } | null>(null);
 
   const normalizedOptions: SelectOption[] = options.map((o) =>
     typeof o === "string" ? { value: o, label: o } : o
@@ -79,7 +87,7 @@ export default function Select({
     : normalizedOptions;
   const safeDropdownStyle = nonPositionalDropdownStyle(dropdownStyle);
 
-  // Position the portaled menu under the trigger; keep it tracking on scroll/resize.
+  // Position the portaled menu on the side with enough room; keep it tracking on scroll/resize.
   useEffect(() => {
     if (!open) return;
     const place = () => {
@@ -87,22 +95,42 @@ export default function Select({
       if (r) {
         const menuWidth = Math.max(r.width, dropdownMinWidth);
         const viewportPadding = 12;
+        const configuredMaxHeight = typeof dropdownStyle?.maxHeight === "number"
+          ? dropdownStyle.maxHeight
+          : 240;
+        const optionHeight = typeof optionStyle?.height === "number" ? optionStyle.height : 36;
+        const estimatedMenuHeight = Math.min(
+          configuredMaxHeight,
+          Math.max(44, filtered.length * optionHeight + (filterable ? 50 : 8)),
+        );
+        const menuHeight = menuRef.current?.getBoundingClientRect().height || estimatedMenuHeight;
+        const availableBelow = window.innerHeight - r.bottom - viewportPadding;
+        const availableAbove = r.top - viewportPadding;
+        const openAbove = menuHeight > availableBelow && availableAbove > availableBelow;
+        const availableHeight = openAbove ? availableAbove : availableBelow;
+        const maxHeight = Math.max(0, Math.min(configuredMaxHeight, availableHeight));
+        const visibleMenuHeight = Math.min(menuHeight, maxHeight);
         const maxLeft = Math.max(viewportPadding, window.innerWidth - menuWidth - viewportPadding);
         setCoords({
-          top: r.bottom + 4,
+          top: openAbove
+            ? Math.max(viewportPadding, r.top - visibleMenuHeight - 4)
+            : Math.min(r.bottom + 4, window.innerHeight - viewportPadding - visibleMenuHeight),
           left: Math.min(Math.max(viewportPadding, r.left), maxLeft),
           width: r.width,
+          maxHeight,
         });
       }
     };
     place();
+    const frame = window.requestAnimationFrame(place);
     window.addEventListener("scroll", place, true);
     window.addEventListener("resize", place);
     return () => {
+      window.cancelAnimationFrame(frame);
       window.removeEventListener("scroll", place, true);
       window.removeEventListener("resize", place);
     };
-  }, [open, dropdownMinWidth]);
+  }, [open, dropdownMinWidth, dropdownStyle?.maxHeight, filterable, filtered.length, optionStyle?.height]);
 
   // Close on outside click — the menu lives in a portal, so check both it and the trigger.
   useEffect(() => {
@@ -128,6 +156,10 @@ export default function Select({
         ref={triggerRef}
         type="button"
         disabled={disabled}
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
         onClick={() => {
           if (disabled) return;
           setOpen(!open);
@@ -159,14 +191,20 @@ export default function Select({
 
       {/* Dropdown — portaled to <body> so a parent's overflow never clips it. */}
       {open && coords && createPortal(
-        <div ref={menuRef} className="manor-select-menu" style={{
+        <div
+          ref={menuRef}
+          id={menuId}
+          className="manor-select-menu"
+          role="listbox"
+          aria-label={ariaLabel || placeholder}
+          style={{
           position: "fixed", top: coords.top, left: coords.left, width: coords.width, zIndex: 100000,
           background: "var(--surface-panel)", backdropFilter: "blur(28px) saturate(140%)",
           WebkitBackdropFilter: "blur(28px) saturate(140%)",
           border: "1px solid var(--border-default)", borderRadius: 14,
           boxShadow: "var(--shadow-lg)",
           minWidth: dropdownMinWidth,
-          maxHeight: 240, overflowY: "auto", padding: 4,
+          maxHeight: coords.maxHeight, overflowY: "auto", padding: 4,
           animation: "dialog-in 0.15s ease-out",
           ...safeDropdownStyle,
         }}>
@@ -198,6 +236,8 @@ export default function Select({
               <button
                 key={o.value}
                 type="button"
+                role="option"
+                aria-selected={isSelected}
                 className={`manor-select-option${isSelected ? " is-selected" : ""}`}
                 onClick={() => { onChange(o.value); setOpen(false); setQuery(""); }}
                 style={{

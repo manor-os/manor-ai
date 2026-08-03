@@ -50,11 +50,28 @@ async def _prepare_test_database(engine, *, truncate_existing: bool) -> None:
     if not _tables_created:
         async with engine.begin() as conn:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
             await conn.run_sync(Base.metadata.drop_all)
             await conn.run_sync(Base.metadata.create_all)
-            # Add pgvector embedding column (managed outside SQLAlchemy model)
+            # Add pgvector embedding columns (managed outside SQLAlchemy models)
+            # and the trigram index document_chunks' lexical search needs —
+            # these come from Alembic migrations in real deployments, but this
+            # test bootstrap goes straight from models to schema, bypassing
+            # migrations entirely.
             await conn.execute(
                 text(f"ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding vector({TEST_EMBEDDING_DIMENSIONS})")
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS "
+                    f"embedding vector({TEST_EMBEDDING_DIMENSIONS})"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_document_chunks_content_trgm "
+                    "ON document_chunks USING GIN (content gin_trgm_ops)"
+                )
             )
         _tables_created = True
     elif truncate_existing:

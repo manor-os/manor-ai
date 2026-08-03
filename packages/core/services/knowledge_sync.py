@@ -28,6 +28,19 @@ from packages.core.services.knowledge_visibility import (
 from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.tool_cache_version import bump_tool_cache_version
 
+def _schedule_document_reembed(document_id: str | None) -> None:
+    """Best-effort re-embed after a byte change; the periodic sweep of
+    vector_status=='pending' is the durable fallback if the queue is down."""
+    if not document_id:
+        return
+    try:
+        from packages.core.tasks.ai_tasks import process_document_embeddings
+
+        process_document_embeddings.delay(document_id)
+    except Exception:
+        pass
+
+
 _AUTO_CREATE_FOLDER_SOURCES = {
     "manual",
     "upload",
@@ -56,6 +69,7 @@ class KnowledgeReconcileResult:
     scanned_files: int = 0
     synced_files: int = 0
     checked_documents: int = 0
+    missing_documents: int = 0
     trashed_missing_documents: int = 0
     limited: bool = False
 
@@ -94,14 +108,28 @@ async def sync_file_to_knowledge(
     detected = detect_file_type(abs_path, declared_name=os.path.basename(rel_path))
     ext = detected.extension
     mime_type = detected.mime_type
+    if not workspace_id:
+        from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
+        workspace_id = await infer_workspace_id_from_storage_path(
+            entity_id=entity_id,
+            rel_path=rel_path,
+        )
     resolved_folder_id = folder_id
     if resolved_folder_id is None:
-        rel_dir = os.path.dirname(rel_path)
-        if rel_dir and is_user_visible_folder_path(rel_dir):
-            if source in _AUTO_CREATE_FOLDER_SOURCES:
-                resolved_folder_id = await ensure_folder_path(entity_id, rel_dir)
-            else:
-                resolved_folder_id = await find_folder_path(entity_id, rel_dir)
+        if workspace_id:
+            from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+            resolved_folder_id = await ensure_workspace_document_folder(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                rel_path=rel_path,
+            )
+        else:
+            rel_dir = os.path.dirname(rel_path)
+            if rel_dir and is_user_visible_folder_path(rel_dir):
+                if source in _AUTO_CREATE_FOLDER_SOURCES:
+                    resolved_folder_id = await ensure_folder_path(entity_id, rel_dir)
+                else:
+                    resolved_folder_id = await find_folder_path(entity_id, rel_dir)
 
     # Reconcile re-projects files already on disk, so it must never be blocked
     # by the storage quota; every other source counts as adding to the KB.
@@ -125,11 +153,36 @@ async def sync_file_to_knowledge(
             # Over the plan limit: the file stays on disk but is not added to the
             # knowledge index. Callers (e.g. the generate_file tool) surface this.
             return KnowledgeSyncResult(False, reason="storage_limit")
+        # ── invalidate derived representations on a byte change ──
+        # A file's content lives in ONE place (the filesystem). The Document
+        # projection carries TWO derived copies — the pgvector embedding and a
+        # legacy metadata.content_text — that RAG serves. If a write/edit
+        # changed the bytes but we leave those derived copies alone, read-back
+        # returns stale content forever (the indexer only re-embeds
+        # vector_status=='pending', which nothing was setting on edit). Detect
+        # the change by mtime_ns (every writer here goes through os.replace, so
+        # mtime always advances) and mark the projection dirty + drop the
+        # content_text fork + schedule re-embedding, so the change pipeline is
+        # the single point that keeps every representation coherent.
+        prior_integrity = {}
+        if isinstance(doc.metadata_, dict):
+            prior_integrity = doc.metadata_.get("file_integrity") or {}
+        prior_mtime = prior_integrity.get("mtime_ns")
+        new_mtime = getattr(stat, "st_mtime_ns", None)
+        content_changed = prior_mtime != new_mtime  # None on first sync ⇒ changed
+
         doc.metadata_ = _with_file_integrity(
             doc.metadata_,
             status="ok",
-            mtime_ns=getattr(stat, "st_mtime_ns", None),
+            mtime_ns=new_mtime,
         )
+        if content_changed:
+            doc.vector_status = VectorStatus.PENDING
+            stale_meta = dict(doc.metadata_ or {})
+            stale_meta.pop("content_text", None)
+            stale_meta.pop("content", None)
+            doc.metadata_ = stale_meta
+            _schedule_document_reembed(doc.id)
         if resolved_folder_id is None and is_storage_only_path(rel_path):
             doc.folder_id = None
         if source in _FINAL_ARTIFACT_SOURCES or is_storage_only_path(rel_path):
@@ -170,15 +223,15 @@ async def reconcile_entity_filesystem(
     source: str = "filesystem_reconcile",
     created_by: str | None = None,
     sync_files: bool = True,
-    trash_missing: bool = True,
+    mark_missing: bool = True,
     max_files: int = 10_000,
 ) -> KnowledgeReconcileResult:
     """Make the Knowledge projection match the entity's real visible files.
 
     This is intentionally filesystem-led: visible files are upserted into
     ``documents`` and visible document rows whose ``fs_path`` no longer exists
-    are soft-deleted. Metadata-only documents and remote ``file_url`` documents
-    are left alone because they do not have a required local payload.
+    receive a recoverable integrity diagnostic. Reconciliation never trashes a
+    row because mounted storage can be temporarily unavailable.
     """
     root = os.path.realpath(entity_root)
     if not entity_id or not root or not os.path.isdir(root):
@@ -228,8 +281,8 @@ async def reconcile_entity_filesystem(
                 continue
 
     checked_documents = 0
-    trashed_missing = 0
-    if trash_missing:
+    missing_documents = 0
+    if mark_missing and not limited:
         async with async_session() as db:
             docs = list((await db.execute(
                 select(Document).where(
@@ -239,7 +292,6 @@ async def reconcile_entity_filesystem(
                 )
             )).scalars().all())
             checked_documents = len(docs)
-            now = datetime.now(timezone.utc)
             for doc in docs:
                 rel_path = normalize_rel_path(str(doc.fs_path or ""))
                 if not rel_path or not is_user_visible_path(rel_path):
@@ -254,17 +306,13 @@ async def reconcile_entity_filesystem(
                         continue
                 except ValueError:
                     pass
-                doc.is_trashed = True
-                doc.trashed_at = now
                 doc.metadata_ = _with_file_integrity(
                     doc.metadata_,
                     status="missing",
-                    recoverable=False,
+                    recoverable=True,
                 )
-                if doc.vector_status != VectorStatus.FAILED:
-                    doc.vector_status = VectorStatus.FAILED
-                trashed_missing += 1
-            if trashed_missing:
+                missing_documents += 1
+            if missing_documents:
                 await db.commit()
                 await bump_tool_cache_version(entity_id, "documents")
 
@@ -272,7 +320,8 @@ async def reconcile_entity_filesystem(
         scanned_files=len(visible_files),
         synced_files=synced_files,
         checked_documents=checked_documents,
-        trashed_missing_documents=trashed_missing,
+        missing_documents=missing_documents,
+        trashed_missing_documents=0,
         limited=limited,
     )
 
@@ -363,7 +412,12 @@ async def _mark_document_workspace_origin(
     return doc.id
 
 
-async def ensure_folder_path(entity_id: str, rel_path: str) -> str | None:
+async def ensure_folder_path(
+    entity_id: str,
+    rel_path: str,
+    *,
+    owner_id: str | None = None,
+) -> str | None:
     """Create/find the DocumentFolder chain for a visible relative directory."""
     rel_path = normalize_rel_path(rel_path)
     if not rel_path or not is_user_visible_folder_path(rel_path):
@@ -392,6 +446,7 @@ async def ensure_folder_path(entity_id: str, rel_path: str) -> str | None:
                         entity_id=entity_id,
                         name=name,
                         parent_id=parent_id,
+                        owner_id=owner_id,
                     )
                     .on_conflict_do_nothing()
                     .returning(DocumentFolder.id)
@@ -408,6 +463,16 @@ async def ensure_folder_path(entity_id: str, rel_path: str) -> str | None:
                     raise RuntimeError(f"Could not create or find Knowledge folder: {rel_path}")
             parent_id = folder_id
             last_id = folder_id
+        if owner_id and last_id:
+            await db.execute(
+                sa_update(DocumentFolder)
+                .where(
+                    DocumentFolder.id == last_id,
+                    DocumentFolder.entity_id == entity_id,
+                    DocumentFolder.owner_id.is_(None),
+                )
+                .values(owner_id=owner_id)
+            )
         await db.commit()
     return last_id
 

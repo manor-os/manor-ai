@@ -12,6 +12,7 @@ from packages.core.ai.runtime.skill_routing import (
     external_platform_action_intent,
     external_platform_draft_intent,
     local_coding_cli_intent,
+    youtube_platform_action_intent,
 )
 
 RuntimePromptGuidanceKind = Literal[
@@ -22,6 +23,7 @@ RuntimePromptGuidanceKind = Literal[
     "workspace_artifact",
     "workspace_task_update",
     "workspace_agent_mode",
+    "artifact_reference",
 ]
 
 
@@ -146,6 +148,31 @@ def _runtime_channel_language_instruction(language: str | None) -> str:
 
 def _runtime_file_editor_format_guidance(file_type: str, editor_type: str) -> list[str]:
     key = f"{file_type} {editor_type}".lower()
+    if "workflow" in key:
+        return [
+            "",
+            "Workflow editor-state requirements:",
+            "- Patch the current JSON graph and preserve "
+            '`format:"manor-workflow-v1"`.',
+            "- Keep these top-level fields complete and valid: `name`, `description`, "
+            "`trigger_type`, `trigger_config`, `variables`, `category`, `tags`, and `steps`.",
+            "- Every step requires a unique non-empty `id`, supported `type`, non-empty "
+            "`name`, `config` object, and its graph connections.",
+            "- Supported node types are trigger, webhook, llm, agent, rag, classifier, "
+            "extract, image, video, audio, condition, switch, loop, parallel, merge, "
+            "transform, filter, aggregate, split, limit, sort, dedupe, datetime, wait, "
+            "http, connector, code, tool, subworkflow, extractfromfile, respond, notify, "
+            "stop, end, and note.",
+            "- Use `next` arrays for ordinary connections, `true_next`/`false_next` for "
+            "conditions, and switch case/default targets where applicable. Every target "
+            "must reference an existing step id.",
+            "- A runnable graph has exactly one entry node of type `trigger` or `webhook`; "
+            "do not remove it unless replacing it with another explicit entry.",
+            "- Preserve node positions when editing existing nodes. Give newly added nodes "
+            "reasonable non-overlapping `{x,y}` positions.",
+            "- Preserve unrelated nodes, configuration, input/output bindings, and edges "
+            "unless the user explicitly asks to change them.",
+        ]
     if "diagram" in key:
         return [
             "",
@@ -320,6 +347,8 @@ _GUIDANCE_PROFILE_ALLOWLIST: dict[RuntimePromptGuidanceKind, set[RuntimeProfile]
     "workspace_artifact": _WORKSPACE_ACTION_PROFILES,
     "workspace_task_update": _WORKSPACE_ACTION_PROFILES,
     "workspace_agent_mode": {RuntimeProfile.WORKSPACE_OPERATOR},
+    # Any runtime that can produce a file must cite where it went.
+    "artifact_reference": _INTERNAL_ACTION_PROFILES | _WORKSPACE_ACTION_PROFILES,
 }
 
 
@@ -509,17 +538,31 @@ def runtime_tool_usage_guidance(
         return None
     loaded_tools = _tool_name_set(tool_names)
     chrome_local_route = detect_chrome_local_browser_route(active_user_message)
+    chrome_unavailable_clause = (
+        "For this YouTube request, follow the parallel YouTube capability "
+        "routing contract: if Chrome is unavailable before any side effect, "
+        "the parent may choose a runtime-visible YouTube MCP route only when "
+        "its actual tools support the requested operation. Marketplace Skill "
+        "absence is not a blocker. "
+        if youtube_platform_action_intent(active_user_message)
+        else (
+            "If the Chrome skill is not visible in this turn, stop and explain "
+            "that the Chrome runtime skill or setup is unavailable. "
+        )
+    )
     chrome_hint = (
-        "- The latest request explicitly asks to operate the user's local "
-        "Chrome browser. Treat this as a Chrome skill task, not a direct MCP "
-        "tool-discovery task. When the `chrome` skill is listed in Available "
+        "- Explicit Chrome intent wins: the latest request explicitly asks to "
+        "operate the user's local Chrome browser. Treat this as a Chrome skill task, "
+        "not a direct MCP tool-discovery task. URL or open browser tab is context, not browser intent, "
+        "but this request names Chrome/local browser or browser interaction. "
+        "When the `chrome` skill is listed in Available "
         "Skills, call `invoke_skill(skill=\"chrome\", input=<latest user "
         "request>)` as the primary route; if the `invoke_skill` schema is "
-        "deferred, load `invoke_skill` with `search_tools`; do not load Chrome MCP tools directly from the parent chat. The Chrome skill owns "
-        "status/open/list-tabs/read_page/click_element/fill_or_select/"
-        "computer/key/scroll through the Runtime Harness. If the Chrome skill is not "
-        "visible in this turn, stop and explain that the Chrome runtime skill "
-        "or setup is unavailable. Do not use `web_search`, `web_fetch`, or "
+        "deferred, load `invoke_skill` with `search_tools`; do not load Chrome MCP tools directly from the parent chat. The Chrome skill owns the Browser MCP package, including "
+        "documentation/capabilities/status/open_or_reuse/get_group_state/list-tabs/read_page/click_element/fill_or_select/"
+        "computer/key/scroll/upload/diagnostic tools, through the Runtime Harness. For nontrivial Chrome tasks, the Chrome skill should read the runtime-contract documentation before acting. It maintains a visible Browser Group with `open_or_reuse` and `groupTitle`. "
+        f"{chrome_unavailable_clause}"
+        "Do not use `web_search`, `web_fetch`, or "
         "`browse_web` as a substitute for Chrome.\n"
         if chrome_local_route and {"invoke_skill", "search_tools"}.intersection(loaded_tools)
         else ""
@@ -530,6 +573,45 @@ def runtime_tool_usage_guidance(
         "`web_fetch` only reads static HTTP content.\n"
         if not chrome_local_route
         and ("search_tools" in loaded_tools or "browse_web" in loaded_tools)
+        else ""
+    )
+    search_tools_two_step_hint = (
+        "- `search_tools`: search once with intent keywords first. If a "
+        "result's server summary looks right but the exact tool isn't "
+        "listed, call `search_tools` again with `browse_server:<server_key>` "
+        "to see that server's full tool list, then call the tool.\n"
+        if "search_tools" in loaded_tools
+        else ""
+    )
+    file_search_routing_hint = (
+        "- Default to `grep_files`/`glob_files` for searching entity files: "
+        "they run under a scan budget with a resume cursor, honestly report "
+        "`truncated` instead of silently timing out, and cannot mutate "
+        "anything. Reach for `bash`'s `grep`/`rg`/`find` only when you need "
+        "something they don't do — case-sensitive matching, context lines "
+        "(`-A`/`-B`/`-C`), `.gitignore`/hidden-path exclusion, or piping "
+        "results into another command.\n"
+        if {"grep_files", "glob_files"}.intersection(loaded_tools) and "bash" in loaded_tools
+        else ""
+    )
+    knowledge_retrieval_hint = (
+        "- Choose the Knowledge retrieval route by the evidence the answer requires, "
+        "not by whether the request happens to mention a file or document. Use `rag` "
+        "when answering requires facts, values, passages, summaries, comparisons, or "
+        "calculations from document bodies. Use `list_documents` / `search_documents` "
+        "(directly or through `manor`) only to inventory or identify documents by "
+        "filename/metadata, resolve a document reference, or locate a file for later "
+        "reading. For mixed or genuinely uncertain intent, call `rag` first. If RAG "
+        "reports `content_evidence_available=false`, document-name matches may be used "
+        "to identify possible files but never as evidence of their contents; say that "
+        "no indexed content evidence was found and only then use document metadata "
+        "search when it helps the user locate candidates. When the final answer uses "
+        "RAG body evidence, end it with `Sources:` followed by one Markdown bullet "
+        "`- [document name](url)` for each used `sources` entry whose "
+        "`evidence_type` is `content`; use the returned URL exactly. If "
+        "`content_evidence_available=false`, do not label metadata matches as sources; "
+        "when useful, link them under `Possible documents (metadata only):` instead.\n"
+        if "rag" in loaded_tools
         else ""
     )
     return (
@@ -545,6 +627,9 @@ def runtime_tool_usage_guidance(
         "- Match response length to scope: short question → short answer.\n"
         f"{chrome_hint}"
         f"{rendered_web_hint}"
+        f"{search_tools_two_step_hint}"
+        f"{file_search_routing_hint}"
+        f"{knowledge_retrieval_hint}"
         "- Route code/scripts/large content through generate_file(kind='code'), "
         "write_file, or bash, not inline chat text.\n"
         "- For LARGE files, prefer edit_file (targeted find/replace) over "
@@ -683,6 +768,55 @@ def runtime_external_integration_routing_guidance(
     if not external_platform_action_intent(active_user_message):
         return None
     loaded_tools = _tool_name_set(tool_names)
+    if youtube_platform_action_intent(active_user_message):
+        youtube_workspace_scope = ""
+        if workspace_id:
+            youtube_workspace_scope = (
+                "- In Workspace chats, use only YouTube MCP and Chrome "
+                "capabilities already present in the workspace runtime surface. "
+                "Do not invent, auto-bind, or treat a platform name as "
+                "authorization. If neither route is present, report the missing "
+                "connection; adding a future binding remains a separately "
+                "confirmed workspace operation.\n"
+            )
+        return (
+            "## YouTube Capability Routing\n"
+            "- Treat the YouTube MCP and Manor local Chrome as parallel "
+            "capability routes. Respect a route the user explicitly requested "
+            "when it can perform the operation; otherwise use whichever route "
+            "is actually available and capable. Do not require both.\n"
+            "- Inspect the runtime-visible tools and Available Skills before "
+            "choosing. The built-in `mcp_youtube` Skill is the default guidance "
+            "for a connectable YouTube MCP. The optional "
+            "`youtube-studio-publisher` Marketplace Skill adds a professional "
+            "Chrome/Studio workflow; if it is not installed, recommend it once "
+            "without blocking, then continue through a viable direct `chrome` "
+            "Skill or YouTube MCP route.\n"
+            "- For a professional Chrome upload, invoke "
+            "`youtube-studio-publisher` when it is listed in Available Skills. "
+            "If it is not listed, the recommendation is informational: use the "
+            "direct `chrome` Skill when its local connection can complete the "
+            "request.\n"
+            f"{youtube_workspace_scope}"
+            "- Match capability to operation. Search, reads, comments, ratings, "
+            "metadata, and playlists may use a connected MCP when its current "
+            "tool surface exposes that operation, with Chrome as a fallback. A "
+            "new-video upload requires a route with an actual file-upload "
+            "operation; Manor's current built-in YouTube MCP pack does not "
+            "declare one, so do not infer upload support merely because the MCP "
+            "is connected.\n"
+            "- Execute a write through exactly one route. Before any file "
+            "selection, transfer, save, mutation, or publication click, a failed "
+            "or incapable route may hand off to another verified route. Once a "
+            "write may have started, lock that write to the route and verify the "
+            "original outcome before retrying anywhere else; never race or "
+            "blindly duplicate an upload or mutation.\n"
+            "- Follow the selected route's approval rules. An upload approval "
+            "does not authorize making a video public or scheduling it. If no "
+            "route can perform the requested operation, report the exact missing "
+            "capability or connection instead of treating Marketplace "
+            "installation as the blocker."
+        )
     if "search_tools" not in loaded_tools:
         return None
     workspace_scope = ""
@@ -918,4 +1052,42 @@ def runtime_workspace_in_flight_task_update_guidance(
         "workspace, or add persistent workspace-wide policy.\n"
         "- After the tool call succeeds, briefly confirm which task was updated and that "
         "the original running work was not interrupted."
+    )
+
+
+def runtime_artifact_reference_guidance(
+    *,
+    envelope,
+    tool_names: Iterable[str] | None,
+    has_tools: bool,
+) -> str | None:
+    """Require a real address whenever a file is produced or referred to.
+
+    A filename on its own is not a reference. The UI can only turn a mention
+    into something clickable when the text carries an address it can open, so
+    an answer that says "I saved final.mp4" leaves the user with a name and no
+    way to reach the file — and if the UI guesses from the name instead, it
+    produces cards that lead nowhere. One staging reply named an MP4 with no
+    path at all; the user's next message was that they could not find it.
+    """
+    if not has_tools or not runtime_allows_prompt_guidance(envelope, "artifact_reference"):
+        return None
+    loaded = _tool_name_set(tool_names)
+    produces_files = bool(loaded & {
+        "generate_file", "generate_image", "generate_video", "generate_audio",
+        "write_file", "merge_videos", "compose_video_timeline", "upload_document",
+    })
+    if not produces_files:
+        return None
+    return (
+        "## Naming a file is not delivering it\n"
+        "- Every time you tell the user about a file you produced or are "
+        "pointing them at, give the address the tool returned for it — the "
+        "`fs_path`, `document_id`, or file URL. Not the bare filename.\n"
+        "- Use the value verbatim from the tool result. Do not reconstruct a "
+        "path from the filename, the folder you intended, or a previous run: "
+        "a path you assembled yourself may not exist, and the user will click "
+        "it and find nothing.\n"
+        "- If a tool did not return an address, say the file was not saved "
+        "rather than naming it as though it were available."
     )

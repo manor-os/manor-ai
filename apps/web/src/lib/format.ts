@@ -323,3 +323,14 @@ export function formatPriceUsd(cents?: number | null): string {
 export function isPaidBlueprint(bp: { price_cents?: number | null }): boolean {
   return (bp.price_cents ?? 0) > 0;
 }
+
+/** True when a Blueprint has a higher reference price than its checkout price. */
+export function isBlueprintOnSale(bp: {
+  price_cents?: number | null;
+  list_price_cents?: number | null;
+}): boolean {
+  return (
+    bp.list_price_cents != null
+    && bp.list_price_cents > (bp.price_cents ?? 0)
+  );
+}

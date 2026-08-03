@@ -20,7 +20,7 @@ from packages.core.ai.llm_client import (
     _apply_prompt_cache,
     _openai_content_to_anthropic_blocks,
 )
-from packages.core.ai.runtime.legacy_tool_surface import MASTER_ALWAYS_LOADED
+from packages.core.ai.runtime.tool_visibility import MASTER_ALWAYS_LOADED
 from packages.core.ai.runtime import RUNTIME_AGENTIC_MAX_TOKENS
 from packages.core.ai.tool_pool import ToolPool
 from packages.core.services.usage_service import log_token_usage
@@ -218,6 +218,47 @@ def test_compact_search_tools_result_preserves_mcp_option_status():
     assert options["linkedin"]["execution_mode"] == "official_api"
 
 
+def test_compact_search_tools_result_keeps_servers_and_bounded_suppressed_mcp():
+    """Review #2 (tool_discovery_v2 B1): servers[] and suppressed_mcp used
+    to be dropped entirely by this compaction step, silently discarding
+    B1's model-facing value (which server groups matched, and why a
+    strongly-related server's tools didn't load) before it ever reached
+    the next turn's context."""
+    search_result = {
+        "query": "post a tweet",
+        "matches": [
+            {"name": "mcp__twitter_x__create_tweet", "available": False},
+        ],
+        "servers": [
+            {
+                "key": "twitter_x",
+                "name": "Twitter / X",
+                "matched_tools": 1,
+                "top_tools": ["mcp__twitter_x__create_tweet"],
+            },
+        ],
+        "suppressed_mcp": [
+            {
+                "server_key": f"provider_{i}",
+                "reason": "outside_active_user_intent",
+                "matched_tools": [f"mcp__provider_{i}__tool", "extra1", "extra2", "extra3"],
+            }
+            for i in range(5)
+        ],
+    }
+
+    compact = json.loads(
+        _compact_search_tools_result_for_context(search_result, [])
+    )
+
+    assert compact["servers"] == search_result["servers"]
+    # bounded: at most 3 suppressed entries, each with matched_tools capped at 3
+    assert len(compact["suppressed_mcp"]) == 3
+    for item in compact["suppressed_mcp"]:
+        assert set(item.keys()) == {"server_key", "reason", "matched_tools"}
+        assert len(item["matched_tools"]) <= 3
+
+
 def test_compact_tool_result_preserves_json_metadata():
     raw = json.dumps(
         {
@@ -349,9 +390,43 @@ async def test_compact_messages_summarizes_long_non_tool_history():
 
     assert len(compacted) < len(messages)
     assert compacted[0]["role"] == "system"
-    assert compacted[1]["content"] == "old question 0"
+    # The stale first question must NOT be promoted as the active task.
+    assert compacted[1]["content"] != "old question 0"
     assert any("[Earlier conversation compacted" in str(message.get("content", "")) for message in compacted)
     assert compacted[-1]["content"] == "fresh request"
+
+
+@pytest.mark.asyncio
+async def test_compact_messages_anchors_on_current_user_message_not_first():
+    """Regression: with long chat history plus >3 tool rounds, compaction must
+    preserve the *current* turn's user message verbatim — not resurrect the
+    conversation's first (stale) question as the active task."""
+    messages = [{"role": "system", "content": "system"}]
+    for index in range(30):
+        messages.append({"role": "user", "content": f"stale topic {index}"})
+        messages.append({"role": "assistant", "content": f"stale answer {index}"})
+    messages.append({"role": "user", "content": "migrate the files one by one"})
+    for round_index in range(5):
+        call_id = f"call_{round_index}"
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": call_id,
+                "function": {"name": "manor", "arguments": "{}"},
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": json.dumps({"ok": True, "round": round_index}),
+        })
+
+    compacted = await _compact_messages(messages, model=None, temperature=0)
+
+    standalone_contents = [str(m.get("content", "")) for m in compacted]
+    assert "migrate the files one by one" in standalone_contents
+    assert "stale topic 0" not in standalone_contents
 
 
 @pytest.mark.asyncio

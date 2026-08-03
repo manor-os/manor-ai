@@ -14,6 +14,21 @@ import packages.core.database as db_module
 router = APIRouter(tags=["health"])
 
 _STARTUP_TIME = time.time()
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+_PRODUCTION_ENVIRONMENTS = {"prod", "production"}
+
+
+def _feature_available(name: str, environment: str) -> bool:
+    """Return an environment default with an explicit deployment override."""
+    override = os.getenv(name)
+    if override is not None:
+        value = override.strip().lower()
+        if value in _TRUTHY:
+            return True
+        if value in _FALSY:
+            return False
+    return environment.strip().lower() not in _PRODUCTION_ENVIRONMENTS
 
 
 def _is_mountpoint(path: str) -> bool:
@@ -48,6 +63,7 @@ async def client_config():
         "environment": environment,
         "email_enabled": os.getenv("EMAIL_ENABLED", "false").lower() == "true",
         "fs_enabled": os.getenv("MANOR_FS_ENABLED", "false").lower() in ("true", "1"),
+        "flows_available": _feature_available("FLOWS_AVAILABLE", environment),
         "support_tickets_enabled": deployment_mode.lower() == "cloud",
     }
     return config
@@ -111,6 +127,21 @@ async def deep_health():
                 all_ok = False
     else:
         checks["filesystem"] = {"status": "disabled"}
+
+    # Credential backend (Vault Transit in cloud/prod, dev provider locally).
+    try:
+        import packages.core.credentials as credentials
+
+        cred_health = credentials.get_credential_service().health()
+        checks["credentials"] = {
+            "status": "ok" if cred_health.ok else "error",
+            "detail": cred_health.detail,
+        }
+        if not cred_health.ok:
+            all_ok = False
+    except Exception as e:
+        checks["credentials"] = {"status": "error", "detail": str(e)[:200]}
+        all_ok = False
 
     # System info
     uptime_seconds = time.time() - _STARTUP_TIME

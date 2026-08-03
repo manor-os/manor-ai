@@ -1,9 +1,9 @@
-import { useState, useMemo, type ReactNode } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../lib/api";
 import { useToastStore } from "../stores/toast";
-import type { Agent } from "../lib/types";
+import type { Agent, Workspace } from "../lib/types";
 import { relativeTime } from "../lib/format";
 import { MANOR_AGENT_ID, MANOR_AGENT_NAME, isMasterAgent } from "../lib/constants";
 import Modal from "../components/ui/Modal";
@@ -14,13 +14,16 @@ import LoadingSpinner from "../components/ui/LoadingSpinner";
 import UserAvatar from "../components/ui/UserAvatar";
 import Toggle from "../components/ui/Toggle";
 import StatPill from "../components/ui/StatPill";
+import TabSwitcher from "../components/ui/TabSwitcher";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import SmartToolbar from "../components/ui/SmartToolbar";
+import { FilterBar, FilterSelect } from "../components/ui/FilterBar";
+import Pagination from "../components/ui/Pagination";
 import { t } from "../lib/i18n";
 import { formatUserFacingText } from "../lib/taskDisplay";
 import { stringifyJobRunResult, summarizeJobRunResult } from "../lib/jobRunResult";
 import {
-  IconEdit, IconTrash, IconClock, IconChevronRight, IconPlay,
+  IconEdit, IconTrash, IconClock, IconChevronRight, IconPlay, IconFlow, IconWorkspace,
 } from "../components/icons";
 
 /* ── types ── */
@@ -30,9 +33,18 @@ interface ScheduledJob {
   schedule_kind?: string; cron_expr?: string; interval_seconds?: number; every_seconds?: number;
   run_at?: string; payload?: Record<string, any>; payload_message?: string;
   execution_target?: Record<string, any>;
+  execution_type?: string;
   agent_id?: string; enabled: boolean; timezone?: string;
   manor_task_id?: string | null;
-  last_run_at?: string; last_status?: string; consecutive_errors: number; created_at?: string;
+  last_run_at?: string; last_status?: string; last_error?: string; consecutive_errors: number; created_at?: string;
+}
+interface WorkflowBinding {
+  id: string; workflow_id: string; workspace_id?: string; name?: string;
+  trigger_type: string; trigger_config?: Record<string, any>;
+  config?: Record<string, any>; variables?: Record<string, any>; enabled: boolean; status: string;
+}
+interface WorkflowSummary {
+  id: string; name: string; description?: string; status: string;
 }
 interface JobRun {
   id: string; job_id: string; status: string; trigger_type: string;
@@ -40,6 +52,17 @@ interface JobRun {
 }
 
 /* ── constants ── */
+const PAGE_SIZE = 10;
+
+type AutomationStatusFilter = "all" | "enabled" | "paused" | "attention";
+
+const AUTOMATION_STATUS_OPTIONS = [
+  { key: "all", label: t("page.scheduled_jobs.all_statuses") },
+  { key: "enabled", label: t("page.scheduled_jobs.enabled") },
+  { key: "paused", label: t("page.scheduled_jobs.paused") },
+  { key: "attention", label: t("page.scheduled_jobs.needs_attention") },
+];
+
 const TYPE_META: Record<string, { label: string; color: string; icon: string }> = {
   cron:     { label: t("page.scheduled_jobs.recurring"), color: "#6d6fb2", icon: "M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" },
   interval: { label: t("page.scheduled_jobs.interval"), color: "#4f7d75", icon: "M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182" },
@@ -61,6 +84,25 @@ const TIMEZONE_OPTIONS = [
   "UTC", "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
   "Europe/London", "Europe/Paris", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai",
   "Asia/Singapore", "Asia/Kolkata", "Australia/Sydney", "Pacific/Auckland",
+];
+
+type AutomationKind = "agent_schedule" | "workflow_schedule" | "workflow_event";
+
+const AUTOMATION_KIND_TABS = [
+  { key: "agent_schedule", label: "Schedule an agent" },
+  { key: "workflow_schedule", label: "Schedule a workflow" },
+  { key: "workflow_event", label: "Run workflow on event" },
+];
+
+const WORKSPACE_EVENT_SUGGESTIONS = [
+  { value: "task.approval_decision", label: "Task approved or changes requested" },
+  { value: "task.comment", label: "Task receives a comment" },
+  { value: "workspace.channel_attached", label: "Channel connected" },
+  { value: "workspace.channel_updated", label: "Channel updated" },
+  { value: "workspace_work_batch.completed", label: "Work batch completed" },
+  { value: "workspace_work_batch.stalled", label: "Work batch stalled" },
+  { value: "workspace_agent.task_created", label: "Workspace agent creates a task" },
+  { value: "workspace_agent.task_runtime_updated", label: "Task runtime changes" },
 ];
 
 function browserTimezone(): string {
@@ -88,6 +130,17 @@ function summarizeAutomationMessage(message?: string | null, maxLength = 138): s
     .replace(/\.\.$/, ".");
 
   const friendly = formatUserFacingText(candidate);
+  if (friendly.length <= maxLength) return friendly;
+  return `${friendly.slice(0, Math.max(0, maxLength - 3)).trim()}...`;
+}
+
+function summarizeAutomationError(error?: string | null, maxLength = 120): string {
+  const friendly = formatUserFacingText(
+    String(error || "")
+      .replace(/^Agent execution failed:\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
   if (friendly.length <= maxLength) return friendly;
   return `${friendly.slice(0, Math.max(0, maxLength - 3)).trim()}...`;
 }
@@ -306,20 +359,30 @@ function RunDetail({ jobId, runId }: { jobId: string; runId: string }) {
 
 
 interface ScheduledJobsProps {
-  headerTabs?: ReactNode;
   workspaceId?: string;
+  workflowsEnabled?: boolean;
 }
 
 /* ── main ── */
-export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobsProps) {
+export default function ScheduledJobs({ workspaceId, workflowsEnabled = true }: ScheduledJobsProps) {
   const qc = useQueryClient();
   const toast = useToastStore();
-  const jobsQueryKey = useMemo(() => ["scheduled-jobs", workspaceId || "all"], [workspaceId]);
+  const showWorkflowAutomations = workspaceId ? workflowsEnabled : true;
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search.trim());
+  const [statusFilter, setStatusFilter] = useState<AutomationStatusFilter>("all");
+  const [agentFilter, setAgentFilter] = useState("all");
+  const [workspaceFilter, setWorkspaceFilter] = useState(workspaceId || "all");
+  const [page, setPage] = useState(1);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [openRunId, setOpenRunId] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [editJob, setEditJob] = useState<ScheduledJob | null>(null);
+  const [editBinding, setEditBinding] = useState<WorkflowBinding | null>(null);
+  const [fKind, setFKind] = useState<AutomationKind>("agent_schedule");
+  const [fWorkflow, setFWorkflow] = useState("");
+  const [fWorkspaceBinding, setFWorkspaceBinding] = useState("");
+  const [fEvent, setFEvent] = useState("task.approval_decision");
   const [fName, setFName] = useState("");
   const [fFreq, setFFreq] = useState<"hourly" | "daily" | "weekly" | "monthly" | "interval" | "once">("daily");
   const [fHour, setFHour] = useState(9); const [fMinute, setFMinute] = useState(0);
@@ -328,36 +391,123 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
   const [fIntervalSec, setFIntervalSec] = useState(3600);
   const [fRunAt, setFRunAt] = useState(""); const [fMessage, setFMessage] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleteBindingTarget, setDeleteBindingTarget] = useState<string | null>(null);
   const [fAgent, setFAgent] = useState(MANOR_AGENT_ID);
   const [fTimezone, setFTimezone] = useState(browserTimezone);
+  const selectedWorkspaceId = workspaceId || (workspaceFilter === "all" ? undefined : workspaceFilter);
+  const jobsQueryKey = useMemo(
+    () => [
+      "scheduled-jobs",
+      selectedWorkspaceId || "all",
+      deferredSearch,
+      statusFilter,
+      agentFilter,
+      page,
+      showWorkflowAutomations,
+    ],
+    [
+      agentFilter,
+      deferredSearch,
+      page,
+      selectedWorkspaceId,
+      showWorkflowAutomations,
+      statusFilter,
+    ],
+  );
+
+  useEffect(() => {
+    setPage(1);
+    setExpandedId(null);
+  }, [agentFilter, deferredSearch, selectedWorkspaceId, statusFilter]);
 
   // WebSocket job_update events and local mutations invalidate this query live.
-  const { data: jobsData, isLoading } = useQuery({
+  const { data: jobsData, isLoading, isFetching } = useQuery({
     queryKey: jobsQueryKey,
-    queryFn: () => api.jobs.list(workspaceId ? { workspace_id: workspaceId } : undefined),
+    queryFn: () => api.jobs.list({
+      workspace_id: selectedWorkspaceId,
+      search: deferredSearch || undefined,
+      status: statusFilter,
+      agent_id: agentFilter === "all" ? undefined : agentFilter,
+      include_workflows: showWorkflowAutomations,
+      limit: PAGE_SIZE,
+      offset: (page - 1) * PAGE_SIZE,
+    }),
+    placeholderData: (previousData) => previousData,
   });
-  const jobs: ScheduledJob[] = (jobsData?.items as ScheduledJob[] | undefined) ?? [];
+  const allJobs: ScheduledJob[] = (jobsData?.items as ScheduledJob[] | undefined) ?? [];
+  const jobs = showWorkflowAutomations ? allJobs : allJobs.filter((job) => job.execution_type !== "workflow");
+  const totalPages = Math.max(1, Math.ceil((jobsData?.total ?? 0) / PAGE_SIZE));
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+  const { data: workflows = [] } = useQuery({
+    queryKey: ["workflows"],
+    queryFn: () => api.workflows.list(),
+    enabled: !!workspaceId && showWorkflowAutomations,
+  });
+  const bindingsQueryKey = useMemo(() => ["workflow-bindings", workspaceId || "none"], [workspaceId]);
+  const { data: bindings = [], isLoading: bindingsLoading } = useQuery({
+    queryKey: bindingsQueryKey,
+    queryFn: () => workspaceId ? api.workflows.listBindings({ workspace_id: workspaceId }) : Promise.resolve([]),
+    enabled: !!workspaceId && showWorkflowAutomations,
+  });
   const { data: agents = [] } = useQuery({ queryKey: ["agents"], queryFn: () => api.agents.list() });
+  const { data: availableWorkspaces = [] } = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: () => api.workspaces.list(),
+    enabled: !workspaceId,
+  });
+  const workspaceById = useMemo(
+    () => new Map(
+      (availableWorkspaces as Workspace[]).map((workspace) => [workspace.id, workspace]),
+    ),
+    [availableWorkspaces],
+  );
+  const workspaceFilterOptions = useMemo(
+    () => [
+      { key: "all", label: t("page.scheduled_jobs.all_workspaces") },
+      ...(availableWorkspaces as Workspace[]).map((workspace) => ({
+        key: workspace.id,
+        label: workspace.name,
+      })),
+    ],
+    [availableWorkspaces],
+  );
+  const agentFilterOptions = useMemo(
+    () => [
+      { key: "all", label: t("page.scheduled_jobs.all_agents") },
+      { key: MANOR_AGENT_ID, label: MANOR_AGENT_NAME },
+      ...(agents as Agent[])
+        .filter((agent) => !isMasterAgent(agent.id))
+        .map((agent) => ({ key: agent.id, label: agent.name })),
+    ],
+    [agents],
+  );
+  const activeFilterCount = (statusFilter === "all" ? 0 : 1)
+    + (agentFilter === "all" ? 0 : 1)
+    + (!workspaceId && workspaceFilter !== "all" ? 1 : 0);
   const { data: runs = [] } = useQuery({ queryKey: ["job-runs", expandedId], queryFn: () => expandedId ? api.jobs.runs(expandedId) : Promise.resolve([]), enabled: !!expandedId });
+  const invalidateJobs = () => qc.invalidateQueries({ queryKey: ["scheduled-jobs"] });
 
   const createMut = useMutation({
     mutationFn: (d: any) => api.jobs.create(d),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: jobsQueryKey }); toast.success("Automation created"); closeModal(); },
+    onSuccess: () => { invalidateJobs(); toast.success("Automation created"); closeModal(); },
     onError: (e) => toast.error(translateApiError(e, "Failed to create automation")),
   });
   const updateMut = useMutation({
     mutationFn: ({ id, data }: { id: string; data: any }) => api.jobs.update(id, data),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: jobsQueryKey }); toast.success("Automation saved"); closeModal(); },
+    onSuccess: () => { invalidateJobs(); toast.success("Automation saved"); closeModal(); },
     onError: (e) => toast.error(translateApiError(e, "Failed to save automation")),
   });
-  const toggleMut = useMutation({ mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.jobs.toggle(id, enabled), onSuccess: () => qc.invalidateQueries({ queryKey: jobsQueryKey }) });
-  const deleteMut = useMutation({ mutationFn: (id: string) => api.jobs.delete(id), onSuccess: () => qc.invalidateQueries({ queryKey: jobsQueryKey }) });
+  const toggleMut = useMutation({ mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.jobs.toggle(id, enabled), onSuccess: invalidateJobs });
+  const deleteMut = useMutation({ mutationFn: (id: string) => api.jobs.delete(id), onSuccess: invalidateJobs });
   const runNowMut = useMutation({
     mutationFn: (id: string) => api.jobs.runNow(id),
     onSuccess: (_, id) => {
       // Worker creates the JobRun row; refresh both list (updates last_run_at)
       // and the runs panel for this job.
-      qc.invalidateQueries({ queryKey: jobsQueryKey });
+      invalidateJobs();
       qc.invalidateQueries({ queryKey: ["job-runs", id] });
       // Auto-refresh runs panel for ~10s so the new row appears as the
       // worker picks it up — JobRun rows often land 1-3s after dispatch.
@@ -369,19 +519,136 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
     },
   });
 
-  const filtered = useMemo(() => { const q = search.toLowerCase(); return q ? jobs.filter((j) => j.name.toLowerCase().includes(q) || j.job_type.includes(q)) : jobs; }, [jobs, search]);
-  const enabledN = jobs.filter((j) => j.enabled).length;
-  const errorN = jobs.filter((j) => j.consecutive_errors > 0).length;
-  const stats = jobs.length > 0 ? (
-    <div className="mt-2 flex flex-wrap items-center gap-2">
-      <StatPill label={`${jobs.length} total`} />
-      {enabledN > 0 && <StatPill label={`${enabledN} active`} color="#437f6b" bg="rgba(220,234,227,0.6)" />}
-      {errorN > 0 && <StatPill label={`${errorN} failing`} color="#c14a44" bg="rgba(241,221,219,0.6)" />}
+  const createBindingMut = useMutation({
+    mutationFn: (data: any) => api.workflows.createBinding(data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: bindingsQueryKey });
+      toast.success("Workflow automation created");
+      closeModal();
+    },
+    onError: (error) => toast.error(translateApiError(error, "Failed to create workflow automation")),
+  });
+  const updateBindingMut = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: any }) => api.workflows.updateBinding(id, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: bindingsQueryKey });
+      toast.success("Workflow automation saved");
+      closeModal();
+    },
+    onError: (error) => toast.error(translateApiError(error, "Failed to save workflow automation")),
+  });
+  const toggleBindingMut = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      api.workflows.updateBinding(id, { enabled, status: enabled ? "active" : "paused" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: bindingsQueryKey }),
+  });
+  const deleteBindingMut = useMutation({
+    mutationFn: (id: string) => api.workflows.deleteBinding(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: bindingsQueryKey });
+      setDeleteBindingTarget(null);
+    },
+  });
+  const runBindingMut = useMutation({
+    mutationFn: (id: string) => api.workflows.runBinding(id, { execute: false, trigger_data: { manual_test: true } }),
+    onSuccess: () => toast.success("Workflow run queued"),
+    onError: (error) => toast.error(
+      "Couldn't run workflow",
+      translateApiError(error, "The workflow service is unavailable. Refresh and try again."),
+    ),
+  });
+
+  const workflowBindings = useMemo(
+    () => showWorkflowAutomations
+      ? (bindings as WorkflowBinding[]).filter((binding) => binding.trigger_type === "workspace_event")
+      : [],
+    [bindings, showWorkflowAutomations],
+  );
+  const workspaceWorkflowBindings = useMemo(
+    () => showWorkflowAutomations
+      ? (bindings as WorkflowBinding[]).filter((binding) => binding.trigger_type === "manual")
+      : [],
+    [bindings, showWorkflowAutomations],
+  );
+  const workflowBindingOptions = useMemo(() => {
+    const options = workspaceWorkflowBindings.map((binding) => {
+      const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
+      return { value: binding.id, label: binding.name || workflow?.name || "Workspace workflow" };
+    });
+    if (fWorkflow && !fWorkspaceBinding && !workspaceWorkflowBindings.some((binding) => binding.workflow_id === fWorkflow)) {
+      const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === fWorkflow);
+      options.unshift({ value: `legacy:${fWorkflow}`, label: `${workflow?.name || "Legacy workflow"} · not attached` });
+    }
+    return options;
+  }, [fWorkflow, fWorkspaceBinding, workspaceWorkflowBindings, workflows]);
+  const selectedWorkflowBinding = fWorkspaceBinding || (fWorkflow ? `legacy:${fWorkflow}` : "");
+  const workflowSelectionMissing = fKind !== "agent_schedule"
+    && (!fWorkflow || ((!editJob && !editBinding) && !fWorkspaceBinding));
+  const workflowAutomationTabs = showWorkflowAutomations
+    ? AUTOMATION_KIND_TABS
+    : AUTOMATION_KIND_TABS.filter((tab) => tab.key === "agent_schedule");
+  const filteredBindings = useMemo(() => {
+    if (page !== 1 || agentFilter !== "all") return [];
+    const query = deferredSearch.toLowerCase();
+    return workflowBindings.filter((binding) => {
+      const enabled = binding.enabled && binding.status === "active";
+      if (statusFilter === "enabled" && !enabled) return false;
+      if (statusFilter === "paused" && enabled) return false;
+      if (statusFilter === "attention") return false;
+      const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
+      return !query
+        || `${binding.name || ""} ${workflow?.name || ""} ${binding.trigger_config?.event || ""}`
+          .toLowerCase()
+          .includes(query);
+    });
+  }, [agentFilter, deferredSearch, page, statusFilter, workflowBindings, workflows]);
+  const bindingSummary = useMemo(() => {
+    if (agentFilter !== "all") return { total: 0, enabled: 0 };
+    const query = deferredSearch.toLowerCase();
+    const matching = workflowBindings.filter((binding) => {
+      const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
+      return !query
+        || `${binding.name || ""} ${workflow?.name || ""} ${binding.trigger_config?.event || ""}`
+          .toLowerCase()
+          .includes(query);
+    });
+    return {
+      total: matching.length,
+      enabled: matching.filter((binding) => binding.enabled && binding.status === "active").length,
+    };
+  }, [agentFilter, deferredSearch, workflowBindings, workflows]);
+  const automationCount = (jobsData?.summary_total ?? 0) + bindingSummary.total;
+  const enabledN = (jobsData?.enabled_total ?? 0) + bindingSummary.enabled;
+  const attentionN = jobsData?.attention_total ?? 0;
+  const stats = automationCount > 0 ? (
+    <div className="flex flex-wrap items-center gap-2">
+      <StatPill label={t("page.scheduled_jobs.total_count", { count: automationCount })} />
+      {enabledN > 0 && (
+        <StatPill
+          label={t("page.scheduled_jobs.enabled_count", { count: enabledN })}
+          color="var(--accent)"
+          bg="var(--accent-soft)"
+        />
+      )}
+      {attentionN > 0 && (
+        <StatPill
+          label={t("page.scheduled_jobs.attention_count", { count: attentionN })}
+          color="var(--editor-danger-text)"
+          bg="var(--editor-danger-bg)"
+        />
+      )}
     </div>
   ) : null;
 
   function openModal(job?: ScheduledJob) {
+    const workflowId = String(job?.execution_target?.workflow_id || "");
+    const matchingBinding = workspaceWorkflowBindings.find((binding) => binding.workflow_id === workflowId);
     setEditJob(job || null);
+    setEditBinding(null);
+    setFKind(job?.execution_type === "workflow" ? "workflow_schedule" : "agent_schedule");
+    setFWorkflow(workflowId || matchingBinding?.workflow_id || "");
+    setFWorkspaceBinding(String(job?.execution_target?.binding_id || matchingBinding?.id || ""));
+    setFEvent("task.approval_decision");
     setFName(job?.name || "");
     // Parse existing schedule into builder state
     if (job?.job_type === "once" || job?.schedule_kind === "at") {
@@ -405,16 +672,75 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
     setFAgent(job?.agent_id || MANOR_AGENT_ID); setFTimezone(job?.timezone || browserTimezone());
     setModalOpen(true);
   }
-  function closeModal() { setModalOpen(false); setEditJob(null); }
+  function openBindingModal(binding: WorkflowBinding) {
+    const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
+    const referencedBindingId = String(binding.config?.workspace_workflow_binding_id || "");
+    const matchingBinding = workspaceWorkflowBindings.find((item) => item.id === referencedBindingId)
+      || workspaceWorkflowBindings.find((item) => item.workflow_id === binding.workflow_id);
+    setEditJob(null);
+    setEditBinding(binding);
+    setFKind("workflow_event");
+    setFWorkflow(binding.workflow_id);
+    setFWorkspaceBinding(matchingBinding?.id || "");
+    setFEvent(String(binding.trigger_config?.event || "task.approval_decision"));
+    setFName(binding.name || workflow?.name || "Workflow automation");
+    setFMessage("");
+    setModalOpen(true);
+  }
+  function openNewModal() {
+    openModal();
+    if (workspaceId && showWorkflowAutomations) {
+      const binding = workspaceWorkflowBindings[0];
+      setFKind("workflow_schedule");
+      setFWorkflow(binding?.workflow_id || "");
+      setFWorkspaceBinding(binding?.id || "");
+    }
+  }
+  function closeModal() { setModalOpen(false); setEditJob(null); setEditBinding(null); }
   function submit() {
+    if (fKind === "workflow_event") {
+      if (!workspaceId || workflowSelectionMissing || !fEvent.trim()) return;
+      const config = { ...(editBinding?.config || {}) };
+      if (fWorkspaceBinding) config.workspace_workflow_binding_id = fWorkspaceBinding;
+      else delete config.workspace_workflow_binding_id;
+      const data = {
+        workflow_id: fWorkflow,
+        workspace_id: workspaceId,
+        name: fName.trim(),
+        trigger_type: "workspace_event",
+        trigger_config: { event: fEvent.trim() },
+        config,
+      };
+      if (editBinding) {
+        updateBindingMut.mutate({
+          id: editBinding.id,
+          data: { ...data, enabled: editBinding.enabled, status: editBinding.status },
+        });
+      } else {
+        createBindingMut.mutate(data);
+      }
+      return;
+    }
+
+    if (fKind === "workflow_schedule" && workflowSelectionMissing) return;
     const d: any = {
       name: fName,
-      payload_message: fMessage || undefined,
-      agent_id: fAgent || undefined,
       timezone: fTimezone,
     };
-    if (editJob?.execution_target && Object.keys(editJob.execution_target).length > 0) {
-      d.execution_target = editJob.execution_target;
+    if (fKind === "workflow_schedule") {
+      d.execution_type = "workflow";
+      d.execution_target = {
+        workflow_id: fWorkflow,
+        ...(fWorkspaceBinding ? { binding_id: fWorkspaceBinding } : {}),
+        ...(workspaceId ? { workspace_id: workspaceId } : {}),
+      };
+    } else {
+      d.execution_type = "agent";
+      d.payload_message = fMessage || undefined;
+      d.agent_id = fAgent || undefined;
+      if (editJob?.execution_target && Object.keys(editJob.execution_target).length > 0) {
+        d.execution_target = editJob.execution_target;
+      }
     }
     if (workspaceId) d.workspace_id = workspaceId;
     if (fFreq === "once") {
@@ -431,17 +757,16 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, minHeight: "100%", padding: 0 }}>
 
       <PageHeader
         title={t("page.scheduled_jobs.automations")}
-        subtitle={(
-          <>
-            <span>{t("page.scheduled_jobs.automations_subtitle")}</span>
-            {stats}
-          </>
-        )}
-        tabs={headerTabs}
+        subtitle={workspaceId
+          ? showWorkflowAutomations
+            ? "Schedule agents, or use an attached workflow on a schedule or workspace event."
+            : "Schedule agents to run recurring or one-time workspace work."
+          : t("page.scheduled_jobs.automations_subtitle")}
+        meta={stats}
         toolbar={(
           <SmartToolbar
             searchValue={search}
@@ -450,14 +775,48 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
             className="w-full sm:w-56"
           />
         )}
-        actions={<PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={() => openModal()} />}
+        actions={<PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={openNewModal} />}
       />
 
+      <FilterBar
+        activeCount={activeFilterCount}
+        trailing={isFetching ? <LoadingSpinner size={14} /> : undefined}
+      >
+        <FilterSelect
+          label={t("page.scheduled_jobs.status")}
+          value={statusFilter}
+          onChange={(value) => setStatusFilter(value as AutomationStatusFilter)}
+          options={AUTOMATION_STATUS_OPTIONS}
+          width={154}
+          dropdownMinWidth={176}
+        />
+        {!workspaceId && (
+          <FilterSelect
+            label={t("page.scheduled_jobs.workspace")}
+            value={workspaceFilter}
+            onChange={setWorkspaceFilter}
+            options={workspaceFilterOptions}
+            width={196}
+            dropdownMinWidth={240}
+            filterable
+          />
+        )}
+        <FilterSelect
+          label={t("page.scheduled_jobs.runs_as")}
+          value={agentFilter}
+          onChange={setAgentFilter}
+          options={agentFilterOptions}
+          width={182}
+          dropdownMinWidth={220}
+          filterable
+        />
+      </FilterBar>
+
       {/* ── Loading ── */}
-      {isLoading && <div style={{ display: "flex", justifyContent: "center", padding: 48 }}><LoadingSpinner size={24} /></div>}
+      {(isLoading || bindingsLoading) && <div style={{ display: "flex", justifyContent: "center", padding: 48 }}><LoadingSpinner size={24} /></div>}
 
       {/* ── Empty ── */}
-      {!isLoading && filtered.length === 0 && (
+      {!isLoading && !bindingsLoading && jobs.length === 0 && filteredBindings.length === 0 && (
         <div className="glass-panel" style={{ textAlign: "center", padding: "56px 24px", borderRadius: 24 }}>
           <div style={{ width: 56, height: 56, borderRadius: 16, background: "linear-gradient(135deg, rgba(109,111,178,0.08), rgba(79,125,117,0.08))", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}>
             <IconClock size={28} style={{ color: "#6d6fb2" }} />
@@ -466,69 +825,198 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
           <p style={{ fontSize: 13, color: "#a8a29e", margin: "0 0 16px", maxWidth: 320, marginLeft: "auto", marginRight: "auto" }}>
             {t("page.scheduled_jobs.schedule_recurring_tasks_daily_reports_weekly_sy")}
           </p>
-          <PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={() => openModal()} />
+          <PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={openNewModal} />
         </div>
       )}
 
+      {!isLoading && !bindingsLoading && (jobs.length > 0 || filteredBindings.length > 0) && (
+        <div className="scheduled-automation-list-header" aria-hidden="true">
+          <span />
+          <span>{t("page.scheduled_jobs.automation")}</span>
+          <span>{t("page.scheduled_jobs.runs_as")}</span>
+          <span>{t("page.scheduled_jobs.last_run")}</span>
+          <span>{t("page.scheduled_jobs.controls")}</span>
+          <span />
+        </div>
+      )}
+
+      {/* Workspace-event workflow bindings share this tab with scheduled jobs. */}
+      {!isLoading && !bindingsLoading && filteredBindings.map((binding) => {
+        const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
+        const enabled = binding.enabled && binding.status === "active";
+        const eventName = String(binding.trigger_config?.event || "workspace event");
+        return (
+          <div
+            key={`binding-${binding.id}`}
+            className={`glass-card scheduled-job-card${enabled ? "" : " scheduled-job-card--disabled"}`}
+            style={{ padding: 0, overflow: "visible", borderRadius: 18, transform: "none" }}
+          >
+            <div className="scheduled-job-row scheduled-automation-grid">
+              <div className="workspace-workflow-automation-icon scheduled-automation-icon-cell" aria-hidden>
+                <IconFlow size={17} />
+              </div>
+              <div className="scheduled-job-info">
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                  <span className="scheduled-job-title">{formatUserFacingText(binding.name || workflow?.name || "Workflow automation")}</span>
+                  {!enabled && <span className="workspace-workflow-automation-state">Paused</span>}
+                </div>
+                <div className="scheduled-job-meta">
+                  <span className="workspace-workflow-automation-kind">Workspace event</span>
+                  <span className="mono">{eventName}</span>
+                  <span className="scheduled-job-separator">|</span>
+                  <span>{workflow?.name || "Missing workflow"}</span>
+                </div>
+              </div>
+              <div className="scheduled-automation-executor">
+                <div className="workspace-workflow-automation-chip">
+                  <IconFlow size={13} />
+                  <span>{workflow?.name || "Workflow"}</span>
+                </div>
+              </div>
+              <span className="scheduled-job-last-run">{t("page.scheduled_jobs.never")}</span>
+              <div className="scheduled-job-actions scheduled-automation-controls" onClick={(event) => event.stopPropagation()}>
+                <span className="scheduled-automation-linked-slot" />
+                <Toggle
+                  checked={enabled}
+                  onChange={() => toggleBindingMut.mutate({ id: binding.id, enabled: !enabled })}
+                  aria-label={`${enabled ? "Pause" : "Enable"} ${binding.name || workflow?.name || "workflow automation"}`}
+                />
+                <button
+                  type="button"
+                  onClick={() => runBindingMut.mutate(binding.id)}
+                  disabled={!enabled || (runBindingMut.isPending && runBindingMut.variables === binding.id)}
+                  className="btn-manor-ghost workspace-workflow-automation-action"
+                  aria-label={`Run ${binding.name || workflow?.name || "workflow automation"}`}
+                  title={enabled ? t("page.scheduled_jobs.run_now") : t("page.scheduled_jobs.enable_first")}
+                ><IconPlay size={13} /></button>
+                <button
+                  type="button"
+                  onClick={() => openBindingModal(binding)}
+                  className="btn-manor-ghost workspace-workflow-automation-action"
+                  aria-label={`Edit ${binding.name || workflow?.name || "workflow automation"}`}
+                  title={t("action.edit")}
+                ><IconEdit size={13} /></button>
+                <button
+                  type="button"
+                  onClick={() => setDeleteBindingTarget(binding.id)}
+                  className="btn-manor-ghost workspace-workflow-automation-action is-delete"
+                  aria-label={`Delete ${binding.name || workflow?.name || "workflow automation"}`}
+                  title={t("action.delete")}
+                ><IconTrash size={13} /></button>
+              </div>
+              <span className="scheduled-automation-expand" />
+            </div>
+          </div>
+        );
+      })}
+
       {/* ── Job Cards ── */}
-      {!isLoading && filtered.length > 0 && filtered.map((job) => {
+      {!isLoading && jobs.length > 0 && jobs.map((job) => {
         const exp = expandedId === job.id;
         const m = TYPE_META[job.job_type] || TYPE_META.cron;
         const ag = job.agent_id && !isMasterAgent(job.agent_id) ? (agents as Agent[]).find((a) => a.id === job.agent_id) : null;
         const isM = isMasterAgent(job.agent_id);
         const hasErr = job.consecutive_errors > 0;
+        const lastError = summarizeAutomationError(job.last_error);
+        const sourceWorkspace = job.workspace_id
+          ? workspaceById.get(job.workspace_id)
+          : undefined;
         const msg = (job as any).payload_message || job.payload?.message;
         const msgSummary = summarizeAutomationMessage(msg);
+        const jobWorkflow = job.execution_type === "workflow"
+          ? (workflows as WorkflowSummary[]).find((item) => item.id === job.execution_target?.workflow_id)
+          : null;
 
         return (
-          <div key={job.id} className={`glass-card scheduled-job-card${job.enabled ? "" : " scheduled-job-card--disabled"}${hasErr ? " scheduled-job-card--error" : ""}`} style={{
-            padding: 0, overflow: "visible", borderRadius: 18,
-            borderColor: hasErr ? "rgba(214,95,89,0.2)" : undefined,
-            background: hasErr ? "rgba(248,240,239,0.15)" : undefined,
-            transform: "none",
+          <div key={job.id} className={`glass-card scheduled-job-card${job.enabled ? "" : " scheduled-job-card--disabled"}`} style={{
+            padding: 0, overflow: "visible", borderRadius: 8, transform: "none",
           }}>
             {/* Main row */}
             <div onClick={() => setExpandedId(exp ? null : job.id)}
-              className="scheduled-job-row"
-              style={{ display: "flex", alignItems: "center", gap: 14, padding: "14px 18px", cursor: "pointer", transition: "background 0.15s", borderRadius: exp ? "18px 18px 0 0" : 18 }}>
+              className="scheduled-job-row scheduled-automation-grid"
+              style={{ cursor: "pointer", transition: "background 0.15s", borderRadius: exp ? "8px 8px 0 0" : 8 }}>
 
               {/* Type icon box */}
-              <div style={{ width: 38, height: 38, borderRadius: 12, background: `${m.color}08`, border: `1.5px solid ${m.color}15`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <div className="scheduled-automation-icon-cell" style={{ width: 38, height: 38, borderRadius: 12, background: `${m.color}08`, border: `1.5px solid ${m.color}15`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                 <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke={m.color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d={m.icon} /></svg>
               </div>
 
               {/* Info */}
-              <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="scheduled-job-info" style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
                   <span className="scheduled-job-title" style={{ fontSize: 14, fontWeight: 600, color: "#0f172a" }}>{formatUserFacingText(job.name)}</span>
-                  {hasErr && <span style={{ fontSize: 9, fontWeight: 700, color: "#dc2626", padding: "1px 6px", borderRadius: 8, background: "#fee2e2" }}>
-                    {job.consecutive_errors} {t(job.consecutive_errors === 1 ? "page.scheduled_jobs.issue" : "page.scheduled_jobs.issues")}
-                  </span>}
-                  {!job.enabled && <span style={{ fontSize: 9, fontWeight: 600, color: "#a8a29e", padding: "1px 6px", borderRadius: 8, background: "#f6f5f3" }}>{t("page.workspaces.filter_paused")}</span>}
+                  {!job.enabled && (
+                    <span className="workspace-workflow-automation-state">
+                      {t("page.workspaces.filter_paused")}
+                    </span>
+                  )}
                 </div>
                 <div className="scheduled-job-meta" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#78716c" }}>
                   <span className="scheduled-job-kind" style={{ fontWeight: 600, color: m.color, padding: "1px 7px", borderRadius: 6, background: `${m.color}08` }}>{m.label}</span>
+                  {!workspaceId && job.workspace_id && (
+                    <>
+                      <span className="scheduled-job-separator" style={{ color: "#e7e5e4" }}>|</span>
+                      <Link
+                        to={`/workspaces/${job.workspace_id}`}
+                        onClick={(event) => event.stopPropagation()}
+                        title={sourceWorkspace?.name || "Workspace"}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 4,
+                          maxWidth: 220,
+                          color: "inherit",
+                          textDecoration: "none",
+                          overflow: "hidden",
+                        }}
+                      >
+                        <IconWorkspace size={12} style={{ flexShrink: 0 }} />
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {sourceWorkspace?.name || t("page.workspaces.workspace")}
+                        </span>
+                      </Link>
+                    </>
+                  )}
                   <span style={{ fontFamily: "monospace" }}>{fmtSchedule(job)}</span>
+                  {jobWorkflow && <><span className="scheduled-job-separator" style={{ color: "#e7e5e4" }}>|</span><span>{jobWorkflow.name}</span></>}
                   {msgSummary && <><span className="scheduled-job-separator" style={{ color: "#e7e5e4" }}>|</span><span title={msgSummary} style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontStyle: "italic" }}>{msgSummary}</span></>}
                 </div>
+                {hasErr && (
+                  <div
+                    className="scheduled-job-error-summary"
+                    title={job.last_error || t("page.scheduled_jobs.last_run_failed")}
+                  >
+                    <span>{t("page.scheduled_jobs.last_run_failed")}</span>
+                    {lastError && <span className="scheduled-job-error-message">{lastError}</span>}
+                  </div>
+                )}
               </div>
 
-              {/* Agent chip */}
-              {(isM || ag) && (
-                <div className="scheduled-job-agent-chip" style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px 4px 5px", borderRadius: 20, background: "rgba(250,250,249,0.8)", border: "1px solid rgba(28,25,23,0.06)", flexShrink: 0 }}>
-                  <UserAvatar type={isM ? "manor" : "agent"} name={ag?.name} avatarUrl={ag?.avatar_url} seed={ag?.id} size={20} />
-                  <span className="scheduled-job-agent-name" style={{ fontSize: 11, color: "#57534e", fontWeight: 500 }}>{isM ? MANOR_AGENT_NAME : ag?.name || t("page.workspace_detail.agent")}</span>
-                </div>
-              )}
+              <div className="scheduled-automation-executor">
+                {jobWorkflow ? (
+                  <div className="workspace-workflow-automation-chip">
+                    <IconFlow size={13} />
+                    <span>{jobWorkflow.name}</span>
+                  </div>
+                ) : (isM || ag) ? (
+                  <div className="scheduled-job-agent-chip" style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px 4px 5px", borderRadius: 20, background: "rgba(250,250,249,0.8)", border: "1px solid rgba(28,25,23,0.06)", flexShrink: 0 }}>
+                    <UserAvatar type={isM ? "manor" : "agent"} name={ag?.name} avatarUrl={ag?.avatar_url} seed={ag?.id} size={20} />
+                    <span className="scheduled-job-agent-name" style={{ fontSize: 11, color: "#57534e", fontWeight: 500 }}>{isM ? MANOR_AGENT_NAME : ag?.name || t("page.workspace_detail.agent")}</span>
+                  </div>
+                ) : (
+                  <span className="scheduled-automation-empty-value">--</span>
+                )}
+              </div>
 
               {/* Last run */}
-              <span className="scheduled-job-last-run" style={{ fontSize: 10, color: "#a8a29e", flexShrink: 0, minWidth: 60, textAlign: "right" }}>
+              <span className="scheduled-job-last-run">
                 {job.last_run_at ? relativeTime(job.last_run_at) : t("page.scheduled_jobs.never")}
               </span>
 
               {/* Actions */}
-              <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
-                {job.manor_task_id && (
+              <div className="scheduled-job-actions scheduled-automation-controls" onClick={(e) => e.stopPropagation()}>
+                <span className="scheduled-automation-linked-slot">
+                  {job.manor_task_id && (
                   <Link
                     to={`/tasks/${job.manor_task_id}`}
                     title={t("page.scheduled_jobs.linked_task")}
@@ -540,8 +1028,8 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
                       padding: "0 10px",
                       borderRadius: 8,
                       border: "1px solid rgba(28,25,23,0.06)",
-                      background: hasErr ? "#fff1f2" : "#fafaf9",
-                      color: hasErr ? "#c14a44" : "#57534e",
+                      background: "#fafaf9",
+                      color: "#57534e",
                       fontSize: 11,
                       fontWeight: 750,
                       textDecoration: "none",
@@ -550,8 +1038,13 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
                   >
                     {t("page.scheduled_jobs.linked_task")}
                   </Link>
-                )}
-                <Toggle checked={job.enabled} onChange={() => toggleMut.mutate({ id: job.id, enabled: !job.enabled })} />
+                  )}
+                </span>
+                <Toggle
+                  checked={job.enabled}
+                  onChange={() => toggleMut.mutate({ id: job.id, enabled: !job.enabled })}
+                  aria-label={`${job.enabled ? "Pause" : "Enable"} ${job.name}`}
+                />
                 <button
                   onClick={() => runNowMut.mutate(job.id)}
                   disabled={!job.enabled || (runNowMut.isPending && runNowMut.variables === job.id)}
@@ -563,7 +1056,7 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
                 <button onClick={() => setDeleteTarget(job.job_id)} className="btn-manor-ghost" style={{ width: 28, height: 28, padding: 0, borderRadius: 8, color: "#a8a29e" }} title={t("action.delete")}><IconTrash size={13} /></button>
               </div>
 
-              <IconChevronRight size={12} style={{ color: "#d6d3d1", transition: "transform 0.2s", transform: exp ? "rotate(90deg)" : "none", flexShrink: 0 }} />
+              <IconChevronRight className="scheduled-automation-expand" size={12} style={{ color: "#d6d3d1", transition: "transform 0.2s", transform: exp ? "rotate(90deg)" : "none", flexShrink: 0 }} />
             </div>
 
             {/* Runs */}
@@ -614,6 +1107,17 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
         );
       })}
 
+      {!isLoading && !bindingsLoading && (jobsData?.total ?? 0) > 0 && (
+        <div className="scheduled-automation-pagination">
+          <span>{t("page.scheduled_jobs.showing_range", {
+            start: Math.min((page - 1) * PAGE_SIZE + 1, jobsData?.total ?? 0),
+            end: Math.min(page * PAGE_SIZE, jobsData?.total ?? 0),
+            total: jobsData?.total ?? 0,
+          })}</span>
+          <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
+        </div>
+      )}
+
       {/* ── Modal ── */}
       <ConfirmDialog
         open={!!deleteTarget}
@@ -624,13 +1128,33 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
         confirmLabel={t("action.delete")}
         danger
       />
+      <ConfirmDialog
+        open={!!deleteBindingTarget}
+        onClose={() => setDeleteBindingTarget(null)}
+        onConfirm={() => { if (deleteBindingTarget) deleteBindingMut.mutate(deleteBindingTarget); }}
+        title="Delete workflow automation"
+        message="This removes the workflow from this workspace event. The workflow itself is kept."
+        confirmLabel={t("action.delete")}
+        danger
+      />
 
-      <Modal open={modalOpen} onClose={closeModal} title={editJob ? t("page.scheduled_jobs.edit_automation") : t("page.scheduled_jobs.new_automation")} maxWidth="520px"
+      <Modal open={modalOpen} onClose={closeModal} title={editJob || editBinding ? t("page.scheduled_jobs.edit_automation") : t("page.scheduled_jobs.new_automation")} maxWidth="560px"
         footer={
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, width: "100%" }}>
             <button className="btn-manor-ghost" onClick={closeModal} style={{ fontSize: 12, height: 34, padding: "0 16px" }}>{t("action.cancel")}</button>
-            <button className="btn-manor" onClick={submit} disabled={!fName.trim()} style={{ fontSize: 12, height: 34, padding: "0 20px" }}>
-              {createMut.isPending || updateMut.isPending ? t("page.task_collections.saving") : editJob ? t("action.save") : t("action.create")}
+            <button
+              className="btn-manor"
+              onClick={submit}
+              disabled={
+                !fName.trim()
+                || workflowSelectionMissing
+                || (fKind === "workflow_event" && !fEvent.trim())
+              }
+              style={{ fontSize: 12, height: 34, padding: "0 20px" }}
+            >
+              {createMut.isPending || updateMut.isPending || createBindingMut.isPending || updateBindingMut.isPending
+                ? t("page.task_collections.saving")
+                : editJob || editBinding ? t("action.save") : t("action.create")}
             </button>
           </div>
         }>
@@ -641,9 +1165,79 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
             <input className="manor-input" value={fName} onChange={(e) => setFName(e.target.value)} placeholder={t("page.scheduled_jobs.e_g_daily_report")} style={{ width: "100%", fontSize: 14, fontWeight: 500, height: 40 }} autoFocus />
           </div>
 
-          {/* Type selector */}
-          {/* When should this run? */}
           <div>
+            <label className="manor-label">Automation action</label>
+            <TabSwitcher
+              value={fKind}
+              onChange={(value) => {
+                if (editJob || editBinding) return;
+                setFKind(value as AutomationKind);
+              }}
+              size="sm"
+              wrap
+              tabs={(editJob || editBinding)
+                ? workflowAutomationTabs.filter((tab) => tab.key === fKind)
+                : workflowAutomationTabs.filter((tab) => workspaceId || tab.key === "agent_schedule")}
+            />
+            {(editJob || editBinding) && (
+              <p className="workspace-workflow-automation-help">Automation type is fixed after creation; its workflow and condition remain editable.</p>
+            )}
+          </div>
+
+          {fKind !== "agent_schedule" && (
+            <div>
+              <label className="manor-label">Workspace workflow</label>
+              {workflowBindingOptions.length > 0 ? (
+                <Select
+                  value={selectedWorkflowBinding}
+                  onChange={(value) => {
+                    if (value.startsWith("legacy:")) {
+                      setFWorkspaceBinding("");
+                      setFWorkflow(value.slice("legacy:".length));
+                      return;
+                    }
+                    const binding = workspaceWorkflowBindings.find((item) => item.id === value);
+                    setFWorkspaceBinding(binding?.id || "");
+                    setFWorkflow(binding?.workflow_id || "");
+                  }}
+                  filterable
+                  placeholder="Select an attached workflow"
+                  options={workflowBindingOptions}
+                />
+              ) : (
+                <div className="workspace-workflow-automation-empty">
+                  <span>Attach a workflow to this workspace before creating a workflow automation.</span>
+                  {workspaceId && <Link to={`/workspaces/${workspaceId}?tab=workflows`}>Manage workspace workflows</Link>}
+                </div>
+              )}
+              <p className="workspace-workflow-automation-help">Automations trigger the selected workspace binding; the workflow can also run manually or from an API.</p>
+            </div>
+          )}
+
+          {fKind === "workflow_event" && (
+            <div>
+              <label className="manor-label">Workspace event</label>
+              <input
+                className="manor-input mono"
+                value={fEvent}
+                onChange={(event) => setFEvent(event.target.value)}
+                placeholder="task.approval_decision"
+                aria-label="Workspace event name"
+                style={{ width: "100%" }}
+              />
+              <div className="workspace-workflow-event-suggestions" aria-label="Common workspace events">
+                {WORKSPACE_EVENT_SUGGESTIONS.map((event) => (
+                  <button key={event.value} type="button" onClick={() => setFEvent(event.value)} title={event.value}>
+                    {event.label}
+                  </button>
+                ))}
+              </div>
+              <p className="workspace-workflow-automation-help">The event payload is available to workflow nodes as <span className="mono">trigger</span>.</p>
+            </div>
+          )}
+
+          {/* When should this run? */}
+          {fKind !== "workflow_event" && <div>
             <label className="manor-label">{t("page.scheduled_jobs.when_should_this_run")}</label>
             {/* Frequency selector */}
             <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 12 }}>
@@ -761,10 +1355,10 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
                 <span style={{ color: "#a8a29e" }}> · {fTimezone}</span>
               </div>
             )}
-          </div>
+          </div>}
 
           {/* What to do */}
-          <div>
+          {fKind === "agent_schedule" && <div>
             <label className="manor-label">{t("page.scheduled_jobs.what_should_the_agent_do")}</label>
             <textarea className="manor-textarea" value={fMessage} onChange={(e) => setFMessage(e.target.value)} rows={3}
               placeholder={t("page.scheduled_jobs.e_g_generate_a_summary_of_all_tasks_completed_th")}
@@ -773,21 +1367,21 @@ export default function ScheduledJobs({ headerTabs, workspaceId }: ScheduledJobs
               <svg width="10" height="10" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" /></svg>
               {t("page.scheduled_jobs.a_step_by_step_execution_procedure_will_be_auto")}
             </p>
-          </div>
+          </div>}
 
           {/* Agent */}
-          <div>
+          {fKind === "agent_schedule" && <div>
             <label className="manor-label">{t("page.scheduled_jobs.execute_with")}</label>
             <Select value={fAgent} onChange={setFAgent} filterable
               options={[{ value: "", label: t("page.scheduled_jobs.no_agent_create_task_only") }, { value: MANOR_AGENT_ID, label: MANOR_AGENT_NAME }, ...(agents as Agent[]).map((a) => ({ value: a.id, label: a.name }))]} />
-          </div>
+          </div>}
 
           {/* Timezone */}
-          <div>
+          {fKind !== "workflow_event" && <div>
             <label className="manor-label">{t("page.scheduled_jobs.timezone")}</label>
             <Select value={fTimezone} onChange={setFTimezone} filterable
               options={TIMEZONE_OPTIONS.includes(fTimezone) ? TIMEZONE_OPTIONS : [fTimezone, ...TIMEZONE_OPTIONS]} />
-          </div>
+          </div>}
         </div>
       </Modal>
     </div>

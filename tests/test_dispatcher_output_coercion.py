@@ -298,6 +298,32 @@ def test_coerce_twitter_publish_payload_uses_platform_created_at_when_available(
     assert coerced["status"] == "published"
 
 
+def test_coerce_linkedin_created_urn_to_publish_schema() -> None:
+    schema = {
+        "type": "object",
+        "required": ["post_url", "post_text", "published_at", "status"],
+        "properties": {
+            "post_url": {"type": "string"},
+            "post_text": {"type": "string"},
+            "published_at": {"type": "string"},
+            "status": {"type": "string"},
+        },
+    }
+    raw = {
+        "created": True,
+        "urn": "urn:li:share:1999000000000000000",
+        "post_text": "Every founder hits a wall.",
+        "created_at": "2026-05-21T12:00:00.000Z",
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["post_url"] == "https://www.linkedin.com/feed/update/urn:li:share:1999000000000000000/"
+    assert coerced["published_at"] == "2026-05-21T12:00:00.000Z"
+    assert coerced["status"] == "published"
+
+
 def test_coerce_topics_from_existing_markdown_field() -> None:
     schema = {
         "type": "object",
@@ -752,3 +778,136 @@ def test_coerce_generate_video_mixed_file_refs_validate() -> None:
     coerced = coerce_step_output_for_schema(schema, raw)
     validate_step_output(_step(schema), coerced)
     assert all(f.get("fs_path") for f in coerced["files"])
+
+
+# ── Social publish coercion: LinkedIn payloads + pinned fields ──────────────
+# Regression pack for the X Growth – Startup Founder publish failures
+# (tasks …X5W1 / …QB8C / …03NK / …BDVS, 2026-05): subagent publish steps
+# failed output validation because only tweet payloads were recognized and
+# planner-pinned fields like platform: enum ["LinkedIn"] were never filled.
+
+
+def test_coerce_linkedin_publish_payload_fills_x5w1_schema() -> None:
+    # Verbatim schema from failed step publish_linkedin_post (task …X5W1).
+    schema = {
+        "type": "object",
+        "required": ["post_text", "platform", "published_at"],
+        "properties": {
+            "platform": {"enum": ["LinkedIn"], "type": "string"},
+            "post_text": {"type": "string"},
+            "published_at": {"type": "string"},
+        },
+    }
+    raw = {
+        "result": {
+            "urn": "urn:li:share:7350000000000000000",
+            "text": "Founder story: how we shipped Manor's planning loop.",
+            "created_at": "2026-05-15T21:00:00Z",
+        },
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["platform"] == "LinkedIn"
+    assert coerced["post_text"] == "Founder story: how we shipped Manor's planning loop."
+    assert coerced["published_at"] == "2026-05-15T21:00:00Z"
+
+
+def test_coerce_linkedin_publish_payload_fills_post_url_from_urn() -> None:
+    # Verbatim requireds from failed step publish_post (task …QB8C).
+    schema = {
+        "type": "object",
+        "required": ["post_url", "post_text"],
+        "properties": {
+            "post_url": {"type": "string"},
+            "post_text": {"type": "string"},
+        },
+    }
+    raw = {
+        "response": {
+            "urn": "urn:li:ugcPost:7351111111111111111",
+            "commentary": "One founder story, three lessons.",
+        },
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["post_url"] == "https://www.linkedin.com/feed/update/urn:li:ugcPost:7351111111111111111/"
+    assert coerced["post_text"] == "One founder story, three lessons."
+
+
+def test_coerce_linkedin_publish_prefers_explicit_post_url() -> None:
+    schema = {
+        "type": "object",
+        "required": ["post_url", "status"],
+        "properties": {
+            "post_url": {"type": "string"},
+            "status": {"type": "string", "enum": ["published", "failed"]},
+        },
+    }
+    raw = {"post_url": "https://www.linkedin.com/posts/founder_story-activity-7352", "status": "published"}
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["post_url"] == "https://www.linkedin.com/posts/founder_story-activity-7352"
+
+
+def test_coerce_twitter_publish_fills_platform_from_enum() -> None:
+    schema = {
+        "type": "object",
+        "required": ["tweet_id", "platform", "status"],
+        "properties": {
+            "tweet_id": {"type": "string"},
+            "platform": {"type": "string", "enum": ["X (Twitter)", "LinkedIn"]},
+            "status": {"type": "string", "enum": ["published"]},
+        },
+    }
+    raw = {"data": {"id": "1999000000000000002", "text": "hi", "edit_history_tweet_ids": ["1999000000000000002"]}}
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    # Multi-value enum: pick the member matching the proven payload kind.
+    assert coerced["platform"] == "X (Twitter)"
+    assert coerced["status"] == "published"
+
+
+def test_coerce_publish_fills_singleton_enum_and_const_fields() -> None:
+    schema = {
+        "type": "object",
+        "required": ["tweet_id", "platform", "campaign"],
+        "properties": {
+            "tweet_id": {"type": "string"},
+            "platform": {"type": "string", "enum": ["Weibo"]},  # no alias match — singleton still wins
+            "campaign": {"const": "x-growth-w20"},
+        },
+    }
+    raw = {"tweet_id": "1999000000000000003"}
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["platform"] == "Weibo"
+    assert coerced["campaign"] == "x-growth-w20"
+
+
+def test_coerce_linkedin_publish_requires_real_evidence() -> None:
+    # No urn / post_url anywhere → nothing is invented and validation still fails.
+    schema = {
+        "type": "object",
+        "required": ["post_url", "post_text", "platform"],
+        "properties": {
+            "post_url": {"type": "string"},
+            "post_text": {"type": "string"},
+            "platform": {"enum": ["LinkedIn"], "type": "string"},
+        },
+    }
+    raw = {"text": "I decided not to publish because the connector errored."}
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    with pytest.raises(SchemaError):
+        validate_step_output(_step(schema), coerced)

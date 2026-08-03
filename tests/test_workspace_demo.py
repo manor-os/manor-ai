@@ -838,7 +838,11 @@ async def test_solo_founder_content_engine_can_finish_a_work_wave(db_session, mo
             assert batch.status == "completed"
             assert batch.completed_at is not None
             assert len(calls) == 1
-            assert calls[0]["kwargs"]["args"] == [workspace_id, f"work_batch_completed:{batch_id}"]
+            assert calls[0]["kwargs"]["args"] == [workspace_id]
+            assert calls[0]["kwargs"]["kwargs"] == {
+                "trigger_kind": "event",
+                "trigger_detail": f"work batch completed: {batch_id}",
+            }
 
     artifact_search = await chat_context.workspace_search(
         db_session,

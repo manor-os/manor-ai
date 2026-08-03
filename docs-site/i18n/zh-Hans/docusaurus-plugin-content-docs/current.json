@@ -1,0 +1,22 @@
+{
+  "version.label": {
+    "message": "Next",
+    "description": "The label for version current"
+  },
+  "sidebar.mainSidebar.category.Learn": {
+    "message": "入门",
+    "description": "The label for category Learn in sidebar mainSidebar"
+  },
+  "sidebar.mainSidebar.category.Operating": {
+    "message": "运维",
+    "description": "The label for category Operating in sidebar mainSidebar"
+  },
+  "sidebar.mainSidebar.category.Reference": {
+    "message": "参考",
+    "description": "The label for category Reference in sidebar mainSidebar"
+  },
+  "sidebar.mainSidebar.link.Roadmap": {
+    "message": "路线图",
+    "description": "The label for link Roadmap in sidebar mainSidebar, linking to https://github.com/manor-os/manor-ai/blob/main/ROADMAP.md"
+  }
+}

@@ -275,7 +275,7 @@ async def test_workspace_members_only_role_matrix(client: AsyncClient):
     assert (
         await client.get(f"/api/v1/workspaces/{entity_visible_id}", headers=client_user["headers"])
     ).status_code == 404
-    await _add_workspace_staff(entity_visible_id, client_user["id"], "external_client", owner["user_id"])
+    await _add_workspace_staff(entity_visible_id, client_user["id"], "viewer", owner["user_id"])
     assert (
         await client.get(f"/api/v1/workspaces/{entity_visible_id}", headers=client_user["headers"])
     ).status_code == 200

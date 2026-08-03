@@ -13,7 +13,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from packages.core.ai.runtime import (
+# Import from the defining submodule, NOT the package root. This module is
+# lazily imported on first tool use; in a long-running worker booted before a
+# deploy, the old `packages.core.ai.runtime` __init__ stays cached in
+# sys.modules and lacks newly added re-exports — a root import then dies with
+# "ImportError: cannot import name ...". A fresh submodule import reads the
+# new code from disk and survives the deploy version-skew window.
+from packages.core.ai.runtime.agent_provisioning import (
     runtime_provision_agent_action,
     runtime_query_entity_agents_action,
 )

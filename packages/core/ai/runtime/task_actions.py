@@ -101,6 +101,7 @@ async def runtime_create_task_action(
     *,
     entity_id: str,
     params: dict[str, Any] | None = None,
+    actor_agent_id: str | None = None,
 ) -> str:
     """Create a task through the Runtime action boundary."""
 
@@ -122,7 +123,8 @@ async def runtime_create_task_action(
             task_type=raw_params.get("task_type", "general"),
             assignee_id=raw_params.get("assignee_id"),
             deadline=raw_params.get("deadline"),
-            creator_id="ai-agent",
+            creator_id=raw_params.get("user_id") or None,
+            creator_agent_id=actor_agent_id,
         )
         await db.commit()
 

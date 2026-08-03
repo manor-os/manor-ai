@@ -80,6 +80,12 @@ def _validate_provider_key(provider: str, api_key: str) -> None:
         if detected != "openrouter":
             raise ValueError("OpenRouter official token must start with sk-or-.")
         return
+    if provider == "vercel":
+        if detected:
+            raise ValueError(
+                f"Vercel AI Gateway token looks like a {detected} provider key."
+            )
+        return
     if detected == "openrouter":
         raise ValueError("Official native provider tokens cannot be OpenRouter keys.")
     if detected and detected != provider:

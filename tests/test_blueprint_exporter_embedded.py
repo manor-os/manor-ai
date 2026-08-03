@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.blueprints.exporter import ExportContext, export_workspace
@@ -366,3 +367,76 @@ async def test_payload_validates_against_v11_schema(
     seeded = await _seed(db_session, entity_id)
     payload = await export_workspace(db_session, seeded["workspace"].id, title="T")
     validate_payload(payload)  # should not raise
+
+
+async def test_legacy_private_agent_and_skill_get_portable_blueprint_refs(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    agent = seeded["agent_a"]
+    private_skill = (await db_session.execute(
+        select(Skill).where(
+            Skill.entity_id == entity_id,
+            Skill.slug == seeded["private_skill_slug"],
+        )
+    )).scalar_one()
+    agent.slug = None
+    agent.config = {
+        **dict(agent.config or {}),
+        "business_capabilities": ["workspace.search"],
+    }
+    private_skill.slug = None
+    await db_session.commit()
+
+    payload = await export_workspace(db_session, seeded["workspace"].id, title="T")
+    [embedded_agent] = payload["embedded"]["agents"]
+    [embedded_skill] = payload["embedded"]["skills"]
+
+    assert embedded_agent["slug"].startswith("calvin-reply-")
+    assert embedded_skill["slug"].startswith("reply-tone-")
+    assert embedded_agent["business_capabilities"] == ["workspace.search"]
+    assert embedded_skill["slug"] in embedded_agent["skill_bindings"]
+    private_subscription = next(
+        subscription
+        for subscription in payload["recipe"]["subscriptions"]
+        if subscription["service_key"] == "social.x.reply"
+    )
+    assert private_subscription["agent_slug"] == embedded_agent["slug"]
+
+
+async def test_export_drops_source_workspace_runtime_ids(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    workspace = seeded["workspace"]
+    source_user_id = generate_ulid()
+    source_group_id = generate_ulid()
+    workspace.operating_model = {
+        "services": [{"service_key": "social.x.reply"}],
+        "agent_mappings": [{
+            "service_key": "social.x.reply",
+            "agent_id": seeded["agent_a"].id,
+        }],
+        "knowledge": {
+            "auto_search": True,
+            "default_group_ids": [source_group_id],
+            "group_purposes": {source_group_id: "Source-only group"},
+        },
+    }
+    workspace.settings = {
+        "created_by_user_id": source_user_id,
+        "provisioning": {"status": "ready"},
+        "access_mode": "members_only",
+    }
+    await db_session.commit()
+
+    payload = await export_workspace(db_session, workspace.id, title="T")
+    operating_model = payload["recipe"]["operating_model"]
+    assert "agent_mappings" not in operating_model
+    assert operating_model["knowledge"] == {"auto_search": True}
+    assert operating_model["settings"] == {"access_mode": "members_only"}
+    assert seeded["agent_a"].id not in str(payload)
+    assert source_user_id not in str(payload)
+    assert source_group_id not in str(payload)

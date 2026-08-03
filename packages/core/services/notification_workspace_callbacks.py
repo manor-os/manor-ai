@@ -38,6 +38,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import async_session
 from packages.core.services.hitl_options import approval_notification_actions
 from packages.core.services.notification_callbacks import register_callback
@@ -110,7 +111,7 @@ async def _resolve_message_via_chat_service(
 
         kind = (msg.pending_action or {}).get("kind") if isinstance(msg.pending_action, dict) else None
         ack_message = "Recorded your response."
-        if kind == "external_message_approval":
+        if kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
             ack_message = await _resolve_external_message_action(
                 db, msg=msg, action_key=action_key, responder_user_id=responder_user_id,
             )

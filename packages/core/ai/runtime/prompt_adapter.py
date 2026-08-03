@@ -31,7 +31,7 @@ class ChatContext:
     thread_ref_kind: str | None = None
     thread_ref_id: str | None = None
     runtime_profile: str | None = None
-    legacy_runtime_profile: str | None = None
+    tool_profile: str | None = None
     runtime_surface: str | None = None
     runtime_profile_name: str | None = None
     runtime_envelope: Any = None
@@ -52,6 +52,13 @@ class ChatContext:
     tool_names: list[str] = field(default_factory=list)
     allowed_tool_names: set[str] = field(default_factory=set)
     auto_forced_tool_calls: list[dict] = field(default_factory=list)
+
+    # tool_discovery_v2 (A3 intent-path memory): the tool names surfaced in
+    # this turn's cache-first hint (resolve_runtime_chat_context), so the
+    # chat-layer tool-exec callback can pass it to
+    # agentic_loop._maybe_record_tool_path for hinted-failure recording.
+    # Empty when the flag is off, no match, or lookup failed.
+    hinted_tool_names: set[str] = field(default_factory=set)
 
     extra_context: str | None = None
 

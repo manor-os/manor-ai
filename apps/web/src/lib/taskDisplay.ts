@@ -230,8 +230,24 @@ function structuredList(label: string, values: unknown[], fallbackItem: string):
   return rows.length ? `**${label}**\n${rows.join("\n")}` : "";
 }
 
+function jsonFallback(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "";
+  }
+}
+
+function indentBlock(value: string): string {
+  return value
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n");
+}
+
 function structuredText(value: unknown, depth = 0): string {
-  if (value === null || value === undefined || depth > 3) return "";
+  if (value === null || value === undefined) return "";
+  if (depth > 3) return jsonFallback(value);
   if (typeof value === "string") {
     const parsed = tryParseJsonish(value);
     if (parsed !== null) return structuredText(parsed, depth + 1);
@@ -278,12 +294,15 @@ function structuredText(value: unknown, depth = 0): string {
   for (const [key, rawValue] of Object.entries(obj)) {
     if (rows.length >= 6) break;
     if (INTERNAL_SUMMARY_KEYS.has(key) || rawValue === null || rawValue === undefined || rawValue === "") continue;
-    if (Array.isArray(rawValue) || typeof rawValue === "object") continue;
-    const rendered = scalarPreview(rawValue);
+    const rendered = Array.isArray(rawValue) || typeof rawValue === "object"
+      ? structuredText(rawValue, depth + 1).trim() || jsonFallback(rawValue)
+      : scalarPreview(rawValue);
     if (!rendered) continue;
-    rows.push(`- **${formatUserFacingLabel(key)}:** ${rendered}`);
+    rows.push(rendered.includes("\n")
+      ? `- **${formatUserFacingLabel(key)}:**\n${indentBlock(rendered)}`
+      : `- **${formatUserFacingLabel(key)}:** ${rendered}`);
   }
-  return rows.join("\n");
+  return rows.join("\n") || jsonFallback(value);
 }
 
 export function formatUserFacingLabel(value?: string | null): string {
@@ -341,7 +360,7 @@ export function formatUserFacingText(value?: string | null): string {
     .replace(/\boperator review\b/gi, "your review")
     .replace(/\boperator confirms\b/gi, "you confirm")
     .replace(/\boperator flagged\b/gi, "you flagged")
-    .replace(/\boperator\b/gi, "you")
+    .replace(/\boperator\b(?!-)/gi, "you")
     .replace(/\bre[-\s]?triggering\b/gi, "restarting")
     .replace(/\bre[-\s]?seeding\b/gi, "refreshing")
     .replace(/\bautonomously\b/gi, "without help")
@@ -423,7 +442,10 @@ export function formatUserFacingStructuredText(value?: unknown): string {
     }
     return formatUserFacingText(value);
   }
-  return structuredText(value) || formatUserFacingText(String(value || ""));
+  const rendered = structuredText(value);
+  if (rendered) return rendered;
+  if (typeof value === "object") return jsonFallback(value) || "";
+  return formatUserFacingText(String(value || ""));
 }
 
 export function formatTaskDescriptionForDisplay(description?: string | null): string {

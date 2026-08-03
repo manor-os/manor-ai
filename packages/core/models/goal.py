@@ -16,7 +16,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Date, DateTime, Index, Numeric, SmallInteger, String, Text, func
+from sqlalchemy import Date, DateTime, Index, Integer, Numeric, SmallInteger, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -80,6 +80,13 @@ class Goal(Base, TimestampMixin):
     # ``strategist.evaluation.evaluate_strategist_outcomes``.
 
     achieved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # M11 config revision — bumped via packages.core.revisions.bump_revision
+    # on operator-driven config changes (target/deadline/status), never on
+    # measurement-driven current_value writes.
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
 
 
 class GoalMeasurement(Base):

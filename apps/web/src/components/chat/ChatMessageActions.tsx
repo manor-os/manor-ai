@@ -2,6 +2,7 @@ import { useState } from "react";
 import { t } from "../../lib/i18n";
 import type { ChatMessage } from "../../lib/chatStream";
 import { IconCheck, IconCopy, IconRefresh, IconThumbDown, IconThumbUp } from "../icons";
+import ChatActionButton from "./ChatActionButton";
 
 export type ChatMessageFeedbackRating = "up" | "down";
 
@@ -51,21 +52,18 @@ export default function ChatMessageActions({
       }`}
     >
       {canRetry && onRetry && (
-        <button
-          type="button"
-          className="chat-message-action chat-message-action--retry"
+        <ChatActionButton
+          retry
           disabled={disabled}
           onClick={() => void onRetry()}
           title={retryTitle}
           aria-label={retryTitle}
         >
           <IconRefresh size={13} aria-hidden="true" />
-        </button>
+        </ChatActionButton>
       )}
       {safeCopyText && (
-        <button
-          type="button"
-          className="chat-message-action"
+        <ChatActionButton
           onClick={copy}
           title={copyTitle}
           aria-label={copyTitle}
@@ -75,34 +73,28 @@ export default function ChatMessageActions({
           ) : (
             <IconCopy size={13} aria-hidden="true" />
           )}
-        </button>
+        </ChatActionButton>
       )}
       {canFeedback && (
         <>
-          <button
-            type="button"
-            className={`chat-message-action ${
-              feedbackValue === "up" ? "chat-message-action--active" : ""
-            }`}
+          <ChatActionButton
+            active={feedbackValue === "up"}
             disabled={disabled}
             onClick={() => void onFeedback?.("up")}
             title={t("component.chat_message_actions.thumbs_up")}
             aria-label={t("component.chat_message_actions.thumbs_up")}
           >
             <IconThumbUp size={13} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            className={`chat-message-action ${
-              feedbackValue === "down" ? "chat-message-action--active" : ""
-            }`}
+          </ChatActionButton>
+          <ChatActionButton
+            active={feedbackValue === "down"}
             disabled={disabled}
             onClick={() => void onFeedback?.("down")}
             title={t("component.chat_message_actions.thumbs_down")}
             aria-label={t("component.chat_message_actions.thumbs_down")}
           >
             <IconThumbDown size={13} aria-hidden="true" />
-          </button>
+          </ChatActionButton>
         </>
       )}
     </div>

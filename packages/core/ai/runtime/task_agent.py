@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from packages.core.constants.task import AI_LOG_TYPES, TaskLogType
 from packages.core.ai.engine import ChatMessage
 from packages.core.ai.runtime.artifacts import (
     runtime_artifact_tracking_scope,
@@ -284,16 +285,18 @@ def runtime_task_user_prompt(
         for log in (task_logs or [])
         if getattr(log, "log_type", None)
         in {
-            "comment",
-            "ai_execution_completed",
-            "ai_hitl_requested",
+            TaskLogType.COMMENT,
+            TaskLogType.AI_EXECUTION_COMPLETED,
+            TaskLogType.AI_HITL_REQUESTED,
         }
     ]
     if relevant_logs:
         convo_lines = ["## Conversation History"]
         for log in relevant_logs[-max_history_entries:]:
             log_type = str(getattr(log, "log_type", "") or "")
-            who = getattr(log, "created_by", None) or ("AI Agent" if log_type.startswith("ai_") else "System")
+            who = getattr(log, "created_by", None) or (
+                "AI Agent" if log_type in AI_LOG_TYPES else "System"
+            )
             content = str(getattr(log, "content", "") or "")[:max_log_chars]
             convo_lines.append(f"**{who}:** {content}")
         prompt = f"{prompt}\n\n" + "\n\n".join(convo_lines)
@@ -418,9 +421,11 @@ async def runtime_execute_task_agent_turn(
     conversation_id: str | None = None,
     task_id: str | None = None,
     active_user_message: str | None = None,
-    legacy_tool_profile: str | None = None,
+    tool_profile: str | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     metadata: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> RuntimeTaskAgentTurnResult:
     """Run one scheduled-task agent turn through Runtime-owned tool plumbing."""
 
@@ -430,6 +435,8 @@ async def runtime_execute_task_agent_turn(
         tools=tools,
         system_prompt=system_prompt,
         metadata=metadata,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
     usage = dict(response.usage or {})
     tool_calls = list(response.tool_calls or [])
@@ -472,7 +479,7 @@ async def runtime_execute_task_agent_turn(
                 conversation_id=conversation_id,
                 task_id=task_id,
                 active_user_message=active_user_message,
-                legacy_tool_profile=legacy_tool_profile,
+                tool_profile=tool_profile,
                 allowed_tool_names=allowed_tool_names,
                 runtime_envelope=runtime_envelope,
             )
@@ -646,6 +653,8 @@ async def runtime_execute_task_final_response(
     messages: list[ChatMessage],
     system_prompt: str,
     metadata: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> RuntimeTaskFinalResponseResult:
     """Force a final no-tools scheduled-task response after max tool rounds."""
 
@@ -662,6 +671,8 @@ async def runtime_execute_task_final_response(
         messages=messages,
         system_prompt=system_prompt,
         metadata=metadata,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
     content = response.content or ""
     finalized = bool(content.strip())

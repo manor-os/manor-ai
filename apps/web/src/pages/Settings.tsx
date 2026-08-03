@@ -1,10 +1,12 @@
 import { useState, useEffect, type ComponentType } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { api, type BillingPayment } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
 import Modal from "../components/ui/Modal";
+import PageHeader from "../components/ui/PageHeader";
+import { ListRowsSkeleton, PanelLoading } from "../components/ui/Skeleton";
 import DeveloperTab from "../components/settings/DeveloperTab";
 import {
   IconBell,
@@ -238,7 +240,7 @@ function NotificationsTab() {
   });
 
   if (isLoading || !data) {
-    return <div style={{ color: "#a8a29e" }}>{t("status.loading")}</div>;
+    return <PanelLoading rows={4} minHeight={240} />;
   }
 
   const supported = data.supported_channels || [];
@@ -556,7 +558,13 @@ function SecurityTab() {
   const handleVerify = async () => { setError(""); try { const r = await api.twoFactor.verify(code.trim()); if (r.backup_codes) setBackupCodes(r.backup_codes); setStep("idle"); setCode(""); setSetupData(null); refetch(); } catch (e: any) { setError(e.message); } };
   const handleDisable = async () => { setError(""); try { await api.twoFactor.disable(code.trim()); setStep("idle"); setCode(""); setBackupCodes(null); refetch(); } catch (e: any) { setError(e.message); } };
 
-  if (isLoading) return null;
+  if (isLoading) {
+    return (
+      <div className="glass-card" style={{ padding: "24px 28px" }}>
+        <ListRowsSkeleton rows={2} action />
+      </div>
+    );
+  }
   return (
     <div className="glass-card" style={{ padding: "24px 28px" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -753,8 +761,14 @@ export default function Settings() {
   return (
     <div
       className="settings-page"
-      style={{ height: "100%", overflowY: "auto", padding: "clamp(16px, 4vw, 26px)", animation: "fade-in 0.3s ease-out" }}
+      style={{ height: "100%", overflowY: "auto", padding: "8px 24px 24px", animation: "fade-in 0.3s ease-out" }}
     >
+      <PageHeader
+        title={t("nav.settings")}
+        subtitle={
+          undefined
+        }
+      />
       <div className="settings-shell">
         <aside className="settings-local-sidebar" aria-label="Settings navigation">
           <button
@@ -765,10 +779,6 @@ export default function Settings() {
             <span aria-hidden="true">{"<"}</span>
             Back to app
           </button>
-
-          <div className="settings-sidebar-head">
-            <h1>{t("nav.settings")}</h1>
-          </div>
 
           <label className="settings-sidebar-search">
             <IconSearch size={15} />

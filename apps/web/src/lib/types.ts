@@ -552,8 +552,7 @@ export type WorkspaceRole =
   | "owner"
   | "editor"
   | "contributor"
-  | "viewer"
-  | "external_client";
+  | "viewer";
 
 // Documents
 export interface Document {
@@ -561,6 +560,7 @@ export interface Document {
   entity_id: string;
   name: string;
   fs_path?: string;
+  display_path?: string;
   file_size?: number;
   file_type?: string;
   mime_type?: string;
@@ -580,10 +580,6 @@ export interface Document {
   classification?: Classification;
   owner_id?: string;
   client_visible?: boolean;
-  legal_hold?: boolean;
-  legal_hold_reason?: string;
-  legal_hold_set_by?: string;
-  legal_hold_set_at?: string;
   pii_detected?: boolean;
   quarantine_status?: QuarantineStatus;
   editor_recipe_document_id?: string | null;
@@ -628,6 +624,7 @@ export interface Notification {
   read_at?: string;
   created_at?: string;
 }
+
 
 export interface NotificationEventDescriptor {
   kind: string;
@@ -680,6 +677,7 @@ export interface Workspace {
   id: string;
   entity_id: string;
   name: string;
+  artifact_folder_id?: string;
   description?: string;
   category?: string;
   address?: string;
@@ -701,6 +699,16 @@ export interface Workspace {
   heartbeat_cadence?: string;
   last_heartbeat_at?: string;
   stats?: Record<string, any>;
+  /** Whether the blueprint this workspace was installed from has changed
+   *  since. Detection only — applying an update is a deliberate act. */
+  blueprint_update?: {
+    status: "current" | "update_available" | "unknown" | "not_from_blueprint";
+    blueprint_slug?: string | null;
+    installed_at?: string | null;
+    installed_fingerprint?: string | null;
+    current_fingerprint?: string | null;
+    changed?: string[];
+  } | null;
   status: string;
   created_at?: string;
   updated_at?: string;

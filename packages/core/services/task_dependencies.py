@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskStatus
 from packages.core.models.task import Task
 from packages.core.services.task_state_machine import TERMINAL_STATUSES
 
@@ -176,7 +177,7 @@ async def release_or_block_dependents(
         select(Task).where(
             Task.entity_id == task.entity_id,
             Task.workspace_id == task.workspace_id,
-            Task.status.in_(["pending", "on_hold", "blocked"]),
+            Task.status.in_((TaskStatus.PENDING, TaskStatus.ON_HOLD, TaskStatus.BLOCKED,)),
             Task.details["depends_on_task_ids"].astext.isnot(None),
         )
     )).scalars().all())

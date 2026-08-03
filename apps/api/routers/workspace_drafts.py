@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.blueprints import BlueprintStatus
 from packages.core.database import async_session, get_db
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.user import User
@@ -155,7 +156,7 @@ async def _hydrate_response(
     suggestion: Optional[BlueprintSuggestionResponse] = None
     if draft.suggested_blueprint_id and not draft.applied_blueprint_id:
         bp = await db.get(WorkspaceBlueprint, draft.suggested_blueprint_id)
-        if bp is not None and bp.status == "published":
+        if bp is not None and bp.status == BlueprintStatus.PUBLISHED:
             suggestion = BlueprintSuggestionResponse(
                 id=bp.id,
                 title=bp.title,
@@ -577,6 +578,35 @@ async def finalize(
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     await db.commit()
+    from packages.core.services.workspace_setup_service import (
+        dispatch_workspace_post_commit,
+        record_workspace_post_commit_dispatch_failure,
+    )
+
+    try:
+        await dispatch_workspace_post_commit(
+            db,
+            workspace_id=workspace_id,
+            entity_id=user.entity_id,
+        )
+        await db.commit()
+    except Exception as dispatch_exc:  # noqa: BLE001
+        await db.rollback()
+        logger.exception(
+            "workspace %s was created but startup dispatch failed",
+            workspace_id,
+        )
+        try:
+            await record_workspace_post_commit_dispatch_failure(
+                db,
+                workspace_id=workspace_id,
+                entity_id=user.entity_id,
+                error=dispatch_exc,
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            logger.exception("could not record startup dispatch failure for %s", workspace_id)
     return FinalizeDraftResponse(
         workspace_id=workspace_id,
         draft=await _hydrate_response(db, draft),
@@ -600,8 +630,9 @@ async def finalize_stream(
       - ``default_skills_seeded``
       - ``memory_seeded``
       - ``runtime_scheduled``        heartbeat registered.
-      - ``strategist_dispatched``    eta_seconds = 20.
-      - ``complete``                 final {workspace_id, strategist_eta_seconds}.
+      - ``post_commit_dispatch_pending`` durable materialization is ready to commit.
+      - ``strategist_dispatched``    emitted only after the materialization commit.
+      - ``complete``                 final committed workspace result.
       - ``error``                    if anything blew up.
     """
     queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
@@ -623,6 +654,51 @@ async def finalize_stream(
                     progress=progress,
                 )
                 await db.commit()
+                from packages.core.services.workspace_setup_service import (
+                    dispatch_workspace_post_commit,
+                    record_workspace_post_commit_dispatch_failure,
+                )
+
+                try:
+                    dispatch = await dispatch_workspace_post_commit(
+                        db,
+                        workspace_id=workspace_id,
+                        entity_id=user.entity_id,
+                        progress=progress,
+                    )
+                    await db.commit()
+                except Exception as dispatch_exc:  # noqa: BLE001
+                    await db.rollback()
+                    logger.exception(
+                        "workspace %s was created but startup dispatch failed",
+                        workspace_id,
+                    )
+                    dispatch = {"strategist_eta_seconds": None}
+                    try:
+                        await record_workspace_post_commit_dispatch_failure(
+                            db,
+                            workspace_id=workspace_id,
+                            entity_id=user.entity_id,
+                            error=dispatch_exc,
+                        )
+                        await db.commit()
+                    except Exception:  # noqa: BLE001
+                        await db.rollback()
+                        logger.exception(
+                            "could not record startup dispatch failure for %s",
+                            workspace_id,
+                        )
+                    progress(
+                        "dispatch_warning",
+                        {"workspace_id": workspace_id, "message": str(dispatch_exc)},
+                    )
+                progress(
+                    "complete",
+                    {
+                        "workspace_id": workspace_id,
+                        "strategist_eta_seconds": dispatch.get("strategist_eta_seconds"),
+                    },
+                )
                 hydrated = await _hydrate_response(db, draft)
                 await queue.put((
                     "done",
@@ -650,12 +726,22 @@ async def finalize_stream(
                     break
                 yield _sse(event_name, payload)
         finally:
-            if not task.done():
-                task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+            # A dropped SSE connection must not roll back a workspace whose
+            # provisioning is already underway. The runner owns its DB session
+            # and continues to a commit even when the client stops listening.
+            if task.done():
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            else:
+                def _consume_runner_result(done: asyncio.Task) -> None:
+                    try:
+                        done.result()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                task.add_done_callback(_consume_runner_result)
 
     return StreamingResponse(
         gen(),

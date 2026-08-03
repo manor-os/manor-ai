@@ -132,10 +132,16 @@ By the end of the path you should have:
 ## Where to go next
 
 - [Installation](installation.md) explains local and deployment prerequisites.
-- [Configuration](configuration.md) covers secrets, model providers, storage,
-  and runtime settings.
-- [Agents, Skills, and Tools](concepts/agents.md) explains how agents use
-  workspace context.
+- [Configuration](configuration.md) documents every environment variable —
+  secrets, model providers, storage, rate limits, and channels.
+- [Workspaces and Knowledge](concepts/workspaces-knowledge.md),
+  [Agents](concepts/agents.md), [Tasks](concepts/tasks.md), and
+  [Goals & Plans](concepts/goals.md) cover the core operating model.
+- [Workflows](concepts/workflows.md) and
+  [Automations](concepts/automations.md) cover node-graph and scheduled
+  automation.
 - [HITL Governance](concepts/hitl-governance.md) explains approval and deny
   policies before agents touch external systems.
+- [Message Channels](integrations/channels.md) connects WhatsApp, Telegram,
+  Slack, email, and more to your agents.
 - [API Reference](api-reference.md) maps the HTTP API used by the web app.

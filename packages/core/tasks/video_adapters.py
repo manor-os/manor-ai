@@ -511,6 +511,86 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
         return await _download_adapter_result(runtime, job, video_url, model, duration, resolution)
 
 
+ATLASCLOUD_API_BASE = "https://api.atlascloud.ai"
+
+
+class AtlasCloudVideoAdapter(VideoGenerationAdapter):
+    """Atlas Cloud unified video API (Wan family).
+
+    BYOK-only: Manor holds no platform Atlas key, so this adapter is only
+    reachable with a user-supplied key (enforced in generate_video).
+    Contract: POST /api/v1/model/generateVideo → {"data": {"id": ...}},
+    then GET /api/v1/model/prediction/{id} until status completed/failed
+    with the video URL in data.outputs[].
+    """
+
+    adapter_name = "atlascloud"
+    provider = "atlascloud"
+    route = "native"
+    poll_provider = "atlascloud"
+
+    async def submit(
+        self,
+        job: _JobLike,
+        api_key: str,
+        base_url: str | None,
+        runtime: VideoAdapterRuntime,
+    ) -> dict[str, Any]:
+        model = job.model or "atlascloud/wan-2.2-turbo-spicy"
+        native_model = native_video_model(model)
+        params = job.params or {}
+        duration = runtime.normalize_duration(params.get("duration", 5))
+        resolution = runtime.normalize_resolution(model, params.get("resolution", "480p"))
+        public_base_url = str(params.get("public_base_url") or "").strip()
+        base = (base_url or ATLASCLOUD_API_BASE).rstrip("/")
+
+        payload: dict[str, Any] = {
+            "model": native_model,
+            "prompt": job.prompt,
+            "duration": duration,
+            "resolution": resolution,
+        }
+        first_frame = params.get("first_frame_url")
+        if first_frame:
+            payload["image"] = await runtime.ensure_public_url(
+                first_frame,
+                job.entity_id,
+                **runtime.public_url_kwargs(public_base_url),
+            )
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        async with runtime.http_client_cls(timeout=runtime.media_api_timeout) as client:
+            resp = await client.post(
+                f"{base}/api/v1/model/generateVideo", headers=headers, json=payload,
+            )
+            data = resp.json()
+
+        logger.info(
+            "Video job %s Atlas Cloud response (%d): %s", job.id, resp.status_code, str(data)[:500],
+        )
+        if resp.status_code not in (200, 201, 202):
+            err = data.get("error") or data.get("message") or data
+            msg = err.get("message", "") if isinstance(err, dict) else str(err)
+            return {
+                "error": (
+                    f"Atlas Cloud generation failed ({resp.status_code}): {msg}"
+                    f"{provider_error_hint(resp.status_code, msg)}"
+                )
+            }
+
+        body = data.get("data") if isinstance(data.get("data"), dict) else data
+        prediction_id = body.get("id") or body.get("prediction_id")
+        video_url = runtime.extract_video_url(data)
+        if not video_url and prediction_id:
+            poll_url = f"{base}/api/v1/model/prediction/{prediction_id}"
+            await runtime.remember_provider_poll(job.id, self.poll_provider, poll_url, prediction_id)
+            video_url = await runtime.poll_generic_video_task(poll_url, headers)
+        if not video_url:
+            return {"error": "No video URL in Atlas Cloud response", "raw": str(data)[:500]}
+
+        return await _download_adapter_result(runtime, job, video_url, model, duration, resolution)
+
+
 class KlingVideoAdapter(VideoGenerationAdapter):
     adapter_name = "kling"
     provider = "kwaivgi"
@@ -692,9 +772,13 @@ def select_video_generation_adapter(
     provider: str,
     api_key: str,
 ) -> VideoGenerationAdapter | None:
+    selected_provider = (provider or catalog_video_provider(model)).lower()
+    # Atlas models exist only on Atlas — never route them through OpenRouter,
+    # even when the resolved key is an OpenRouter key.
+    if selected_provider == "atlascloud":
+        return AtlasCloudVideoAdapter()
     if (api_key or "").startswith("sk-or-"):
         return OpenRouterVideoAdapter()
-    selected_provider = (provider or catalog_video_provider(model)).lower()
     if selected_provider == "bytedance":
         return VolcengineSeedanceAdapter()
     if selected_provider == "kwaivgi":
@@ -707,6 +791,7 @@ def video_adapter_by_name(name: str) -> VideoGenerationAdapter | None:
         OpenRouterVideoAdapter.adapter_name: OpenRouterVideoAdapter(),
         VolcengineSeedanceAdapter.adapter_name: VolcengineSeedanceAdapter(),
         KlingVideoAdapter.adapter_name: KlingVideoAdapter(),
+        AtlasCloudVideoAdapter.adapter_name: AtlasCloudVideoAdapter(),
     }
     return adapters.get(str(name or "").strip())
 
@@ -755,4 +840,6 @@ async def _download_adapter_result(
         agent_id=getattr(job, "agent_id", None),
         conversation_id=getattr(job, "conversation_id", None),
         user_id=getattr(job, "user_id", None),
+        with_audio=bool(params.get("generate_audio")),
+        has_video_input=bool(params.get("reference_video_urls")),
     )

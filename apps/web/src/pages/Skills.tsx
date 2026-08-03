@@ -1,5 +1,4 @@
 import React, { useState } from "react";
-import { createPortal } from "react-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { t } from "../lib/i18n";
@@ -17,8 +16,6 @@ import CompactCard from "../components/ui/CompactCard";
 import Chip from "../components/ui/Chip";
 import Dropdown from "../components/ui/Dropdown";
 import {
-  IconCheck,
-  IconClose,
   IconInfo,
   IconPlus,
   IconSkill,
@@ -37,31 +34,11 @@ import {
   getSkillTheme,
 } from "./skills/skillTypes";
 import { SkillCard, SectionHeader, SkillIcon } from "./skills/SkillCard";
+import { SkillDetailsModal } from "./skills/SkillDetailsModal";
 import { CredentialModal } from "./skills/CredentialModal";
 import { InvokeModal } from "./skills/InvokeModal";
 import { SkillFormModal } from "./skills/SkillFormModal";
 import { ImportSkillsDialog } from "./skills/ImportSkillsDialog";
-
-function skillExamples(skill: any): any[] {
-  const examples = skill?.examples ?? skill?.config?.examples ?? [];
-  return Array.isArray(examples) ? examples : [];
-}
-
-function skillExampleScenarios(skill: any): string[] {
-  const scenarios =
-    skill?.example_scenarios ?? skill?.config?.example_scenarios ?? [];
-  return Array.isArray(scenarios) ? scenarios : [];
-}
-
-function skillUsageSummary(skill: any): string {
-  return skill?.usage_summary ?? skill?.config?.usage_summary ?? "";
-}
-
-function skillExtraPaths(skill: any): string[] {
-  const paths =
-    skill?.extra_file_paths ?? skill?.config?.extra_file_paths ?? [];
-  return Array.isArray(paths) ? paths : [];
-}
 
 function agentDisplayName(agent: any): string {
   return agent?.name || agent?.agent_name || agent?.agentName || agent?.id || "";
@@ -217,7 +194,7 @@ export default function Skills() {
         height: "100%",
         display: "flex",
         flexDirection: "column",
-        padding: "1rem",
+        padding: 0,
         overflow: "hidden",
         position: "relative",
         zIndex: 10,
@@ -253,7 +230,7 @@ export default function Skills() {
         actions={tab === "my" && scope === "entity" ? (
           <Dropdown
             align="right"
-            trigger={<PageHeaderAddButton label={t("page.skills.add_skill")} caret />}
+            trigger={<PageHeaderAddButton label={t("page.skills.add_skill")} caret className="skills-add-button" />}
             items={[
               { key: "create", label: t("page.skills.create_skill"), icon: <IconPlus size={14} /> },
               { key: "import", label: t("page.skills.import_skills"), icon: <IconUpload size={14} /> },
@@ -807,296 +784,5 @@ export default function Skills() {
         onClose={() => setCredentialSkill(null)}
       />
     </div>
-  );
-}
-
-function SkillDetailsModal({
-  skill,
-  onClose,
-  onImport,
-  importing,
-  subscribed,
-}: {
-  skill: any | null;
-  onClose: () => void;
-  onImport?: () => void;
-  importing?: boolean;
-  subscribed?: boolean;
-}) {
-  if (!skill) return null;
-
-  const examples = skillExamples(skill);
-  const scenarios = skillExampleScenarios(skill);
-  const usage = skillUsageSummary(skill);
-  const paths = skillExtraPaths(skill);
-  const title =
-    skill.display_name || skill.name || skill.skill_name || t("page.skills.skill");
-  const description = getSkillDescription(skill);
-
-  return createPortal(
-    <div
-      className="manor-dialog-overlay"
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 20000,
-        background: "var(--modal-overlay-bg)",
-        backdropFilter: "blur(5px)",
-        WebkitBackdropFilter: "blur(5px)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 20,
-      }}
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        className="manor-dialog skill-details-dialog"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          width: "min(760px, 100%)",
-          maxHeight: "86vh",
-          overflow: "hidden",
-          background: "var(--modal-bg)",
-          backdropFilter: "blur(20px) saturate(1.08)",
-          WebkitBackdropFilter: "blur(20px) saturate(1.08)",
-          borderRadius: 18,
-          boxShadow: "var(--modal-shadow)",
-          border: "1px solid var(--modal-border)",
-          display: "flex",
-          flexDirection: "column",
-        }}
-      >
-        <div
-          style={{
-            padding: "18px 20px",
-            borderBottom: "1px solid var(--modal-border)",
-            display: "flex",
-            justifyContent: "space-between",
-            gap: 16,
-          }}
-        >
-          <div style={{ minWidth: 0 }}>
-            <p
-              style={{
-                margin: "0 0 4px",
-                fontSize: 11,
-                fontWeight: 800,
-                color: "var(--text-muted)",
-                textTransform: "uppercase",
-                letterSpacing: "0.08em",
-              }}
-            >
-              {t("page.skills.skill_details")}
-            </p>
-            <h2
-              style={{
-                margin: 0,
-                fontSize: 20,
-                lineHeight: 1.25,
-                color: "var(--text-strong)",
-                wordBreak: "break-word",
-              }}
-            >
-              {title}
-            </h2>
-          </div>
-          <button
-            onClick={onClose}
-            title={t("page.flows.close")}
-            style={{
-              width: 34,
-              height: 34,
-              borderRadius: "50%",
-              border: "1px solid var(--modal-border)",
-              background: "var(--modal-muted-bg)",
-              color: "var(--text-muted)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: "pointer",
-              flexShrink: 0,
-            }}
-          >
-            <IconClose size={16} />
-          </button>
-        </div>
-
-        <div style={{ overflowY: "auto", padding: 20 }}>
-          {description && (
-            <p
-              style={{ margin: "0 0 16px", color: "var(--text-muted)", lineHeight: 1.6 }}
-            >
-              {description}
-            </p>
-          )}
-
-          {usage && (
-            <DetailSection title={t("page.skills.how_to_use")}>
-              <p style={{ margin: 0, color: "var(--text-default)", lineHeight: 1.6 }}>
-                {usage}
-              </p>
-            </DetailSection>
-          )}
-
-          {scenarios.length > 0 && (
-            <DetailSection title={t("page.skills.example_scenarios")}>
-              <ul style={{ margin: 0, paddingLeft: 18, color: "var(--text-default)" }}>
-                {scenarios.map((scenario) => (
-                  <li
-                    key={scenario}
-                    style={{ marginBottom: 6, lineHeight: 1.5 }}
-                  >
-                    {scenario}
-                  </li>
-                ))}
-              </ul>
-            </DetailSection>
-          )}
-
-          {examples.length > 0 && (
-            <DetailSection title={t("page.skills.examples_folder")}>
-              <div style={{ display: "grid", gap: 10 }}>
-                {examples.map((example: any) => (
-                  <div
-                    key={example.path || example.title}
-                    style={{
-                      border: "1px solid var(--modal-border)",
-                      borderRadius: 10,
-                      overflow: "hidden",
-                      background: "var(--modal-muted-bg)",
-                    }}
-                  >
-                    <div
-                      style={{
-                        padding: "9px 11px",
-                        borderBottom: "1px solid var(--modal-border)",
-                        background: "var(--modal-sunken-bg)",
-                        display: "flex",
-                        justifyContent: "space-between",
-                        gap: 12,
-                      }}
-                    >
-                      <strong style={{ fontSize: 13, color: "var(--text-strong)" }}>
-                        {example.title || example.path}
-                      </strong>
-                      {example.path && (
-                        <span style={{ fontSize: 11, color: "var(--text-faint)" }}>
-                          {example.path}
-                        </span>
-                      )}
-                    </div>
-                    <pre
-                      style={{
-                        margin: 0,
-                        padding: 12,
-                        maxHeight: 220,
-                        overflow: "auto",
-                        whiteSpace: "pre-wrap",
-                        fontSize: 12,
-                        lineHeight: 1.55,
-                        color: "var(--text-default)",
-                        fontFamily:
-                          "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                      }}
-                    >
-                      {(example.content || "").slice(0, 3200)}
-                    </pre>
-                  </div>
-                ))}
-              </div>
-            </DetailSection>
-          )}
-
-          {paths.length > 0 && (
-            <DetailSection title={t("page.skills.bundled_files")}>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                {paths.slice(0, 24).map((path) => (
-                  <span
-                    key={path}
-                    style={{
-                      fontSize: 11,
-                      color: "var(--text-muted)",
-                      background: "var(--modal-muted-bg)",
-                      border: "1px solid var(--modal-border)",
-                      borderRadius: 7,
-                      padding: "3px 7px",
-                    }}
-                  >
-                    {path}
-                  </span>
-                ))}
-              </div>
-            </DetailSection>
-          )}
-        </div>
-
-        <div
-          style={{
-            padding: "14px 20px",
-            borderTop: "1px solid var(--modal-border)",
-            display: "flex",
-            justifyContent: "flex-end",
-            gap: 10,
-          }}
-        >
-          <Button variant="outline" size="sm" onClick={onClose}>
-            {t("page.flows.close")}
-          </Button>
-          {onImport && (subscribed ? (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled
-              style={{
-                color: "#44895f",
-                borderColor: "#bbf7d0",
-                background: "var(--accent-soft)",
-              }}
-            >
-              <IconCheck size={12} />
-              {t("page.skills.subscribed")}
-            </Button>
-          ) : (
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={onImport}
-              loading={importing}
-            >
-              <IconPlus size={12} />
-              {t("page.skills.subscribe")}
-            </Button>
-          ))}
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-function DetailSection({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section style={{ marginBottom: 18 }}>
-      <h3
-        style={{
-          margin: "0 0 8px",
-          fontSize: 13,
-          color: "#1c1917",
-          fontWeight: 800,
-        }}
-      >
-        {title}
-      </h3>
-      {children}
-    </section>
   );
 }

@@ -18,11 +18,15 @@ class Workspace(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "workspaces"
     __table_args__ = (
         Index("ix_workspaces_entity", "entity_id"),
+        Index("uq_workspaces_artifact_folder_id", "artifact_folder_id", unique=True),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # One stable identity shared by the logical Knowledge folder and physical
+    # artifact storage. Display names may change without moving files.
+    artifact_folder_id: Mapped[Optional[str]] = mapped_column(String(26))
     description: Mapped[Optional[str]] = mapped_column(String)
     category: Mapped[Optional[str]] = mapped_column(String(100))
     address: Mapped[Optional[str]] = mapped_column(String)
@@ -75,7 +79,7 @@ class WorkspaceStaff(Base, TimestampMixin):
     promotes it to the canonical workspace membership record. ``user_id``
     is the new direct identity link (preferred for new code); ``staff_id``
     stays for backwards compatibility. ``role`` becomes the workspace-level
-    role (owner / editor / contributor / viewer / external_client) — see
+    role (owner / editor / contributor / viewer) — see
     docs/PERMISSIONS_DESIGN_ZH.md §5.
     """
     __tablename__ = "workspace_staff"
@@ -101,10 +105,20 @@ class Agent(Base, TimestampMixin, SoftDeleteMixin):
     __table_args__ = (
         Index("ix_agents_entity", "entity_id"),
         Index("ix_agents_tags", "tags", postgresql_using="gin"),
+        Index("ix_agents_workspace", "entity_id", "workspace_id"),
+        Index("ix_agents_owner", "entity_id", "owner_user_id"),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[Optional[str]] = mapped_column(String(26))  # NULL = platform template
+    # Ownership triple read by packages/core/services/resource_access.py.
+    # NULL owner = pre-migration row (only an entity admin may modify it);
+    # NULL workspace = shared entity-wide rather than scoped to one workspace.
+    owner_user_id: Mapped[Optional[str]] = mapped_column(String(26))
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
+    visibility: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="entity"
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[Optional[str]] = mapped_column(String(100))
     description: Mapped[Optional[str]] = mapped_column(String)
@@ -128,6 +142,19 @@ class Agent(Base, TimestampMixin, SoftDeleteMixin):
     # version field and update consumers.
     version: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="1.0",
+    )
+    # M11 config revision — the machine-owned counterpart of ``version``.
+    # Split of duties: ``version`` is the AUTHOR's human label (semver-ish
+    # string, referenced by blueprint ``min_version``, bumped by hand and
+    # only for releases); ``revision`` is a monotone integer the platform
+    # bumps automatically via ``packages.core.revisions.bump_revision`` on
+    # every behavior-affecting content change (system_prompt / config /
+    # status), with an ``automation_revisions`` audit row. Ledger events
+    # stamp ``revision`` into ``config_versions`` so outcome analysis can
+    # attribute a run to the exact config that produced it; CAS
+    # (``assert_revision``) also runs against it.
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", default=1,
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -18,6 +19,18 @@ def _dumps(payload: dict[str, Any]) -> str:
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _event_time() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _tool_event_signature(name: str, args: dict[str, Any] | None) -> str:
+    try:
+        encoded = json.dumps(args or {}, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        encoded = str(args or {})
+    return f"{name}\0{encoded}"
 
 
 def _bounded_max_rounds(
@@ -196,14 +209,23 @@ async def runtime_workspace_delegate_service_action(
     if not prompt:
         return _dumps({"error": "prompt is required"})
 
+    run_id = ""
+    event_sink = None
+    event_base: dict[str, Any] = {}
     try:
         from packages.core.ai.context import build_agent_context
         from packages.core.ai.runtime.harness import runtime_execute_chat_agent_loop
         from packages.core.ai.runtime.output_policy import (
             runtime_sanitize_assistant_content_after_loop,
         )
+        from packages.core.ai.runtime.streams import (
+            runtime_tool_arguments_for_chat,
+            runtime_tool_status_for_chat,
+            runtime_tool_stream_sink_var,
+        )
         from packages.core.ai.runtime.surfaces import ChatSurface
         from packages.core.database import async_session
+        from packages.core.models.base import generate_ulid
 
         async with async_session() as db:
             sub, agent, available_services, error = await _resolve_workspace_service_agent(
@@ -217,6 +239,24 @@ async def runtime_workspace_delegate_service_action(
                     "error": "workspace_service_agent_not_found",
                     "message": error,
                     "available_services": available_services,
+                })
+
+            run_id = generate_ulid()
+            event_sink = runtime_tool_stream_sink_var.get(None)
+            event_base = {
+                "run_id": run_id,
+                "agent_id": sub.agent_id,
+                "agent_subscription_id": sub.id,
+                "agent_name": agent.name,
+                "service_key": sub.service_key,
+                "objective": prompt[:500],
+            }
+            if event_sink is not None and event_sink.active:
+                event_sink.emit_sub_agent_event({
+                    **event_base,
+                    "event_type": "started",
+                    "status": "running",
+                    "updated_at": _event_time(),
                 })
 
             ctx = await build_agent_context(
@@ -233,6 +273,64 @@ async def runtime_workspace_delegate_service_action(
             )
 
         max_rounds = _bounded_max_rounds(raw_params.get("max_rounds"))
+        tool_seq = [0]
+        pending_tool_seqs: dict[str, list[int]] = {}
+
+        def on_tool_start(name: str, args: dict[str, Any]) -> None:
+            tool_seq[0] += 1
+            seq = tool_seq[0]
+            signature = _tool_event_signature(name, args)
+            pending_tool_seqs.setdefault(signature, []).append(seq)
+            if event_sink is not None and event_sink.active:
+                safe_arguments = runtime_tool_arguments_for_chat(name, args)
+                tool = {
+                    "seq": seq,
+                    "name": name,
+                    "status": "running",
+                }
+                if safe_arguments is not None:
+                    tool["arguments"] = safe_arguments
+                event_sink.emit_sub_agent_event({
+                    **event_base,
+                    "event_type": "tool_started",
+                    "status": "running",
+                    "updated_at": _event_time(),
+                    "tool": tool,
+                })
+
+        def on_tool_end(
+            name: str,
+            result: str,
+            duration_ms: float = 0,
+            args: dict[str, Any] | None = None,
+        ) -> None:
+            signature = _tool_event_signature(name, args)
+            pending = pending_tool_seqs.get(signature) or []
+            seq = pending.pop(0) if pending else None
+            if not pending:
+                pending_tool_seqs.pop(signature, None)
+            if event_sink is not None and event_sink.active:
+                safe_arguments = runtime_tool_arguments_for_chat(name, args)
+                tool = {
+                    "seq": seq,
+                    "name": name,
+                    "status": (
+                        "error"
+                        if runtime_tool_status_for_chat(result) == "error"
+                        else "completed"
+                    ),
+                    "duration_ms": int(duration_ms),
+                }
+                if safe_arguments is not None:
+                    tool["arguments"] = safe_arguments
+                event_sink.emit_sub_agent_event({
+                    **event_base,
+                    "event_type": "tool_completed",
+                    "status": "running",
+                    "updated_at": _event_time(),
+                    "tool": tool,
+                })
+
         result = await runtime_execute_chat_agent_loop(
             runtime_envelope=ctx.runtime_envelope,
             system_prompt=ctx.system_prompt,
@@ -245,18 +343,43 @@ async def runtime_workspace_delegate_service_action(
             conversation_id=conversation_id,
             task_id=ctx.task_id,
             active_user_message=prompt,
-            legacy_tool_profile=ctx.legacy_runtime_profile,
+            tool_profile=ctx.tool_profile,
             allowed_tool_names=ctx.allowed_tool_names,
             model=ctx.model,
+            temperature=getattr(ctx, "temperature", None),
+            max_tokens=getattr(ctx, "max_tokens", None),
             max_rounds=max_rounds,
             metadata=getattr(ctx, "llm_metadata", None),
+            on_tool_start=on_tool_start,
+            on_tool_end=on_tool_end,
         )
         content = runtime_sanitize_assistant_content_after_loop(
             result.content or "",
             result.tool_calls_made or [],
         )
+        run_status = (
+            "failed"
+            if result.error or result.stop_reason == "error"
+            else "blocked"
+            if result.stop_reason in {"blocked", "hitl_required", "needs_hitl"}
+            else "completed"
+        )
+        if event_sink is not None and event_sink.active:
+            event_sink.emit_sub_agent_event({
+                **event_base,
+                "event_type": "completed" if run_status == "completed" else run_status,
+                "status": run_status,
+                "updated_at": _event_time(),
+                "content": content[:1200],
+                "rounds": result.rounds,
+                "tool_calls_made": list(result.tool_calls_made or [])[:20],
+                "stop_reason": result.stop_reason,
+                "error": result.error,
+            })
         return _dumps({
             "delegated": True,
+            "run_id": run_id,
+            "status": run_status,
             "service": {
                 "agent_subscription_id": sub.id,
                 "service_key": sub.service_key,
@@ -271,6 +394,14 @@ async def runtime_workspace_delegate_service_action(
             "error": result.error,
         })
     except Exception as exc:  # noqa: BLE001
+        if event_sink is not None and event_sink.active and event_base:
+            event_sink.emit_sub_agent_event({
+                **event_base,
+                "event_type": "failed",
+                "status": "failed",
+                "updated_at": _event_time(),
+                "error": str(exc),
+            })
         logger.warning(
             "workspace service delegation failed: workspace=%s",
             workspace_id,

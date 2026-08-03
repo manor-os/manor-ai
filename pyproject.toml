@@ -54,9 +54,6 @@ dependencies = [
     "PyYAML>=6.0",
     # Step I/O strict validation (M3 dispatcher)
     "jsonschema>=4.20",
-    # Durable plan workflows (M3 — opt-in, off by default;
-    # set TEMPORAL_ENABLED=true to use)
-    "temporalio>=1.7",
 ]
 
 [project.urls]

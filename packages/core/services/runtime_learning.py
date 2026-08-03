@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import RUNTIME_CHAT_SOURCE
 from packages.core.ai.runtime.skill_forcing import runtime_message_text_for_intent
+from packages.core.ai.terminal_stops import is_terminal_success_stop_reason
 from packages.core.models.base import generate_ulid
 from packages.core.models.runtime_learning import AgentLearningCandidate, RuntimeEvidence
 from packages.core.models.workspace import Agent, Workspace
@@ -75,6 +76,11 @@ def runtime_status_from_stop_reason(stop_reason: str | None, *, has_content: boo
     """Normalize agentic-loop stop reasons into evidence status."""
     reason = (stop_reason or "completed").strip().lower()
     if reason == "completed":
+        return "succeeded"
+    # A terminal-tool policy (submit_result, skill terminals, media generation,
+    # dispatched local coding) ends the loop on purpose — that is a completed
+    # run, not a partial/failed one.
+    if is_terminal_success_stop_reason(reason):
         return "succeeded"
     if reason in {"credit_exhausted", "blocked", "hitl_required"}:
         return "blocked"

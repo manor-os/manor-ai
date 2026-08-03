@@ -14,7 +14,7 @@ from packages.core.ai.task_runner import TaskRunner
 from packages.core.models.base import generate_ulid
 from packages.core.models.runtime_learning import RuntimeEvidence
 from packages.core.models.task import Task
-from packages.core.models.workspace import Workspace
+from packages.core.models.workspace import Agent, Workspace
 
 
 class _FakeTaskEngine:
@@ -367,3 +367,137 @@ async def test_task_runner_uses_owner_user_when_creator_is_missing(
     assert "byok" not in seen["billing_context"]
     assert seen["agent_turn"]["user_id"] == owner_user_id
     assert seen["agent_turn"]["metadata"] == {"llm_api_key": "primary-owner-key"}
+
+
+@pytest.mark.asyncio
+async def test_task_runner_prefers_fixed_agent_runtime_config(
+    client,
+    db_session,
+    monkeypatch,
+):
+    import packages.core.ai.task_runner as task_runner_module
+    import packages.core.database as db_module
+    import packages.core.services.model_resolver as model_resolver
+    import packages.core.services.workspace_runtime as workspace_runtime
+
+    class _NoopBillingContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    agent_id = generate_ulid()
+    task_id = generate_ulid()
+    db_session.add_all(
+        [
+            Workspace(
+                id=workspace_id,
+                entity_id=entity_id,
+                name="Fixed Agent Workspace",
+                operating_model={},
+                settings={},
+                status="active",
+            ),
+            Agent(
+                id=agent_id,
+                entity_id=entity_id,
+                name="Fixed Runtime Agent",
+                config={
+                    "model_mode": "fixed",
+                    "model": "openai/gpt-5.6-terra",
+                    "temperature": 0.1,
+                    "max_tokens": 7168,
+                },
+            ),
+            Task(
+                id=task_id,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                agent_id=agent_id,
+                title="Run with a fixed Agent model",
+                description="Use the Agent's saved runtime configuration.",
+                status="pending",
+                priority=4,
+                task_type="general",
+                details={"done_when": "The fixed Agent run completes."},
+                owner_service_key="content",
+                delegate_service_keys=[],
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    async def fake_resolve_model_for_user(role, **_kwargs):
+        return f"{role}-fallback-model"
+
+    async def fake_resolve_metadata_for_user(*_args, **_kwargs):
+        return None
+
+    async def fake_runtime(_db, **_kwargs):
+        return workspace_runtime.WorkspaceRuntimeEnvelope(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            is_master=False,
+            bound_tool_names=set(),
+            mcp_allowed_names=set(),
+        )
+
+    async def fake_agent_turn(**kwargs):
+        seen.update(kwargs)
+        return RuntimeTaskAgentTurnResult(
+            messages=list(kwargs["messages"]),
+            tools=list(kwargs["tools"]),
+            loaded_tool_names=set(kwargs["loaded_tool_names"]),
+            response_text="Completed with fixed Agent settings.",
+            tool_names=[],
+            usage={},
+            had_tool_calls=False,
+        )
+
+    async def fake_supervisor(**_kwargs):
+        return {"verdict": "done", "summary": "ok", "reason": "complete"}
+
+    async def fake_assemble_runtime_prompt(**_kwargs):
+        return SimpleNamespace(
+            prompt="Fixed Agent prompt",
+            tool_schemas=[],
+            allowed_tool_names=set(),
+            envelope=None,
+        )
+
+    seen: dict = {}
+    monkeypatch.setattr(model_resolver, "resolve_model_for_user", fake_resolve_model_for_user)
+    monkeypatch.setattr(
+        model_resolver,
+        "resolve_llm_metadata_for_user",
+        fake_resolve_metadata_for_user,
+    )
+    monkeypatch.setattr(workspace_runtime, "resolve_workspace_runtime", fake_runtime)
+    monkeypatch.setattr(
+        task_runner_module,
+        "runtime_task_llm_billing_context",
+        lambda **_kwargs: _NoopBillingContext(),
+    )
+    monkeypatch.setattr(
+        task_runner_module,
+        "runtime_execute_task_agent_turn",
+        fake_agent_turn,
+    )
+    monkeypatch.setattr(
+        task_runner_module,
+        "runtime_review_task_agent_output",
+        fake_supervisor,
+    )
+
+    runner = TaskRunner(engine=_FakeTaskEngine(), session_factory=db_module.async_session)
+    monkeypatch.setattr(runner, "_assemble_runtime_prompt", fake_assemble_runtime_prompt)
+
+    result = await runner.run(task_id)
+
+    assert result["status"] == "completed"
+    assert runner._engine.config.model == "openai/gpt-5.6-terra"
+    assert seen["temperature"] == 0.1
+    assert seen["max_tokens"] == 7168

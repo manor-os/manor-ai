@@ -31,6 +31,8 @@ before this works for real").
 """
 from __future__ import annotations
 
+import re
+
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -41,6 +43,13 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.blueprints.freshness import (
+    BLUEPRINT_VERSION_KEY,
+    CONTENT_FINGERPRINT_KEY,
+    SECTION_FINGERPRINTS_KEY,
+    blueprint_content_fingerprint,
+    blueprint_section_fingerprints,
+)
 from packages.core.blueprints.payload import (
     PayloadError, migrate_payload, validate_payload,
 )
@@ -60,13 +69,21 @@ from packages.core.models.workspace import (
     AgentToolBinding,
     ToolDefinition,
 )
+from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 from packages.core.services.entity_service import create_workspace
 from packages.core.services.workspace_access import (
     ensure_workspace_owner_membership,
     settings_with_default_workspace_access,
 )
+from packages.core.workers.registry import ensure_internal_worker
 
 logger = logging.getLogger(__name__)
+
+_BLUEPRINT_WORKFLOW_KIND_TO_TYPE = {
+    "agent_call": "agent",
+    "tool_call": "tool",
+    "hitl_approval": "wait",
+}
 
 
 class InstallError(Exception):
@@ -104,6 +121,7 @@ class InstallResult:
     goal_ids: list[str] = field(default_factory=list)
     subscription_ids: list[str] = field(default_factory=list)
     scheduled_job_ids: list[str] = field(default_factory=list)
+    workflow_binding_ids: list[str] = field(default_factory=list)
     custom_field_ids: list[str] = field(default_factory=list)
     governance_applied: bool = False
     todos: list[InstallTodo] = field(default_factory=list)
@@ -122,6 +140,7 @@ async def install_blueprint(
     user_id: Optional[str] = None,
     blueprint_id: Optional[str] = None,
     blueprint_slug: Optional[str] = None,
+    blueprint_version: Optional[int] = None,
     create_missing_agents: bool = False,
     governance_preset: str = "standard",
 ) -> InstallResult:
@@ -150,6 +169,8 @@ async def install_blueprint(
     ws_kind = manifest.get("kind") or om_full.pop("kind", None) or ""
     operating_context = om_full.pop("context", None) or ""
     primary_work = om_full.pop("primary_work", None) or ""
+    heartbeat_enabled = bool(om_full.pop("heartbeat_enabled", False))
+    heartbeat_cadence = om_full.pop("heartbeat_cadence", None)
     ws_settings_seed = dict(om_full.pop("settings", None) or {})
 
     # Strategist template (recipe.strategist) goes into
@@ -197,6 +218,8 @@ async def install_blueprint(
     # Carry operating_model + settings forward (create_workspace
     # leaves both empty by design).
     workspace.operating_model = workspace_operating_model
+    workspace.heartbeat_enabled = heartbeat_enabled
+    workspace.heartbeat_cadence = heartbeat_cadence
     settings = settings_with_default_workspace_access(ws_settings_seed)
     if user_id:
         settings.setdefault("created_by_user_id", user_id)
@@ -209,6 +232,17 @@ async def install_blueprint(
         "blueprint_slug": blueprint_slug,
         "title": manifest.get("title"),
         "installed_at": datetime.now(timezone.utc).isoformat(),
+        # What was actually copied, so a later blueprint fix can be detected.
+        # manifest.blueprint_version is the payload *format* version and does
+        # not move when the content does — it read "1.1" across the whole
+        # rewrite that left one workspace running a 636-character skill while
+        # the blueprint had already been corrected to 4664.
+        # Identity is the blueprint id, always — a built-in carries the
+        # marketplace id ``builtin:<slug>``, so nothing has to fall back to
+        # matching on a slug.
+        BLUEPRINT_VERSION_KEY: blueprint_version,
+        CONTENT_FINGERPRINT_KEY: blueprint_content_fingerprint(payload),
+        SECTION_FINGERPRINTS_KEY: blueprint_section_fingerprints(payload),
         "install_mode": mode.value,
         "original_kind": ws_kind,
         # Persist requirement lists so promote() can re-check them.
@@ -270,6 +304,24 @@ async def install_blueprint(
         if sk_id and sk.get("slug"):
             skill_id_by_slug[sk["slug"]] = sk_id
 
+    # External skill requirements can refer to platform built-ins such as the
+    # Chrome runtime skill. Seed those rows before resolving agent bindings so
+    # a clean deployment does not turn a bundled capability into a blocking
+    # ``missing_skill`` install todo merely because no earlier request happened
+    # to initialize the built-in catalog.
+    if (contract.get("requires") or {}).get("skills"):
+        from packages.core.services.builtin_skill_loader import seed_builtin_skills
+
+        await seed_builtin_skills(db)
+
+    # Keep the persisted binding catalog aligned with the live runtime before
+    # validating embedded agent tool bindings. Dev and upgraded deployments can
+    # legitimately have a stale ToolDefinition snapshot even though the tool is
+    # already registered and executable.
+    from packages.core.services.agent_service import ensure_runtime_tool_definitions
+
+    await ensure_runtime_tool_definitions(db)
+
     # ── Embedded agents (with tool / MCP / skill bindings + starter_memory) ──
     for a in embedded.get("agents") or []:
         await _install_embedded_agent(
@@ -278,6 +330,41 @@ async def install_blueprint(
             final_policy=final_policy_preview,
             todos=result.todos,
         )
+
+    required_mcp_slugs = [
+        str(item.get("slug") or "").strip()
+        for item in (contract.get("requires") or {}).get("mcp_servers") or []
+        if isinstance(item, dict) and str(item.get("slug") or "").strip()
+    ]
+    if required_mcp_slugs:
+        from packages.core.services.integration_resolution import (
+            integration_provider_readiness,
+        )
+
+        readiness = await integration_provider_readiness(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            provider_keys=required_mcp_slugs,
+        )
+        existing_todo_providers = {
+            str(todo.payload.get("provider") or todo.payload.get("server_slug") or "")
+            for todo in result.todos
+        }
+        for state in readiness.values():
+            provider = state.provider
+            if state.ready or provider in existing_todo_providers:
+                continue
+            result.todos.append(InstallTodo(
+                kind="missing_integration",
+                detail=state.reason,
+                payload={
+                    "provider": provider,
+                    "setup_kind": state.setup_kind,
+                    "scope": state.scope,
+                },
+                blocking=True,
+            ))
 
     # ── Knowledge packs ──
     for kp in embedded.get("knowledge_packs") or []:
@@ -296,6 +383,12 @@ async def install_blueprint(
             result.subscription_ids.append(sub_id)
         if todo:
             result.todos.append(todo)
+
+    # A copied workspace must be executable, not merely point at Agents.
+    # This is idempotent and binds every active subscription to the entity's
+    # built-in worker, including the subscriptions created just above.
+    if result.subscription_ids:
+        await ensure_internal_worker(db, entity_id)
 
     # ── Custom fields ──
     for cf in recipe.get("custom_fields") or []:
@@ -322,9 +415,21 @@ async def install_blueprint(
     # ── Workflows ──
     # WorkflowDefinition is entity-scoped (no workspace_id column), so
     # multiple workspaces in the same entity share workflow definitions
-    # by slug. The installer is idempotent — (entity_id, name) reuse.
+    # by slug. WorkflowBinding is workspace-scoped, so install must attach
+    # each definition to this workspace for the Workflows tab and manual run
+    # endpoints to see it.
     for w in recipe.get("workflows") or []:
-        await _install_workflow(db, entity_id=entity_id, w=w)
+        workflow_id = await _install_workflow(db, entity_id=entity_id, w=w)
+        if workflow_id and not bool(w.get("internal")):
+            binding_id = await _install_workflow_binding(
+                db,
+                entity_id=entity_id,
+                workspace_id=workspace.id,
+                workflow_id=workflow_id,
+                w=w,
+            )
+            if binding_id:
+                result.workflow_binding_ids.append(binding_id)
 
     # NOTE: v1.1-new sections that still aren't materialised:
     # recipe.task_categories, recipe.sla_policies, recipe.escalation_rules,
@@ -626,6 +731,49 @@ async def _install_scheduled_job(
 # ── Embedded skills / agents / knowledge packs ────────────────────────
 
 
+def normalize_skill_slug(value: str | None) -> str:
+    """Fold the ways one skill name gets written into a single key.
+
+    ``stickman-video-creator`` and ``stickman_video_creator`` are the same
+    capability to everyone except an exact-match lookup. Installing a
+    blueprint that spelled it the other way used to create a SECOND row —
+    the agents bound to the fresh, thin copy while the mature one sat
+    unreferenced — with nothing logged to say a near-duplicate now existed.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+
+
+async def _find_installed_skill(
+    db: AsyncSession, *, entity_id: str, slug: str,
+) -> Optional[Skill]:
+    """Find this entity's skill for ``slug``, tolerating separator drift."""
+    exact = (await db.execute(
+        select(Skill).where(Skill.entity_id == entity_id, Skill.slug == slug)
+    )).scalar_one_or_none()
+    if exact is not None:
+        return exact
+
+    target = normalize_skill_slug(slug)
+    if not target:
+        return None
+    rows = (await db.execute(
+        select(Skill).where(Skill.entity_id == entity_id)
+    )).scalars().all()
+    matches = [row for row in rows if normalize_skill_slug(row.slug) == target]
+    if not matches:
+        return None
+    # Prefer the richest existing definition: a blueprint's embedded copy is
+    # a starting point, not an upgrade over a skill the entity has grown.
+    matches.sort(key=lambda row: len(row.system_prompt or ""), reverse=True)
+    chosen = matches[0]
+    logger.warning(
+        "blueprint install: skill %r matches existing %r after slug "
+        "normalization — reusing it instead of creating a near-duplicate",
+        slug, chosen.slug,
+    )
+    return chosen
+
+
 async def _install_embedded_skill(
     db: AsyncSession, *, entity_id: str, sk: dict[str, Any],
 ) -> Optional[str]:
@@ -641,14 +789,33 @@ async def _install_embedded_skill(
         logger.warning("blueprint install: embedded skill missing slug, skipping")
         return None
 
-    existing = (await db.execute(
-        select(Skill).where(Skill.entity_id == entity_id, Skill.slug == slug)
-    )).scalar_one_or_none()
+    existing = await _find_installed_skill(db, entity_id=entity_id, slug=slug)
     if existing is not None:
-        logger.info(
-            "blueprint install: skill %r already exists in entity, reusing",
-            slug,
+        # M11: reconciling an already-installed skill only bumps its config
+        # revision when the union actually widens the tool set or reactivates
+        # a disabled skill — a repeat install of the same blueprint is a
+        # no-op and must leave the revision (and the audit trail) alone.
+        from packages.core.revisions import (
+            SKILL_CONTENT_REVISION_FIELDS,
+            bump_revision,
+            content_patch_for,
         )
+        merged_tools = sorted(set(existing.tools or []) | set(sk.get("tools") or []))
+        content_patch = content_patch_for(
+            existing,
+            {"tools": merged_tools, "status": "active"},
+            SKILL_CONTENT_REVISION_FIELDS,
+        )
+        existing.tools = merged_tools
+        if existing.status != "active":
+            existing.status = "active"
+        if content_patch:
+            await bump_revision(db, existing, patch=content_patch)
+        logger.info(
+            "blueprint install: skill %r already exists in entity as %r, reconciling",
+            slug, existing.slug,
+        )
+        await db.flush()
         return existing.id
 
     row = Skill(
@@ -707,30 +874,72 @@ async def _install_embedded_agent(
         select(Agent).where(Agent.entity_id == entity_id, Agent.slug == slug)
     )).scalar_one_or_none()
     if existing is not None:
+        from packages.core.revisions import (
+            AGENT_CONTENT_REVISION_FIELDS,
+            bump_revision,
+            content_patch_for,
+        )
+        agent = existing
+        config = dict(agent.config or {})
+        config.update(dict(a.get("config") or {}))
+        config = normalize_agent_runtime_config(config)
+        capabilities = sorted({
+            str(capability).strip()
+            for capability in (
+                list(config.get("business_capabilities") or [])
+                + list(a.get("business_capabilities") or [])
+            )
+            if str(capability or "").strip()
+        })
+        if capabilities:
+            config["business_capabilities"] = capabilities
+        # M11: same rule as skills — an idempotent re-install that produces
+        # the identical merged config and an already-active agent must not
+        # bump the revision.
+        content_patch = content_patch_for(
+            agent,
+            {"config": config, "status": "active"},
+            AGENT_CONTENT_REVISION_FIELDS,
+        )
+        agent.status = "active"
+        agent.config = config
+        if content_patch:
+            await bump_revision(db, agent, patch=content_patch)
         logger.info(
-            "blueprint install: agent %r already exists in entity, reusing",
+            "blueprint install: agent %r already exists in entity, reconciling bindings",
             slug,
         )
-        return existing.id
+    else:
+        config = normalize_agent_runtime_config(a.get("config"))
+        capabilities = sorted({
+            str(capability).strip()
+            for capability in a.get("business_capabilities") or []
+            if str(capability or "").strip()
+        })
+        if capabilities:
+            config["business_capabilities"] = capabilities
+        agent = Agent(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            name=a.get("name") or slug,
+            slug=slug,
+            description=a.get("description"),
+            system_prompt=a.get("system_prompt"),
+            config=config,
+            is_template=False,
+            is_public=False,  # embedded agents stay entity-private
+            category=a.get("category"),
+            tags=list(a.get("tags") or []),
+            source="blueprint",
+            status="active",
+            version=a.get("version") or "1.0",
+        )
+        db.add(agent)
+        await db.flush()
 
-    agent = Agent(
-        id=generate_ulid(),
-        entity_id=entity_id,
-        name=a.get("name") or slug,
-        slug=slug,
-        description=a.get("description"),
-        system_prompt=a.get("system_prompt"),
-        config=dict(a.get("config") or {}),
-        is_template=False,
-        is_public=False,  # embedded agents stay entity-private
-        category=a.get("category"),
-        tags=list(a.get("tags") or []),
-        source="blueprint",
-        status="active",
-        version=a.get("version") or "1.0",
-    )
-    db.add(agent)
-    await db.flush()
+    existing_tool_ids = set((await db.execute(
+        select(AgentToolBinding.tool_id).where(AgentToolBinding.agent_id == agent.id)
+    )).scalars().all())
 
     # Tool bindings — fail-fast on missing ToolDefinition (the exporter's
     # invariant says requires.tools should cover everything embedded
@@ -746,7 +955,16 @@ async def _install_embedded_agent(
                 f"deployment's ToolDefinition catalog. Add the tool first or "
                 f"drop it from the blueprint."
             )
-        db.add(AgentToolBinding(agent_id=agent.id, tool_id=td.id))
+        if td.id not in existing_tool_ids:
+            db.add(AgentToolBinding(agent_id=agent.id, tool_id=td.id))
+            existing_tool_ids.add(td.id)
+
+    existing_mcp_bindings = {
+        row.mcp_server_id: row
+        for row in (await db.execute(
+            select(AgentMCPBinding).where(AgentMCPBinding.agent_id == agent.id)
+        )).scalars().all()
+    }
 
     # MCP bindings — missing server becomes a todo, not a failure.
     for binding in a.get("mcp_bindings") or []:
@@ -776,16 +994,32 @@ async def _install_embedded_agent(
                 blocking=True,
             ))
             continue
-        db.add(AgentMCPBinding(
-            id=generate_ulid(),
-            agent_id=agent.id,
-            mcp_server_id=srv.id,
-            allowed_tools=list(binding.get("allowed_tools") or []) or None,
-            # config_override starts empty — the operator fills in the
-            # allowlisted fields via UI (or the MCP setup flow).
-            config_override={},
-            status="active",
-        ))
+        existing_mcp = existing_mcp_bindings.get(srv.id)
+        if existing_mcp is not None:
+            existing_mcp.allowed_tools = (
+                list(binding.get("allowed_tools") or []) or None
+            )
+            existing_mcp.status = "active"
+        else:
+            new_binding = AgentMCPBinding(
+                id=generate_ulid(),
+                agent_id=agent.id,
+                mcp_server_id=srv.id,
+                allowed_tools=list(binding.get("allowed_tools") or []) or None,
+                # config_override starts empty — the operator fills in the
+                # allowlisted fields via UI (or the MCP setup flow).
+                config_override={},
+                status="active",
+            )
+            db.add(new_binding)
+            existing_mcp_bindings[srv.id] = new_binding
+
+    existing_skill_bindings = {
+        row.skill_id: row
+        for row in (await db.execute(
+            select(AgentSkillBinding).where(AgentSkillBinding.agent_id == agent.id)
+        )).scalars().all()
+    }
 
     # Skill bindings — embedded skills resolve via skill_id_by_slug
     # (created earlier in install_blueprint); external skills look up by
@@ -810,17 +1044,41 @@ async def _install_embedded_agent(
                 ))
                 continue
             skill_id = sk_row.id
-        db.add(AgentSkillBinding(
-            id=generate_ulid(),
-            agent_id=agent.id,
-            skill_id=skill_id,
-            status="active",
-        ))
+        existing_skill = existing_skill_bindings.get(skill_id)
+        if existing_skill is not None:
+            existing_skill.status = "active"
+        else:
+            new_binding = AgentSkillBinding(
+                id=generate_ulid(),
+                agent_id=agent.id,
+                skill_id=skill_id,
+                status="active",
+            )
+            db.add(new_binding)
+            existing_skill_bindings[skill_id] = new_binding
 
     # Starter memory — agent-level (workspace_id NULL, user_id NULL).
+    existing_memory_keys = {
+        (row.memory_type, row.scope, row.content)
+        for row in (await db.execute(
+            select(AgentMemory).where(
+                AgentMemory.agent_id == agent.id,
+                AgentMemory.user_id.is_(None),
+                AgentMemory.workspace_id.is_(None),
+                AgentMemory.status == "active",
+            )
+        )).scalars().all()
+    }
     for m in a.get("starter_memory") or []:
         if not isinstance(m, dict) or "user_id" in m and m["user_id"] is not None:
             # validate_payload already rejected user_id, but be defensive.
+            continue
+        memory_key = (
+            m.get("memory_type") or "instruction",
+            m.get("scope"),
+            m.get("content") or "",
+        )
+        if memory_key in existing_memory_keys:
             continue
         db.add(AgentMemory(
             id=generate_ulid(),
@@ -837,6 +1095,7 @@ async def _install_embedded_agent(
             metadata_={"installed_with_agent_slug": slug},
             status="active",
         ))
+        existing_memory_keys.add(memory_key)
 
     await db.flush()
     return agent.id
@@ -964,20 +1223,8 @@ async def _install_workflow(
         logger.warning("blueprint install: workflow missing slug, skipping")
         return None
 
-    existing = (await db.execute(
-        select(WorkflowDefinition).where(
-            WorkflowDefinition.entity_id == entity_id,
-            WorkflowDefinition.name == slug,
-        )
-    )).scalar_one_or_none()
-    if existing is not None:
-        logger.info(
-            "blueprint install: workflow %r already exists in entity, reusing",
-            slug,
-        )
-        return existing.id
-
-    # Translate steps: kind → type, depends_on → next.
+    # Translate blueprint workflow DSL into the canonical runtime graph:
+    # kind → type, depends_on → next, and an explicit trigger entry node.
     bp_steps = list(w.get("steps") or [])
     next_map: dict[str, list[str]] = {}
     for s in bp_steps:
@@ -994,20 +1241,77 @@ async def _install_workflow(
         if not isinstance(s, dict) or not s.get("id"):
             continue
         sid = s["id"]
-        # Pack everything besides id/kind/depends_on into the model's
-        # ``config`` so the runtime engine has full access without us
-        # imposing a fixed schema.
-        config = {
-            k: v for k, v in s.items()
-            if k not in ("id", "kind", "depends_on", "name")
-        }
-        runtime_steps.append({
+        step_type = _blueprint_runtime_step_type(s)
+        config = _blueprint_runtime_step_config(s, step_type)
+        step = {
             "id": sid,
-            "type": s.get("kind") or "agent",
+            "type": step_type,
             "name": s.get("name") or sid,
             "config": config,
-            "next": next_map.get(sid, []),
+            "next": _workflow_targets(s.get("next")) if "next" in s else next_map.get(sid, []),
+        }
+        for route_key in ("true_next", "false_next"):
+            if route_key in s:
+                step[route_key] = _workflow_targets(s.get(route_key))
+        if s.get("meta"):
+            step["meta"] = s["meta"]
+        runtime_steps.append(step)
+
+    if runtime_steps and not any(
+        step.get("type") in ("trigger", "webhook") for step in runtime_steps
+    ):
+        existing_ids = {str(step.get("id")) for step in runtime_steps}
+        start_id = "start" if "start" not in existing_ids else "blueprint_start"
+        root_ids = [
+            str(s.get("id"))
+            for s in bp_steps
+            if isinstance(s, dict) and s.get("id") and not s.get("depends_on")
+        ]
+        if not root_ids and runtime_steps:
+            root_ids = [str(runtime_steps[0]["id"])]
+        trigger_config = {"trigger_type": w.get("trigger_type") or "manual"}
+        if w.get("trigger_ref"):
+            trigger_config["trigger_ref"] = w["trigger_ref"]
+        if isinstance(w.get("run_inputs"), list):
+            run_inputs = [
+                dict(item)
+                for item in w["run_inputs"]
+                if isinstance(item, dict)
+            ]
+            trigger_config["run_inputs"] = run_inputs
+            trigger_config["outputs"] = [
+                {
+                    "key": str(item.get("key") or item.get("name")).strip(),
+                    "type": (
+                        "text"
+                        if str(item.get("type") or "string").lower() == "string"
+                        else str(item.get("type") or "any").lower()
+                    ),
+                    "value": (
+                        "{{"
+                        + start_id
+                        + "."
+                        + str(item.get("key") or item.get("name")).strip()
+                        + "}}"
+                    ),
+                }
+                for item in run_inputs
+                if str(item.get("key") or item.get("name") or "").strip()
+            ]
+        runtime_steps.insert(0, {
+            "id": start_id,
+            "type": "trigger",
+            "name": "Workflow start",
+            "config": trigger_config,
+            "next": root_ids,
         })
+
+    from packages.core.services.workflow_service import validate_workflow_steps
+
+    validation = validate_workflow_steps(runtime_steps)
+    if not validation["valid"]:
+        messages = "; ".join(error["message"] for error in validation["errors"])
+        raise InstallError(f"workflow {slug!r} is invalid: {messages}")
 
     # Convert variables list → dict {key: default_value}.
     variables_dict: dict[str, Any] = {}
@@ -1018,6 +1322,30 @@ async def _install_workflow(
     trigger_config: dict[str, Any] = {}
     if w.get("trigger_ref"):
         trigger_config["trigger_ref"] = w["trigger_ref"]
+
+    existing = (await db.execute(
+        select(WorkflowDefinition).where(
+            WorkflowDefinition.entity_id == entity_id,
+            WorkflowDefinition.name == slug,
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        logger.info(
+            "blueprint install: workflow %r already exists in entity, reconciling",
+            slug,
+        )
+        existing.description = w.get("description")
+        existing.trigger_type = w.get("trigger_type") or "manual"
+        existing.trigger_config = trigger_config
+        existing.steps = runtime_steps
+        existing.variables = variables_dict
+        existing.category = w.get("category")
+        existing.tags = list(w.get("tags") or [])
+        existing.version = int(w.get("version") or existing.version or 1)
+        existing.is_active = True
+        existing.status = "active"
+        await db.flush()
+        return existing.id
 
     row = WorkflowDefinition(
         id=generate_ulid(),
@@ -1037,6 +1365,121 @@ async def _install_workflow(
     db.add(row)
     await db.flush()
     return row.id
+
+
+def _blueprint_runtime_step_type(step: dict[str, Any]) -> str:
+    raw = str(step.get("type") or step.get("kind") or "agent").strip()
+    return _BLUEPRINT_WORKFLOW_KIND_TO_TYPE.get(raw, raw or "agent")
+
+
+def _blueprint_runtime_step_config(
+    step: dict[str, Any],
+    step_type: str,
+) -> dict[str, Any]:
+    config = dict(step.get("config") or {})
+    excluded = {
+        "id",
+        "type",
+        "kind",
+        "depends_on",
+        "name",
+        "config",
+        "next",
+        "true_next",
+        "false_next",
+        "meta",
+    }
+    for key, value in step.items():
+        if key not in excluded:
+            config.setdefault(key, value)
+
+    if step_type == "wait" and str(step.get("kind") or "") == "hitl_approval":
+        config.setdefault("wait_type", "approval")
+        config.setdefault("message", step.get("name") or "Operator approval required")
+        config.setdefault("requires_operator_approval", True)
+    return config
+
+
+def _workflow_targets(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)] if str(value).strip() else []
+
+
+async def _install_workflow_binding(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    workflow_id: str,
+    w: dict[str, Any],
+) -> Optional[str]:
+    """Attach a blueprint workflow definition to the installed workspace."""
+    slug = w.get("slug")
+    if not slug:
+        return None
+
+    trigger_type = w.get("trigger_type") or "manual"
+    if trigger_type == "schedule":
+        logger.warning(
+            "blueprint install: workflow %r uses trigger_type=schedule; "
+            "scheduled work should be declared in recipe.scheduled_jobs",
+            slug,
+        )
+        return None
+
+    from packages.core.services import workflow_service
+
+    binding_config = {
+        **dict(w.get("binding_config") or {}),
+        "source": "blueprint",
+        "workspace_blueprint_workflow_slug": slug,
+    }
+    variables_dict: dict[str, Any] = {}
+    for v in w.get("variables") or []:
+        if isinstance(v, dict) and v.get("key"):
+            variables_dict[v["key"]] = v.get("default")
+
+    existing = await workflow_service.list_bindings(
+        db,
+        entity_id,
+        workspace_id=workspace_id,
+        workflow_id=workflow_id,
+    )
+    for binding in existing:
+        if binding.trigger_type == trigger_type:
+            binding.enabled = True
+            binding.status = "active"
+            binding.name = w.get("name") or slug
+            binding.config = {
+                **dict(binding.config or {}),
+                **binding_config,
+            }
+            binding.variables = {
+                **dict(binding.variables or {}),
+                **variables_dict,
+            }
+            await db.flush()
+            return binding.id
+
+    trigger_config: dict[str, Any] = {}
+    if w.get("trigger_ref"):
+        trigger_config["trigger_ref"] = w["trigger_ref"]
+
+    binding = await workflow_service.create_workflow_binding(
+        db,
+        entity_id,
+        workflow_id,
+        workspace_id=workspace_id,
+        name=w.get("name") or slug,
+        trigger_type=trigger_type,
+        trigger_config=trigger_config,
+        variables=variables_dict,
+        config=binding_config,
+    )
+    return binding.id
 
 
 # ── Post-install checks ───────────────────────────────────────────────

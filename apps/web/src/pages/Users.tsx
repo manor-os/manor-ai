@@ -132,11 +132,11 @@ export default function Users() {
   }
 
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "1rem", overflow: "hidden", position: "relative", zIndex: 10 }}>
+    <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: 0, overflow: "hidden", position: "relative", zIndex: 10 }}>
       {/* Header */}
       <PageHeader
         title={t("nav.users")}
-        subtitle={`${activeUsers} ${t("page.users.active")} / ${totalUsers} ${t("page.users.total")}`}
+        meta={`${activeUsers} ${t("page.users.active")} / ${totalUsers} ${t("page.users.total")}`}
         toolbar={(
           <SmartToolbar
             searchValue={search}
@@ -218,7 +218,7 @@ export default function Users() {
       />
 
       {/* Users Table */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "8px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: 0 }}>
         {filtered.length > 0 ? (
           <div className="glass-panel" style={{ overflow: "hidden", padding: "8px 16px 16px" }}>
             <table className="glass-table">

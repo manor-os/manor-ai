@@ -13,6 +13,7 @@ import httpx
 from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, VectorStatus
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,12 @@ logger = logging.getLogger(__name__)
 # Config helpers
 # ---------------------------------------------------------------------------
 
-_MAX_CHUNK_CHARS = 24_000  # ~8 000 tokens at ~3 chars/token (OpenAI/large-context models)
+
+# Retrieval-granularity chunk size, not a provider context limit. ~1600 chars
+# sits in the 256-512-token range general/fact-focused RAG retrieval is
+# measured to work best at — small enough that a chunk's embedding represents
+# one idea, not an averaged blur of everything in the document.
+_RETRIEVAL_CHUNK_CHARS = 1_600
 _OLLAMA_CHUNK_CHARS = 400  # Conservative limit for Ollama models (512-token context, CJK ≈ 1 token/char)
 
 
@@ -423,7 +429,7 @@ async def _mark_document_content_unavailable(
     await db.commit()
 
 
-def _chunk_text(text_content: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:
+def _chunk_text(text_content: str, max_chars: int = _RETRIEVAL_CHUNK_CHARS) -> list[str]:
     """Split text into chunks of roughly *max_chars* characters."""
     if len(text_content) <= max_chars:
         return [text_content]
@@ -441,17 +447,6 @@ def _chunk_text(text_content: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[st
         chunks.append(text_content[start:end])
         start = end
     return chunks
-
-
-def _average_embeddings(embeddings: list[list[float]]) -> list[float]:
-    """Compute the element-wise average of multiple embedding vectors."""
-    dim = len(embeddings[0])
-    avg = [0.0] * dim
-    for emb in embeddings:
-        for i in range(dim):
-            avg[i] += emb[i]
-    n = len(embeddings)
-    return [v / n for v in avg]
 
 
 # ---------------------------------------------------------------------------
@@ -520,41 +515,65 @@ async def index_document(db: AsyncSession, document_id: str) -> bool:
 
         await _update_progress("chunking", 20)
         # Use smaller chunks for Ollama (limited context window)
-        chunk_size = _OLLAMA_CHUNK_CHARS if not cfg["api_key"] or cfg["api_key"] == "ollama" else _MAX_CHUNK_CHARS
+        chunk_size = _OLLAMA_CHUNK_CHARS if not cfg["api_key"] or cfg["api_key"] == "ollama" else _RETRIEVAL_CHUNK_CHARS
         chunks = _chunk_text(content, max_chars=chunk_size)
         total = len(chunks)
 
         await _update_progress("embedding", 30, total_chunks=total, current_chunk=0)
 
-        if total == 1:
-            embedding = await generate_embedding(chunks[0])
-            await _update_progress("embedding", 90, total_chunks=1, current_chunk=1)
-        else:
-            # Process in batches and report per-batch progress
-            batch_size = 100
-            all_embeddings: list[list[float]] = []
-            for i in range(0, total, batch_size):
-                batch = chunks[i : i + batch_size]
-                batch_embeddings = await generate_embeddings_batch(batch)
-                all_embeddings.extend(batch_embeddings)
-                done = min(i + batch_size, total)
-                pct = 30 + int(60 * done / total)
-                await _update_progress("embedding", pct, total_chunks=total, current_chunk=done)
-
-            embedding = _average_embeddings(all_embeddings)
+        # Each chunk gets its OWN embedding — no averaging. Averaging collapsed
+        # a whole document into one point, so a fact three pages in got no more
+        # representation in the vector than the title did; independent chunk
+        # embeddings let retrieval find the paragraph, not just the document.
+        batch_size = 100
+        chunk_embeddings: list[list[float]] = []
+        for i in range(0, total, batch_size):
+            batch = chunks[i : i + batch_size]
+            batch_embeddings = await generate_embeddings_batch(batch)
+            if len(batch_embeddings) != len(batch):
+                # A provider returning fewer/more embeddings than inputs sent
+                # cannot be safely zipped to chunks — silently pairing them
+                # positionally would attach the wrong vector to the wrong
+                # text. Treat it as a hard failure rather than guess.
+                raise RuntimeError(
+                    f"embedding provider returned {len(batch_embeddings)} vectors "
+                    f"for {len(batch)} inputs"
+                )
+            chunk_embeddings.extend(batch_embeddings)
+            done = min(i + batch_size, total)
+            pct = 30 + int(60 * done / total)
+            await _update_progress("embedding", pct, total_chunks=total, current_chunk=done)
 
         await _update_progress("storing", 95, total_chunks=total, current_chunk=total)
 
-        # Store embedding using raw SQL since SQLAlchemy needs explicit cast for pgvector.
-        # Use connection.execute() to avoid MissingGreenlet errors with asyncpg.
-        vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
         conn = await db.connection()
+        # Replace this document's chunks wholesale — reindexing must not
+        # accumulate stale rows alongside fresh ones.
         await conn.execute(
-            text(
-                "UPDATE documents SET embedding = CAST(:vec AS vector), "
-                "vector_status = :status WHERE id = :doc_id"
-            ),
-            {"vec": vec_str, "status": VectorStatus.READY, "doc_id": document_id},
+            text("DELETE FROM document_chunks WHERE document_id = :doc_id"),
+            {"doc_id": document_id},
+        )
+        for index, (chunk_content, embedding) in enumerate(zip(chunks, chunk_embeddings)):
+            vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
+            await conn.execute(
+                text(
+                    "INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding) "
+                    "VALUES (:id, :doc_id, :idx, :content, CAST(:vec AS vector))"
+                ),
+                {
+                    "id": generate_ulid(),
+                    "doc_id": document_id,
+                    "idx": index,
+                    "content": chunk_content,
+                    "vec": vec_str,
+                },
+            )
+
+        # documents.vector_status stays the one signal for "is this document
+        # indexed" — document_chunks now hold the actual embeddings.
+        await conn.execute(
+            text("UPDATE documents SET vector_status = :status WHERE id = :doc_id"),
+            {"status": VectorStatus.READY, "doc_id": document_id},
         )
 
         # Sync in-memory object with what raw SQL just wrote,
@@ -731,149 +750,186 @@ async def search_similar(
     return results
 
 
-async def hybrid_search(
+async def search_similar_chunks(
     db: AsyncSession,
     entity_id: str,
     query: str,
     *,
-    limit: int = 10,
-    workspace_id: str | None = None,
-    group_ids: list[str] | None = None,
+    limit: int = 20,
+    threshold: float = 0.5,
+    allowed_doc_ids: set[str] | None = None,
 ) -> list[dict]:
-    """Hybrid search: combine vector similarity + text search.
+    """Chunk-level semantic search using pgvector cosine similarity.
 
-    1. Get top N vector results (semantic)
-    2. Get top N text results (ILIKE on name)
-    3. Merge and deduplicate, boosting items that appear in both
-    4. Return top K
+    Returns one row per matching CHUNK, ranked by similarity — a document can
+    appear more than once; callers wanting one hit per document should dedupe
+    keeping the first (highest-scored) occurrence, since rows are pre-ordered.
     """
-    allowed_doc_ids = (
-        await _group_document_ids(db, entity_id, group_ids)
-        if group_ids
-        else await _workspace_document_ids(db, entity_id, workspace_id) if workspace_id else None
-    )
-    candidate_limit = limit * 4 if allowed_doc_ids is not None else max(limit * 3, 10)
+    cfg = await _resolve_embedding_config()
+    if not cfg:
+        return []
+    query_embedding = await generate_embedding(query)
+    vec_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
-    # --- Vector results ---
-    # threshold=0.5 is intentionally conservative: cross-lingual embeddings
-    # (e.g. mxbai-embed-large on Chinese text) produce a long tail of weak
-    # 0.3–0.5 hits that drown exact filename matches in the merge step below.
-    vector_results: list[dict] = []
-    if await _resolve_embedding_config():
-        try:
-            vector_results = await search_similar(
-                db, entity_id, query, limit=candidate_limit, threshold=0.5
-            )
-            if allowed_doc_ids is not None:
-                vector_results = [r for r in vector_results if r.get("document_id") in allowed_doc_ids]
-        except Exception:
-            logger.warning("Vector search failed, falling back to text only", exc_info=True)
+    conditions = [
+        "d.entity_id = :eid",
+        "d.is_trashed = false",
+        "dc.embedding IS NOT NULL",
+        "1 - (dc.embedding <=> CAST(:query_vec AS vector)) >= :threshold",
+    ]
+    params: dict[str, object] = {
+        "query_vec": vec_str, "eid": entity_id, "threshold": threshold, "lim": limit,
+    }
+    if allowed_doc_ids is not None:
+        if not allowed_doc_ids:
+            return []
+        conditions.append("dc.document_id = ANY(:doc_ids)")
+        params["doc_ids"] = list(allowed_doc_ids)
 
-    # --- Text results ---
-    from packages.core.services.document_service import list_documents
+    # ivfflat is an approximate index: with the default probes=1 it scans only
+    # the single nearest cluster of its 100 lists, and at low chunk counts
+    # (a new or small workspace, or any table before autovacuum has run
+    # ANALYZE) a real match can land in a cluster that never gets probed and
+    # is silently missed — not a slow query, a WRONG one. SET LOCAL scopes
+    # this to the current transaction only, so it can't leak the setting onto
+    # other queries sharing a pooled connection.
+    await db.execute(text("SET LOCAL ivfflat.probes = 10"))
+    sql = text(f"""
+        SELECT dc.document_id, dc.content, d.name,
+               1 - (dc.embedding <=> CAST(:query_vec AS vector)) AS score
+        FROM document_chunks dc
+        JOIN documents d ON d.id = dc.document_id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY dc.embedding <=> CAST(:query_vec AS vector)
+        LIMIT :lim
+    """)
+    rows = (await db.execute(sql, params)).fetchall()
+    return [
+        {
+            "document_id": row.document_id,
+            "name": row.name,
+            "score": round(float(row.score), 4),
+            "content_preview": row.content[:_PREVIEW_MAX_CHARS],
+        }
+        for row in rows
+    ]
 
-    text_docs, _ = await list_documents(
-        db, entity_id, name_search=query, limit=candidate_limit,
-    )
-    query_lower = query.lower()
-    text_results = []
-    for doc in text_docs:
-        if allowed_doc_ids is not None and doc.id not in allowed_doc_ids:
+
+async def search_similar_trigram(
+    db: AsyncSession,
+    entity_id: str,
+    query: str,
+    *,
+    limit: int = 20,
+    allowed_doc_ids: set[str] | None = None,
+) -> list[dict]:
+    """Chunk-level lexical search via Postgres ``pg_trgm``.
+
+    Character-trigram similarity rather than word tokenization: it scales via
+    the GIN index to the whole corpus (the fallback this replaced scanned at
+    most 25 documents, unindexed, per query), and it works on CJK text, which
+    Postgres's built-in text-search parsers do not segment into words at all.
+    No embedding provider required — this path is always available.
+    """
+    conditions = ["d.entity_id = :eid", "d.is_trashed = false"]
+    params: dict[str, object] = {"query": query, "eid": entity_id, "lim": limit}
+    if allowed_doc_ids is not None:
+        if not allowed_doc_ids:
+            return []
+        conditions.append("dc.document_id = ANY(:doc_ids)")
+        params["doc_ids"] = list(allowed_doc_ids)
+
+    sql = text(f"""
+        SELECT dc.document_id, dc.content, d.name,
+               similarity(dc.content, :query) AS score
+        FROM document_chunks dc
+        JOIN documents d ON d.id = dc.document_id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY similarity(dc.content, :query) DESC
+        LIMIT :lim
+    """)
+    rows = (await db.execute(sql, params)).fetchall()
+    return [
+        {
+            "document_id": row.document_id,
+            "name": row.name,
+            "score": round(float(row.score), 4),
+            "content_preview": row.content[:_PREVIEW_MAX_CHARS],
+        }
+        for row in rows
+        if row.score and row.score > 0
+    ]
+
+
+def _dedupe_best_per_document(ranked_chunk_hits: list[dict]) -> list[dict]:
+    """Collapse a chunk-ranked list to one row per document (its best chunk),
+    preserving rank order — fusion combines per-DOCUMENT ranks, and the final
+    result contract is one row per document, matching every caller from
+    before chunking existed."""
+    seen: set[str] = set()
+    out = []
+    for hit in ranked_chunk_hits:
+        doc_id = hit["document_id"]
+        if doc_id in seen:
             continue
-        preview = await _build_content_preview(
-            entity_id=entity_id,
-            fs_path=doc.fs_path,
-            mime_type=doc.mime_type,
-            file_type=doc.file_type,
-            metadata=doc.metadata_,
-            name=doc.name,
-        )
-        # name_search ILIKE also matches mime_type/source/metadata — only
-        # treat a hit as "exact" when the query is literally in the name.
-        name_substring_hit = bool(doc.name) and query_lower in doc.name.lower()
-        text_results.append({
-            "document_id": doc.id,
-            "name": doc.name,
-            "score": 0.9 if name_substring_hit else 0.55,
-            "content_preview": preview,
-        })
-
-    lexical_results = await _lexical_scope_results(
-        db,
-        entity_id,
-        query,
-        limit=candidate_limit,
-        allowed_doc_ids=allowed_doc_ids,
-    )
-
-    # --- Merge ---
-    seen: dict[str, dict] = {}
-
-    # Add vector results first (higher quality scores)
-    for r in vector_results:
-        seen[r["document_id"]] = r
-
-    # Merge text results — boost score if already present from vector
-    for r in text_results:
-        doc_id = r["document_id"]
-        if doc_id in seen:
-            seen[doc_id]["score"] = min(1.0, seen[doc_id]["score"] + 0.15)
-        else:
-            seen[doc_id] = r
-
-    # Merge scoped lexical results last. These are especially important for
-    # Knowledge Nets when embeddings are disabled/unavailable and the natural
-    # language question is longer than any filename.
-    for r in lexical_results:
-        doc_id = r["document_id"]
-        if doc_id in seen:
-            seen[doc_id]["score"] = max(float(seen[doc_id].get("score") or 0), float(r.get("score") or 0))
-            if not seen[doc_id].get("content_preview") or seen[doc_id]["content_preview"] == seen[doc_id].get("name"):
-                seen[doc_id]["content_preview"] = r.get("content_preview", "")
-        else:
-            seen[doc_id] = r
-
-    merged = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
-    return merged[:limit]
+        seen.add(doc_id)
+        out.append(hit)
+    return out
 
 
-async def _lexical_scope_results(
+def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], *, k: int = 60) -> dict[str, float]:
+    """Fuse several document-ranked lists into one score per document_id,
+    using each item's RANK in each list rather than its raw score.
+
+    Vector cosine similarity, trigram similarity, and a hand-tuned 0.9/0.55
+    filename-match score live on incompatible scales — adding them lets
+    whichever source happens to produce bigger numbers dominate regardless of
+    actual relevance. Reciprocal Rank Fusion sidesteps the scale problem
+    entirely by ignoring the scores and only looking at position; it is the
+    default hybrid-search fusion in Elasticsearch, OpenSearch, and Azure AI
+    Search for the same reason. ``k=60`` is the value all three of those use.
+    """
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked, start=1):
+            doc_id = item["document_id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return scores
+
+
+async def _unindexed_scope_results(
     db: AsyncSession,
     entity_id: str,
     query: str,
     *,
     limit: int,
-    allowed_doc_ids: set[str] | None,
+    allowed_doc_ids: set[str],
 ) -> list[dict]:
-    """Content-aware fallback for scoped RAG when vector search is unavailable.
+    """Read-the-file fallback for documents that have no chunks yet.
 
-    ``list_documents(name_search=query)`` only works when the whole natural
-    language query appears in metadata/name. Workspace agents usually ask a
-    richer question ("brand voice safety rules draft style..."), so scoped
-    Knowledge Net searches need a lightweight content scan before returning
-    "no indexed content".
+    document_chunks only exist once index_document has run — but a Knowledge
+    Net or workspace scope is a small, explicit membership list the caller
+    picked (``the set is already constrained by membership`` — this is why
+    the read-on-the-fly cost here is acceptable when it would not be for an
+    entity-wide search), and a freshly-uploaded or never-embedded file must
+    still be searchable within its own scope. Entity-wide (unscoped) search
+    does not get this path — see search_similar_trigram for that, which is
+    indexed and does not require reading every file on every query.
     """
     terms = _lexical_terms(query)
-    if not terms:
+    if not terms or not allowed_doc_ids:
         return []
 
     from packages.core.models.document import Document
 
-    stmt = select(Document).where(
-        Document.entity_id == entity_id,
-        Document.is_trashed == False,  # noqa: E712
-    )
-    if allowed_doc_ids is not None:
-        if not allowed_doc_ids:
-            return []
-        stmt = stmt.where(Document.id.in_(allowed_doc_ids))
-    else:
-        # Entity-wide fallback should stay bounded; scoped Knowledge Net
-        # searches can safely inspect all allowed docs because the set is
-        # already constrained by membership.
-        stmt = stmt.limit(max(limit, 25))
+    docs = list((await db.execute(
+        select(Document).where(
+            Document.entity_id == entity_id,
+            Document.is_trashed == False,  # noqa: E712
+            Document.id.in_(allowed_doc_ids),
+        )
+    )).scalars().all())
 
-    docs = list((await db.execute(stmt)).scalars().all())
     scored: list[dict] = []
     for doc in docs:
         search_content = await _build_content_preview(
@@ -886,11 +942,8 @@ async def _lexical_scope_results(
             max_chars=_LEXICAL_SCAN_MAX_CHARS,
         )
         score = _lexical_score(query, terms, f"{doc.name}\n{search_content}")
-        if score <= 0 and allowed_doc_ids is None:
-            continue
-        # For explicit Knowledge Net/workspace scopes, returning a small
-        # low-score preview is better than a false empty result: the caller
-        # intentionally selected that corpus.
+        # Explicit scope selection is itself evidence the caller wants this
+        # corpus considered — a low-score preview beats a false empty result.
         if score <= 0:
             score = 0.25
         scored.append({
@@ -904,8 +957,8 @@ async def _lexical_scope_results(
 
 
 def _lexical_terms(query: str) -> list[str]:
-    text = query.lower()
-    raw = re.findall(r"[a-z0-9_\-\u4e00-\u9fff]+", text)
+    lowered = query.lower()
+    raw = re.findall(r"[a-z0-9_\-一-鿿]+", lowered)
     stop = {
         "the", "and", "or", "for", "with", "from", "that", "this", "into",
         "about", "rules", "rule", "criteria", "style", "draft", "drafts",
@@ -957,6 +1010,139 @@ def _lexical_score(query: str, terms: list[str], haystack: str) -> float:
     coverage = len(hits) / max(len(terms), 1)
     density_bonus = min(len(hits), 6) * 0.03
     return min(0.85, 0.35 + coverage * 0.35 + density_bonus + exact)
+
+
+async def hybrid_search(
+    db: AsyncSession,
+    entity_id: str,
+    query: str,
+    *,
+    limit: int = 10,
+    workspace_id: str | None = None,
+    group_ids: list[str] | None = None,
+) -> list[dict]:
+    """Hybrid search: chunk-level vector + chunk-level trigram-lexical +
+    filename match (+ a scoped read-the-file fallback), fused by Reciprocal
+    Rank Fusion.
+
+    1. Vector search over document_chunks (semantic) — finds the paragraph
+       that answers the question, not just the document it lives in.
+    2. Trigram search over document_chunks (lexical, CJK-safe, indexed,
+       covers the whole corpus regardless of size).
+    3. Filename match — the user sometimes remembers the file, not its text.
+    4. When the caller passed workspace_id/group_ids: also read any
+       still-unindexed document's file directly (see
+       _unindexed_scope_results). document_chunks only exist once
+       index_document has actually run; a freshly-uploaded file in an
+       explicitly scoped Knowledge Net must still be searchable before that
+       happens. Entity-wide search skips this — it is not indexed or bounded,
+       and would mean reading every file in the entity on every query.
+    5. Fuse by rank (see _reciprocal_rank_fusion for why not by score), then
+       normalize the fused score to the top hit in THIS result set so the
+       number shown to callers (e.g. "relevance: 0.87" in the rag tool's
+       output) reads as a confidence, not a tiny raw RRF sum.
+    """
+    allowed_doc_ids = (
+        await _group_document_ids(db, entity_id, group_ids)
+        if group_ids
+        else await _workspace_document_ids(db, entity_id, workspace_id) if workspace_id else None
+    )
+    candidate_limit = max(limit * 4, 20)
+
+    vector_hits: list[dict] = []
+    if await _resolve_embedding_config():
+        try:
+            vector_hits = await search_similar_chunks(
+                db, entity_id, query, limit=candidate_limit, threshold=0.5,
+                allowed_doc_ids=allowed_doc_ids,
+            )
+        except Exception:
+            logger.warning("Vector search failed, falling back to lexical only", exc_info=True)
+
+    try:
+        trigram_hits = await search_similar_trigram(
+            db, entity_id, query, limit=candidate_limit, allowed_doc_ids=allowed_doc_ids,
+        )
+    except Exception:
+        logger.warning("Trigram search failed", exc_info=True)
+        trigram_hits = []
+
+    unindexed_hits: list[dict] = []
+    if allowed_doc_ids is not None:
+        try:
+            unindexed_hits = await _unindexed_scope_results(
+                db, entity_id, query, limit=candidate_limit, allowed_doc_ids=allowed_doc_ids,
+            )
+        except Exception:
+            logger.warning("Unindexed-scope fallback failed", exc_info=True)
+
+    from packages.core.services.document_service import list_documents
+
+    text_docs, _ = await list_documents(
+        db, entity_id, name_search=query, limit=candidate_limit,
+    )
+    query_lower = query.lower()
+    filename_hits: list[dict] = []
+    for doc in text_docs:
+        if allowed_doc_ids is not None and doc.id not in allowed_doc_ids:
+            continue
+        preview = await _build_content_preview(
+            entity_id=entity_id,
+            fs_path=doc.fs_path,
+            mime_type=doc.mime_type,
+            file_type=doc.file_type,
+            metadata=doc.metadata_,
+            name=doc.name,
+        )
+        # name_search ILIKE also matches mime_type/source/metadata — only
+        # treat a hit as "exact" when the query is literally in the name.
+        name_substring_hit = bool(doc.name) and query_lower in doc.name.lower()
+        filename_hits.append({
+            "document_id": doc.id,
+            "name": doc.name,
+            "score": 0.9 if name_substring_hit else 0.55,
+            "content_preview": preview,
+        })
+    # ILIKE gives no natural rank beyond exact-vs-fuzzy; put exact substring
+    # hits first so rank-based fusion treats them as stronger than the fuzzy
+    # metadata matches list_documents(name_search=...) also returns.
+    filename_hits.sort(key=lambda r: r["score"], reverse=True)
+
+    vector_by_doc = _dedupe_best_per_document(vector_hits)
+    trigram_by_doc = _dedupe_best_per_document(trigram_hits)
+    unindexed_by_doc = _dedupe_best_per_document(unindexed_hits)
+
+    fused_scores = _reciprocal_rank_fusion(
+        [vector_by_doc, trigram_by_doc, unindexed_by_doc, filename_hits]
+    )
+    if not fused_scores:
+        return []
+
+    # Prefer a real chunk's own text as the preview (vector, then trigram),
+    # then the read-on-the-fly scope fallback, then plain filename match —
+    # each step down is progressively less direct evidence of an actual
+    # content match, and content_preview == name for a pure filename hit is
+    # what lets callers (see _runtime_rag_result_has_content) tell a real
+    # content match from "we only matched the filename".
+    by_doc: dict[str, dict] = {}
+    for hit in filename_hits:
+        by_doc[hit["document_id"]] = hit
+    for hit in unindexed_by_doc:
+        by_doc[hit["document_id"]] = hit
+    for hit in trigram_by_doc:
+        by_doc[hit["document_id"]] = hit
+    for hit in vector_by_doc:
+        by_doc[hit["document_id"]] = hit
+
+    max_score = max(fused_scores.values())
+    ranked_ids = sorted(fused_scores, key=lambda doc_id: fused_scores[doc_id], reverse=True)
+    results = []
+    for doc_id in ranked_ids[:limit]:
+        row = dict(by_doc[doc_id])
+        row["score"] = round(fused_scores[doc_id] / max_score, 4)
+        results.append(row)
+    return results
+
 
 
 async def _workspace_document_ids(

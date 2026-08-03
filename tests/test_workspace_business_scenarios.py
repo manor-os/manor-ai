@@ -819,7 +819,11 @@ async def test_business_workspace_strategist_review_persists_business_proposal(
 
     posted_cards: list[dict[str, Any]] = []
 
-    async def _fake_post_proposal_chat(workspace_arg, proposal, task_ids, *, auto_approved=False):
+    async def _fake_post_proposal_chat(
+        workspace_arg, proposal, task_ids, *,
+        auto_approved=False, policy_denied=False, pending_items=None,
+        auto_approved_action_key=None,
+    ):
         assert auto_approved is False
         posted_cards.append(
             {
@@ -829,14 +833,17 @@ async def test_business_workspace_strategist_review_persists_business_proposal(
             }
         )
 
+    from packages.core.strategist.triggers import ReviewTriggerKind
+
     monkeypatch.setattr(strategist_service, "generate_proposal", _fake_generate_proposal)
     monkeypatch.setattr(strategist_service, "_post_proposal_chat", _fake_post_proposal_chat)
 
     result = await strategist_service.run_review(
         db_session,
         workspace.id,
-        trigger="manual",
-        skip_if_open_proposals=False,
+        # A person asked for this one; suppression follows the kind, not a
+        # separate boolean the caller has to remember to pass.
+        trigger=ReviewTriggerKind.HUMAN_REQUESTED,
     )
 
     assert result["workspace_id"] == workspace.id

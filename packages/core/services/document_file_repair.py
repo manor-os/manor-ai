@@ -12,7 +12,7 @@ from sqlalchemy import case, select
 
 from packages.core.database import async_session
 from packages.core.models.document import Document, VectorStatus
-from packages.core.models.media_job import MediaJob
+from packages.core.models.media_job import MediaJob, MediaJobStatus
 from packages.core.services.entity_fs import (
     EntityFilesystemError,
     assert_entity_filesystem_ready,
@@ -237,7 +237,7 @@ async def _find_recoverable_media_job(db, doc: Document) -> MediaJob | None:
         select(MediaJob)
         .where(
             MediaJob.entity_id == doc.entity_id,
-            MediaJob.status == "completed",
+            MediaJob.status == MediaJobStatus.COMPLETED,
             MediaJob.source_url.is_not(None),
             MediaJob.source_url != "",
             MediaJob.params["result_document_id"].astext == doc.id,
@@ -253,7 +253,7 @@ async def _find_recoverable_media_job(db, doc: Document) -> MediaJob | None:
         select(MediaJob)
         .where(
             MediaJob.entity_id == doc.entity_id,
-            MediaJob.status == "completed",
+            MediaJob.status == MediaJobStatus.COMPLETED,
             MediaJob.source_url.is_not(None),
             MediaJob.source_url != "",
             MediaJob.result_url.ilike(f"%/{doc.fs_path}"),

@@ -1,37 +1,28 @@
 """Permission-v1 endpoints — knowledge-base classification, legal hold,
 visibility changes, and access requests.
 
-Reference implementation showing how routers should call the new
-``authorize()`` entry. Behavior is fully gated by ``permissions_v1_enforce``;
-when the flag is OFF (default), endpoints fall back to the legacy
-``require_permission`` dependency chain — no behavior change for anyone
-currently in production.
+Authorization uses the same effective-capability model as the rest of the
+document surface (``packages.core.services.document_access``): the document
+owner and entity owner/admin hold every capability; other users need an
+explicit ``resource_grants`` row (direct or inherited from a folder).
 
 Sister-RFC: ``docs/PERMISSIONS_DESIGN_ZH.md`` §13.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user
 from apps.api.errors import CodedError
-from packages.core.auth import (
-    Resource,
-    authorize,
-    make_actor,
-    require,
-)
 from packages.core.database import get_db
 from packages.core.models import (
     Capability,
     Classification,
-    ResourceType,
     Visibility,
 )
 from packages.core.models.document import Document
@@ -40,7 +31,14 @@ from packages.core.models.permission import (
     ResourceGrantPending,
 )
 from packages.core.models.user import User
-from packages.core.permissions import Permission
+from packages.core.permissions import (
+    Permission,
+    has_permission,
+    user_has_permission,
+)
+from packages.core.services.document_access import (
+    effective_document_capabilities_for_user,
+)
 
 router = APIRouter(prefix="/api/v1/permissions", tags=["permissions-v1"])
 
@@ -59,11 +57,6 @@ class VisibilityRequest(BaseModel):
     visibility: str = Field(
         ..., description="One of: private | workspace | entity | public"
     )
-
-
-class LegalHoldRequest(BaseModel):
-    enabled: bool
-    reason: Optional[str] = None
 
 
 class ClientVisibleRequest(BaseModel):
@@ -94,9 +87,14 @@ _VALID_VISIBILITIES = {
 }
 
 
-async def _load_doc(db: AsyncSession, document_id: str) -> Document:
+async def _load_doc(db: AsyncSession, document_id: str, entity_id: str) -> Document:
     doc = (
-        await db.execute(select(Document).where(Document.id == document_id))
+        await db.execute(
+            select(Document).where(
+                Document.id == document_id,
+                Document.entity_id == entity_id,
+            )
+        )
     ).scalar_one_or_none()
     if doc is None:
         raise CodedError(
@@ -107,18 +105,50 @@ async def _load_doc(db: AsyncSession, document_id: str) -> Document:
     return doc
 
 
-def _doc_to_resource(doc: Document) -> Resource:
-    return Resource(
-        type=ResourceType.DOCUMENT,
-        id=doc.id,
-        entity_id=doc.entity_id,
-        workspace_id=None,  # not modeled on Document directly today
-        visibility=getattr(doc, "visibility", None),
-        classification=getattr(doc, "classification", None),
-        owner_id=getattr(doc, "owner_id", None),
-        client_visible=bool(getattr(doc, "client_visible", False)),
-        legal_hold=bool(getattr(doc, "legal_hold", False)),
-        quarantine_status=getattr(doc, "quarantine_status", None),
+async def _require_document_capability(
+    db: AsyncSession,
+    user: User,
+    doc: Document,
+    capability: str,
+    message: str,
+) -> None:
+    """403 unless the user is the doc owner, an entity owner/admin, or
+    holds an explicit grant carrying ``capability`` (direct or via a
+    folder ancestor). Same model as the documents router."""
+    capabilities = await effective_document_capabilities_for_user(
+        db,
+        document=doc,
+        user_id=user.id,
+        role=user.role,
+    )
+    if capability not in capabilities:
+        raise HTTPException(403, message)
+
+
+async def _is_audit_admin(db: AsyncSession, user: User) -> bool:
+    if has_permission(user.role, Permission.ADMIN_AUDIT):
+        return True
+    return await user_has_permission(
+        db, user.id, user.entity_id, Permission.ADMIN_AUDIT
+    )
+
+
+async def _audit(
+    db: AsyncSession,
+    doc: Document,
+    user: User,
+    action: str,
+    request: Request | None,
+) -> None:
+    from apps.api.routers.document_permissions import _write_access_log
+
+    await _write_access_log(
+        db,
+        doc=doc,
+        actor_type="user",
+        actor_id=user.id,
+        action=action,
+        request=request,
     )
 
 
@@ -129,31 +159,52 @@ def _doc_to_resource(doc: Document) -> Resource:
 async def reclassify_document(
     document_id: str,
     body: ClassifyRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Change a document's classification.
 
-    Authorization: caller must hold the ``reclassify`` capability on the
-    resource OR be an admin (legacy fallthrough). Restricted/legal-hold
-    invariants are enforced by ``authorize()``.
+    Authorization: doc owner / entity admin, or a ``reclassify`` grant.
+    Classification *downgrades* additionally require the ``admin.audit``
+    verb — dropping confidentiality must not happen silently (RFC §13.3).
     """
     if body.classification not in _VALID_CLASSIFICATIONS:
         raise HTTPException(
             400,
             f"Invalid classification (allowed: {sorted(_VALID_CLASSIFICATIONS)})",
         )
-    doc = await _load_doc(db, document_id)
-    actor = make_actor(user)
-    await require(db, actor, Capability.RECLASSIFY, _doc_to_resource(doc))
+    doc = await _load_doc(db, document_id, user.entity_id)
+    await _require_document_capability(
+        db,
+        user,
+        doc,
+        Capability.RECLASSIFY,
+        "Only the document owner/admin or a user with reclassify access "
+        "can change classification",
+    )
 
-    # Refuse silent classification *downgrade* — must explicitly use
-    # admin.audit verb to drop confidentiality. (Invariant 13.3.)
+    # Invariant 1 (RFC §13.14): restricted ⇒ visibility ≠ public.
+    if (
+        body.classification == Classification.RESTRICTED
+        and getattr(doc, "visibility", None) == Visibility.PUBLIC
+    ):
+        raise HTTPException(
+            409, "restricted documents cannot have public visibility"
+        )
+
+    # Refuse silent classification *downgrade* — requires the admin.audit
+    # verb to drop confidentiality. (Invariant 13.3.)
     current = getattr(doc, "classification", Classification.INTERNAL)
     if Classification.rank(body.classification) < Classification.rank(current):
-        await require(db, actor, Permission.ADMIN_AUDIT)
+        if not await _is_audit_admin(db, user):
+            raise HTTPException(
+                403,
+                "Classification downgrade requires admin audit permission",
+            )
 
     doc.classification = body.classification
+    await _audit(db, doc, user, "reclassify", request)
     await db.commit()
     await db.refresh(doc)
     return {
@@ -167,6 +218,7 @@ async def reclassify_document(
 async def change_document_visibility(
     document_id: str,
     body: VisibilityRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -175,9 +227,15 @@ async def change_document_visibility(
             400,
             f"Invalid visibility (allowed: {sorted(_VALID_VISIBILITIES)})",
         )
-    doc = await _load_doc(db, document_id)
-    actor = make_actor(user)
-    await require(db, actor, Capability.MANAGE_METADATA, _doc_to_resource(doc))
+    doc = await _load_doc(db, document_id, user.entity_id)
+    await _require_document_capability(
+        db,
+        user,
+        doc,
+        Capability.MANAGE_METADATA,
+        "Only the document owner/admin or a user with metadata access "
+        "can change visibility",
+    )
 
     # Invariant 1: restricted ⇒ visibility ≠ public
     if (
@@ -189,64 +247,36 @@ async def change_document_visibility(
         )
 
     doc.visibility = body.visibility
+    await _audit(db, doc, user, "visibility_change", request)
     await db.commit()
     return {"id": doc.id, "visibility": doc.visibility}
-
-
-@router.post("/documents/{document_id}/legal-hold")
-async def toggle_legal_hold(
-    document_id: str,
-    body: LegalHoldRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Place / lift a legal hold on a document.
-
-    Once held, ``authorize()`` blocks delete / reclassify / retention
-    triggers via invariant 5 — see RFC §13.9.
-    """
-    doc = await _load_doc(db, document_id)
-    actor = make_actor(user)
-    await require(db, actor, Capability.LEGAL_HOLD, _doc_to_resource(doc))
-
-    doc.legal_hold = body.enabled
-    if body.enabled:
-        if not body.reason:
-            raise CodedError(
-                400,
-                code="permissions.error.legal_hold.reason_required",
-                message="reason required when enabling legal hold",
-            )
-        doc.legal_hold_reason = body.reason
-        doc.legal_hold_set_by = user.id
-        doc.legal_hold_set_at = datetime.now(timezone.utc)
-    else:
-        doc.legal_hold_reason = None
-        doc.legal_hold_set_by = None
-        doc.legal_hold_set_at = None
-
-    await db.commit()
-    return {"id": doc.id, "legal_hold": doc.legal_hold}
 
 
 @router.post("/documents/{document_id}/client-visible")
 async def set_document_client_visible(
     document_id: str,
     body: ClientVisibleRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Toggle ``client_visible`` on a document.
 
-    Same authorization as visibility/classification (``MANAGE_METADATA``).
+    Same authorization as visibility/classification (``manage_metadata``).
     Refuses if the document is Confidential or Restricted — those
     classifications imply the client portal must not surface the doc
     (invariant 4, RFC §13.14). The frontend disables the toggle in those
     cases, but the server gate is the source of truth.
     """
-    doc = await _load_doc(db, document_id)
-    actor = make_actor(user)
-    await require(db, actor, Capability.MANAGE_METADATA, _doc_to_resource(doc))
+    doc = await _load_doc(db, document_id, user.entity_id)
+    await _require_document_capability(
+        db,
+        user,
+        doc,
+        Capability.MANAGE_METADATA,
+        "Only the document owner/admin or a user with metadata access "
+        "can change client visibility",
+    )
 
     cls = getattr(doc, "classification", None)
     if body.client_visible and cls in (Classification.CONFIDENTIAL, Classification.RESTRICTED):
@@ -257,6 +287,7 @@ async def set_document_client_visible(
         )
 
     doc.client_visible = body.client_visible
+    await _audit(db, doc, user, "client_visible_change", request)
     await db.commit()
     return {"id": doc.id, "client_visible": doc.client_visible}
 
@@ -301,9 +332,7 @@ async def list_access_requests(
     db: AsyncSession = Depends(get_db),
 ):
     """List pending requests scoped to the caller's entity."""
-    actor = make_actor(user)
-    decision = await authorize(db, actor, Permission.ADMIN_AUDIT)
-    is_admin = decision.allow
+    is_admin = await _is_audit_admin(db, user)
 
     q = select(ResourceGrantPending).where(
         ResourceGrantPending.entity_id == user.entity_id

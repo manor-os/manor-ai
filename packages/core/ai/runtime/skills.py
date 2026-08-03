@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,125 +24,86 @@ from packages.core.ai.runtime.harness import RuntimeHarness
 from packages.core.ai.runtime.middleware import apply_runtime_middleware
 from packages.core.ai.runtime.profiles import RuntimeProfile
 from packages.core.ai.runtime.sources import RUNTIME_SKILL_GENERATOR_SOURCE
+from packages.core.ai.terminal_stops import LOCAL_CODING_DISPATCHED_STOP_REASON
 from packages.core.ai.runtime.skill_routing import filter_skills_for_runtime_turn
 from packages.core.ai.runtime.skill_routing import (
     external_platform_action_intent,
+    is_chrome_skill,
     is_local_coding_skill,
+    is_youtube_publisher_skill,
+    is_youtube_route_skill,
     local_coding_cli_intent,
+    runtime_approval_resume_intent,
     should_route_external_action_to_integration,
     skill_slug_and_name,
+    youtube_platform_action_intent,
 )
+from packages.core.ai.runtime.skill_invocation_policy import (
+    retain_required_skill_invocation_policies,
+    render_skill_invocation_policy,
+    trusted_skill_invocation_policy,
+)
+from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
 from packages.core.ai.runtime.surfaces import ChatSurface
-from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+from packages.core.ai.runtime.tool_context import (
+    RUNTIME_TOOL_CONTEXT_KEYS,
+    runtime_tool_call_context_from_kwargs,
+)
 from packages.core.services.skill_bundle import parse_clarifying_questions
 
 
 SkillSource = Literal["builtin", "entity", "agent_binding", "workspace_operation", "manual"]
 
+_SKILL_CREATOR_ROOT = (
+    Path(__file__).resolve().parents[1] / "skills" / "skill-creator"
+)
+_SKILL_CREATOR_GENERATION_CONTRACT = (
+    _SKILL_CREATOR_ROOT / "references" / "generation-contract.md"
+)
+
+
+@lru_cache(maxsize=1)
+def runtime_skill_generation_contract() -> str:
+    """Load the repository-controlled Skill Creator contract."""
+
+    try:
+        contract = _SKILL_CREATOR_GENERATION_CONTRACT.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            "Packaged Skill Creator generation contract is unavailable"
+        ) from exc
+    if not contract:
+        raise RuntimeError("Packaged Skill Creator generation contract is empty")
+    return contract
+
+
+def _system_prompt_with_skill_creation_contract(base_prompt: str) -> str:
+    return (
+        f"{base_prompt.strip()}\n\n"
+        "## Packaged Skill Creator Contract\n\n"
+        f"{runtime_skill_generation_contract()}"
+    )
+
+
 RUNTIME_SKILL_GENERATION_SYSTEM_PROMPT = """\
 You are an expert skill designer for an AI agent platform. Given a \
 natural-language description, produce a single JSON object that fully defines \
-a reusable, production-grade skill.
+a reusable skill at production quality.
 
-The JSON **must** contain exactly these keys:
-  name          - short lowercase-hyphenated identifier (e.g. "weekly-report")
-  slug          - same as name (URL-safe, underscores OK)
-  display_name  - human-friendly title
-  description   - SEE "Rules for description" below
-  system_prompt - SEE "Rules for system_prompt" below (the bulk of the skill)
-  tools         - list of tool names the skill may call (empty list if none)
-  input_schema  - JSON Schema describing the expected user input (use {} if free-text)
-  output_format - "text", "json", or "markdown"
-  category      - a short category label (e.g. "reporting", "analysis")
-  tags          - list of keyword strings
-  complexity    - "worker" or "primary". Use "worker" for simple/routine tasks \
-(summaries, notifications, data lookups, status updates, reminders, simple reports). \
-Use "primary" for complex tasks (multi-step research, creative writing, customer-facing \
-communications, analysis requiring judgment, tasks needing many tool calls).
+Follow the packaged Skill Creator contract below as the authoritative schema and
+quality standard. Prefer progressive disclosure and semantic trigger guidance.
+Do not force an arbitrary size such as 200-300 lines; include only instructions
+that improve reliable execution.
 
-It MAY also include these optional keys (use them when the skill benefits):
-  scripts       - object {"filename.py": "<file contents>"} of STANDALONE helper
-                  scripts the skill runs. Strongly preferred over inline code for
-                  anything non-trivial.
-  references    - object {"name.md": "<file contents>"} of longer reference
-                  material (style guides, templates, schemas, long examples) that
-                  the agent reads ON DEMAND instead of carrying in the prompt.
-When either is present the platform packages the skill as a sandbox bundle: the
-system_prompt becomes the SKILL.md, the files are mounted next to it, and the
-agent reads them with sandbox_read_file and runs scripts with sandbox_exec. Do
-NOT list sandbox_* tools yourself — packaging is automatic.
-
-Rules for description (this is what makes the skill get DISCOVERED and chosen):
-- Third person, 2-4 sentences. This single field decides whether the agent
-  remembers to use the skill, so be explicit.
-- State WHAT the skill does AND — crucially — WHEN to use it: the concrete
-  situations, the user phrasings, and the trigger keywords that should
-  activate it.
-- Start with "Use this skill when ...".
-  Bad:  "Generates a report."
-  Good: "Use this skill when the user asks for a weekly performance report, a
-         recap of last week, or 'how did we do this week'. Pulls task and
-         revenue metrics, computes deltas vs. the prior week, and produces a
-         formatted markdown summary."
-
-Rules for system_prompt (THE most important field — be thorough, never terse):
-- This is a complete operating manual for the agent. Aim for 200-300 lines;
-  never fewer than ~150. A short prompt is a FAILED skill — real skills are
-  detailed and leave no ambiguity about what to do.
-- Write it as markdown with these sections, in this order:
-    # <Skill Title>
-    ## Overview          - what the skill accomplishes and the end result.
-    ## When to use       - trigger situations, plus when NOT to use it.
-    ## Inputs            - every input, its meaning, and how to handle it when
-                           missing or ambiguous (ask the user vs. apply a
-                           documented default).
-    ## Prerequisites     - data, integrations, permissions, or context the
-                           skill assumes are in place first.
-    ## Workflow          - the core. 6-15 NUMBERED steps in strict order. Each
-                           step MUST specify: the exact action; the exact tool
-                           and representative arguments to use; what data to
-                           read or compute; the expected intermediate result;
-                           and what to do if that step fails. Break complex
-                           steps into lettered sub-steps (a, b, c).
-    ## Tools             - list each tool the skill uses and exactly how/when
-                           to call it, with example arguments.
-    ## Worked example    - one realistic end-to-end run: a sample input, the
-                           key tool calls it triggers, and the final output.
-                           Make it concrete, not abstract.
-    ## Edge cases & failure handling - enumerate what goes wrong (empty data,
-                           auth/permission errors, rate limits, ambiguous or
-                           missing input) and the exact recovery behaviour for
-                           each.
-    ## Quality bar       - a checklist the output must satisfy before the agent
-                           considers the task done.
-    ## Output format     - the EXACT structure of every run's final output
-                           (headings, fields, ordering). Include a template.
-- Be specific and actionable everywhere. Never vague ("analyze the data");
-  always concrete ("call manor list_tasks with status=completed for the last
-  7 days, group by assignee, and compute each one's completion rate").
-- When the skill needs runnable code (data aggregation, computation,
-  formatting, report building), PREFER standalone files: put each script in the
-  top-level "scripts" object and have the Workflow run it (e.g. "run
-  `scripts/build_report.py`"). Scripts may be any length, stdlib only, and must
-  document how they read inputs and print outputs. Only fall back to an inline
-  ```python ... ``` block for a trivial one-off snippet.
-- For long, static reference material (style guides, templates, schemas,
-  example outputs), put it in the "references" object and instruct the agent to
-  read it on demand (sandbox_read_file) at the step that needs it — do NOT paste
-  it inline. This keeps the system_prompt focused (progressive disclosure).
-
-Rules for tools:
-- Available tools: bash, read_file, write_file, web_search, web_fetch, \
-manor (platform actions), invoke_skill, search_tools.
-- Keep the tools list realistic; only include tools the system_prompt actually
-  references.
-
-Output **only** the JSON object, no markdown fences, no commentary."""
+Output only the JSON object, with no Markdown fences or surrounding prose."""
 
 RUNTIME_SKILL_REVIEW_SYSTEM_PROMPT = (
     "You are a strict skill quality reviewer. Hold skills to a high bar: a "
-    "good skill is detailed (200-300 lines), unambiguous, and has a "
-    "discovery-ready description. Be specific about every problem you find."
+    "good skill is focused, executable, safe, and has a discovery-ready "
+    "description. Do not treat 200-300 lines as a quality target. Be specific "
+    "about every problem you find and follow the packaged contract below. "
+    "When you return a refined spec, return the COMPLETE spec — including "
+    "the unchanged scripts and references objects — never a partial one."
 )
 
 RUNTIME_SKILL_PATCH_SYSTEM_PROMPT = """\
@@ -150,6 +114,9 @@ the fields that changed**. Omit unchanged fields entirely.
 Rules:
 - Preserve the existing style and structure of any text fields you modify.
 - If the system_prompt needs editing, include the full updated system_prompt.
+- Preserve identity unless the requested change explicitly includes a rename.
+- Keep the Skill concise and use progressive disclosure where appropriate.
+- Follow the packaged Skill Creator contract below.
 - Output **only** the JSON patch object, no markdown fences, no commentary."""
 
 RUNTIME_SKILL_CLARIFY_SYSTEM_PROMPT = """\
@@ -302,6 +269,15 @@ async def runtime_invoke_skill_action(
         return skip_result
 
     from packages.core.database import async_session
+    from packages.core.ai.runtime.workflow_tools import runtime_workflow_tool_context_args
+
+    runtime_tool_context = runtime_workflow_tool_context_args({
+        "workflow_project_id": getattr(runtime_context, "workflow_project_id", None),
+        "workflow_action_grant_id": getattr(runtime_context, "workflow_action_grant_id", None),
+        "workflow_scene_id": getattr(runtime_context, "workflow_scene_id", None),
+        "workflow_batch_capture": getattr(runtime_context, "workflow_batch_capture", None),
+        "approved_plan_version": getattr(runtime_context, "approved_plan_version", None),
+    })
 
     async with async_session() as db:
         result = await runtime_invoke_skill(
@@ -316,11 +292,13 @@ async def runtime_invoke_skill_action(
             conversation_id=conversation_id or getattr(runtime_context, "conversation_id", None),
             task_id=getattr(runtime_context, "task_id", None),
             manual_skill_selected=bool(getattr(runtime_context, "manual_skill_selected", False)),
-            legacy_tool_profile=getattr(runtime_context, "legacy_tool_profile", None),
+            tool_profile=getattr(runtime_context, "tool_profile", None),
             allowed_tool_names=getattr(runtime_context, "allowed_tool_names", None),
             runtime_envelope=getattr(runtime_context, "runtime_envelope", None),
             metadata=runtime_skill_invocation_metadata(runtime_context),
             model=getattr(runtime_context, "llm_model", None),
+            active_user_message=getattr(runtime_context, "active_user_message", None),
+            runtime_tool_context=runtime_tool_context,
         )
     return runtime_format_invoke_skill_result(skill, result)
 
@@ -513,7 +491,12 @@ def runtime_skill_generation_messages(
     """Build Runtime one-shot messages for initial skill generation."""
 
     return [
-        {"role": "system", "content": RUNTIME_SKILL_GENERATION_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": _system_prompt_with_skill_creation_contract(
+                RUNTIME_SKILL_GENERATION_SYSTEM_PROMPT
+            ),
+        },
         {
             "role": "user",
             "content": runtime_skill_generation_user_message(
@@ -543,9 +526,10 @@ async def runtime_execute_skill_generation_completion(
         entity_id=entity_id,
         source=RUNTIME_SKILL_GENERATOR_SOURCE,
         temperature=0.4,
-        # Detailed skills run 200-300 lines of system_prompt plus the other
-        # JSON fields; a low cap silently truncates them mid-spec.
-        max_tokens=8000,
+        # A bundle spec carries the main instructions plus complete scripts
+        # and references file contents; a low cap silently truncates the
+        # JSON mid-spec.
+        max_tokens=16000,
     )
 
 
@@ -623,10 +607,16 @@ async def runtime_draft_skill_action(
 def runtime_skill_review_prompt(spec: dict[str, Any]) -> str:
     """Build the Runtime-owned skill review simulation prompt."""
 
+    scripts = spec.get("scripts") or {}
+    references = spec.get("references") or {}
+    bundled = sorted(
+        [f"scripts/{name}" for name in scripts] + [f"references/{name}" for name in references]
+    )
     return (
         f"You are testing a skill before it goes live.\n\n"
         f"Skill name: {spec.get('name', 'unknown')}\n"
-        f"System prompt:\n{spec.get('system_prompt', '')}\n\n"
+        f"System prompt (the SKILL.md body):\n{spec.get('system_prompt', '')}\n\n"
+        f"Bundled files: {bundled or 'none'}\n"
         f"Tools available: {spec.get('tools', [])}\n"
         f"Input schema: {json.dumps(spec.get('input_schema', {}))}\n\n"
         f"Simulate running this skill with a realistic sample input. Then evaluate:\n"
@@ -635,17 +625,20 @@ def runtime_skill_review_prompt(spec: dict[str, Any]) -> str:
         f"3. Is the output format well-defined (with a concrete template)?\n"
         f"4. Are there edge cases that would break the skill? Are they handled?\n"
         f"5. Is the system_prompt specific enough (not vague/generic)?\n"
-        f"6. Is the system_prompt detailed enough? It should be ~200-300 lines "
-        f"and contain the Overview / When to use / Inputs / Workflow / Tools / "
-        f"Worked example / Edge cases / Quality bar / Output format sections. "
-        f"A short or skeletal prompt FAILS — it must be expanded.\n"
-        f"7. Does the description say BOTH what the skill does AND when to use "
-        f"it (trigger situations / keywords)? A bare one-line summary FAILS.\n\n"
+        f"6. Is the main prompt concise while still complete, with detailed "
+        f"static knowledge moved into directly linked references?\n"
+        f"7. Is every bundled file explicitly pointed to from the system_prompt "
+        f"(e.g. 'read `references/style-guide.md`', 'run "
+        f"`scripts/build_report.py`')? An unmentioned file is dead weight.\n"
+        f"8. Does the description say both what the skill does and the semantic "
+        f"situations in which it should be used, including important near-misses?\n"
+        f"9. Are side effects, approvals, authorization, and failure states handled "
+        f"without surprising the user?\n\n"
         f"If the skill passes all checks, respond with exactly: PASS\n"
         f"If it needs changes, respond with: FAIL followed by a JSON object "
-        f"with the COMPLETE corrected skill spec (same keys as before). When "
-        f"the problem is thinness, return a fully expanded system_prompt — do "
-        f"not just describe what to add."
+        f"with the complete corrected skill spec using the same keys — "
+        f"including the unchanged scripts and references objects. Return "
+        f"the correction itself rather than commentary about what to change."
     )
 
 
@@ -653,7 +646,12 @@ def runtime_skill_review_messages(spec: dict[str, Any]) -> list[dict[str, str]]:
     """Build Runtime one-shot messages for skill quality review."""
 
     return [
-        {"role": "system", "content": RUNTIME_SKILL_REVIEW_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": _system_prompt_with_skill_creation_contract(
+                RUNTIME_SKILL_REVIEW_SYSTEM_PROMPT
+            ),
+        },
         {"role": "user", "content": runtime_skill_review_prompt(spec)},
     ]
 
@@ -670,9 +668,10 @@ async def runtime_execute_skill_review_completion(
         entity_id=entity_id,
         source=RUNTIME_SKILL_GENERATOR_SOURCE,
         temperature=0.3,
-        # On FAIL the reviewer returns the COMPLETE corrected spec, including a
-        # fully expanded system_prompt, so it needs the same headroom.
-        max_tokens=8000,
+        # On FAIL the reviewer returns the COMPLETE corrected spec, including
+        # the scripts and references objects, so it needs the same headroom as
+        # generation.
+        max_tokens=16000,
     )
 
 
@@ -710,7 +709,12 @@ def runtime_skill_patch_messages(
     """Build Runtime one-shot messages for skill patch generation."""
 
     return [
-        {"role": "system", "content": RUNTIME_SKILL_PATCH_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": _system_prompt_with_skill_creation_contract(
+                RUNTIME_SKILL_PATCH_SYSTEM_PROMPT
+            ),
+        },
         {"role": "user", "content": runtime_skill_patch_user_message(skill, change_description)},
     ]
 
@@ -744,7 +748,7 @@ _LOCAL_CODING_TERMINAL_TOOL_RESULT_POLICY: dict[str, Any] = {
             ],
             "statuses": ["running", "queued", "pending"],
             "json_equals": {"tool": ["codex_cli", "claude_code"]},
-            "stop_reason": "local_coding_dispatched",
+            "stop_reason": LOCAL_CODING_DISPATCHED_STOP_REASON,
             "stop_parent": True,
             "replace_visible_text": True,
             "notice": {
@@ -807,11 +811,21 @@ def runtime_available_skills_omission_section(
     """Return the runtime-owned skill omission message for this turn."""
     if manual_skill_selected:
         return None
-    if external_platform_action_intent(active_user_message):
+    chrome_local_route = (
+        None
+        if runtime_approval_resume_intent(active_user_message)
+        else detect_chrome_local_browser_route(active_user_message)
+    )
+    if (
+        external_platform_action_intent(active_user_message)
+        and not youtube_platform_action_intent(active_user_message)
+        and not chrome_local_route
+        and not youtube_platform_action_intent(active_user_message)
+    ):
         return _runtime_available_skills_section(
-            "Skills are intentionally omitted for this turn because the latest "
+            "Optional Skills are not offered for this turn because the latest "
             "request targets an external platform action. Use `search_tools` "
-            "for the relevant Integration/MCP tool instead."
+            "for the relevant Integration/MCP tool."
         )
     return None
 
@@ -826,23 +840,70 @@ def _filter_skills_for_prompt(
     if manual_skill_selected:
         return items, None
 
-    # Intent-scoped narrowing. When a turn's intent lands squarely in a local
-    # coding capability domain, we focus the catalog on that umbrella skill.
-    # Per-MCP guidance packs (``mcp_*``) remain visible when connected so the
-    # model can still consult the selected MCP's pack.
+    # Intent-scoped narrowing. When a turn's intent lands squarely in an
+    # umbrella capability domain (local Chrome / local coding), we focus the
+    # catalog on that umbrella skill. Per-MCP guidance packs (``mcp_*``) are
+    # NOT mutually exclusive with the umbrella, though — they combine: the
+    # umbrella skill drives the task, and if it reaches for a connected MCP
+    # the model can still consult that MCP's pack to learn how to use it. So
+    # each branch keeps the umbrella skill *and* any ``mcp_*`` packs (the
+    # latter stay availability-gated downstream, so only connected MCPs
+    # actually surface).
+    chrome_local_route = (
+        None
+        if runtime_approval_resume_intent(active_user_message)
+        else detect_chrome_local_browser_route(active_user_message)
+    )
+    if chrome_local_route:
+        selected = [
+            skill
+            for skill in items
+            if is_chrome_skill(*skill_slug_and_name(skill))
+            or _is_mcp_guidance_pack(skill)
+            or (
+                youtube_platform_action_intent(active_user_message)
+                and is_youtube_publisher_skill(*skill_slug_and_name(skill))
+            )
+        ]
+        filtered = retain_required_skill_invocation_policies(items, selected)
+        if not selected:
+            return filtered, _runtime_available_skills_section(
+                "No Chrome runtime skill is available. Stop and report that the "
+                "local Chrome runtime skill or setup is unavailable; do not use "
+                "generic web tools."
+            )
+        return filtered, None
+
+    if youtube_platform_action_intent(active_user_message):
+        selected = [
+            skill
+            for skill in items
+            if is_youtube_route_skill(*skill_slug_and_name(skill))
+        ]
+        filtered = retain_required_skill_invocation_policies(items, selected)
+        if not selected:
+            return filtered, _runtime_available_skills_section(
+                "The optional youtube-studio-publisher Skill is not installed, "
+                "but that does not block this request. Recommend it as a "
+                "professional workflow enhancement, then continue with any "
+                "verified YouTube MCP or local Chrome capability available for "
+                "the requested operation."
+            )
+        return filtered, None
+
     if local_coding_cli_intent(active_user_message):
-        filtered = [
+        selected = [
             skill
             for skill in items
             if is_local_coding_skill(*skill_slug_and_name(skill)) or _is_mcp_guidance_pack(skill)
         ]
-        if not filtered:
-            return [], _runtime_available_skills_section(
-                "Skills are intentionally omitted for this turn because no "
-                "local coding operations skill is available. Use "
+        filtered = retain_required_skill_invocation_policies(items, selected)
+        if not selected:
+            return filtered, _runtime_available_skills_section(
+                "No local coding operations skill is available. Use "
                 "`search_tools` for `mcp__codex_cli__check_path`/`run` or "
-                "`mcp__claude_code__check_path`/`run` instead."
-        )
+                "`mcp__claude_code__check_path`/`run`."
+            )
         return filtered, None
 
     return items, None
@@ -1182,20 +1243,23 @@ def render_runtime_available_skills_section(
     for an MCP the agent has not connected. When ``None``, no MCP gating is
     applied (backward-compatible).
     """
-    omitted = runtime_available_skills_omission_section(
+    items = list(skills or [])
+    routing_message = runtime_available_skills_omission_section(
         active_user_message=active_user_message,
         manual_skill_selected=manual_skill_selected,
     )
-    if omitted:
-        return omitted
-
-    filtered, empty_message = _filter_skills_for_prompt(
-        skills,
-        active_user_message=active_user_message,
-        manual_skill_selected=manual_skill_selected,
-    )
-    if empty_message:
-        return empty_message
+    if routing_message:
+        filtered = retain_required_skill_invocation_policies(items, ())
+        if not filtered:
+            return routing_message
+    else:
+        filtered, routing_message = _filter_skills_for_prompt(
+            items,
+            active_user_message=active_user_message,
+            manual_skill_selected=manual_skill_selected,
+        )
+        if routing_message and not filtered:
+            return routing_message
 
     if available_tool_names is not None and not manual_skill_selected:
         available_prefixes = _mcp_server_prefixes(available_tool_names)
@@ -1206,7 +1270,7 @@ def render_runtime_available_skills_section(
         ]
 
     if not filtered:
-        return None
+        return routing_message
 
     loaded = {str(name) for name in (loaded_tool_names or ()) if str(name or "").strip()}
     lines = ["## Available Skills"]
@@ -1217,6 +1281,30 @@ def render_runtime_available_skills_section(
             "`invoke_skill` is available in this runtime but its schema may be deferred. "
             "Call `search_tools` for `invoke_skill` first if needed, then run one of these skills:"
         )
+    invocation_policy_lines = []
+    if not manual_skill_selected:
+        for skill in filtered:
+            policy = trusted_skill_invocation_policy(skill)
+            if policy is None:
+                continue
+            slug, _name = skill_slug_and_name(skill)
+            invocation_policy_lines.append(
+                render_skill_invocation_policy(
+                    skill_slug=slug,
+                    policy=policy,
+                )
+            )
+    if invocation_policy_lines:
+        lines.append("### Required Skill Invocation Policies")
+        lines.extend(invocation_policy_lines)
+    if routing_message:
+        _heading, _separator, routing_body = routing_message.partition("\n")
+        lines.append("### Runtime Routing Constraint")
+        lines.append(
+            "This constraint applies only to optional/domain Skills and does "
+            "not override any applicable Required Skill Invocation Policy above."
+        )
+        lines.append(routing_body or routing_message)
     for skill in filtered:
         slug, _name = skill_slug_and_name(skill)
         desc = str(getattr(skill, "description", "") or "")
@@ -1285,6 +1373,20 @@ def _declared_tool_names(skill) -> tuple[str, ...]:
     return tuple(str(tool_name) for tool_name in (getattr(skill, "tools", None) or ()) if str(tool_name or "").strip())
 
 
+def _skill_has_bundle_extra_files(skill) -> bool:
+    config = getattr(skill, "config", None) or {}
+    return isinstance(config, dict) and isinstance(config.get("extra_files"), dict) and bool(config.get("extra_files"))
+
+
+def _prompt_skill_declared_tool_names(skill) -> tuple[str, ...]:
+    declared = list(_declared_tool_names(skill))
+    if _skill_has_bundle_extra_files(skill):
+        for tool_name in ("read_file", "list_files"):
+            if tool_name not in declared:
+                declared.append(tool_name)
+    return tuple(declared)
+
+
 def _runtime_allowed_tool_name_set(
     allowed_tool_names: Iterable[str] | None,
 ) -> frozenset[str] | None:
@@ -1348,10 +1450,13 @@ def _prompt_skill_runtime_envelope(
         return runtime_envelope
     effective_tools = set(runtime_envelope.tool_names or ())
     effective_tools.update(skill_tool_names)
+    metadata = deepcopy(runtime_envelope.metadata)
+    metadata.pop("chrome_runtime_contract_v1", None)
     return replace(
         runtime_envelope,
         tool_names=tuple(sorted(effective_tools)),
         allowed_tool_names=tuple(sorted(effective_allowed)),
+        metadata=metadata,
     )
 
 
@@ -1393,7 +1498,7 @@ def runtime_prepare_prompt_skill_tool_surface(
     External customer/channel profiles keep the existing runtime allowlist.
     """
 
-    declared = _declared_tool_names(skill)
+    declared = _prompt_skill_declared_tool_names(skill)
     allowed = _prompt_skill_effective_allowed_tools(
         declared,
         allowed_tool_names,
@@ -1504,10 +1609,11 @@ def runtime_prompt_skill_registered_tool_executor(
     task_id: str | None = None,
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
-    legacy_tool_profile: str | None = None,
+    tool_profile: str | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     runtime_envelope: RuntimeEnvelope | None = None,
     skill_slug: str | None = None,
+    runtime_tool_context: Mapping[str, Any] | None = None,
 ) -> Callable[[str, Any], Awaitable[str]]:
     """Build the registered-tool executor used inside prompt-skill runs."""
 
@@ -1518,9 +1624,15 @@ def runtime_prompt_skill_registered_tool_executor(
 
         from packages.core.ai.runtime.tool_registry import runtime_execute_tool
 
+        tool_args = dict(args) if isinstance(args, dict) else {}
+        tool_args.update({
+            key: value
+            for key, value in dict(runtime_tool_context or {}).items()
+            if key in RUNTIME_TOOL_CONTEXT_KEYS
+        })
         return await runtime_execute_tool(
             tool_name,
-            args,
+            tool_args,
             entity_id=entity_id,
             user_id=user_id,
             agent_id=agent_id,
@@ -1529,7 +1641,7 @@ def runtime_prompt_skill_registered_tool_executor(
             task_id=task_id,
             active_user_message=active_user_message,
             manual_skill_selected=manual_skill_selected,
-            legacy_tool_profile=legacy_tool_profile,
+            tool_profile=tool_profile,
             allowed_tool_names=allowed_tool_names,
             runtime_envelope=runtime_envelope,
         )
@@ -1613,6 +1725,14 @@ def descriptor_from_skill(
             profile=profile,
         )
     )
+    metadata = {
+        "category": str(getattr(skill, "category", "") or ""),
+        "output_format": str(getattr(skill, "output_format", "") or ""),
+    }
+    invocation_policy = trusted_skill_invocation_policy(skill, source=source)
+    if invocation_policy is not None:
+        metadata["invocation_policy"] = invocation_policy.to_dict()
+
     return SkillDescriptor(
         id=str(getattr(skill, "id", "") or ""),
         slug=str(getattr(skill, "slug", "") or getattr(skill, "name", "") or ""),
@@ -1623,10 +1743,7 @@ def descriptor_from_skill(
         required_capabilities=required_capabilities,
         declared_tools=declared_tools,
         visibility_reason=reason,
-        metadata={
-            "category": str(getattr(skill, "category", "") or ""),
-            "output_format": str(getattr(skill, "output_format", "") or ""),
-        },
+        metadata=metadata,
     )
 
 
@@ -1721,8 +1838,6 @@ async def resolve_skill_descriptors(
     if not db or not entity_id or not invoke_skill_visible:
         return []
     max_count = max(limit, 0)
-    if max_count == 0:
-        return []
     try:
         if agent_id:
             from packages.core.services.skill_service import list_skills_for_agent
@@ -1762,7 +1877,8 @@ async def resolve_skill_descriptors(
         else None
     )
 
-    descriptors: list[SkillDescriptor] = []
+    required_descriptors: list[SkillDescriptor] = []
+    ordinary_descriptors: list[SkillDescriptor] = []
     for skill in skills:
         if not runtime_skill_allowed_on_surface(skill, surface):
             continue
@@ -1775,23 +1891,31 @@ async def resolve_skill_descriptors(
         )
         if declared_tools and not visible_declared_tools:
             continue
-        descriptors.append(
-            descriptor_from_skill(
+        descriptor = descriptor_from_skill(
+            skill,
+            source=runtime_skill_source_for_skill(
                 skill,
-                source=runtime_skill_source_for_skill(
-                    skill,
-                    agent_id=agent_id,
-                    agent_bound_skill_ids=agent_bound_skill_ids,
-                ),
-                surface=surface,
-                profile=profile,
-                visible_declared_tools=tuple(sorted(visible_declared_tools)),
-                reason=f"visible on {surface.value}",
-            )
+                agent_id=agent_id,
+                agent_bound_skill_ids=agent_bound_skill_ids,
+            ),
+            surface=surface,
+            profile=profile,
+            visible_declared_tools=tuple(sorted(visible_declared_tools)),
+            reason=f"visible on {surface.value}",
         )
-        if len(descriptors) >= max_count:
-            break
-    return descriptors
+        if (
+            not manual_skill_selected
+            and trusted_skill_invocation_policy(skill) is not None
+        ):
+            required_descriptors.append(descriptor)
+        elif len(ordinary_descriptors) < max_count:
+            ordinary_descriptors.append(descriptor)
+
+    # ``limit`` is a soft prompt-catalog budget, not permission to violate a
+    # required-before-answer policy. Required descriptors are always retained;
+    # ordinary descriptors fill whatever portion of the budget remains.
+    ordinary_slots = max(max_count - len(required_descriptors), 0)
+    return required_descriptors + ordinary_descriptors[:ordinary_slots]
 
 
 def invoke_skill_visible_for_runtime(

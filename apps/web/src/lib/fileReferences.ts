@@ -46,6 +46,48 @@ export function fileNameFromReference(reference: string): string {
   return name || reference;
 }
 
+/**
+ * A reference we can actually open, as opposed to a filename someone typed.
+ *
+ * The prose linkifier used to accept anything matching `FILE_LIKE_RE` — a
+ * known extension anywhere in the token. So "完全搜不到这个视频
+ * two_minute_start_method_openable.mp4" became a file card: the user's own
+ * complaint that a file was missing, rendered as a button to open it. Clicking
+ * fell through to a document search that found nothing and dumped them on the
+ * Knowledge page.
+ *
+ * A card is a promise that clicking opens the file, so it needs an address:
+ *
+ *   - `manor-file:` — already an encoded reference
+ *   - `/viewer/<id>` — a document route
+ *   - `/api/v1/fs/<entity>/<path>` — an entity filesystem path
+ *   - an absolute http(s) URL whose path ends in a file
+ *   - a bare 26-char ULID document id
+ *
+ * A bare `report.pdf`, or a relative `daily/report.pdf`, is a NAME. It may not
+ * exist, may be one of several, and cannot be resolved without guessing.
+ */
+export function isOpenableFileReference(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+
+  if (decodeFileReferenceHref(trimmed)) return true;
+  if (/^\/viewer\/[^/]+/.test(trimmed)) return true;
+  if (/^\/api\/v1\/fs\/[^/]+\/.+/.test(trimmed)) return true;
+  if (/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(trimmed)) return true;
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      return FILE_LIKE_RE.test(url.pathname);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 export function looksLikeFileReference(value: unknown): boolean {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
@@ -64,7 +106,9 @@ function trimReferenceCandidate(value: string): string {
 
 function standaloneInlineFileReference(value: string): string | null {
   const reference = trimReferenceCandidate(value);
-  if (!reference || !looksLikeFileReference(reference)) return null;
+  // Strict on purpose: prose is turned into a clickable card only when the
+  // text carries an address we can open, never on a filename alone.
+  if (!reference || !isOpenableFileReference(reference)) return null;
 
   if (decodeFileReferenceHref(reference)) return reference;
 
@@ -88,7 +132,9 @@ function standaloneInlineFileReference(value: string): string | null {
 function linkifyPlainFileReferencesSegment(segment: string): string {
   return segment.replace(FILE_REF_RE, (full, prefix: string, candidate: string) => {
     const reference = trimReferenceCandidate(candidate);
-    if (!looksLikeFileReference(reference)) return full;
+    // This is the path that turned a sentence mentioning a filename into a
+    // card. Only an address we can open earns one.
+    if (!isOpenableFileReference(reference)) return full;
     const label = escapeMarkdownLabel(fileNameFromReference(reference));
     return `${prefix}[${label}](${fileReferenceHref(reference)})`;
   });

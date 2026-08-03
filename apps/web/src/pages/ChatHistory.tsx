@@ -10,12 +10,12 @@ import SmartToolbar from "../components/ui/SmartToolbar";
 import Avatar from "../components/ui/Avatar";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
-import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import TabSwitcher from "../components/ui/TabSwitcher";
 import PageHeader from "../components/ui/PageHeader";
-import { SkeletonLine, SkeletonCircle } from "../components/ui/Skeleton";
+import { ChatMessagesSkeleton, SkeletonLine, SkeletonCircle } from "../components/ui/Skeleton";
 import ChatMarkdown from "../components/ChatMarkdown";
+import CollapsibleSentMessage from "../components/chat/CollapsibleSentMessage";
 import AssistantMessageBlocks from "../components/AssistantMessageBlocks";
 import CreditLimitNotice from "../components/ui/CreditLimitNotice";
 import ToolCallList from "../components/ui/ToolCallList";
@@ -239,8 +239,8 @@ function MessagePanel({
       {/* Messages — old repo layout: user LEFT, agent RIGHT */}
       <div ref={bodyRef} className="chat-history-message-body flex-1 overflow-y-auto">
         {loading ? (
-          <div className="flex items-center justify-center h-full">
-            <LoadingSpinner size={24} />
+          <div className="h-full p-5" aria-busy="true" aria-live="polite">
+            <ChatMessagesSkeleton rows={5} />
           </div>
         ) : messages.length === 0 ? (
           <div className="flex items-center justify-center h-full">
@@ -305,7 +305,13 @@ function MessagePanel({
                           isUser ? "chat-bubble--user" : "chat-bubble--bot w-full"
                         }`}
                       >
-                        <ChatMarkdown content={msg.content} isUser={isUser} />
+                        {isUser ? (
+                          <CollapsibleSentMessage text={msg.content}>
+                            <ChatMarkdown content={msg.content} isUser />
+                          </CollapsibleSentMessage>
+                        ) : (
+                          <ChatMarkdown content={msg.content} isUser={false} />
+                        )}
                       </div>
                     )}
                   </div>
@@ -455,11 +461,10 @@ export default function ChatHistory() {
   /* ================================================================ */
 
   return (
-    <div className="chat-history-page flex flex-col h-full -m-6">
-      <div className="px-6 pt-6">
+    <div className="chat-history-page flex h-full flex-col">
+      <div>
         <PageHeader
           title={t("nav.chatHistory")}
-          compactControls
           tabs={<TabSwitcher tabs={channelTabs} value={channelFilter} onChange={setChannelFilter} />}
           toolbar={(
             <SmartToolbar

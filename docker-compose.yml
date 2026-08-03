@@ -34,11 +34,15 @@ services:
     image: redis:7-alpine
     container_name: manor-os-redis
     restart: unless-stopped
-    command: redis-server --maxmemory ${REDIS_MAXMEMORY:-0} --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-noeviction}
+    command: ["/bin/sh", "/usr/local/bin/manor-redis-aof-entrypoint.sh"]
+    environment:
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-0}
+      REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-noeviction}
     ports:
       - "6389:6379"
     volumes:
       - redis_data:/data
+      - ./scripts/redis-aof-entrypoint.sh:/usr/local/bin/manor-redis-aof-entrypoint.sh:ro
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -248,6 +252,7 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-oss}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       MANOR_ENV: ${MANOR_ENV:-dev}
       EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
       APP_URL: ${APP_URL:-http://localhost:18080}
@@ -261,11 +266,6 @@ services:
       OTEL_ENABLED: ${OTEL_ENABLED:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
       OTEL_SAMPLE_RATE: ${OTEL_SAMPLE_RATE:-1.0}
-      # Temporal — opt-in. Set TEMPORAL_ENABLED=true to route plans
-      # through the Temporal workflow runtime instead of Celery.
-      TEMPORAL_ENABLED: ${TEMPORAL_ENABLED:-false}
-      TEMPORAL_HOST: ${TEMPORAL_HOST:-temporal:7233}
-      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
       # Nango — set NANGO_SECRET_KEY in .env after first-time admin
       # bootstrap (visit http://localhost:3003 → Settings → Admin Key).
       # When unset, Nango integration is disabled gracefully.
@@ -298,13 +298,43 @@ services:
         condition: service_healthy
       ollama-init:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
-  # ── Worker ──
-  worker:
+  # ── Workers ──
+  #
+  # Two Celery workers, one per role, consuming disjoint queues declared in
+  # packages/core/queues.py:
+  #
+  #   worker       -Q celery  — the CONTROL PLANE, and the only one running
+  #                             beat (-B): internal_worker_tick (5s),
+  #                             cleanup_expired_leases (30s), scheduler.tick
+  #                             (60s), ops/monitor beats. Short bounded tasks;
+  #                             small concurrency is enough and it must never
+  #                             be blocked.
+  #   worker-work  -Q work    — long steps (execute_lease and friends, up to
+  #                             the 6h step-deadline ceiling). THIS is the one
+  #                             to scale (WORKER_WORK_CONCURRENCY, or replicas).
+  #
+  # Before the split both roles shared 4 slots in one process, so four
+  # concurrent long steps stalled the entire orchestration loop: no new leases
+  # dispatched, no expired leases reclaimed, no scheduled job fired.
+  #
+  # DEPLOY NOTE: these must come up together. The default queue keeps its
+  # historical name ("celery"), so an old single worker started without -Q
+  # still drains the control plane, but nothing consumes "work" until
+  # worker-work exists. `docker compose up -d` recreates both.
+  worker: &worker-base
     image: manor-api:${TAG:-prod}
     build: *api-build
     container_name: manor-os-worker
     restart: unless-stopped
+    # Anchored so worker-work below inherits build / env / depends_on verbatim
+    # and only overrides what differs by role (name, command, volumes).
     # Mounts JuiceFS (privileged + /dev/fuse via entrypoint.sh) and runs Celery
     # tasks against it. Give in-flight tasks plus the FUSE layer time to drain,
     # flush cache to MinIO, and unmount cleanly on stop — the default 10s can
@@ -319,7 +349,9 @@ services:
       # ops.log_scan need read access to the Docker daemon to inspect
       # peer containers + tail their stderr. Read-only.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    command: celery -A packages.core.celery_app worker -B -l info -c 4
+    command: >-
+      celery -A packages.core.celery_app worker -B -l info
+      -Q celery -c ${WORKER_CONTROL_CONCURRENCY:-2}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
       DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
@@ -341,6 +373,8 @@ services:
       EMBEDDING_BASE_URL: http://ollama:11434/v1
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-oss}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_TOKEN: ${VAULT_TOKEN:-manor-dev-root-token}
       VAULT_TRANSIT_KEY: ${VAULT_TRANSIT_KEY:-manor-keys}
@@ -349,9 +383,6 @@ services:
       OTEL_ENABLED: ${OTEL_ENABLED:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
       OTEL_SAMPLE_RATE: ${OTEL_SAMPLE_RATE:-1.0}
-      TEMPORAL_ENABLED: ${TEMPORAL_ENABLED:-false}
-      TEMPORAL_HOST: ${TEMPORAL_HOST:-temporal:7233}
-      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
       NANGO_BASE_URL: ${NANGO_BASE_URL:-http://nango-server:3003}
       NANGO_PUBLIC_URL: ${NANGO_PUBLIC_URL:-}
       NANGO_SECRET_KEY: ${NANGO_SECRET_KEY:-}
@@ -378,6 +409,20 @@ services:
         condition: service_healthy
       ollama-init:
         condition: service_completed_successfully
+      api:
+        condition: service_healthy
+
+  # Long-running plan steps. No beat here — beat lives in the control-plane
+  # worker above and merely *enqueues* onto the work queue; the work worker
+  # only consumes. No docker socket either: nothing on the work queue inspects
+  # peer containers, and this is the process that runs user step bodies.
+  worker-work:
+    <<: *worker-base
+    container_name: manor-os-worker-work
+    volumes: []
+    command: >-
+      celery -A packages.core.celery_app worker -l info
+      -Q work -c ${WORKER_WORK_CONCURRENCY:-4}
 
   # ── Sandbox base image ──
   # Builds the image used by sandbox service child containers so public users
@@ -533,47 +578,6 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-
-  # ── Temporal (M3 — opt-in via profile) ───────────────────────────────
-  # Durable workflow backend for opt-in plan execution. The API + worker
-  # only connect when TEMPORAL_ENABLED=true; without that flag, plans
-  # run on the Celery PlanExecutor as before.
-  # Enable with:
-  #   docker compose --profile temporal up -d temporal temporal-ui
-  # Then export TEMPORAL_ENABLED=true and TEMPORAL_HOST=temporal:7233.
-  temporal:
-    image: temporalio/auto-setup:1.27
-    container_name: manor-os-temporal
-    profiles: ["temporal"]
-    environment:
-      DB: postgres12
-      DB_PORT: "5432"
-      POSTGRES_USER: ${POSTGRES_USER:-manor}
-      POSTGRES_PWD: ${POSTGRES_PASSWORD:-manor_secret}
-      POSTGRES_SEEDS: postgres
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
-    ports:
-      - "7233:7233"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "tctl", "--address", "127.0.0.1:7233", "cluster", "health"]
-      interval: 15s
-      timeout: 5s
-      retries: 8
-
-  temporal-ui:
-    image: temporalio/ui:2.30.3
-    container_name: manor-os-temporal-ui
-    profiles: ["temporal"]
-    environment:
-      TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_CORS_ORIGINS: ${APP_URL:-http://localhost:18080}
-    ports:
-      - "8088:8080"
-    depends_on:
-      - temporal
 
   # ── Jimeng API proxy ──
   # Reverse-engineered Jimeng (即梦) HTTP gateway from

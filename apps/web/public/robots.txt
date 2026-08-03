@@ -1,0 +1,5 @@
+# Manor's web application contains authenticated, user-specific routes.
+# Public product and project content lives at manorai.xyz and GitHub.
+User-agent: *
+Disallow: /
+Allow: /llms.txt

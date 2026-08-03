@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Iterable, Optional
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.goals.pace import compute_pace
@@ -104,12 +104,20 @@ async def list_goals(
     *,
     workspace_id: Optional[str] = None,
     status: Optional[str] = None,
+    readable_workspace_ids: set[str] | None = None,
 ) -> list[Goal]:
     stmt = select(Goal).where(Goal.entity_id == entity_id)
     if workspace_id:
         stmt = stmt.where(Goal.workspace_id == workspace_id)
     if status:
         stmt = stmt.where(Goal.status == status)
+    if readable_workspace_ids is not None:
+        # Restrict to readable workspaces + workspace-less goals; None (entity
+        # admin) is unrestricted.
+        stmt = stmt.where(or_(
+            Goal.workspace_id.is_(None),
+            Goal.workspace_id.in_(readable_workspace_ids),
+        ))
     stmt = stmt.order_by(Goal.priority.desc(), Goal.created_at.desc())
     return list((await db.execute(stmt)).scalars().all())
 
@@ -125,6 +133,14 @@ async def update_goal(
 
     previous_measurement_source = goal.measurement_source
     previous_measurement_cadence = goal.measurement_cadence
+    # M11: operator-driven config fields tracked for revision bumps.
+    # current_value / measurement writes intentionally excluded — those
+    # are facts about the world, not config changes.
+    previous_config = {
+        "target_value": goal.target_value,
+        "deadline": goal.deadline,
+        "status": goal.status,
+    }
     schedule_relevant_changed = (
         ("measurement_source" in fields and fields["measurement_source"] != goal.measurement_source)
         or ("measurement_cadence" in fields and fields["measurement_cadence"] != goal.measurement_cadence)
@@ -142,6 +158,15 @@ async def update_goal(
             v = Decimal(str(v))
         if hasattr(goal, k):
             setattr(goal, k, v)
+
+    config_changed = {
+        key: getattr(goal, key)
+        for key, old in previous_config.items()
+        if getattr(goal, key) != old
+    }
+    if config_changed:
+        from packages.core.revisions import bump_revision
+        await bump_revision(db, goal, patch=config_changed)
     await db.flush()
 
     from packages.core.goals.scheduling import (
@@ -222,6 +247,8 @@ async def record_measurement(
     goal.current_value = value_dec
     goal.current_value_updated_at = measured_at
 
+    old_pace = goal.pace_status
+    achieved_now = False
     if recompute_pace_now:
         goal.pace_status = compute_pace(
             current_value=goal.current_value,
@@ -237,10 +264,17 @@ async def record_measurement(
         if goal.pace_status == "achieved" and goal.status == "active":
             goal.status = "achieved"
             goal.achieved_at = measured_at
+            achieved_now = True
             from packages.core.goals.scheduling import remove_measurement_schedule
             await remove_measurement_schedule(db, goal)
 
     await db.flush()
+    # Ledger (M1): goal_measured (+ pace change / achievement), same transaction.
+    from packages.core.ledger.adapters import record_goal_measurement_events
+    await record_goal_measurement_events(
+        db, goal, value=value_dec, source=source, measured_at=measured_at,
+        old_pace=old_pace, pace_recomputed=recompute_pace_now, achieved_now=achieved_now,
+    )
     return measurement
 
 

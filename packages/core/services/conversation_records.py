@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import and_, func, or_, select
+from datetime import datetime
+
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.task import Conversation, Message
@@ -51,6 +53,38 @@ async def list_messages(
     return msgs
 
 
+async def list_messages_before(
+    db: AsyncSession,
+    conversation_id: str,
+    limit: int = 100,
+    *,
+    before_created_at: datetime | None = None,
+    before_id: str | None = None,
+) -> list[Message]:
+    """Fetch newest messages before a keyset cursor and return them chronologically."""
+
+    stmt = select(Message).where(Message.conversation_id == conversation_id)
+    if before_created_at is not None:
+        if before_id:
+            stmt = stmt.where(
+                or_(
+                    Message.created_at < before_created_at,
+                    and_(
+                        Message.created_at == before_created_at,
+                        Message.id < before_id,
+                    ),
+                )
+            )
+        else:
+            stmt = stmt.where(Message.created_at < before_created_at)
+    result = await db.execute(
+        stmt.order_by(desc(Message.created_at), desc(Message.id)).limit(limit)
+    )
+    msgs = list(result.scalars().all())
+    msgs.reverse()
+    return msgs
+
+
 async def list_conversations(
     db: AsyncSession,
     entity_id: str,
@@ -70,6 +104,13 @@ async def list_conversations(
         select(Conversation)
         .outerjoin(last_msg, Conversation.id == last_msg.c.conversation_id)
         .where(Conversation.entity_id == entity_id)
+        # Dashboard module conversations are an implementation detail of a
+        # generated module; they surface only through the module's own chat,
+        # never in the user's conversation history.
+        .where(
+            func.coalesce(Conversation.meta["surface"].astext, "")
+            != "dashboard_module"
+        )
     )
     if user_id:
         q = q.where(

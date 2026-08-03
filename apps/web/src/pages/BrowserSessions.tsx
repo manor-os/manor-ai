@@ -41,7 +41,7 @@ function SessionList() {
   });
 
   return (
-    <div className="animate-fade-in" style={{ padding: "1rem" }}>
+    <div className="animate-fade-in">
       <PageHeader
         title={t("page.browser_sessions.title")}
         subtitle={t("page.browser_sessions.subtitle")}
@@ -221,7 +221,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
   if (isLoading) {
     return (
-      <div className="animate-fade-in" style={{ padding: "1rem" }}>
+      <div className="animate-fade-in">
         <PageHeader title={t("page.browser_sessions.session_title")} subtitle={t("status.loading")} />
         <div style={{ display: "flex", justifyContent: "center", padding: "80px 0" }}>
           <LoadingSpinner />
@@ -232,7 +232,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
   if (error) {
     return (
-      <div className="animate-fade-in" style={{ padding: "1rem" }}>
+      <div className="animate-fade-in">
         <PageHeader title={t("page.browser_sessions.session_title")} subtitle={t("status.error")} />
         <div style={{ padding: "80px 0" }}>
           <EmptyState
@@ -255,7 +255,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const statusType = session ? statusBadgeType(session.status) : "inactive";
 
   return (
-    <div className="animate-fade-in" style={{ padding: "1rem" }}>
+    <div className="animate-fade-in">
       <PageHeader
         title={t("page.browser_sessions.session_title")}
         subtitle={`${t("page.browser_sessions.session")} ${sessionId.slice(0, 12)}...`}

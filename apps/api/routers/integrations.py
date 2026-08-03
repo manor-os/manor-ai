@@ -12,6 +12,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user
+from packages.core.credentials import CredentialError
 from packages.core.constants.plans import is_dev
 from packages.core.database import get_db
 from packages.core.models.user import User
@@ -23,6 +24,7 @@ from packages.core.services.provider_keys import (
     canonical_provider_key,
     provider_key_aliases,
 )
+from packages.core.constants.execution import WorkerStatus
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +163,6 @@ class MCPServerStatus(BaseModel):
     # ── Type-specific spec for non-OAuth/non-credentials AI tools ──
     # Populated for browser-session tools so the frontend can render the
     # headed-login flow.
-    cli_spec: dict | None = None
     browser_spec: dict | None = None
 
     # Whether this integration is not yet production-ready. The frontend
@@ -944,7 +945,6 @@ async def list_mcp_server_status(
             # platform is also configured in our self-hosted Nango.
             nango_provider_config_key=nango_config_key_by_server.get(s.server_key),
             oauth_configured=s.server_key in oauth_configured_keys,
-            cli_spec=_cli_spec_payload(cli_specs_by_id.get(s.id)),
             browser_spec=_browser_spec_payload(browser_specs_by_id.get(s.id)),
         ))
 
@@ -1002,18 +1002,6 @@ async def list_mcp_server_status(
     return out
 
 
-
-
-def _cli_spec_payload(spec) -> dict | None:
-    if spec is None:
-        return None
-    return {
-        "command_template": spec.command_template,
-        "supported_subcommands": spec.supported_subcommands or [],
-        "requires_local_paths": bool(spec.requires_local_paths),
-        "timeout_seconds": int(spec.timeout_seconds or 120),
-        "output_format": spec.output_format or "text",
-    }
 
 
 def _browser_spec_payload(spec) -> dict | None:
@@ -1106,8 +1094,7 @@ async def disconnect_account(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove one OAuth account connection. If it was the default, no new
-    default is auto-chosen — next agent call falls back to most-recent."""
+    """Remove one OAuth account and promote a sibling when needed."""
     from sqlalchemy import select
     from packages.core.models.user import OAuthAccount
 
@@ -1120,7 +1107,20 @@ async def disconnect_account(
     )).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "Connection not found")
+    was_default = bool((row.profile or {}).get("is_default"))
     await db.delete(row)
+    await db.flush()
+    if was_default:
+        replacement = (await db.execute(
+            select(OAuthAccount).where(
+                OAuthAccount.user_id == user.id,
+                OAuthAccount.provider == server_key,
+            ).order_by(OAuthAccount.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if replacement:
+            profile = dict(replacement.profile or {})
+            profile["is_default"] = True
+            replacement.profile = profile
     await db.commit()
 
 
@@ -1308,19 +1308,26 @@ async def wechat_personal_finish_session(
         "bearer_token": _WECHAT_RUNNER_BEARER,
         "session_id": session_id,
     }
-    integration = await create_integration(
-        db, user.entity_id, "wechat_personal",
-        config=config, credentials=creds,
+    try:
+        integration = await create_integration(
+            db, user.entity_id, "wechat_personal",
+            config=config, credentials=creds,
+            created_by_user_id=user.id,
+        )
+        await _sync_channel_config_if_needed(
+            db,
+            entity_id=user.entity_id,
+            provider="wechat_personal",
+            integration_id=integration.id,
+            credentials=creds,
+        )
+        await db.commit()
+    except CredentialError as exc:
+        await _raise_credential_backend_unavailable(db, exc, action="wechat_personal_finish")
+    return _integration_resp(
+        integration,
+        creator_names=await _creator_names(db, [integration]),
     )
-    await _sync_channel_config_if_needed(
-        db,
-        entity_id=user.entity_id,
-        provider="wechat_personal",
-        integration_id=integration.id,
-        credentials=creds,
-    )
-    await db.commit()
-    return _integration_resp(integration)
 
 
 @router.delete("/wechat-personal/sessions/{session_id}", status_code=204)
@@ -1678,6 +1685,8 @@ async def delete_entity_account(
 ):
     """Remove one entity-level Integration row. Paired ChannelConfig row
     (if any) is also removed so inbound routing stops."""
+    from packages.core.models.document import Integration
+
     target = await get_integration(db, account_id, user.entity_id)
     if not target or target.provider != server_key:
         raise HTTPException(404, "Account not found")
@@ -1687,7 +1696,21 @@ async def delete_entity_account(
         entity_id=user.entity_id,
         integration_id=account_id,
     )
+    was_default = bool((target.config or {}).get("is_default"))
     await db.delete(target)
+    await db.flush()
+    if was_default:
+        replacement = (await db.execute(
+            select(Integration).where(
+                Integration.entity_id == user.entity_id,
+                Integration.provider == server_key,
+                Integration.status == "active",
+            ).order_by(Integration.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if replacement:
+            config = dict(replacement.config or {})
+            config["is_default"] = True
+            replacement.config = config
     await db.commit()
 
 
@@ -1724,6 +1747,7 @@ def _oauth_success_path(return_to: str | None, server_key: str) -> str:
 async def oauth_start(
     server_key: str,
     return_to: str | None = Query(None),
+    connection_id: str | None = Query(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1743,6 +1767,20 @@ async def oauth_start(
     if not is_oauth_provider(server_key):
         raise HTTPException(400, f"{server_key} is not an OAuth provider")
 
+    if connection_id:
+        from packages.core.models.user import OAuthAccount
+        from packages.core.services.provider_keys import provider_key_aliases
+
+        reconnect_row = (await db.execute(
+            select(OAuthAccount).where(
+                OAuthAccount.id == connection_id,
+                OAuthAccount.user_id == user.id,
+                OAuthAccount.provider.in_(provider_key_aliases(server_key)),
+            )
+        )).scalar_one_or_none()
+        if not reconnect_row:
+            raise HTTPException(404, "Connection not found")
+
     config = await resolve_oauth_config(db, server_key)
     if not config:
         raise HTTPException(
@@ -1759,6 +1797,7 @@ async def oauth_start(
         user_id=user.id,
         redirect_uri=redirect_uri,
         return_to=safe_return_to,
+        connection_id=connection_id,
     )
     return OAuthStartResponse(
         authorize_url=start.authorize_url,
@@ -1790,7 +1829,8 @@ async def oauth_callback(
     from packages.core.services.oauth_provider_config import resolve_oauth_config
     from packages.core.services.oauth_flow import (
         complete_authorization, render_oauth_error_page, OAuthFlowError,
-        get_pending_return_to, validate_pending_state,
+        get_pending_connection_id, get_pending_return_to, resolve_oauth_identity,
+        validate_pending_state,
     )
 
     # Provider rejected (scope, cancel, app not approved) → human page.
@@ -1800,6 +1840,9 @@ async def oauth_callback(
     try:
         validate_pending_state(state, server_key=server_key)
         return_to = get_pending_return_to(state, server_key=server_key)
+        reconnect_connection_id = get_pending_connection_id(
+            state, server_key=server_key,
+        )
     except OAuthFlowError as exc:
         raise HTTPException(exc.status, exc.message)
 
@@ -1826,23 +1869,46 @@ async def oauth_callback(
     access_token = tokens.access_token
     refresh_token = tokens.refresh_token
     token_expires_at = tokens.expires_at
-    data = tokens.raw
+    provider_user_id, identity_profile = await resolve_oauth_identity(
+        server_key,
+        tokens,
+    )
 
-    # Upsert oauth_accounts row
+    # Upsert one external account without overwriting sibling connections.
     from sqlalchemy import select
-    existing = (await db.execute(
+    from packages.core.services.provider_keys import provider_key_aliases
+
+    aliases = provider_key_aliases(server_key)
+    reconnect_row = None
+    if reconnect_connection_id:
+        reconnect_row = (await db.execute(
+            select(OAuthAccount).where(
+                OAuthAccount.id == reconnect_connection_id,
+                OAuthAccount.user_id == user_id,
+                OAuthAccount.provider.in_(aliases),
+            )
+        )).scalar_one_or_none()
+    identity_row = (await db.execute(
         select(OAuthAccount).where(
             OAuthAccount.user_id == user_id,
-            OAuthAccount.provider == server_key,
+            OAuthAccount.provider.in_(aliases),
+            OAuthAccount.provider_user_id == provider_user_id,
         )
     )).scalar_one_or_none()
+    # If a reconnect flow signs into an account that is already connected in
+    # another row, update that identity rather than overwriting the requested
+    # row or violating the per-user external-account uniqueness constraint.
+    existing = identity_row or reconnect_row
 
     if existing:
+        existing.provider = server_key
+        existing.provider_user_id = provider_user_id
         existing.access_token = access_token
         if refresh_token:
             existing.refresh_token = refresh_token
         existing.token_expires_at = token_expires_at
         profile = dict(existing.profile or {})
+        profile.update(identity_profile)
         # A user just completed OAuth again, so any previous "auth failed /
         # reconnect required" health result is stale. The async health probe
         # below will write a fresh result after it validates the new token.
@@ -1851,15 +1917,23 @@ async def oauth_callback(
         existing.profile = profile
         oauth_row_id = existing.id
     else:
+        sibling_count = len((await db.execute(
+            select(OAuthAccount.id).where(
+                OAuthAccount.user_id == user_id,
+                OAuthAccount.provider.in_(aliases),
+            )
+        )).scalars().all())
+        profile = dict(identity_profile)
+        profile["is_default"] = sibling_count == 0
         new_row = OAuthAccount(
             id=generate_ulid(),
             user_id=user_id,
             provider=server_key,
-            provider_user_id=str(data.get("user_id") or data.get("id") or ""),
+            provider_user_id=provider_user_id,
             access_token=access_token,
             refresh_token=refresh_token,
             token_expires_at=token_expires_at,
-            profile={},
+            profile=profile,
         )
         db.add(new_row)
         oauth_row_id = new_row.id
@@ -1937,6 +2011,11 @@ class IntegrationResponse(BaseModel):
     # secret-like fields are replaced by the sentinel below. The raw
     # ``credentials`` object is intentionally never serialized.
     credential_preview: dict = {}
+    # Who connected this. Provenance only — integrations remain entity-wide,
+    # so this never affects who may use or edit one. Null for rows created
+    # before it was recorded, or when that user no longer exists.
+    created_by_user_id: str | None = None
+    created_by_name: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -2007,14 +2086,58 @@ def _credential_preview(creds: dict) -> dict:
     return out
 
 
-def _integration_resp(i) -> IntegrationResponse:
+def _integration_resp(i, *, creator_names: dict[str, str] | None = None) -> IntegrationResponse:
+    creator_id = getattr(i, "created_by_user_id", None)
     return IntegrationResponse(
         id=i.id, entity_id=i.entity_id, provider=i.provider,
         status=i.status, config=i.config,
         credential_preview=_credential_preview(i.credentials or {}),
+        created_by_user_id=creator_id,
+        created_by_name=(creator_names or {}).get(creator_id) if creator_id else None,
         created_at=i.created_at.isoformat() if i.created_at else None,
         updated_at=i.updated_at.isoformat() if i.updated_at else None,
     )
+
+
+async def _creator_names(db: AsyncSession, integrations: list) -> dict[str, str]:
+    """Display names for the users who connected these integrations.
+
+    Rows predating ``created_by_user_id`` have no creator, and a user may have
+    been deleted since — both simply resolve to no name rather than an error.
+    """
+    ids = {
+        getattr(i, "created_by_user_id", None)
+        for i in integrations
+        if getattr(i, "created_by_user_id", None)
+    }
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(User.id, User.display_name, User.email).where(User.id.in_(ids))
+        )
+    ).all()
+    return {
+        str(uid): (display_name or email or "")
+        for uid, display_name, email in rows
+    }
+
+
+async def _raise_credential_backend_unavailable(
+    db: AsyncSession,
+    exc: CredentialError,
+    *,
+    action: str,
+) -> None:
+    try:
+        await db.rollback()
+    except Exception:
+        logger.debug("Could not roll back transaction after credential backend failure", exc_info=True)
+    logger.warning("Credential backend unavailable during %s: %s", action, exc)
+    raise HTTPException(
+        503,
+        "Credential backend is unavailable. Please try again later or contact an operator.",
+    ) from exc
 
 
 def _channel_resp(c) -> ChannelResponse:
@@ -2036,7 +2159,8 @@ async def list_my_integrations(
     db: AsyncSession = Depends(get_db),
 ):
     items = await list_integrations(db, user.entity_id)
-    return [_integration_resp(i) for i in items]
+    names = await _creator_names(db, items)
+    return [_integration_resp(i, creator_names=names) for i in items]
 
 
 @router.post("", response_model=IntegrationResponse, status_code=201)
@@ -2045,22 +2169,26 @@ async def create_new_integration(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    integration = await create_integration(
-        db, user.entity_id, req.provider,
-        config=req.config, credentials=req.credentials,
-    )
+    try:
+        integration = await create_integration(
+            db, user.entity_id, req.provider,
+            config=req.config, credentials=req.credentials,
+            created_by_user_id=user.id,
+        )
 
-    # Channel-flavoured providers also get a ChannelConfig row + auto
-    # webhook registration so inbound routing works without a separate
-    # setup step.
-    await _sync_channel_config_if_needed(
-        db,
-        entity_id=user.entity_id,
-        provider=req.provider,
-        integration_id=integration.id,
-        credentials=req.credentials or {},
-    )
-    await db.commit()
+        # Channel-flavoured providers also get a ChannelConfig row + auto
+        # webhook registration so inbound routing works without a separate
+        # setup step.
+        await _sync_channel_config_if_needed(
+            db,
+            entity_id=user.entity_id,
+            provider=req.provider,
+            integration_id=integration.id,
+            credentials=req.credentials or {},
+        )
+        await db.commit()
+    except CredentialError as exc:
+        await _raise_credential_backend_unavailable(db, exc, action="create_integration")
 
     # Fire-and-forget health check so the user sees green/red on the
     # card within a couple of seconds of saving.
@@ -2073,7 +2201,10 @@ async def create_new_integration(
     # Readiness check (periodic task) will detect the new integration
     # and trigger Strategist review within 10 minutes.
 
-    return _integration_resp(integration)
+    return _integration_resp(
+        integration,
+        creator_names=await _creator_names(db, [integration]),
+    )
 
 
 # ── Integration ↔ ChannelConfig bridge ────────────────────────────────
@@ -2276,7 +2407,10 @@ async def get_one_integration(
     integration = await get_integration(db, integration_id, user.entity_id)
     if not integration:
         raise HTTPException(404, "Integration not found")
-    return _integration_resp(integration)
+    return _integration_resp(
+        integration,
+        creator_names=await _creator_names(db, [integration]),
+    )
 
 
 @router.put("/{integration_id}", response_model=IntegrationResponse)
@@ -2324,11 +2458,14 @@ async def update_one_integration(
             merged[k] = v
         credentials = merged
 
-    integration = await update_integration(
-        db, integration_id, user.entity_id,
-        provider=req.provider, status=req.status,
-        config=req.config, credentials=credentials,
-    )
+    try:
+        integration = await update_integration(
+            db, integration_id, user.entity_id,
+            provider=req.provider, status=req.status,
+            config=req.config, credentials=credentials,
+        )
+    except CredentialError as exc:
+        await _raise_credential_backend_unavailable(db, exc, action="update_integration")
     if not integration:
         raise HTTPException(404, "Integration not found")
 
@@ -2358,7 +2495,10 @@ async def update_one_integration(
     except Exception:
         logger.debug("Could not enqueue health check (Celery unreachable)", exc_info=True)
 
-    return _integration_resp(integration)
+    return _integration_resp(
+        integration,
+        creator_names=await _creator_names(db, [integration]),
+    )
 
 
 @router.delete("/{integration_id}", status_code=204)

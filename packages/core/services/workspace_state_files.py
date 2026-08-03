@@ -19,7 +19,7 @@ from packages.core.memory.canonical import (
     ensure_workspace_memory_docs,
     write_workspace_memory_file,
 )
-from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+from packages.core.models.document import Document, DocumentFolder, DocumentGroup, DocumentGroupMember
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.goal import Goal
 from packages.core.models.task import Task
@@ -37,6 +37,7 @@ class WorkspaceFileEntry:
     name: str
     description: str
     location: str
+    display_location: str = ""
     kind: str = ""
     document_id: str = ""
     group: str = ""
@@ -205,6 +206,23 @@ async def _workspace_files(
     for doc in origin_docs:
         _merge_entry(entries, _document_entry(doc))
 
+    display_folder_name = workspace.name
+    if workspace.artifact_folder_id:
+        linked_name = (await db.execute(
+            select(DocumentFolder.name).where(
+                DocumentFolder.id == workspace.artifact_folder_id,
+                DocumentFolder.entity_id == workspace.entity_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        display_folder_name = str(linked_name or workspace.name)
+    from packages.core.services.workspace_artifacts import workspace_artifact_display_path
+    for entry in entries.values():
+        entry.display_location = workspace_artifact_display_path(
+            entry.location,
+            artifact_folder_id=workspace.artifact_folder_id,
+            display_folder_name=display_folder_name,
+        )
+
     return sorted(
         entries.values(),
         key=lambda item: item.updated_at or datetime.min.replace(tzinfo=timezone.utc),
@@ -303,6 +321,7 @@ def _merge_entry(entries: dict[str, WorkspaceFileEntry], entry: WorkspaceFileEnt
     current.name = current.name or entry.name
     current.description = _prefer_detail(current.description, entry.description)
     current.location = current.location or entry.location
+    current.display_location = current.display_location or entry.display_location
     current.kind = current.kind or entry.kind
     current.document_id = current.document_id or entry.document_id
     current.group = current.group or entry.group
@@ -465,8 +484,8 @@ def _render_files_md(
         return "\n".join(lines).rstrip() + "\n"
 
     lines.extend([
-        "| Name | Document ID | What | Location | Origin | Updated |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Name | Document ID | What | Display Path | Storage Location | Origin | Updated |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ])
     for item in files:
         origin_bits = []
@@ -482,7 +501,8 @@ def _render_files_md(
         lines.append(
             f"| {_cell(item.name)} | {_cell(item.document_id or '-')} | "
             f"{_cell(item.description or item.kind or 'Workspace file')} | "
-            f"{_cell(item.location)} | {_cell('; '.join(origin_bits) or 'workspace')} | "
+            f"{_cell(item.display_location or item.location)} | {_cell(item.location)} | "
+            f"{_cell('; '.join(origin_bits) or 'workspace')} | "
             f"{_cell(updated)} |"
         )
 
@@ -490,7 +510,8 @@ def _render_files_md(
         "",
         "## Lookup Rules",
         "- Prefer `document_id` when present for Knowledge/document APIs.",
-        "- Prefer `fs_path` or relative locations for filesystem tools.",
+        "- Display paths use the mutable `Workspaces/<workspace name>` view shown to users.",
+        "- Filesystem tools must use Storage Location; workspace storage is keyed by immutable folder ID.",
         "- If an expected output is missing here, inspect the source task output before regenerating it.",
     ])
     return "\n".join(lines).rstrip() + "\n"

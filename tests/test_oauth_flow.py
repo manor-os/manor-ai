@@ -133,6 +133,75 @@ async def test_oauth_start_tiktok_uses_client_key(client: AsyncClient, monkeypat
     assert "video.publish" in url
 
 
+def test_apply_authorize_param_conventions_google_select_account():
+    """Google providers upgrade ``prompt`` to ``select_account consent`` so a
+    second connect lets the user pick a different Google account, while
+    keeping ``consent`` (refresh_token) and leaving non-Google flows alone."""
+    from types import SimpleNamespace
+
+    from packages.core.services.oauth_provider_config import (
+        apply_authorize_param_conventions,
+        is_google_provider,
+    )
+
+    base = {"prompt": "consent", "access_type": "offline", "client_id": "cid"}
+
+    for key in ("gmail", "google_calendar", "google_drive", "youtube"):
+        assert is_google_provider(key)
+        out = apply_authorize_param_conventions(SimpleNamespace(server_key=key), dict(base))
+        prompt_values = out["prompt"].split()
+        assert "select_account" in prompt_values, key
+        assert "consent" in prompt_values, key  # refresh_token still forced
+        assert out["access_type"] == "offline"
+        # No accidental duplication if select_account is already present.
+        out2 = apply_authorize_param_conventions(
+            SimpleNamespace(server_key=key), {**base, "prompt": "select_account consent"}
+        )
+        assert out2["prompt"].split().count("select_account") == 1
+
+    # Non-Google providers keep prompt=consent, never gain select_account.
+    for key in ("slack", "github", "twitter_x"):
+        assert not is_google_provider(key)
+        out = apply_authorize_param_conventions(SimpleNamespace(server_key=key), dict(base))
+        assert out["prompt"] == "consent"
+        assert "select_account" not in out["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_oauth_start_google_uses_select_account_prompt(
+    client: AsyncClient, monkeypatch
+):
+    """The gmail authorize URL must carry ``prompt=select_account`` (plus
+    ``consent`` + ``access_type=offline``) so a second connect can target a
+    different Google account. A non-Google provider must be unaffected."""
+    headers, _, _ = await _register_owner(client, "oauth_google_select")
+
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "g_cid")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "g_csec")
+    monkeypatch.setenv("SLACK_CLIENT_ID", "s_cid")
+    monkeypatch.setenv("SLACK_CLIENT_SECRET", "s_csec")
+    monkeypatch.setenv("APP_URL", "http://localhost:3010")
+
+    resp = await client.get(
+        "/api/v1/integrations/oauth/gmail/start",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    url = resp.json()["authorize_url"]
+    # urlencode() renders the space as '+': prompt=select_account+consent
+    assert "prompt=select_account" in url
+    assert "consent" in url
+    assert "access_type=offline" in url
+
+    # A non-Google provider keeps the plain consent prompt.
+    slack = await client.get(
+        "/api/v1/integrations/oauth/slack/start",
+        headers=headers,
+    )
+    assert slack.status_code == 200
+    assert "select_account" not in slack.json()["authorize_url"]
+
+
 @pytest.mark.asyncio
 async def test_oauth_start_db_overrides_env(client: AsyncClient, monkeypatch):
     """DB-stored client_id beats env."""
@@ -304,20 +373,15 @@ async def test_callback_clears_stale_failed_health_on_reconnect(client: AsyncCli
     monkeypatch.setenv("SLACK_CLIENT_SECRET", "csec")
     monkeypatch.setenv("APP_URL", "http://localhost:3010")
 
-    start = await client.get(
-        "/api/v1/integrations/oauth/slack/start",
-        headers=headers,
-    )
-    state = start.json()["state"]
-
     import packages.core.database as dbmod
     from packages.core.models.base import generate_ulid
     from packages.core.models.user import OAuthAccount
 
+    connection_id = generate_ulid()
     async with dbmod.async_session() as db:
         db.add(
             OAuthAccount(
-                id=generate_ulid(),
+                id=connection_id,
                 user_id=user_id,
                 provider="slack",
                 provider_user_id="old-provider-user",
@@ -335,6 +399,12 @@ async def test_callback_clears_stale_failed_health_on_reconnect(client: AsyncCli
             )
         )
         await db.commit()
+
+    start = await client.get(
+        f"/api/v1/integrations/oauth/slack/start?connection_id={connection_id}",
+        headers=headers,
+    )
+    state = start.json()["state"]
 
     class _MockResp:
         status_code = 200
@@ -378,6 +448,79 @@ async def test_callback_clears_stale_failed_health_on_reconnect(client: AsyncCli
     assert row.refresh_token == "rt-reconnected"
     assert "last_health_check" not in row.profile
     assert "oauth_refresh" not in row.profile
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_keeps_multiple_external_accounts(
+    client: AsyncClient,
+    monkeypatch,
+):
+    """Connecting a second provider identity creates a sibling connection."""
+    headers, user_id, _ = await _register_owner(client, "oauth_multi_callback")
+    monkeypatch.setenv("SLACK_CLIENT_ID", "cid")
+    monkeypatch.setenv("SLACK_CLIENT_SECRET", "csec")
+    monkeypatch.setenv("APP_URL", "http://localhost:3010")
+
+    token_payloads = {
+        "first": {
+            "access_token": "token-first",
+            "authed_user": {"id": "U-FIRST"},
+            "team": {"name": "First workspace"},
+        },
+        "second": {
+            "access_token": "token-second",
+            "authed_user": {"id": "U-SECOND"},
+            "team": {"name": "Second workspace"},
+        },
+    }
+
+    class _MockResp:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _MockClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, _url, *, data, **_kwargs):
+            return _MockResp(token_payloads[data["code"]])
+
+    for code in ("first", "second"):
+        start = await client.get(
+            "/api/v1/integrations/oauth/slack/start",
+            headers=headers,
+        )
+        state = start.json()["state"]
+        with patch("httpx.AsyncClient", lambda *args, **kwargs: _MockClient()):
+            response = await client.get(
+                f"/api/v1/integrations/oauth/slack/callback?code={code}&state={state}",
+                follow_redirects=False,
+            )
+        assert response.status_code == 302
+
+    import packages.core.database as dbmod
+    from packages.core.models.user import OAuthAccount
+
+    async with dbmod.async_session() as db:
+        rows = list((await db.execute(
+            select(OAuthAccount).where(
+                OAuthAccount.user_id == user_id,
+                OAuthAccount.provider == "slack",
+            )
+        )).scalars().all())
+
+    assert {row.provider_user_id for row in rows} == {"U-FIRST", "U-SECOND"}
+    assert {row.access_token for row in rows} == {"token-first", "token-second"}
+    assert sum(bool((row.profile or {}).get("is_default")) for row in rows) == 1
 
 
 @pytest.mark.asyncio

@@ -17,16 +17,29 @@ is not handled here.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.deps import get_current_user
+from apps.api.deps import get_current_user, require_plan
+from packages.core.ai.pending_action import LEASE_HITL_CLOSEABLE_KINDS
+from packages.core.constants.pending_actions import (
+    WORKFLOW_RUN_ACTION_KINDS,
+    PendingActionKind,
+)
+from packages.core.constants.task import TaskStatus
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
 from packages.core.database import get_db
 from packages.core.models.task import Conversation, Message
 from packages.core.models.user import User
@@ -34,9 +47,12 @@ from packages.core.models.workspace import Workspace
 from packages.core.services.hitl_options import (
     APPROVAL_CHOICE_ALWAYS_APPROVE,
     APPROVAL_CHOICE_APPROVE,
-    APPROVAL_CHOICE_REJECT,
+    ERROR_CHOICE_RETRY,
 )
-from packages.core.services.workspace_access import user_can_read_workspace
+from packages.core.services.workspace_access import (
+    user_can_control_workspace_run,
+    user_can_read_workspace,
+)
 from packages.core.workspace_chat import service as chat_service
 
 
@@ -47,6 +63,16 @@ router = APIRouter(
     tags=["workspace-chat"],
 )
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+# How many open action cards the first page will pin, however old they are.
+# Reaching this cap means the client is NOT holding the whole open set, which
+# it needs to know before it treats an absent card as answered.
+_PINNED_ACTION_LIMIT = 50
+
 
 # ── Schemas ────────────────────────────────────────────────────────────
 
@@ -54,6 +80,7 @@ class MessageResponse(BaseModel):
     id: str
     conversation_id: str
     created_at: datetime
+    updated_at: Optional[datetime] = None
     body: Optional[str]
     tool_calls: Optional[Any] = None
     assistant_blocks: Optional[list[dict]] = None
@@ -74,6 +101,20 @@ class MessageResponse(BaseModel):
     resolved_by_user_name: Optional[str] = None
     resolved_by_user_email: Optional[str] = None
     resolved_by_user_avatar_url: Optional[str] = None
+
+
+class MessagesPageResponse(BaseModel):
+    items: list[MessageResponse]
+    has_more: bool
+    next_cursor: Optional[str] = None
+    # Workspace-wide count of action cards still waiting on a human, counted in
+    # the DB. The client cannot derive this from `items`: a card answered from
+    # this very page leaves the pinned set rather than coming back marked
+    # resolved, and the client's merge-by-id never removes what it has seen.
+    open_action_count: int = 0
+    # True when `items` carries EVERY open action card in the workspace, so an
+    # open card the client remembers but that is absent here has been answered.
+    open_actions_complete: bool = False
 
 
 class PostMessageRequest(BaseModel):
@@ -149,6 +190,7 @@ def _to_message(
     refs: Optional[list[dict]] = None,
     author_user: User | None = None,
     resolved_by_user: User | None = None,
+    updated_at: datetime | None = None,
 ) -> MessageResponse:
     pending_action = m.pending_action if isinstance(m.pending_action, dict) and m.pending_action.get("kind") else None
     author_user_id = _message_author_user_id(m)
@@ -156,6 +198,7 @@ def _to_message(
         id=m.id,
         conversation_id=m.conversation_id,
         created_at=m.created_at,
+        updated_at=updated_at,
         body=m.content,
         tool_calls=m.tool_calls,
         assistant_blocks=(m.meta or {}).get("assistant_blocks") if isinstance(m.meta, dict) else None,
@@ -179,6 +222,116 @@ def _to_message(
     )
 
 
+def _encode_message_cursor(message: Message | None) -> str | None:
+    if not message or not message.created_at or not message.id:
+        return None
+    return f"{message.created_at.isoformat()}|{message.id}"
+
+
+def _decode_message_cursor(value: str | None) -> tuple[datetime | None, str | None]:
+    if not value:
+        return None, None
+    timestamp, separator, message_id = value.partition("|")
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid message cursor") from exc
+    return parsed, message_id if separator and message_id else None
+
+
+#: Re-exported under the router's historical name — ``apps/api/routers/
+#: workflows.py`` imports it from here.
+WORKSPACE_WORKFLOW_RUN_ACTION_KINDS = WORKFLOW_RUN_ACTION_KINDS
+
+#: The cards that ask the user to type or confirm something directly, as
+#: opposed to deciding a proposal or a policy. Their resolve branches share an
+#: evidence type, a summary and an activity event.
+_INPUT_CARD_KINDS: frozenset[str] = frozenset({
+    PendingActionKind.HUMAN_INPUT.value,
+    PendingActionKind.NEEDS_INPUT.value,
+    PendingActionKind.NEEDS_CONFIRMATION.value,
+    PendingActionKind.NEEDS_LOGIN.value,
+})
+
+#: A ``wait`` step inside a running workflow, of either flavour.
+_WORKFLOW_WAIT_KINDS: frozenset[str] = frozenset({
+    PendingActionKind.WORKFLOW_APPROVAL.value,
+    PendingActionKind.WORKFLOW_INPUT.value,
+})
+_ACTIONABLE_WORKFLOW_STATUSES = {"queued", "pending", "running", "paused", "failed"}
+_ACTIONABLE_WORKFLOW_OUTCOMES = {
+    "needs_input",
+    "revision_required",
+    "ready_for_acceptance",
+}
+
+
+def _message_workflow_run_id(message: Message) -> str | None:
+    pending_action = message.pending_action if isinstance(message.pending_action, dict) else {}
+    meta = message.meta if isinstance(message.meta, dict) else {}
+    run_id = pending_action.get("workflow_run_id") or meta.get("workflow_run_id")
+    if run_id:
+        return str(run_id)
+    for ref in message.refs or []:
+        if isinstance(ref, dict) and ref.get("type") == "workflow_run" and ref.get("id"):
+            return str(ref["id"])
+    return None
+
+
+def _is_actionable_workflow_activity(message: Message) -> bool:
+    if message.message_kind != "workflow_activity":
+        return False
+    meta = message.meta if isinstance(message.meta, dict) else {}
+    status = str(meta.get("workflow_status") or "").strip().lower()
+    if status in _ACTIONABLE_WORKFLOW_STATUSES:
+        return True
+    outcome = str(meta.get("workflow_business_outcome") or "").strip().lower()
+    return status == "completed" and outcome in _ACTIONABLE_WORKFLOW_OUTCOMES
+
+
+async def _augment_latest_page_with_workflow_runtime(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    rows: list[Message],
+) -> list[Message]:
+    activity_rows = list((await db.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.message_kind == "workflow_activity",
+        )
+    )).scalars().all())
+    actionable_activity = [
+        message for message in activity_rows if _is_actionable_workflow_activity(message)
+    ]
+    actionable_run_ids = {
+        run_id
+        for message in actionable_activity
+        if (run_id := _message_workflow_run_id(message))
+    }
+    if not actionable_run_ids:
+        return rows
+
+    unresolved_rows = list((await db.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.pending_action.isnot(None),
+            Message.resolved_at.is_(None),
+        )
+    )).scalars().all())
+    associated_actions = [
+        message
+        for message in unresolved_rows
+        if isinstance(message.pending_action, dict)
+        and message.pending_action.get("kind") in WORKSPACE_WORKFLOW_RUN_ACTION_KINDS
+        and _message_workflow_run_id(message) in actionable_run_ids
+    ]
+    by_id = {message.id: message for message in rows}
+    for message in [*actionable_activity, *associated_actions]:
+        by_id.setdefault(message.id, message)
+    return sorted(by_id.values(), key=lambda message: (message.created_at, message.id))
+
+
 async def _verify_workspace(
     db: AsyncSession, workspace_id: str, user: User,
 ) -> Workspace:
@@ -196,16 +349,120 @@ async def _verify_workspace(
     return ws
 
 
+# M9.1 authority matrix for the strategist proposal card: proposal item
+# kind → the participant permission approving it demands. A cohort needs
+# EVERY distinct permission its kinds map to, so an editor (approve_tasks
+# + approve_goal_changes by role default) cannot wave through an
+# automation change riding the same card.
+_PROPOSAL_PERMISSION_BY_ITEM_KIND: dict[str, str] = {
+    "task": "approve_tasks",
+    "automation_change": "approve_automation_changes",
+    "workflow_change": "approve_automation_changes",
+    "experiment": "approve_automation_changes",
+    "goal_change": "approve_goal_changes",
+}
+
+
+def _pending_action_items(pending_action: dict | None) -> list[dict]:
+    """The non-task items a proposal card carries (empty on older cards)."""
+    if not isinstance(pending_action, dict):
+        return []
+    raw = pending_action.get("items")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _pending_action_item_ids(pending_action: dict | None) -> list[str]:
+    return [
+        str(item["item_id"])
+        for item in _pending_action_items(pending_action)
+        if item.get("item_id")
+    ]
+
+
+def _proposal_required_permissions(
+    pending_action: dict | None,
+    *,
+    selected_task_ids: list[str] | None = None,
+    selected_item_ids: list[str] | None = None,
+) -> list[str]:
+    """Every authority key this cohort's kinds demand, approve_tasks first.
+
+    A task-only cohort (and any legacy card with no ``items`` key) requires
+    exactly ``approve_tasks``, unchanged.
+
+    With the unified card a user may approve a *subset* of the cohort. When
+    ``selected_*`` are passed (the ``approve_selected`` path) only the picked
+    rows count: someone who may approve tasks but not automation changes can
+    still approve just the tasks on a mixed card. ``approve``/``approve_all``
+    pass neither and keep requiring the union over the whole cohort.
+    """
+    partial = selected_task_ids is not None or selected_item_ids is not None
+    item_filter = set(selected_item_ids or []) if partial else None
+    required: list[str] = []
+    for item in _pending_action_items(pending_action):
+        if item_filter is not None and str(item.get("item_id") or "") not in item_filter:
+            continue
+        key = _PROPOSAL_PERMISSION_BY_ITEM_KIND.get(str(item.get("kind") or ""))
+        if key and key not in required:
+            required.append(key)
+    action = pending_action if isinstance(pending_action, dict) else {}
+    has_tasks = bool(selected_task_ids) if partial else bool(action.get("task_ids"))
+    if has_tasks or not required:
+        if "approve_tasks" in required:
+            required.remove("approve_tasks")
+        required.insert(0, "approve_tasks")
+    return required
+
+
+def _proposal_selection(
+    pending_action: dict | None, payload: dict | None,
+) -> tuple[list[str], list[str]]:
+    """Effective ``approve_selected`` picks: (task_ids, item_ids).
+
+    A missing key means "everything of that half" — an older frontend that
+    only knows about tasks keeps every non-task item in the approved half.
+    Shared by the authority gate and the approval branch so the permissions
+    checked are always the ones actually acted on.
+    """
+    action = pending_action if isinstance(pending_action, dict) else {}
+    data = payload if isinstance(payload, dict) else {}
+    raw_tasks = data.get("selected_task_ids")
+    task_ids = (
+        [str(task_id) for task_id in raw_tasks]
+        if isinstance(raw_tasks, list)
+        else [str(task_id) for task_id in (action.get("task_ids") or [])]
+    )
+    raw_items = data.get("selected_item_ids")
+    item_ids = (
+        [str(item_id) for item_id in raw_items]
+        if isinstance(raw_items, list)
+        else _pending_action_item_ids(action)
+    )
+    return task_ids, item_ids
+
+
+def _proposal_authority_error(permission_key: str) -> str:
+    subject = "tasks" if permission_key == "approve_tasks" else "this proposal"
+    return (
+        f"You do not have authority to approve {subject} in this workspace. "
+        f"Approving requires the '{permission_key}' permission (workspace "
+        "owner or editor role, or an explicit authority grant on your "
+        "participant profile)."
+    )
+
+
 def _pending_action_evidence_type(kind: str, choice: str) -> str:
-    if kind == "approve_proposals":
+    if kind == PendingActionKind.APPROVE_PROPOSALS:
         return "user_feedback" if choice == "feedback" else "proposal_decision"
-    if kind in {"human_input", "needs_input", "needs_confirmation", "needs_login"}:
+    if kind in _INPUT_CARD_KINDS:
         return "hitl_resolution"
-    if kind == "workspace_operation_review":
+    if kind == PendingActionKind.WORKSPACE_OPERATION_REVIEW:
         return "workspace_operation_decision"
-    if kind == "external_message_approval":
+    if kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
         return "external_message_decision"
-    if kind == "retry_strategist_review":
+    if kind == PendingActionKind.RETRY_STRATEGIST_REVIEW:
         return "retry_request"
     return "pending_action_resolution"
 
@@ -220,7 +477,7 @@ def _pending_action_summary(kind: str, choice: str, note: str | None) -> str:
     rejected = normalized in {"reject", "rejected", "reject_all", "no", "decline", "cancel"}
     feedback = normalized in {"feedback", "request_changes", "changes"}
 
-    if kind == "approve_proposals":
+    if kind == PendingActionKind.APPROVE_PROPOSALS:
         if normalized in {"always_approve", "approve_always", "always_allow"}:
             base = "Strategist proposal auto-approval enabled"
         elif approved:
@@ -231,15 +488,15 @@ def _pending_action_summary(kind: str, choice: str, note: str | None) -> str:
             base = "Feedback sent to the strategist"
         else:
             base = "Strategist proposal reviewed"
-    elif kind == "workspace_operation_review":
+    elif kind == PendingActionKind.WORKSPACE_OPERATION_REVIEW:
         base = "Workspace operation reviewed"
-    elif kind == "external_message_approval":
+    elif kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
         base = "External message approved" if approved else (
             "External message rejected" if rejected else "External message reviewed"
         )
-    elif kind in {"human_input", "needs_input", "needs_confirmation", "needs_login"}:
+    elif kind in _INPUT_CARD_KINDS:
         base = "Input request answered"
-    elif kind == "retry_strategist_review":
+    elif kind == PendingActionKind.RETRY_STRATEGIST_REVIEW:
         base = "Strategist retry requested"
     else:
         base = "Workspace action reviewed"
@@ -258,6 +515,9 @@ def _pending_action_payload_shape(payload: dict | None) -> dict[str, Any]:
         else [],
         "selected_task_ids": list(payload.get("selected_task_ids") or [])[:50]
         if isinstance(payload.get("selected_task_ids"), list)
+        else [],
+        "selected_item_ids": list(payload.get("selected_item_ids") or [])[:50]
+        if isinstance(payload.get("selected_item_ids"), list)
         else [],
     }
 
@@ -287,20 +547,20 @@ def _pending_action_activity_event(kind: str, choice: str) -> str:
         "yes", "accept", "confirm",
     }
     rejected = normalized in {"reject", "rejected", "no", "decline", "cancel"}
-    if kind == "external_message_approval":
+    if kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
         return "external_message.approved" if approved else (
             "external_message.rejected" if rejected else "external_message.resolved"
         )
-    if kind == "approve_proposals":
+    if kind == PendingActionKind.APPROVE_PROPOSALS:
         if approved or normalized in {"approve_all", "approve_selected"}:
             return "strategist_proposal.approved"
         if rejected or normalized in {"reject_all"}:
             return "strategist_proposal.rejected"
         if normalized == "feedback":
             return "strategist_proposal.feedback"
-    if kind == "workspace_operation_review":
+    if kind == PendingActionKind.WORKSPACE_OPERATION_REVIEW:
         return "workspace_operation.resolved"
-    if kind in {"human_input", "needs_input", "needs_confirmation", "needs_login"}:
+    if kind in _INPUT_CARD_KINDS:
         return "hitl.resolved"
     return "pending_action.resolved"
 
@@ -344,16 +604,16 @@ async def _record_pending_action_activity(
         choice = str(resolution.get("choice") or "").lower()
         event_type = _pending_action_activity_event(kind, choice)
         note = resolution.get("note") if isinstance(resolution.get("note"), str) else None
-        if kind == "external_message_approval":
+        if kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
             verb = "approved" if event_type.endswith(".approved") else (
                 "rejected" if event_type.endswith(".rejected") else "resolved"
             )
             summary = f"External message {verb} by workspace operator."
-        elif kind == "approve_proposals":
+        elif kind == PendingActionKind.APPROVE_PROPOSALS:
             summary = _pending_action_summary(kind, choice, note)
-        elif kind == "workspace_operation_review":
+        elif kind == PendingActionKind.WORKSPACE_OPERATION_REVIEW:
             summary = _pending_action_summary(kind, choice, note)
-        elif kind in {"human_input", "needs_input", "needs_confirmation", "needs_login"}:
+        elif kind in _INPUT_CARD_KINDS:
             summary = _pending_action_summary(kind, choice, note)
         else:
             summary = _pending_action_summary(kind, choice, note)
@@ -559,6 +819,68 @@ async def _plan_task_ids_for_messages(
     return {str(plan_id): str(task_id) for plan_id, task_id in rows if task_id}
 
 
+async def _hydrate_messages(
+    db: AsyncSession,
+    rows: list[Message],
+    *,
+    entity_id: str,
+    workspace_id: str,
+) -> list[MessageResponse]:
+    from packages.core.models.workflow import WorkflowRun
+
+    workflow_run_ids = list(dict.fromkeys(
+        run_id for message in rows if (run_id := _message_workflow_run_id(message))
+    ))
+    workflow_run_updated_at: dict[str, datetime | None] = {}
+    if workflow_run_ids:
+        run_rows = (await db.execute(
+            select(WorkflowRun.id, WorkflowRun.updated_at).where(
+                WorkflowRun.id.in_(workflow_run_ids),
+                WorkflowRun.entity_id == entity_id,
+                WorkflowRun.workspace_id == workspace_id,
+            )
+        )).all()
+        workflow_run_updated_at = {
+            str(run_id): updated_at for run_id, updated_at in run_rows
+        }
+    plan_task_ids = await _plan_task_ids_for_messages(
+        db,
+        rows,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+    )
+    conversation_task_ids = await _conversation_task_ids_for_messages(
+        db,
+        rows,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+    )
+    task_ref_details = await _task_ref_details_for_messages(
+        db,
+        rows,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        plan_task_ids=plan_task_ids,
+        conversation_task_ids=conversation_task_ids,
+    )
+    authors_by_id = await _load_message_authors(db, rows)
+    return [
+        _to_message(
+            m,
+            refs=_message_refs_with_hydrated_task_ref(
+                m,
+                plan_task_ids,
+                conversation_task_ids,
+                task_ref_details,
+            ),
+            author_user=authors_by_id.get(_message_author_user_id(m) or ""),
+            resolved_by_user=authors_by_id.get(m.resolved_by_user_id or ""),
+            updated_at=workflow_run_updated_at.get(_message_workflow_run_id(m) or ""),
+        )
+        for m in rows
+    ]
+
+
 async def _enqueue_learning_candidate_applies(
     db: AsyncSession,
     *,
@@ -622,7 +944,7 @@ async def _record_pending_action_resolution_evidence(
             "channel_config_id": pending_action.get("channel_config_id"),
             "payload_shape": _pending_action_payload_shape(payload),
         }
-        if kind == "external_message_approval":
+        if kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
             reply_text = str(pending_action.get("reply_text") or "")
             details["reply_text_chars"] = len(reply_text)
             details["reply_text_preview"] = reply_text[:240]
@@ -711,6 +1033,107 @@ async def _record_task_completion_feedback_evidence(
 
 # ── Routes ─────────────────────────────────────────────────────────────
 
+
+@router.get("/entrypoints")
+async def list_chat_entrypoints(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _verify_workspace(db, workspace_id, user)
+    from packages.core.services.workspace_workflow_router import (
+        list_workspace_chat_entrypoints,
+    )
+
+    entrypoints = await list_workspace_chat_entrypoints(
+        db,
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+    )
+    return [entrypoint.public_dict() for entrypoint in entrypoints]
+
+
+async def _workspace_entrypoint_started_stream(started) -> Any:
+    from packages.core.services.sse_events import format_sse
+
+    content = started.activity_message.content or "Workflow started."
+    yield format_sse(
+        "stream_start",
+        {
+            "conversation_id": started.conversation.id,
+            "message_id": started.activity_message.id,
+        },
+    )
+    yield format_sse("text_delta", {"content": content, "status": "queued"})
+    yield format_sse(
+        "stream_end",
+        {
+            "conversation_id": started.conversation.id,
+            "message_id": started.activity_message.id,
+            "persisted": True,
+            "usage": {},
+            "rounds": 0,
+            "tool_calls": [],
+            "status": "queued",
+        },
+    )
+
+
+@router.post("/entrypoints/{binding_id}/stream")
+async def stream_chat_entrypoint(
+    workspace_id: str,
+    binding_id: str,
+    message: str = Form(...),
+    conversation_id: str | None = Form(None),
+    document_ids: str | None = Form(None),
+    files: list[UploadFile] = File(default=[]),
+    _gate=Depends(require_plan("ai_budget_usd")),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _verify_workspace(db, workspace_id, user)
+    from apps.api.routers.chat import _build_attachments
+    from packages.core.services.workspace_workflow_router import (
+        get_workspace_chat_entrypoint,
+        start_workspace_chat_entrypoint,
+    )
+
+    resolved = await get_workspace_chat_entrypoint(
+        db,
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+        binding_id=binding_id,
+    )
+    if resolved is None:
+        raise HTTPException(404, "Workflow Starter not found")
+    entrypoint, binding, _workflow = resolved
+    file_context_turn = await _build_attachments(
+        message,
+        document_ids,
+        files,
+        user.entity_id,
+        db,
+        workspace_id=workspace_id,
+        user_id=user.id,
+    )
+    started = await start_workspace_chat_entrypoint(
+        db,
+        entrypoint=entrypoint,
+        binding=binding,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        workspace_id=workspace_id,
+        message=file_context_turn.cleaned_message,
+        attachments=file_context_turn.attachments,
+        conversation_id=conversation_id,
+        route_source="explicit",
+    )
+    return StreamingResponse(
+        _workspace_entrypoint_started_stream(started),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
 @router.get("/messages", response_model=list[MessageResponse])
 async def list_chat_messages(
     workspace_id: str,
@@ -731,41 +1154,124 @@ async def list_chat_messages(
         limit=min(limit, 500),
         before=before,
     )
-    plan_task_ids = await _plan_task_ids_for_messages(
+    return await _hydrate_messages(
         db,
         rows,
         entity_id=user.entity_id,
         workspace_id=workspace_id,
     )
-    conversation_task_ids = await _conversation_task_ids_for_messages(
-        db,
-        rows,
-        entity_id=user.entity_id,
-        workspace_id=workspace_id,
-    )
-    task_ref_details = await _task_ref_details_for_messages(
-        db,
-        rows,
-        entity_id=user.entity_id,
-        workspace_id=workspace_id,
-        plan_task_ids=plan_task_ids,
-        conversation_task_ids=conversation_task_ids,
-    )
-    authors_by_id = await _load_message_authors(db, rows)
-    return [
-        _to_message(
-            m,
-            refs=_message_refs_with_hydrated_task_ref(
-                m,
-                plan_task_ids,
-                conversation_task_ids,
-                task_ref_details,
-            ),
-            author_user=authors_by_id.get(_message_author_user_id(m) or ""),
-            resolved_by_user=authors_by_id.get(m.resolved_by_user_id or ""),
-        )
-        for m in rows
+
+
+@router.get("/messages/page", response_model=MessagesPageResponse)
+async def list_chat_messages_page(
+    workspace_id: str,
+    thread_ref_kind: Optional[str] = None,
+    thread_ref_id: Optional[str] = None,
+    limit: int = Query(75, ge=1, le=200),
+    before: Optional[str] = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _verify_workspace(db, workspace_id, user)
+    before_created_at, before_id = _decode_message_cursor(before)
+    conversation_filters = [
+        Conversation.entity_id == user.entity_id,
+        Conversation.workspace_id == workspace_id,
     ]
+    if thread_ref_kind and thread_ref_id:
+        conversation_filters.extend([
+            Conversation.scope == "workspace_thread",
+            Conversation.thread_ref_kind == thread_ref_kind,
+            Conversation.thread_ref_id == thread_ref_id,
+        ])
+    else:
+        conversation_filters.append(Conversation.scope == "workspace_main")
+    conversation = (await db.execute(
+        select(Conversation).where(*conversation_filters).limit(1)
+    )).scalar_one_or_none()
+    if conversation is None:
+        return MessagesPageResponse(
+            items=[],
+            has_more=False,
+            next_cursor=None,
+            open_action_count=await chat_service.count_open_pending_actions(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=workspace_id,
+            ),
+            open_actions_complete=True,
+        )
+
+    rows = await chat_service.list_messages(
+        db,
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+        thread_ref_kind=thread_ref_kind,
+        thread_ref_id=thread_ref_id,
+        limit=limit + 1,
+        before=before_created_at,
+        before_id=before_id,
+        # Merge the pinned cards AFTER windowing below — pinning before the
+        # `rows[:limit]` truncation pushed them past the cut, so unresolved
+        # approvals filed in plan threads never reached the client while the
+        # sidebar badge kept counting them.
+        pin_pending=False,
+    )
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+    ordered_rows = list(reversed(rows))
+
+    # The cursor must describe the PAGE WINDOW, so it is taken before any
+    # pinned card joins the list. A pinned card is typically the oldest row
+    # present; letting it set the cursor would make the next page ask for
+    # history older than the card and skip the real remainder.
+    next_cursor = _encode_message_cursor(ordered_rows[0]) if has_more and ordered_rows else None
+
+    # First page of the main view: guarantee every unresolved action card is
+    # present, however old, so the chat can always answer the badge.
+    is_main_view = not (thread_ref_kind and thread_ref_id)
+    open_actions_complete = False
+    if is_main_view and before_created_at is None:
+        pinned = await chat_service.unresolved_pending_messages(
+            db,
+            entity_id=user.entity_id,
+            workspace_id=workspace_id,
+            limit=_PINNED_ACTION_LIMIT,
+        )
+        # Tell the client whether it is holding the WHOLE open set, so it can
+        # treat "card I know about, absent from this page" as "already
+        # answered" and stop counting it. Without this the client cannot
+        # distinguish resolved-elsewhere from merely-out-of-window.
+        open_actions_complete = len(pinned) < _PINNED_ACTION_LIMIT
+        if pinned:
+            by_id = {m.id: m for m in ordered_rows}
+            for msg in pinned:
+                by_id.setdefault(msg.id, msg)
+            ordered_rows = sorted(
+                by_id.values(), key=lambda m: (m.created_at, m.id),
+            )
+    response_rows = ordered_rows
+    if is_main_view and before_created_at is None:
+        response_rows = await _augment_latest_page_with_workflow_runtime(
+            db,
+            conversation_id=conversation.id,
+            rows=ordered_rows,
+        )
+    return MessagesPageResponse(
+        items=await _hydrate_messages(
+            db,
+            response_rows,
+            entity_id=user.entity_id,
+            workspace_id=workspace_id,
+        ),
+        has_more=has_more,
+        next_cursor=next_cursor,
+        open_action_count=await chat_service.count_open_pending_actions(
+            db, entity_id=user.entity_id, workspace_id=workspace_id,
+        ),
+        open_actions_complete=open_actions_complete,
+    )
 
 
 @router.post("/messages", response_model=MessageResponse, status_code=201)
@@ -859,12 +1365,63 @@ async def resolve_chat_action(
     pa = msg.pending_action or {}
     kind = pa.get("kind")
     normalized_choice = (req.choice or "").lower()
+    workflow_run_to_enqueue: str | None = None
+    if kind in WORKSPACE_WORKFLOW_RUN_ACTION_KINDS and pa.get("workflow_run_id"):
+        from packages.core.models.workflow import WorkflowRun
+
+        controlled_run = (await db.execute(
+            select(WorkflowRun).where(
+                WorkflowRun.id == str(pa["workflow_run_id"]),
+                WorkflowRun.entity_id == user.entity_id,
+                WorkflowRun.workspace_id == workspace_id,
+            )
+        )).scalar_one_or_none()
+        if controlled_run is None:
+            raise HTTPException(404, "Workflow Run not found")
+        if not await user_can_control_workspace_run(
+            db,
+            run=controlled_run,
+            user_id=user.id,
+            entity_role=user.role,
+        ):
+            raise HTTPException(403, "Workflow Run control permission required")
     proposal_always_approve = (
-        kind == "approve_proposals"
+        kind == PendingActionKind.APPROVE_PROPOSALS
         and normalized_choice == APPROVAL_CHOICE_ALWAYS_APPROVE
     )
     if proposal_always_approve and not resolution.get("note"):
         resolution["note"] = "Future workspace proposals in this workspace will start automatically."
+    # M9.1 authority gate — approving strategist proposals requires the
+    # permission each item kind in the cohort maps to (profile authority >
+    # workspace role map > entity owner/admin fallback). Checked BEFORE the
+    # message is resolved so a denied attempt leaves the card actionable for
+    # someone who can.
+    if kind == PendingActionKind.APPROVE_PROPOSALS and normalized_choice in {
+        APPROVAL_CHOICE_APPROVE,
+        "approve_all",
+        "approve_selected",
+        APPROVAL_CHOICE_ALWAYS_APPROVE,
+    }:
+        from packages.core.humans import participant_can
+        if normalized_choice == "approve_selected":
+            # Unified card: only the picked rows need authority.
+            picked_tasks, picked_items = _proposal_selection(pa, req.payload)
+            required_permissions = _proposal_required_permissions(
+                pa,
+                selected_task_ids=picked_tasks,
+                selected_item_ids=picked_items,
+            )
+        else:
+            required_permissions = _proposal_required_permissions(pa)
+        for permission_key in required_permissions:
+            if not await participant_can(
+                db,
+                user=user,
+                entity_id=user.entity_id,
+                workspace_id=workspace_id,
+                permission_key=permission_key,
+            ):
+                raise HTTPException(403, _proposal_authority_error(permission_key))
     if msg.resolved_at is not None and not _allow_side_effect_after_resolved(pa, req.choice):
         return _to_message(
             msg,
@@ -877,7 +1434,304 @@ async def resolve_chat_action(
     if resolved is None:
         raise HTTPException(404, "message not found")
 
-    if kind == "human_input" and pa.get("step_id"):
+    # Mid-execution HITL cards (CAPTCHA / 2FA / confirmation walls) carry the
+    # id of the unified HitlRequest minted for the pause. Each path-C
+    # branch below records its verdict here — "grant" on the leg that resumes
+    # the step, "deny" on the leg that cancels it — and the single block after
+    # the chain applies it. Keeping the decision in the branch that owns the
+    # choice means the choice vocabulary is never spelled twice.
+    # Leaving this None (needs_login's `sign_in`) decides nothing.
+    # Literal, not str: every write site below is a string literal and the read
+    # site is `== "grant"` with deny as the fallback, so a typo at a grant site
+    # would silently deny — step resumed, record says the user refused.
+    _lease_request_id = pa.get("approval_request_id")
+    _lease_decision: Literal["grant", "deny"] | None = None
+
+    if kind == PendingActionKind.WORKFLOW_STARTER_INPUT and pa.get("workflow_run_id"):
+        from packages.core.models.workflow import WorkflowRun
+        from packages.core.services.workspace_workflow_router import (
+            assemble_workspace_workflow_inputs,
+            get_workspace_chat_entrypoint,
+            preserve_server_captured_workflow_inputs,
+            validate_workspace_workflow_inputs,
+        )
+
+        workflow_run = (await db.execute(
+            select(WorkflowRun).where(
+                WorkflowRun.id == str(pa["workflow_run_id"]),
+                WorkflowRun.entity_id == user.entity_id,
+                WorkflowRun.workspace_id == workspace_id,
+                WorkflowRun.binding_id == str(pa.get("workflow_binding_id") or ""),
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if workflow_run is None:
+            raise HTTPException(404, "Workflow Run not found")
+        entrypoint_context = (
+            (workflow_run.trigger_data or {}).get("_workspace_chat_entrypoint")
+            if isinstance(workflow_run.trigger_data, dict)
+            else None
+        )
+        if not isinstance(entrypoint_context, dict) or entrypoint_context.get("conversation_id") != conv.id:
+            raise HTTPException(409, "Workflow Run does not belong to this Chat")
+        if workflow_run.status != "paused" or workflow_run.step_results:
+            raise HTTPException(409, "Workflow Run is no longer waiting for its inputs")
+
+        cancel_choices = {"cancel", "reject", "rejected", "decline", "deny", "no", "skip"}
+        if normalized_choice in cancel_choices:
+            workflow_run.status = "cancelled"
+            workflow_run.completed_at = datetime.now(timezone.utc)
+        else:
+            if normalized_choice not in {"run", "start", "submit", "confirm"}:
+                raise HTTPException(400, "Unsupported Workflow input choice")
+            resolved_entrypoint = await get_workspace_chat_entrypoint(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=workspace_id,
+                binding_id=str(pa.get("workflow_binding_id") or ""),
+            )
+            if resolved_entrypoint is None:
+                raise HTTPException(404, "Workflow Starter not found")
+            entrypoint, _binding, _workflow = resolved_entrypoint
+            submitted_inputs = preserve_server_captured_workflow_inputs(
+                entrypoint,
+                (req.payload or {}).get("inputs"),
+                workflow_run.trigger_data,
+            )
+            try:
+                input_values = validate_workspace_workflow_inputs(
+                    entrypoint,
+                    submitted_inputs,
+                )
+            except ValueError as exc:
+                try:
+                    errors = json.loads(str(exc))
+                except Exception:
+                    errors = {"inputs": "Invalid workflow inputs."}
+                raise HTTPException(422, {
+                    "message": "Invalid workflow inputs",
+                    "errors": errors,
+                })
+            mapped_input_values = assemble_workspace_workflow_inputs(
+                entrypoint,
+                input_values,
+            )
+            updated_trigger_data = dict(workflow_run.trigger_data or {})
+            updated_trigger_data.update(input_values)
+            updated_trigger_data.update(mapped_input_values)
+            workflow_run.trigger_data = updated_trigger_data
+            updated_variables = dict(workflow_run.variables or {})
+            updated_variables.update(input_values)
+            updated_variables.update(mapped_input_values)
+            updated_variables["trigger"] = {
+                **deepcopy(input_values),
+                **deepcopy(mapped_input_values),
+            }
+            workflow_run.variables = updated_variables
+            workflow_run.status = "running"
+            workflow_run.error = None
+            workflow_run_to_enqueue = workflow_run.id
+        from packages.core.services.workflow_chat_projection import project_workflow_run_status
+
+        await project_workflow_run_status(db, run=workflow_run)
+
+    elif kind == PendingActionKind.WORKFLOW_RETRY and pa.get("workflow_run_id"):
+        from packages.core.models.workflow import WorkflowRun
+        from packages.core.services import workflow_service
+        from packages.core.services.conversation_messages import add_message
+        from packages.core.services.workflow_chat_projection import (
+            project_workflow_run_status,
+            workflow_progress_steps,
+        )
+
+        workflow_run = (await db.execute(
+            select(WorkflowRun).where(
+                WorkflowRun.id == str(pa["workflow_run_id"]),
+                WorkflowRun.entity_id == user.entity_id,
+                WorkflowRun.workspace_id == workspace_id,
+                WorkflowRun.binding_id == str(pa.get("workflow_binding_id") or ""),
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if workflow_run is None:
+            raise HTTPException(404, "Workflow Run not found")
+        entrypoint_context = (
+            (workflow_run.trigger_data or {}).get("_workspace_chat_entrypoint")
+            if isinstance(workflow_run.trigger_data, dict)
+            else None
+        )
+        if not isinstance(entrypoint_context, dict) or entrypoint_context.get("conversation_id") != conv.id:
+            raise HTTPException(409, "Workflow Run does not belong to this Chat")
+        if normalized_choice not in {"retry", "retry_now"}:
+            if normalized_choice not in {"cancel", "skip"}:
+                raise HTTPException(400, "Unsupported Workflow retry choice")
+            workflow_run.status = "cancelled"
+            workflow_run.completed_at = datetime.now(timezone.utc)
+            await project_workflow_run_status(db, run=workflow_run)
+        else:
+            variables = (req.payload or {}).get("variables")
+            if variables is not None and not isinstance(variables, dict):
+                raise HTTPException(422, "Workflow retry variables must be an object")
+            try:
+                retry = await workflow_service.retry_workflow_run(
+                    db,
+                    run_id=workflow_run.id,
+                    entity_id=user.entity_id,
+                    started_by=user.id,
+                    from_step_id=str(pa.get("retry_from_step_id") or "") or None,
+                    variables=variables,
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            title = str((msg.meta or {}).get("workflow_title") or "Workflow")
+            activity_message = await add_message(
+                db,
+                conv.id,
+                role="system",
+                content=f"{title} retry attempt {retry.effective_attempt_number} is starting.",
+                message_kind="workflow_activity",
+                refs=[
+                    {"type": "workflow", "id": retry.workflow_id, "title": title},
+                    {"type": "workflow_run", "id": retry.id},
+                ],
+                meta={
+                    "workflow_run_id": retry.id,
+                    "workflow_binding_id": retry.binding_id,
+                    "workflow_title": title,
+                    "workflow_status": "running",
+                    "workflow_business_outcome": "in_progress",
+                    "workflow_attempt_number": retry.effective_attempt_number,
+                    "workflow_retry_of_run_id": workflow_run.id,
+                    "workflow_steps": workflow_progress_steps(
+                        retry,
+                        activity_status="running",
+                    ),
+                },
+            )
+            retry_trigger = dict(retry.trigger_data or {})
+            retry_context = dict(retry_trigger.get("_workspace_chat_entrypoint") or {})
+            retry_context["activity_message_id"] = activity_message.id
+            retry_trigger["_workspace_chat_entrypoint"] = retry_context
+            retry.trigger_data = retry_trigger
+            workflow_run = retry
+            workflow_run_to_enqueue = retry.id
+
+    elif kind in _WORKFLOW_WAIT_KINDS and pa.get("workflow_run_id"):
+        from packages.core.ai.workflow_runner import (
+            complete_workflow_stage_wait,
+            workflow_approval_decision_metadata,
+            workflow_stage_wait_context,
+        )
+        from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
+
+        workflow_run = (await db.execute(
+            select(WorkflowRun).where(
+                WorkflowRun.id == str(pa["workflow_run_id"]),
+                WorkflowRun.entity_id == user.entity_id,
+                WorkflowRun.workspace_id == workspace_id,
+                WorkflowRun.binding_id == str(pa.get("workflow_binding_id") or ""),
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if workflow_run is None:
+            raise HTTPException(404, "Workflow Run not found")
+        entrypoint_context = (
+            (workflow_run.trigger_data or {}).get("_workspace_chat_entrypoint")
+            if isinstance(workflow_run.trigger_data, dict)
+            else None
+        )
+        if not isinstance(entrypoint_context, dict) or entrypoint_context.get("conversation_id") != conv.id:
+            raise HTTPException(409, "Workflow Run does not belong to this Chat")
+        if workflow_run.status != "paused" or workflow_run.current_step_id != pa.get("step_id"):
+            raise HTTPException(409, "Workflow Run is no longer waiting for this response")
+
+        cancel_choices = {"cancel", "reject", "rejected", "decline", "deny", "no", "skip"}
+        if normalized_choice in cancel_choices:
+            workflow_run.status = "cancelled"
+            workflow_run.completed_at = datetime.now(timezone.utc)
+        else:
+            if kind == PendingActionKind.WORKFLOW_INPUT and normalized_choice not in {"respond", "submit", "provide_answers", "ok"}:
+                raise HTTPException(400, "Unsupported Workflow input choice")
+            response_variable = str(pa.get("response_variable") or f"{pa['step_id']}_response")
+            response_value = {
+                "choice": normalized_choice,
+                **({"note": req.note} if req.note else {}),
+                **({"payload": req.payload} if req.payload is not None else {}),
+            }
+            updated_variables = dict(workflow_run.variables or {})
+            updated_variables[response_variable] = response_value
+            workflow_run.variables = updated_variables
+            workflow = (await db.execute(
+                select(WorkflowDefinition).where(
+                    WorkflowDefinition.id == workflow_run.workflow_id,
+                    WorkflowDefinition.entity_id == user.entity_id,
+                )
+            )).scalar_one_or_none()
+            current_step = next(
+                (
+                    step
+                    for step in (workflow.steps if workflow else [])
+                    if str(step.get("id") or "") == str(pa["step_id"])
+                ),
+                None,
+            )
+            stage_wait_context = workflow_stage_wait_context(
+                workflow_run,
+                current_step,
+            )
+            if (
+                isinstance(current_step, dict)
+                and current_step.get("type") == "stage"
+                and stage_wait_context is None
+            ):
+                raise HTTPException(409, "Workflow stage is no longer waiting")
+            current_config = (
+                stage_wait_context[1].get("config")
+                if stage_wait_context is not None
+                and isinstance(stage_wait_context[1].get("config"), dict)
+                else current_step.get("config")
+                if isinstance(current_step, dict)
+                and isinstance(current_step.get("config"), dict)
+                else {"options": pa.get("options") or []}
+            )
+            approval_metadata: dict[str, Any] = {}
+            if kind == PendingActionKind.WORKFLOW_APPROVAL:
+                try:
+                    approval_metadata = workflow_approval_decision_metadata(
+                        current_config,
+                        decision=normalized_choice,
+                        actor_id=user.id,
+                        decided_at=datetime.now(timezone.utc),
+                    )
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+            if stage_wait_context is not None and isinstance(current_step, dict):
+                complete_workflow_stage_wait(
+                    workflow_run,
+                    current_step,
+                    stage_wait_context,
+                    metadata={
+                        "workflow_response": response_value,
+                        **approval_metadata,
+                    },
+                )
+            else:
+                step_results = dict(workflow_run.step_results or {})
+                previous = dict(step_results.get(str(pa["step_id"])) or {})
+                previous.update({
+                    "status": "completed",
+                    "resumed": True,
+                    "workflow_response": response_value,
+                    "resumed_at": datetime.now(timezone.utc).isoformat(),
+                    **approval_metadata,
+                })
+                step_results[str(pa["step_id"])] = previous
+                workflow_run.step_results = step_results
+            workflow_run.status = "running"
+            workflow_run.error = None
+            workflow_run_to_enqueue = workflow_run.id
+        from packages.core.services.workflow_chat_projection import project_workflow_run_status
+
+        await project_workflow_run_status(db, run=workflow_run)
+
+    elif kind == PendingActionKind.HUMAN_INPUT and pa.get("step_id"):
         # Lease-level HITL (legacy free-form text input): stash the
         # response on the step row + flip back to pending.
         await _resume_step_for_retry(
@@ -886,8 +1740,10 @@ async def resolve_chat_action(
             plan_id=pa.get("plan_id"),
             human_input_response=(req.payload or {"choice": req.choice, "note": req.note}),
         )
+        # No decline path here — any answer is an answer.
+        _lease_decision = "grant"
 
-    elif kind == "needs_input" and pa.get("step_id"):
+    elif kind == PendingActionKind.NEEDS_INPUT and pa.get("step_id"):
         # Tool returned _pending_action(kind="needs_input") —
         # blocking_questions on a form. Resolution choices:
         #   choice="provide_answers" + payload={answers: {...}}
@@ -904,6 +1760,7 @@ async def resolve_chat_action(
                 plan_id=pa.get("plan_id"),
                 params_update={"answers": answers},
             )
+            _lease_decision = "grant"
         else:
             # skip / cancel — fail the step so the plan can move on.
             await _cancel_step(
@@ -912,8 +1769,9 @@ async def resolve_chat_action(
                 plan_id=pa.get("plan_id"),
                 reason="user skipped needs_input",
             )
+            _lease_decision = "deny"
 
-    elif kind == "needs_confirmation" and pa.get("step_id"):
+    elif kind == PendingActionKind.NEEDS_CONFIRMATION and pa.get("step_id"):
         # Tool returned _pending_action(kind="needs_confirmation") —
         # destructive click was intercepted. Resolution:
         #   choice="confirm" → re-run with confirm flag set
@@ -928,6 +1786,7 @@ async def resolve_chat_action(
                 plan_id=pa.get("plan_id"),
                 params_update={"confirm": True, "confirm_destructive": True},
             )
+            _lease_decision = "grant"
         else:
             await _cancel_step(
                 db, user,
@@ -935,8 +1794,9 @@ async def resolve_chat_action(
                 plan_id=pa.get("plan_id"),
                 reason="user cancelled needs_confirmation",
             )
+            _lease_decision = "deny"
 
-    elif kind == "needs_login" and pa.get("step_id"):
+    elif kind == PendingActionKind.NEEDS_LOGIN and pa.get("step_id"):
         # Tool returned _pending_action(kind="needs_login") — login
         # wall hit. Resolution:
         #   choice="sign_in" → mark message resolved; the frontend
@@ -956,11 +1816,13 @@ async def resolve_chat_action(
                 step_id=pa["step_id"],
                 plan_id=pa.get("plan_id"),
             )
+            _lease_decision = "grant"
         elif choice == "sign_in":
             # No backend state change — frontend orchestrates the
             # headed-login flow. Step stays waiting_human; user calls
             # back with choice="continue_after_login" once cookies
-            # are captured.
+            # are captured. The approval request stays PENDING for the
+            # same reason: nothing has been approved yet.
             pass
         else:
             await _cancel_step(
@@ -969,12 +1831,49 @@ async def resolve_chat_action(
                 plan_id=pa.get("plan_id"),
                 reason="user skipped needs_login",
             )
+            _lease_decision = "deny"
 
-    elif kind == "governance_approval" and pa.get("step_id"):
+    elif kind == PendingActionKind.GOVERNANCE_APPROVAL and pa.get("step_id"):
         choice = (req.choice or "").lower()
         _always = choice == APPROVAL_CHOICE_ALWAYS_APPROVE
-        if choice == APPROVAL_CHOICE_APPROVE or _always:
-            if _always and (pa.get("action") or pa.get("capability_id")):
+        # The card carries the unified HitlRequest id. A stale pre-upgrade
+        # card has none — resuming still works: the dispatcher re-gates the
+        # step, finds no grant, and posts a fresh card carrying a request id.
+        _request_id = pa.get("approval_request_id")
+        # An `error` card offers retry/cancel rather than approve/reject: the
+        # step already ran, so there is nothing to authorize — the user went
+        # and fixed something and now wants it run again. Same resume path,
+        # honest label. Without this, "retry" would fall through to the else
+        # branch and CANCEL the step the user just repaired.
+        _resume = choice in {APPROVAL_CHOICE_APPROVE, ERROR_CHOICE_RETRY, "retry_now"}
+        if _resume or _always:
+            # "Always" is a PROMOTION of this action-scope request to a
+            # tool-scope standing grant, and grant_approval(standing=True) is
+            # the one place that performs it: it writes the workspace
+            # auto-approve set and records the widened scope on the row.
+            # Writing the auto-approve set here instead — which is what this
+            # branch used to do — routed the step plane around both.
+            _promoted = False
+            if _request_id:
+                from packages.core.governance.approvals import grant_approval
+                from packages.core.models.hitl_request import HitlRequest
+                request = (await db.execute(
+                    select(HitlRequest).where(
+                        HitlRequest.id == _request_id,
+                        HitlRequest.entity_id == user.entity_id,
+                    )
+                )).scalar_one_or_none()
+                if request is not None:
+                    await grant_approval(
+                        db, request, by_user_id=user.id, via="chat_card",
+                        standing=_always, changed_by=user.id,
+                    )
+                    _promoted = True
+            if _always and not _promoted and (
+                pa.get("action") or pa.get("capability_id")
+            ):
+                # A pre-upgrade card carries no request id, so there is no row
+                # to promote — the standing store still has to be written.
                 from packages.core.governance import (
                     add_auto_approve_action,
                     add_auto_approve_capability,
@@ -999,19 +1898,22 @@ async def resolve_chat_action(
                 db, user,
                 step_id=pa["step_id"],
                 plan_id=pa.get("plan_id"),
-                params_update={
-                    "_governance_approval": {
-                        "status": "approved",
-                        "step_id": pa.get("step_id"),
-                        "action_key": pa.get("action"),
-                        "capability_id": pa.get("capability_id"),
-                        "matched_rule": pa.get("matched_rule"),
-                        "approved_by": user.id,
-                        "approved_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                },
             )
         else:
+            if _request_id:
+                from packages.core.governance.approvals import deny_approval
+                from packages.core.models.hitl_request import HitlRequest
+                request = (await db.execute(
+                    select(HitlRequest).where(
+                        HitlRequest.id == _request_id,
+                        HitlRequest.entity_id == user.entity_id,
+                    )
+                )).scalar_one_or_none()
+                if request is not None:
+                    await deny_approval(
+                        db, request, by_user_id=user.id, via="chat_card",
+                        reason="user rejected governance approval",
+                    )
             await _cancel_step(
                 db, user,
                 step_id=pa["step_id"],
@@ -1019,16 +1921,21 @@ async def resolve_chat_action(
                 reason="user rejected governance approval",
             )
 
-    elif kind == "approve_proposals" and pa.get("review_id"):
+    elif kind == PendingActionKind.APPROVE_PROPOSALS and pa.get("review_id"):
         # Strategist proposal card: approve, approve_selected, reject, or feedback.
         from packages.core.strategist import approve_proposal, reject_proposal
         from packages.core.strategist.service import set_proposal_auto_approval
         review_id = pa["review_id"]
         all_ids = pa.get("task_ids") or []
+        # Non-task items (change kinds / experiments) ride the same card.
+        all_item_ids = _pending_action_item_ids(pa)
         choice = normalized_choice
         payload = req.payload or {}
+        approved_ids: list[str] | None = None
 
         if choice == APPROVAL_CHOICE_ALWAYS_APPROVE:
+            # Legacy workspace boolean — kept for compat with the flag-off
+            # strategist path, which only consults this setting.
             await set_proposal_auto_approval(
                 db,
                 entity_id=user.entity_id,
@@ -1036,31 +1943,68 @@ async def resolve_chat_action(
                 enabled=True,
                 changed_by=user.id,
             )
-            await approve_proposal(
+            # M8: on the strategist_review_v2 path "always approve" is a
+            # BLANKET grant — every Strategist proposal type stops asking,
+            # not just the kinds on this card. Each key gets its own
+            # auditable GovernanceRevision, and any single type can be put
+            # back to human review in Settings → Approval automation.
+            from packages.core.services.feature_flags import is_enabled
+            if await is_enabled(
+                db, "strategist_review_v2",
+                entity_id=user.entity_id, fallback=False,
+            ):
+                from packages.core.governance import add_auto_approve_action
+                from packages.core.proposals.constants import STRATEGIST_ACTION_KEYS
+                for action_key in STRATEGIST_ACTION_KEYS:
+                    await add_auto_approve_action(
+                        db,
+                        entity_id=user.entity_id,
+                        workspace_id=workspace_id,
+                        action_key=action_key,
+                        changed_by=user.id,
+                    )
+            approved_ids = await approve_proposal(
                 db, entity_id=user.entity_id,
                 review_id=review_id, only_task_ids=all_ids or None,
+                actor_id=user.id,
             )
-        elif choice == APPROVAL_CHOICE_APPROVE:
-            await approve_proposal(
+        elif choice in {APPROVAL_CHOICE_APPROVE, "approve_all"}:
+            # ProposalCard historically submits ``approve_all`` while the
+            # shared approval schema uses ``approve``.  Accept both so the
+            # message cannot be resolved without moving its tickets.
+            approved_ids = await approve_proposal(
                 db, entity_id=user.entity_id,
                 review_id=review_id, only_task_ids=all_ids or None,
+                actor_id=user.id,
             )
         elif choice == "approve_selected":
-            # Approve only selected tasks, reject the rest.
-            selected_ids = payload.get("selected_task_ids") or all_ids
-            approved_ids: list[str] = []
-            if selected_ids:
-                approved_ids = await approve_proposal(
-                    db, entity_id=user.entity_id,
-                    review_id=review_id, only_task_ids=selected_ids,
-                )
+            # Approve only the selected tasks / items, reject the rest.
+            # Same helper the authority gate above used, so the permissions
+            # checked are exactly the rows acted on. A missing key still
+            # means "all of that half" for older frontends.
+            selected_ids, selected_item_ids = _proposal_selection(pa, payload)
+            approved_ids = await approve_proposal(
+                db, entity_id=user.entity_id,
+                review_id=review_id,
+                only_task_ids=list(selected_ids),
+                only_item_ids=list(selected_item_ids),
+                actor_id=user.id,
+            )
             approved_set = set(approved_ids)
             rejected_ids = [t for t in all_ids if t not in approved_set]
-            if rejected_ids:
+            approved_item_set = set(selected_item_ids)
+            rejected_item_ids = [
+                item_id for item_id in all_item_ids
+                if item_id not in approved_item_set
+            ]
+            if rejected_ids or rejected_item_ids:
                 await reject_proposal(
                     db, entity_id=user.entity_id,
-                    review_id=review_id, only_task_ids=rejected_ids,
+                    review_id=review_id,
+                    only_task_ids=list(rejected_ids),
+                    only_item_ids=list(rejected_item_ids),
                     reason="Not selected by user",
+                    actor_id=user.id,
                 )
         elif choice == "feedback":
             # User gave feedback — close the stale proposal cohort, then
@@ -1076,40 +2020,83 @@ async def resolve_chat_action(
                     if feedback_text else
                     "Feedback requested"
                 ),
+                actor_id=user.id,
             )
             ws_id = msg.conversation_id and (await db.execute(
                 select(Conversation.workspace_id).where(Conversation.id == msg.conversation_id)
             )).scalar_one_or_none()
             if ws_id:
                 try:
+                    from packages.core.strategist import (
+                        ReviewTrigger, ReviewTriggerKind,
+                    )
                     from packages.core.tasks.ai_tasks import run_strategist_review
                     run_strategist_review.apply_async(
-                        args=[ws_id, f"user_feedback: {feedback_text}"],
+                        args=[ws_id],
+                        kwargs=ReviewTrigger(
+                            kind=ReviewTriggerKind.HUMAN_REQUESTED,
+                            detail=f"feedback on the last proposal: {feedback_text}",
+                        ).celery_kwargs(),
                         countdown=3,
                     )
                 except Exception:
                     pass
         elif choice in {"reject", "reject_all", "decline", "no"}:
+            # M9.3: the reject dialog sends a machine-readable reason_code
+            # (payload) + optional free-text comment (note). Only the
+            # user-offerable vocabulary is accepted; anything else falls
+            # back to OTHER rather than failing the resolution.
+            from packages.core.proposals.constants import USER_REASON_CODES
+            raw_code = payload.get("reason_code")
+            reason_code: str | None = None
+            if isinstance(raw_code, str) and raw_code.strip():
+                candidate = raw_code.strip().upper()
+                reason_code = (
+                    candidate if candidate in USER_REASON_CODES else "OTHER"
+                )
             await reject_proposal(
                 db, entity_id=user.entity_id,
                 review_id=review_id, only_task_ids=all_ids or None,
                 reason=req.note,
+                reason_code=reason_code,
+                actor_id=user.id,
             )
 
-    elif kind == "retry_strategist_review":
+        if approved_ids is not None:
+            if all_ids and choice != "approve_selected" and not approved_ids:
+                # The proposal card and task cohort have drifted apart.  Do
+                # not return a false-success resolution while every ticket is
+                # still proposed; rolling back also keeps the card actionable.
+                raise HTTPException(
+                    409,
+                    "No proposed tickets were approved. Refresh the workspace and try again.",
+                )
+            resolution_payload = dict(resolution.get("payload") or {})
+            resolution_payload["approved_task_ids"] = approved_ids
+            resolution["payload"] = resolution_payload
+            msg.resolution = dict(resolution)
+
+    elif kind == PendingActionKind.RETRY_STRATEGIST_REVIEW:
         choice = (req.choice or "").lower()
         if choice in {"retry", "retry_now", "approve", "yes"}:
             try:
+                from packages.core.strategist import (
+                    ReviewTrigger, ReviewTriggerKind,
+                )
                 from packages.core.tasks.ai_tasks import run_strategist_review
                 original_trigger = pa.get("trigger") or "failed"
                 run_strategist_review.apply_async(
-                    args=[workspace_id, f"manual_retry_after_failure: {original_trigger}"],
+                    args=[workspace_id],
+                    kwargs=ReviewTrigger(
+                        kind=ReviewTriggerKind.HUMAN_REQUESTED,
+                        detail=f"manual retry after failure ({original_trigger})",
+                    ).celery_kwargs(),
                     countdown=1,
                 )
             except Exception as exc:
                 raise HTTPException(500, f"failed to enqueue strategist retry: {exc}") from exc
 
-    elif kind == "workspace_operation_review":
+    elif kind == PendingActionKind.WORKSPACE_OPERATION_REVIEW:
         from packages.core.services.workspace_operation_service import (
             resolve_workspace_operation_review,
         )
@@ -1138,7 +2125,7 @@ async def resolve_chat_action(
         ))
         await db.flush()
 
-    elif kind == "external_message_approval":
+    elif kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
         choice = (req.choice or "").lower()
         always = choice == APPROVAL_CHOICE_ALWAYS_APPROVE
         if choice == APPROVAL_CHOICE_APPROVE or always:
@@ -1199,6 +2186,54 @@ async def resolve_chat_action(
                 ))
                 await db.flush()
 
+    # Apply the verdict the path-C branch above recorded. Same transaction as
+    # the step mutation it accompanies (this handler commits once, below), so
+    # the request decision and the step's fate land together or not at all.
+    #
+    # The kind gate is not redundant with `_lease_decision is not None`:
+    # `approval_request_id` is read off `pa` unconditionally and the
+    # governance_approval card carries that field too, but that branch grants
+    # WITHOUT consuming on purpose (the dispatcher spends the grant when it
+    # next leases the step). Only path-C cards may be decided here.
+    #
+    # LEASE_HITL_CLOSEABLE_KINDS is the very object lease_needs_human mints
+    # against, so the mint set and the close set cannot drift apart into
+    # minting a kind that nothing here can close.
+    if (
+        _lease_request_id
+        and _lease_decision is not None
+        and kind in LEASE_HITL_CLOSEABLE_KINDS
+    ):
+        from packages.core.constants.approvals import ApprovalStatus
+        from packages.core.governance.approvals import (
+            consume_approval,
+            deny_approval,
+            grant_approval,
+        )
+        from packages.core.models.hitl_request import HitlRequest
+
+        _lease_request = (await db.execute(
+            select(HitlRequest).where(
+                HitlRequest.id == _lease_request_id,
+                HitlRequest.entity_id == user.entity_id,
+                HitlRequest.status == ApprovalStatus.PENDING.value,
+            )
+        )).scalar_one_or_none()
+        if _lease_request is not None:
+            if _lease_decision == "grant":
+                await grant_approval(
+                    db, _lease_request, by_user_id=user.id, via="chat_card",
+                )
+                # Spend it immediately: the user's answer IS the consumption.
+                # Nothing downstream consumes a path-C grant, and
+                # _find_open_request counts granted-unconsumed rows as still
+                # live — so without this the row never leaves that state.
+                await consume_approval(db, _lease_request)
+            else:
+                await deny_approval(
+                    db, _lease_request, by_user_id=user.id, via="chat_card",
+                )
+
     queued_learning_ids = await _record_pending_action_resolution_evidence(
         db,
         workspace_id=workspace_id,
@@ -1219,6 +2254,24 @@ async def resolve_chat_action(
     )
 
     await db.commit()
+    if workflow_run_to_enqueue:
+        from packages.core.ai.workflow_runner import WorkflowRunner
+
+        if WorkflowRunner.enqueue(workflow_run_to_enqueue) is False:
+            workflow_run.status = "failed"
+            workflow_run.error = "Workflow could not be queued. Please start it again."
+            workflow_run.completed_at = datetime.now(timezone.utc)
+            from packages.core.services.workflow_run_trace import (
+                update_workflow_history_summary,
+            )
+
+            update_workflow_history_summary(workflow_run)
+            from packages.core.services.workflow_chat_projection import (
+                project_workflow_run_status,
+            )
+
+            await project_workflow_run_status(db, run=workflow_run)
+            await db.commit()
     await _enqueue_learning_candidate_applies(
         db,
         user=user,
@@ -1293,10 +2346,20 @@ async def record_chat_message_feedback(
 # ── Helpers shared across pending_action.kind branches ────────────────────
 
 def _allow_side_effect_after_resolved(pending_action: dict, choice: str | None) -> bool:
-    """Return True for intentional multi-stage pending_action callbacks."""
+    """Return True for intentional callbacks or safe proposal recovery."""
     kind = pending_action.get("kind") if isinstance(pending_action, dict) else None
     normalized = (choice or "").lower()
-    return kind == "needs_login" and normalized == "continue_after_login"
+    if kind == PendingActionKind.NEEDS_LOGIN and normalized == "continue_after_login":
+        return True
+    if kind == PendingActionKind.WORKFLOW_RETRY and normalized in {"retry", "retry_now"}:
+        return True
+    # Releases proposal cards affected by the historical approve_all/approve
+    # mismatch.  approve_proposal() only selects tickets still in `proposed`,
+    # so already-started tickets cannot be dispatched twice.
+    return kind == PendingActionKind.APPROVE_PROPOSALS and normalized in {
+        APPROVAL_CHOICE_APPROVE,
+        "approve_all",
+    }
 
 
 def _apply_step_resume(
@@ -1320,7 +2383,7 @@ def _apply_step_resume(
     if human_input_response is not None:
         step.human_input_response = human_input_response
 
-    step.step_status = "pending"
+    step.step_status = ExecutionStepStatus.PENDING.value
     step.human_input_prompt = None
     step.current_lease_id = None
     step.error = None
@@ -1331,7 +2394,7 @@ def _apply_step_cancel(step: Any, reason: str) -> None:
     """Mutate a step row to fail it after a 'skip' / 'cancel'
     resolution. Pure — caller handles DB load + re-enqueue."""
     from datetime import datetime, timezone
-    step.step_status = "failed"
+    step.step_status = ExecutionStepStatus.FAILED.value
     step.error = {"type": "UserSkipped", "message": reason}
     step.human_input_prompt = None
     step.current_lease_id = None
@@ -1371,6 +2434,20 @@ async def _resume_step_for_retry(
         human_input_response=human_input_response,
     )
 
+    # M9.2 — a resumed step means the awaited human input arrived: fulfil
+    # any open commitment rows for this step (best-effort, silent no-op).
+    try:
+        from packages.core.humans import resolve_commitments_for_step
+        await resolve_commitments_for_step(
+            db, step.id,
+            {"kind": "hitl_response"},
+        )
+    except Exception:
+        logger.warning(
+            "human commitment resolve failed for step %s (ignored)",
+            step.id, exc_info=True,
+        )
+
     target_plan_id = plan_id or step.plan_id
     if not target_plan_id:
         return
@@ -1379,7 +2456,7 @@ async def _resume_step_for_retry(
         select(ExecutionPlan).where(ExecutionPlan.id == target_plan_id)
     )).scalar_one_or_none()
     if plan:
-        plan.status = "running"
+        plan.status = ExecutionPlanStatus.RUNNING.value
         plan.completed_at = None
         plan.last_error = None
         if plan.task_id:
@@ -1389,15 +2466,10 @@ async def _resume_step_for_retry(
                     Task.entity_id == user.entity_id,
                 )
             )).scalar_one_or_none()
-            if task and task.status == "waiting_on_customer":
-                apply_task_status_transition(task, "in_progress")
-
-    if human_input_response is not None and step.kind == "human":
-        try:
-            from packages.core.temporal_app import signal_human_input
-            await signal_human_input(step.plan_id, step.step_key, human_input_response)
-        except Exception:
-            pass
+            if task and task.status == TaskStatus.WAITING_ON_CUSTOMER:
+                await apply_task_status_transition(
+                    task, "in_progress", db=db, actor_kind="user", actor_id=user.id,
+                )
 
     try:
         from packages.core.tasks.ai_tasks import run_plan

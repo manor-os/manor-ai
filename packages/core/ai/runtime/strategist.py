@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from packages.core.constants.task import TaskStatus
 from packages.core.ai.runtime.billing import runtime_llm_billing_context
 from packages.core.ai.runtime.completions import (
     RuntimeTextCompletionResult,
@@ -37,6 +38,14 @@ Hard constraints:
   * Learn from prior reviews: if similar work was rejected with a
     reason, do NOT re-propose it the same way. If similar work
     completed successfully, lean into that pattern.
+  * Never propose meta/bookkeeping tasks — writing or updating
+    learnings, memory, LEARNINGS.md/MEMORY.md/STATE.md, "document
+    what we learned", consolidating notes, or process retrospectives.
+    The runtime records learnings automatically through the learning
+    pipeline; pending learning candidates are for the operator to
+    resolve, not tasks. If learning candidates are piling up, mention
+    it in `notes`. Proposing 0 tasks is better than proposing
+    bookkeeping.
   * Treat Workspace Operating Memory as durable policy/context plus generated
     runtime cache for this workspace. STATE.md and FILES.md are generated
     caches for current status and file locations; RULES.md, KNOWLEDGE.md,
@@ -99,6 +108,115 @@ Task description quality — **this is critical**:
 """
 
 
+RUNTIME_STRATEGIST_EMPTY_OK = """\
+Empty proposals are a first-class good outcome. When the domain reports in
+the briefing are healthy and no new evidence demands action, return an empty
+`tasks` array and explain the no-action reasoning in `notes` — "reviewed,
+nothing needs to change" is a legitimate, valuable conclusion. Never
+fabricate tasks to fill a quota; an empty proposal is strictly better than a
+padded one.
+
+Do not propose high-risk changes for any domain listed under "Coverage gaps"
+in the briefing: data for those domains is unavailable or stale this cycle,
+so there is no evidence basis for risky changes to them."""
+
+
+RUNTIME_STRATEGIST_BASIS_GUIDANCE = """\
+Every task SHOULD cite its evidence basis. Add a `basis` object to each
+task: set `basis.report_refs` to the briefing domain names (e.g. "goal",
+"execution") or report ids the task responds to, and `basis.evidence_refs`
+to the ids shown in [evidence: ...] suffixes of the observations you relied
+on. A task you cannot ground in any report or evidence is a task you should
+reconsider proposing. Optionally set `correlation_key` (stable snake_case)
+on recurring work so duplicate proposals can be detected across cycles."""
+
+
+RUNTIME_STRATEGIST_HUMAN_REQUESTS_GUIDANCE = """\
+Use the optional `human_requests` array (max 3) when the workspace needs a
+HUMAN decision, review, input, or manual work that is NOT an executable work
+task — e.g. a direction confirmation before committing budget, sign-off that
+is blocking progress, information only the operator has, or an offline action
+no agent can perform. Each entry needs: `request_key` (stable snake_case,
+unique in this proposal), `request_kind` (decision | review | input |
+manual_work), `question` (the concrete question or request, self-contained),
+and optionally `role_required` (workspace role expected to answer),
+`expected_by_hours` (soft deadline in hours), and `context`. Human requests
+are created automatically without approval and appear in the workspace's
+Human queue; the addressee may decline. Never use a human_request for work an
+agent service could do — propose a task instead. Omit the field or return []
+when no human input is needed."""
+
+
+RUNTIME_STRATEGIST_EXPERIMENTS_GUIDANCE = """\
+Use the optional `experiments` array (max 1) when the briefing shows repeated
+failures or degraded results for a specific automation and a CONFIG change
+might fix it. Prefer a bounded experiment over proposing a direct
+automation_change: the experiment applies a temporary `overlay_patch` to one
+target (target_kind: scheduled_job | workflow_binding — never a task), runs at
+most `max_runs` runs for at most `duration_days` days, auto-rolls-back after
+consecutive failures, and is evaluated deterministically against the declared
+`success_metrics` (v1 metric names: success_rate, run_count — each with a
+numeric `target`). Set `guardrails.max_cost` honestly (≤ $20 keeps it medium
+risk). Always state the evidence basis in `hypothesis` (cite the briefing
+observations that motivated it). An experiment never becomes permanent by
+itself — if it wins, propose the formal change in a later cycle citing the
+experiment's evaluation. Omit the field or return [] when no config
+experiment is warranted."""
+
+
+RUNTIME_STRATEGIST_CHANGE_GUIDANCE = """\
+Three optional arrays let you change the workspace's CONFIGURATION directly:
+`automation_changes` (max 3, targets scheduled_job | workflow_binding),
+`workflow_changes` (max 2, targets workflow_definition | workflow_binding), and
+`goal_changes` (max 2, targets goal).
+
+Pick the right instrument:
+  * **config change** — the evidence ALREADY shows what the right setting is.
+    A schedule that reliably misses its window, an automation that has failed
+    every run this window and should be paused, a stale binding nobody
+    triggers, a goal whose target was met and should be raised, a deadline
+    that has passed. You are not testing anything; you are correcting a
+    setting you can justify from the briefing.
+  * **experiment** — you believe a config change might help but are NOT sure.
+    Run the bounded trial first; propose the formal change later, citing its
+    evaluation.
+  * **task** — one-off work a service performs. Never model recurring config
+    drift as a task.
+
+Every change entry needs:
+  * `change_key` — stable snake_case, unique within its own array.
+  * `target_kind` + `operation`. automation/workflow operations are
+    create | update | pause | resume | delete; goal operations are
+    create | update_target | update_deadline | pause | archive.
+  * `target_id` — required for every operation except `create`; `create` must
+    NOT carry a target_id or an expected_revision.
+  * `expected_revision` — REQUIRED for update / pause / resume / delete /
+    archive / update_target / update_deadline. Copy the `revision` number
+    shown for that row in the briefing's automation_portfolio digest (for
+    automations and bindings) or goal digest (for goals). If the row changed
+    since the briefing was frozen, the change is rejected as STALE_REVISION
+    instead of overwriting someone else's edit — so copy it exactly, never
+    guess or invent a number.
+  * `patch` — field-level only, and only these keys:
+      - scheduled_job: enabled, cron_expr, every_seconds, schedule_kind,
+        timezone, name, execution_target, payload_message
+      - workflow_binding: enabled, status, trigger_type, trigger_ref,
+        variables, name
+      - workflow_definition: name, steps, variables, description
+      - goal: target_value, deadline, baseline_value, priority,
+        measurement_cadence, status
+    `pause` / `resume` / `delete` / `archive` need no patch (the operation
+    says everything); `update`, `update_target` and `update_deadline` need a
+    non-empty one. Anything outside the lists above is rejected.
+  * `rationale` (>= 16 chars) and `basis` — cite the briefing reports and
+    the [evidence: ...] ids the change rests on. A change you cannot ground
+    in the briefing is a change you should not propose.
+
+Changes to a row that another open proposal already targets are rejected as
+duplicates, so do not re-propose a change that is still awaiting approval.
+Omit these arrays or return [] when the configuration is fine as it is."""
+
+
 RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
     "review_id": "<provided in user prompt — copy verbatim>",
     "summary": "One paragraph: this cycle's framing.",
@@ -151,6 +269,86 @@ RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
 }
 
 
+# v2 (briefing_mode) variant — identical to the legacy hint plus the
+# non-task item kinds (human_requests / experiments / the three change
+# arrays). The legacy hint above must stay byte-identical.
+RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT_V2 = {
+    **RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT,
+    "human_requests": [
+        {
+            "request_key": "stable_snake_case_key_unique_in_this_review",
+            "request_kind": "decision | review | input | manual_work",
+            "role_required": "workspace role expected to answer, or null",
+            "question": (
+                "The concrete question or request for the human "
+                "(self-contained, >= 8 chars)."
+            ),
+            "expected_by_hours": 48,
+            "context": "Optional short context the human needs to answer.",
+        }
+    ],
+    "experiments": [
+        {
+            "experiment_key": "stable_snake_case_key",
+            "hypothesis": (
+                "What the config change should improve and the briefing "
+                "evidence it rests on (>= 16 chars)."
+            ),
+            "target_kind": "scheduled_job | workflow_binding",
+            "target_id": "<id of the automation to experiment on>",
+            "overlay_patch": {"payload_message": "temporary config override"},
+            "max_runs": 5,
+            "duration_days": 7,
+            "success_metrics": {
+                "success_rate": {"baseline": 0.6, "target": 0.9},
+            },
+            "guardrails": {
+                "max_cost": 20,
+                "rollback_on_consecutive_failures": 2,
+            },
+        }
+    ],
+    "automation_changes": [
+        {
+            "change_key": "stable_snake_case_key",
+            "target_kind": "scheduled_job | workflow_binding",
+            "operation": "create | update | pause | resume | delete",
+            "target_id": "<row id; omit only for create>",
+            "expected_revision": 3,
+            "patch": {"cron_expr": "0 9 * * 1"},
+            "rationale": (
+                "Why the evidence already settles this (>= 16 chars)."
+            ),
+            "basis": {"report_refs": ["automation_portfolio"], "evidence_refs": []},
+        }
+    ],
+    "workflow_changes": [
+        {
+            "change_key": "stable_snake_case_key",
+            "target_kind": "workflow_definition | workflow_binding",
+            "operation": "create | update | pause | resume | delete",
+            "target_id": "<row id; omit only for create>",
+            "expected_revision": 1,
+            "patch": {"enabled": False},
+            "rationale": "Why this workflow config must change (>= 16 chars).",
+            "basis": {"report_refs": ["execution"], "evidence_refs": []},
+        }
+    ],
+    "goal_changes": [
+        {
+            "change_key": "stable_snake_case_key",
+            "target_kind": "goal",
+            "operation": "create | update_target | update_deadline | pause | archive",
+            "target_id": "<goal id; omit only for create>",
+            "expected_revision": 2,
+            "patch": {"target_value": 2000},
+            "rationale": "Why the goal itself should change (>= 16 chars).",
+            "basis": {"report_refs": ["goal"], "evidence_refs": []},
+        }
+    ],
+}
+
+
 def runtime_strategist_review_billing_context(
     *,
     entity_id: str,
@@ -191,12 +389,23 @@ def runtime_strategist_system_prompt(
     ctx: Any,
     *,
     preamble: str | None = None,
+    briefing_mode: bool = False,
 ) -> str:
-    """Build the stable Strategist system prompt for a review cycle."""
+    """Build the stable Strategist system prompt for a review cycle.
+
+    ``briefing_mode=True`` (strategist_review_v2 path only) appends the
+    empty-proposal legitimization + coverage-gap restriction paragraph;
+    the default keeps the legacy prompt byte-identical.
+    """
 
     services_block = runtime_strategist_services_block(ctx)
     capabilities_block = runtime_strategist_task_capabilities_block()
-    schema_hint = json.dumps(RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT, indent=2)
+    schema_hint = json.dumps(
+        RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT_V2
+        if briefing_mode
+        else RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT,
+        indent=2,
+    )
 
     base = preamble or RUNTIME_STRATEGIST_DEFAULT_PREAMBLE
     try:
@@ -223,6 +432,12 @@ def runtime_strategist_system_prompt(
         "ArtifactResult, TextResult, DocumentResult, ListResult, "
         "PublishResult, CountResult, DraftPack."
     )
+    if briefing_mode:
+        parts.append(RUNTIME_STRATEGIST_EMPTY_OK)
+        parts.append(RUNTIME_STRATEGIST_BASIS_GUIDANCE)
+        parts.append(RUNTIME_STRATEGIST_HUMAN_REQUESTS_GUIDANCE)
+        parts.append(RUNTIME_STRATEGIST_EXPERIMENTS_GUIDANCE)
+        parts.append(RUNTIME_STRATEGIST_CHANGE_GUIDANCE)
     parts.append(
         "Output valid JSON matching this exact shape. No prose, no markdown:\n"
         f"{schema_hint}"
@@ -318,28 +533,7 @@ def runtime_strategist_user_prompt(ctx: Any, *, review_id: str) -> str:
     if readiness_section:
         sections.append("# Workspace readiness\n" + readiness_section)
 
-    if ctx.missing_setup:
-        missing_labels = {
-            "no_agents": "No agents are mapped to services yet",
-            "no_goals": "No goals are defined yet",
-            "no_channels": "Required workspace channel declarations are not configured yet",
-            "no_integrations": "No external integrations are configured yet",
-        }
-        missing_text = "\n".join(
-            f"- {missing_labels.get(item, item)}" for item in ctx.missing_setup
-        )
-        sections.append(
-            "# Workspace setup incomplete\n"
-            f"The following are NOT ready:\n{missing_text}\n\n"
-            "DO NOT propose work tasks that depend on missing setup. "
-            "Instead, propose generic setup/configuration tasks (e.g. "
-            "'Configure the declared channel' or 'Define workspace goals') "
-            "or propose 0 tasks with a note explaining "
-            "what the operator needs to configure first."
-        )
-        missing_channels = getattr(ctx, "missing_channel_requirements", []) or []
-        if missing_channels:
-            sections.append("# Missing channel requirements\n" + _format_missing_channels(missing_channels))
+    sections.extend(_missing_setup_sections(ctx))
 
     if ctx.configured_integrations:
         sections.append(
@@ -392,6 +586,83 @@ def runtime_strategist_user_prompt(ctx: Any, *, review_id: str) -> str:
         f"`{review_id}` exactly."
     )
     return "\n\n".join(sections)
+
+
+def runtime_strategist_user_prompt_v2(
+    briefing_markdown: str,
+    ctx: Any,
+    *,
+    review_id: str,
+) -> str:
+    """Briefing-driven review user prompt (strategist_review_v2 path, M6).
+
+    The deterministic ReviewBriefing markdown is the data core. Only the
+    cheap operational sections survive from the legacy prompt: workspace
+    readiness / missing setup, the open-proposals dedupe list, and
+    operating + relevant memory. Everything else (recent tasks, plans,
+    activity, outcomes, calibration, evaluation scorecard) is superseded by
+    the briefing's domain reports.
+    """
+    sections = [f"# Review trigger\n{ctx.trigger}\n\nreview_id to use: `{review_id}`"]
+
+    readiness_section = _format_workspace_readiness(ctx)
+    if readiness_section:
+        sections.append("# Workspace readiness\n" + readiness_section)
+
+    sections.extend(_missing_setup_sections(ctx))
+
+    if getattr(ctx, "open_proposed_tasks", None):
+        sections.append(
+            "# Already-proposed tasks not yet approved\n" + _format_open_proposed(ctx)
+        )
+
+    if getattr(ctx, "operating_memory", ""):
+        sections.append(
+            "# Workspace operating memory (canonical docs)\n" + ctx.operating_memory
+        )
+    sections.append(
+        "# Workspace memory (most relevant)\n"
+        + (_format_memory(ctx) or "_(none indexed yet)_")
+    )
+
+    sections.append(
+        "# Review briefing (deterministic domain reports)\n"
+        + briefing_markdown.strip()
+    )
+
+    sections.append(
+        "Now produce the JSON Proposal. review_id MUST equal "
+        f"`{review_id}` exactly."
+    )
+    return "\n\n".join(sections)
+
+
+def _missing_setup_sections(ctx: Any) -> list[str]:
+    """Shared "setup incomplete" sections (legacy + v2 user prompts)."""
+    sections: list[str] = []
+    if ctx.missing_setup:
+        missing_labels = {
+            "no_agents": "No agents are mapped to services yet",
+            "no_goals": "No goals are defined yet",
+            "no_channels": "Required workspace channel declarations are not configured yet",
+            "no_integrations": "No external integrations are configured yet",
+        }
+        missing_text = "\n".join(
+            f"- {missing_labels.get(item, item)}" for item in ctx.missing_setup
+        )
+        sections.append(
+            "# Workspace setup incomplete\n"
+            f"The following are NOT ready:\n{missing_text}\n\n"
+            "DO NOT propose work tasks that depend on missing setup. "
+            "Instead, propose generic setup/configuration tasks (e.g. "
+            "'Configure the declared channel' or 'Define workspace goals') "
+            "or propose 0 tasks with a note explaining "
+            "what the operator needs to configure first."
+        )
+        missing_channels = getattr(ctx, "missing_channel_requirements", []) or []
+        if missing_channels:
+            sections.append("# Missing channel requirements\n" + _format_missing_channels(missing_channels))
+    return sections
 
 
 def runtime_strategist_services_block(ctx: Any) -> str:
@@ -597,7 +868,7 @@ def _format_tasks(ctx: Any) -> str:
         files = _output_artifact_refs(output)
         if files:
             bits.append(f"artifacts={len(files)}")
-        elif task.status == "completed" and _looks_artifact_task(task):
+        elif task.status == TaskStatus.COMPLETED and _looks_artifact_task(task):
             bits.append("artifacts=0 (text-only; do not describe as files/artifacts)")
         lines.append(" ".join(bits))
     return "\n".join(lines)

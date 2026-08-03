@@ -17,6 +17,7 @@ import InfoPopover from "../components/ui/InfoPopover";
 import Modal from "../components/ui/Modal";
 import Select from "../components/ui/Select";
 import AiEditButton from "../components/ui/AiEditButton";
+import { PageHeaderSubtitle, PageHeaderTitle } from "../components/ui/PageHeader";
 import {
   IconArrowLeft,
   IconCheck,
@@ -47,6 +48,7 @@ import {
 } from "../components/icons";
 import { useToastStore } from "../stores/toast";
 import { openEditorLiveChat } from "../lib/editorLiveChat";
+import { getPlayableMediaDuration, requestMediaDurationProbe } from "../lib/mediaDuration";
 
 type ClipSegment = {
   id: string;
@@ -1985,6 +1987,7 @@ export default function VideoEditor() {
   const suppressPreviewPauseRef = useRef(false);
   const playbackAdvancePendingRef = useRef(false);
   const initializedDocRef = useRef<string | null>(null);
+  const durationProbeUrlRef = useRef<string | null>(null);
   const autoProjectTimelineRef = useRef<string | null>(null);
   const undoStackRef = useRef<EditorTrackState[]>([]);
   const redoStackRef = useRef<EditorTrackState[]>([]);
@@ -2733,6 +2736,7 @@ export default function VideoEditor() {
     setMarkers([]);
     setScanningProjectRecipe(false);
     initializedDocRef.current = null;
+    durationProbeUrlRef.current = null;
     autoProjectTimelineRef.current = null;
   }, [docId]);
 
@@ -2853,6 +2857,7 @@ export default function VideoEditor() {
     let objectUrl = "";
     if (!sourceDocId) return undefined;
     setDownloadUrl("");
+    durationProbeUrlRef.current = null;
     autoLoadedRecipeRef.current = null;
     setSourceLoading(true);
     api.documents.download(sourceDocId)
@@ -2930,11 +2935,23 @@ export default function VideoEditor() {
     if (!video) return;
     const currentUrl = video.currentSrc || video.src;
     if (downloadUrl && currentUrl && currentUrl !== downloadUrl) return;
-    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const duration = getPlayableMediaDuration(video);
     const width = video.videoWidth || 1920;
     const height = video.videoHeight || 1080;
-    setSourceDuration(duration);
     setMediaSize({ width, height });
+    if (duration <= 0) {
+      const probeUrl = currentUrl || downloadUrl;
+      if (probeUrl && durationProbeUrlRef.current !== probeUrl) {
+        durationProbeUrlRef.current = probeUrl;
+        if (!requestMediaDurationProbe(video)) durationProbeUrlRef.current = null;
+      }
+      return;
+    }
+    if (durationProbeUrlRef.current === (currentUrl || downloadUrl)) {
+      durationProbeUrlRef.current = null;
+      video.currentTime = 0;
+    }
+    setSourceDuration(duration);
     seedTimeline(duration);
   }, [downloadUrl, seedTimeline]);
 
@@ -3498,6 +3515,10 @@ export default function VideoEditor() {
   }, [isPlaying, pausePlayback, playTimelineFrom, playhead, timelineDuration]);
 
   const handleTimeUpdate = useCallback(() => {
+    if (durationProbeUrlRef.current) {
+      handleLoadedMetadata();
+      if (durationProbeUrlRef.current) return;
+    }
     if (!isPlaying) return;
     if (isPlaybackClockFresh()) return;
     stopPlaybackClock();
@@ -3518,7 +3539,7 @@ export default function VideoEditor() {
     const timelineTime = mapped.timelineStart + Math.max(0, video.currentTime - mapped.clip.sourceStart);
     setPlayhead(clamp(timelineTime, 0, timelineDuration));
     void syncPreviewAudio(timelineTime, true);
-  }, [clips, continuePlaybackFrom, isPlaybackClockFresh, isPlaying, stopPlaybackClock, syncPreviewAudio, timelineDuration]);
+  }, [clips, continuePlaybackFrom, handleLoadedMetadata, isPlaybackClockFresh, isPlaying, stopPlaybackClock, syncPreviewAudio, timelineDuration]);
 
   const handleVideoEnded = useCallback(() => {
     if (previewingMediaAssetId && !mediaAssetPreviewRef.current) {
@@ -5706,15 +5727,15 @@ export default function VideoEditor() {
             <IconArrowLeft size={18} />
           </button>
           <div className="ve-title-block">
-            <span className="ve-kicker">{veText("title")}</span>
             <div className="ve-title-row">
-              <h1>{doc.name}</h1>
+              <PageHeaderTitle>{doc.name}</PageHeaderTitle>
               <VideoEditorHelp
                 titleKey="help.editor.title"
                 bodyKey="help.editor.body"
                 itemKeys={["help.editor.item1", "help.editor.item2", "help.editor.item3", "help.editor.item4"]}
               />
             </div>
+            <PageHeaderSubtitle>{veText("title")}</PageHeaderSubtitle>
           </div>
         </div>
         <div className="ve-topbar-actions">
@@ -6051,6 +6072,7 @@ export default function VideoEditor() {
                   preload="metadata"
                   playsInline
                   onLoadedMetadata={handleLoadedMetadata}
+                  onDurationChange={handleLoadedMetadata}
                   onTimeUpdate={handleTimeUpdate}
                   onPause={handlePreviewPause}
                   onEnded={handleVideoEnded}
@@ -6919,7 +6941,7 @@ const VIDEO_EDITOR_STYLES = `
   align-items: center;
   gap: 6px;
 }
-.ve-title-row h1, .ve-section-title h2, .ve-track-label-name > span {
+.ve-title-row .page-header-title, .ve-section-title h2, .ve-track-label-name > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -6959,10 +6981,7 @@ const VIDEO_EDITOR_STYLES = `
   color: #78716c;
   font-weight: 800;
 }
-.ve-title-block h1 {
-  margin: 1px 0 0;
-  font-size: 16px;
-  line-height: 1.2;
+.ve-title-block .page-header-title {
   white-space: nowrap;
   max-width: 44vw;
 }
@@ -8837,7 +8856,7 @@ const VIDEO_EDITOR_STYLES = `
     align-items: flex-start;
     flex-direction: column;
   }
-  .ve-title-block h1 {
+  .ve-title-block .page-header-title {
     max-width: 82vw;
   }
   .ve-workspace {

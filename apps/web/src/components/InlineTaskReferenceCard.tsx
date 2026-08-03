@@ -5,7 +5,7 @@ import {
   parseChatRouteReference,
   preserveReturnToInHistory,
 } from "../lib/chatRouteReferences";
-import { IconList } from "./icons";
+import { IconChecklist } from "./icons";
 
 export default function InlineTaskReferenceCard({
   reference,
@@ -38,7 +38,7 @@ export default function InlineTaskReferenceCard({
       }}
       title={route.path}
     >
-      <span className="inline-file-reference-card__icon inline-task-reference-card__icon"><IconList size={12} /></span>
+      <span className="inline-file-reference-card__icon inline-task-reference-card__icon"><IconChecklist size={12} /></span>
       <span className="inline-file-reference-card__name">{displayName}</span>
     </button>
   );

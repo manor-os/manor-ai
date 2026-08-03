@@ -13,6 +13,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskStatus
+from packages.core.constants.execution import (
+    ExecutionStepStatus,
+)
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.task import Task
@@ -107,7 +111,7 @@ async def get_workspace_daily_summary(
     )
     stale_cutoff = now - timedelta(hours=48)
     stalled_conditions = (
-        Task.status == "in_progress",
+        Task.status == TaskStatus.IN_PROGRESS,
         func.coalesce(Task.updated_at, Task.created_at) < stale_cutoff,
     )
     stalled_count = await _task_count(db, entity_id, workspace_id, *stalled_conditions)
@@ -142,7 +146,7 @@ async def get_workspace_daily_summary(
         order_by=Task.created_at.desc(),
     )
     failed_conditions = (
-        Task.status == "failed",
+        Task.status == TaskStatus.FAILED,
         func.coalesce(Task.updated_at, Task.created_at) >= window_start,
         func.coalesce(Task.updated_at, Task.created_at) < window_end,
     )
@@ -156,25 +160,25 @@ async def get_workspace_daily_summary(
 
     proposed_tasks = await _tasks(
         db, entity_id, workspace_id,
-        Task.status == "proposed",
+        Task.status == TaskStatus.PROPOSED,
         limit=limit,
         order_by=Task.priority.desc(),
     )
     waiting_tasks = await _tasks(
         db, entity_id, workspace_id,
-        Task.status == "waiting_on_customer",
+        Task.status == TaskStatus.WAITING_ON_CUSTOMER,
         limit=limit,
         order_by=func.coalesce(Task.updated_at, Task.created_at).asc(),
     )
     blocked_tasks = await _tasks(
         db, entity_id, workspace_id,
-        Task.status == "blocked",
+        Task.status == TaskStatus.BLOCKED,
         limit=limit,
         order_by=func.coalesce(Task.updated_at, Task.created_at).asc(),
     )
     failed_open_tasks = await _tasks(
         db, entity_id, workspace_id,
-        Task.status == "failed",
+        Task.status == TaskStatus.FAILED,
         limit=limit,
         order_by=func.coalesce(Task.updated_at, Task.created_at).desc(),
     )
@@ -194,12 +198,12 @@ async def get_workspace_daily_summary(
     )
     in_progress_tasks = await _tasks(
         db, entity_id, workspace_id,
-        Task.status == "in_progress",
+        Task.status == TaskStatus.IN_PROGRESS,
         limit=limit,
         order_by=func.coalesce(Task.updated_at, Task.created_at).desc(),
     )
     priority_conditions = (
-        Task.status.in_(["pending", "proposed", "scheduled"]),
+        Task.status.in_((TaskStatus.PENDING, TaskStatus.PROPOSED, TaskStatus.SCHEDULED,)),
         Task.priority >= 4,
     )
     priority_count = await _task_count(db, entity_id, workspace_id, *priority_conditions)
@@ -409,7 +413,7 @@ async def _execution_health(
         select(func.count(func.distinct(ExecutionStep.plan_id))).where(
             ExecutionStep.entity_id == entity_id,
             ExecutionStep.workspace_id == workspace_id,
-            ExecutionStep.step_status == "waiting_human",
+            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
         )
     )).scalar_one()
     return {

@@ -1,9 +1,8 @@
 """Auto-register generated files from MCP tool outputs into the knowledge base.
 
-After an MCP tool returns its result, this module scans the output for
-file paths (on /mnt/manor) and remote URLs (images/videos from CDNs)
-and creates Document records so generated assets are visible and
-searchable in the Knowledge page.
+After an MCP tool returns its result, this module registers existing files
+under /mnt/manor and remote URLs from the explicit final-artifact contract.
+Arbitrary text, HTML, and page-evidence artifacts are never persisted.
 """
 from __future__ import annotations
 
@@ -11,23 +10,15 @@ import json
 import logging
 import re
 from pathlib import Path
+from urllib.parse import urlparse
+
+from packages.core.contracts.artifacts import normalize_knowledge_artifacts
 
 logger = logging.getLogger(__name__)
 
 # Patterns we look for in tool output
 _LOCAL_PATH_RE = re.compile(r"/mnt/manor/[^\s\"',}]+")
 _FS_ROOT = "/mnt/manor/"
-_IMAGE_URL_RE = re.compile(
-    r"https?://[^\s\"',]+\.(?:png|jpg|jpeg|webp|gif|mp4|mp3|wav|pdf)", re.IGNORECASE
-)
-
-# Known CDN patterns from our MCP tools
-_CDN_PATTERNS = [
-    "replicate.delivery",
-    "jimeng.jianying.com",
-    "oaidalleapiprodscus.blob.core.windows.net",
-    "cdn.openai.com",
-]
 
 # File type mapping
 _EXT_TO_TYPE = {
@@ -51,8 +42,9 @@ async def register_generated_files(
     source: str = "mcp",
     tool_args: dict | None = None,
     origin: dict | None = None,
+    knowledge_artifacts: list[dict] | None = None,
 ) -> int:
-    """Scan tool output for generated files and register them as documents.
+    """Register generated files and explicitly declared remote artifacts.
 
     Returns the number of documents registered.
     """
@@ -90,12 +82,11 @@ async def register_generated_files(
             if ok:
                 registered += 1
 
-    # 2. Remote URLs that look like generated media files
-    urls = _IMAGE_URL_RE.findall(tool_output)
+    # 2. Remote generated assets must be declared by the producing tool.
+    # Never scan arbitrary text/HTML because retrieval tools commonly return
+    # page images that are evidence, not user deliverables.
+    urls = _extract_explicit_knowledge_urls(knowledge_artifacts)
     for index, url in enumerate(urls):
-        # Skip URLs that are clearly not generated assets (e.g. API docs, icons)
-        if any(skip in url for skip in ("favicon", "icon", "logo", "badge")):
-            continue
         matched_artifact = True
         display_name = _friendly_remote_name(
             url,
@@ -119,6 +110,19 @@ async def register_generated_files(
         await _refresh_workspace_file_cache(entity_id=entity_id, origin=origin)
 
     return registered
+
+
+def _extract_explicit_knowledge_urls(
+    knowledge_artifacts: list[dict] | None,
+) -> list[str]:
+    urls: list[str] = []
+    for artifact in normalize_knowledge_artifacts(knowledge_artifacts):
+        url = artifact["url"]
+        parsed_url = urlparse(url)
+        if Path(parsed_url.path).suffix.lower() not in _EXT_TO_TYPE:
+            continue
+        urls.append(url)
+    return urls
 
 
 async def _refresh_workspace_file_cache(*, entity_id: str, origin: dict) -> None:
@@ -239,14 +243,23 @@ async def _register_local(
         from packages.core.models.document import Document
         from packages.core.services.document_metadata import merge_document_metadata
         from packages.core.services.document_service import upsert_document_by_fs_path
-        from packages.core.services.knowledge_sync import ensure_folder_path
         from sqlalchemy import select
 
         ext = path.suffix.lower()
         file_type, mime_type = _EXT_TO_TYPE.get(ext, ("", "application/octet-stream"))
-        rel_dir = str(Path(rel_path).parent).replace("\\", "/")
-        rel_dir = "" if rel_dir == "." else rel_dir
-        folder_id = await ensure_folder_path(entity_id, rel_dir)
+        workspace_id = str(origin.get("workspace_id") or "").strip()
+        if workspace_id:
+            from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+            folder_id = await ensure_workspace_document_folder(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                rel_path=rel_path,
+            )
+        else:
+            from packages.core.services.knowledge_sync import ensure_folder_path
+            rel_dir = str(Path(rel_path).parent).replace("\\", "/")
+            rel_dir = "" if rel_dir == "." else rel_dir
+            folder_id = await ensure_folder_path(entity_id, rel_dir)
 
         async with async_session() as db:
             existing = await db.execute(
@@ -313,6 +326,15 @@ async def _register_url(
         ext = Path(name).suffix.lower()
         file_type, mime_type = _EXT_TO_TYPE.get(ext, ("", "application/octet-stream"))
         origin = dict(origin or {})
+        workspace_id = str(origin.get("workspace_id") or "").strip()
+        folder_id = None
+        if workspace_id:
+            from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+            folder_id = await ensure_workspace_document_folder(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                rel_path="",
+            )
 
         async with async_session() as db:
             # Check if already registered (by file_url)
@@ -324,6 +346,8 @@ async def _register_url(
             )
             doc = existing.scalar_one_or_none()
             if doc:
+                if folder_id and not doc.folder_id:
+                    doc.folder_id = folder_id
                 doc.metadata_ = merge_document_metadata(
                     doc.metadata_,
                     origin=origin,
@@ -347,6 +371,7 @@ async def _register_url(
                 mime_type=mime_type,
                 source=source,
                 created_by=user_id or None,
+                folder_id=folder_id,
                 metadata=merge_document_metadata(
                     origin=origin,
                     artifact={"role": "final", "storage_scope": "artifact"},

@@ -101,7 +101,7 @@ async def runtime_assemble_prompt_for_turn(
     db: AsyncSession | None,
     *,
     request: AIRuntimeRequest,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     runtime_profile: str | None = None,
     agent_id: str | None = None,
     bound_tool_names: set[str] | None = None,
@@ -130,7 +130,7 @@ async def runtime_assemble_prompt_for_turn(
     prepared = await runtime_prepare_prompt_context_for_turn(
         db,
         request=request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         runtime_profile=runtime_profile,
         agent_id=agent_id,
         bound_tool_names=bound_tool_names,
@@ -166,7 +166,7 @@ async def runtime_build_base_prompt_for_turn(
     db: AsyncSession | None,
     *,
     request: AIRuntimeRequest,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     runtime_profile: str | None = None,
     agent_id: str | None = None,
     mode: RuntimePromptMode = "full",
@@ -197,7 +197,7 @@ async def runtime_build_base_prompt_for_turn(
         thread_ref_kind=request.thread_ref_kind,
         thread_ref_id=request.thread_ref_id,
         runtime_profile=effective_runtime_profile,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         runtime_surface=request.surface.value,
         runtime_profile_name=effective_runtime_profile,
         active_user_message=active_user_message or request.input_preview,
@@ -215,7 +215,7 @@ async def runtime_prepare_context_appendix_for_turn(
     db: AsyncSession | None,
     *,
     request: AIRuntimeRequest,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     legacy_extra_context: str | None = None,
     tool_schemas: Iterable[dict] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
@@ -226,7 +226,7 @@ async def runtime_prepare_context_appendix_for_turn(
 
     envelope = RuntimeResolver().resolve_trace_envelope(
         request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         tool_schemas=tool_schemas,
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
@@ -252,7 +252,7 @@ async def runtime_prepare_prompt_appendix_for_turn(
     db: AsyncSession | None,
     *,
     request: AIRuntimeRequest,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     runtime_profile: str | None = None,
     agent_id: str | None = None,
     bound_tool_names: set[str] | None = None,
@@ -277,7 +277,7 @@ async def runtime_prepare_prompt_appendix_for_turn(
     prepared = await runtime_prepare_prompt_context_for_turn(
         db,
         request=request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         runtime_profile=runtime_profile,
         agent_id=agent_id,
         bound_tool_names=bound_tool_names,
@@ -319,7 +319,7 @@ async def runtime_prepare_prompt_context_for_turn(
     db: AsyncSession | None,
     *,
     request: AIRuntimeRequest,
-    legacy_runtime_profile: str | None = None,
+    tool_profile: str | None = None,
     runtime_profile: str | None = None,
     agent_id: str | None = None,
     bound_tool_names: set[str] | None = None,
@@ -357,7 +357,7 @@ async def runtime_prepare_prompt_context_for_turn(
         thread_ref_kind=request.thread_ref_kind,
         thread_ref_id=request.thread_ref_id,
         runtime_profile=effective_runtime_profile,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         runtime_surface=request.surface.value,
         runtime_profile_name=effective_runtime_profile,
         active_user_message=active_user_message or request.input_preview,
@@ -401,7 +401,7 @@ async def runtime_prepare_prompt_context_for_turn(
             bound_tool_names=bound_tool_names,
             is_master=is_master,
             mcp_allowed_names=mcp_allowed_names,
-            legacy_tool_profile=legacy_runtime_profile,
+            tool_profile=tool_profile,
         )
 
     resolved_tools, resolved_allowed_tool_names = _apply_extra_tool_surface(
@@ -434,7 +434,7 @@ async def runtime_prepare_prompt_context_for_turn(
 
     runtime_surface_result = RuntimeResolver().resolve_tool_surface(
         request,
-        legacy_runtime_profile=legacy_runtime_profile,
+        tool_profile=tool_profile,
         tool_schemas=resolved_tools,
         allowed_tool_names=resolved_allowed_tool_names,
         blocked_tool_names=blocked_tool_names,

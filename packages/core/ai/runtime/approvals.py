@@ -153,6 +153,8 @@ def runtime_capability_id_for_action_key(
         return "file.write"
     if key.startswith("workspace.automation."):
         return "automation.manage"
+    if key.startswith("workspace.workflow."):
+        return "workflow.manage"
     if key.startswith("sandbox."):
         return "sandbox.execute"
     if key.startswith(("social_post.", "social.")):
@@ -355,6 +357,17 @@ def runtime_event_from_tool_block_result(
     """Translate a blocking tool payload into a standard runtime event."""
     payload = _payload_from_tool_result(result)
     error = str(payload.get("error") or "").strip()
+    from packages.core.ai.runtime.provider_approvals import (
+        normalize_provider_approval,
+        provider_approval_runtime_event_data,
+    )
+
+    provider_approval = normalize_provider_approval(tool_name, None, payload)
+    if provider_approval is not None:
+        return RuntimeToolBlockEvent(
+            type="approval_required",
+            data=provider_approval_runtime_event_data(provider_approval),
+        )
     if error == "approval_required":
         hitl = payload.get("hitl") if isinstance(payload.get("hitl"), dict) else {}
         operation = payload.get("operation") if isinstance(payload.get("operation"), dict) else {}

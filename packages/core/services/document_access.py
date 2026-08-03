@@ -1,6 +1,7 @@
 """Document visibility helpers used by API and runtime entrypoints."""
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime, timezone
 
@@ -62,7 +63,6 @@ _DOCUMENT_OWNER_CAPABILITIES = {
     Capability.RECLASSIFY,
     Capability.DELETE,
     Capability.GRANT_ACCESS,
-    Capability.LEGAL_HOLD,
 }
 _QUARANTINED_STATUSES = {"quarantined", "rejected"}
 _INTERNAL_FILTER_LIMIT = 2_000
@@ -104,11 +104,12 @@ async def _filter_readable_local_documents(
     db: AsyncSession,
     documents: list[Document],
 ) -> list[Document]:
-    """Hide stale local-file rows from Knowledge lists and mark them missing.
+    """Keep stale local-file rows in Knowledge lists and mark them missing.
 
     The filesystem is the source of truth for rows with ``fs_path``. Background
-    reconcile eventually cleans these up, but the user-facing list should not
-    keep surfacing a row whose required local payload is already gone.
+    reconcile eventually repairs or records these. A read path must not
+    permanently trash or hide documents because a mounted filesystem can be
+    temporarily unavailable.
     """
     from packages.core.config import get_settings
 
@@ -116,6 +117,36 @@ async def _filter_readable_local_documents(
     if not getattr(settings, "MANOR_FS_ENABLED", False):
         return documents
     fs_root = getattr(settings, "MANOR_FS_ROOT", "")
+
+    # Resolve every path and stat it in one worker-thread batch. The mount is
+    # a network filesystem: each realpath/isdir/isfile is a round-trip, and
+    # doing them inline on the event loop stalled every request in the
+    # process when a listing touched hundreds of rows.
+    stat_docs = [
+        document for document in documents
+        if not getattr(document, "file_url", None) and getattr(document, "fs_path", None)
+    ]
+
+    def _stat_batch() -> dict[str, tuple[bool, str | None, bool]]:
+        results: dict[str, tuple[bool, str | None, bool]] = {}
+        root_is_dir: dict[str, bool] = {}
+        for document in stat_docs:
+            entity_root = os.path.realpath(
+                os.path.join(fs_root, str(getattr(document, "entity_id", "")))
+            )
+            root_ok = root_is_dir.get(entity_root)
+            if root_ok is None:
+                root_ok = os.path.isdir(entity_root)
+                root_is_dir[entity_root] = root_ok
+            if not root_ok:
+                results[document.id] = (False, None, False)
+                continue
+            full_path = _document_local_path(document, fs_root)
+            is_file = bool(full_path and os.path.isfile(full_path))
+            results[document.id] = (True, full_path, is_file)
+        return results
+
+    stats = await asyncio.to_thread(_stat_batch) if stat_docs else {}
 
     visible: list[Document] = []
     mutated = False
@@ -137,25 +168,40 @@ async def _filter_readable_local_documents(
                     meta,
                     status="unavailable",
                     source="knowledge_list",
-                    recoverable=False,
+                    recoverable=True,
                 )
-                document.is_trashed = True
-                document.trashed_at = datetime.now(timezone.utc)
                 mutated = True
                 continue
             visible.append(document)
             continue
+
+        root_ok, full_path, is_file = stats.get(document.id, (False, None, False))
+        if not root_ok:
+            document.metadata_ = _with_file_integrity(
+                getattr(document, "metadata_", None),
+                status="unavailable",
+                fs_path=str(getattr(document, "fs_path", "") or ""),
+                source="knowledge_list",
+                recoverable=True,
+            )
+            mutated = True
+            visible.append(document)
+            continue
+
+        if is_file:
+            visible.append(document)
+            continue
+
         if getattr(document, "vector_status", None) in _READABLE_LOCAL_SKIP_STATUSES:
-            visible.append(document)
-            continue
-
-        entity_root = os.path.realpath(os.path.join(fs_root, str(getattr(document, "entity_id", ""))))
-        if not os.path.isdir(entity_root):
-            visible.append(document)
-            continue
-
-        full_path = _document_local_path(document, fs_root)
-        if full_path and os.path.isfile(full_path):
+            document.metadata_ = _with_file_integrity(
+                getattr(document, "metadata_", None),
+                status="pending",
+                fs_path=str(getattr(document, "fs_path", "") or ""),
+                source="knowledge_list",
+                path=full_path,
+                recoverable=True,
+            )
+            mutated = True
             visible.append(document)
             continue
 
@@ -165,12 +211,10 @@ async def _filter_readable_local_documents(
             fs_path=str(getattr(document, "fs_path", "") or ""),
             source="knowledge_list",
             path=full_path,
-            recoverable=False,
+            recoverable=True,
         )
-        document.vector_status = VectorStatus.FAILED
-        document.is_trashed = True
-        document.trashed_at = datetime.now(timezone.utc)
         mutated = True
+        visible.append(document)
 
     if mutated:
         await db.flush()
@@ -726,9 +770,398 @@ async def user_can_read_document(
     if visibility in (Visibility.ENTITY, Visibility.PUBLIC):
         if resolved_role == "client":
             return bool(getattr(document, "client_visible", False))
-        return str(resolved_role or "") in _ENTITY_DOCUMENT_READ_ROLES
+        if str(resolved_role or "") not in _ENTITY_DOCUMENT_READ_ROLES:
+            return False
+        if visibility == Visibility.PUBLIC:
+            # Public means public — a container does not claw that back.
+            return True
+        return await _workspace_containers_allow_read(
+            db,
+            document=document,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=resolved_role,
+        )
 
     return False
+
+
+async def _workspace_containers_allow_read(
+    db: AsyncSession,
+    *,
+    document: Document,
+    entity_id: str,
+    user_id: str | None,
+    role: str | None,
+) -> bool:
+    """Whether an entity-visible document is reachable through its workspaces.
+
+    Filing a document into a workspace's knowledge net binds it to that
+    workspace: the same container narrowing that
+    :func:`_document_folder_path_is_readable` already applies to folders.
+    Without this, a document in a ``members_only`` workspace stayed readable by
+    the whole organization — the workspace hid itself but not its contents.
+
+    A document in no workspace is unaffected, and one in several is readable if
+    any of them is, so sharing into a second workspace never removes access.
+    Workspaces set to ``entity_visible`` admit every member anyway, so this
+    only bites where the workspace is genuinely restricted.
+    """
+    linked_workspace_ids = await document_workspace_ids(db, document)
+    if not linked_workspace_ids:
+        return True
+    for linked_workspace_id in linked_workspace_ids:
+        if await user_can_read_workspace_id(
+            db,
+            workspace_id=linked_workspace_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=role,
+        ):
+            return True
+    return False
+
+
+class DocumentAccessContext:
+    """Batched evaluator for one user's document/folder read access.
+
+    ``user_can_read_document`` / ``user_can_read_folder`` issue several
+    queries per row (subject ids, ancestor walks, grants, workspace links);
+    listing endpoints calling them once per document turned into tens of
+    thousands of round-trips on large entities. This context loads the same
+    state up front — a fixed number of queries per request — and evaluates
+    the identical rules in memory.
+
+    It must stay behaviorally equivalent to the single-item helpers; parity
+    is pinned by tests/test_document_access_batch.py. If you change one side,
+    change the other.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_id: str,
+        user_id: str | None,
+        role: str | None,
+    ) -> None:
+        self.entity_id = entity_id
+        self.user_id = user_id
+        self.role = role
+        self.is_admin = is_entity_admin_role(role)
+        self._folder_by_id: dict[str, DocumentFolder] = {}
+        self._doc_caps: dict[str, set[str]] = {}
+        self._folder_caps: dict[str, set[str]] = {}
+        self._chain_cache: dict[str, list[str]] = {}
+        self._ws_readable: dict[str, bool] = {}
+        self._doc_group_links: dict[str, set[str]] = {}
+
+    @classmethod
+    async def load(
+        cls,
+        db: AsyncSession,
+        *,
+        entity_id: str,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> "DocumentAccessContext":
+        resolved_role = await _resolve_user_role(
+            db,
+            user_id=user_id,
+            entity_id=entity_id,
+            role=role,
+        )
+        ctx = cls(entity_id=entity_id, user_id=user_id, role=resolved_role)
+        # Admins and user-less (background) callers short-circuit to True in
+        # the single-item helpers; no grant/folder state is ever consulted.
+        if not user_id or ctx.is_admin:
+            return ctx
+
+        subject_ids = await _grant_subject_ids_for_user(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+        folders = (
+            await db.execute(
+                select(DocumentFolder).where(DocumentFolder.entity_id == entity_id)
+            )
+        ).scalars().all()
+        ctx._folder_by_id = {folder.id: folder for folder in folders}
+
+        if subject_ids:
+            grants = (
+                await db.execute(
+                    select(ResourceGrant).where(
+                        ResourceGrant.entity_id == entity_id,
+                        ResourceGrant.subject_type == SubjectType.USER,
+                        ResourceGrant.subject_id.in_(subject_ids),
+                        ResourceGrant.status == GrantStatus.ACTIVE,
+                        ResourceGrant.resource_type.in_(
+                            [ResourceType.DOCUMENT, ResourceType.DOCUMENT_FOLDER]
+                        ),
+                    )
+                )
+            ).scalars().all()
+            doc_rows: dict[str, list[ResourceGrant]] = {}
+            folder_rows: dict[str, list[ResourceGrant]] = {}
+            for grant in grants:
+                target = (
+                    doc_rows if grant.resource_type == ResourceType.DOCUMENT else folder_rows
+                )
+                target.setdefault(str(grant.resource_id), []).append(grant)
+            ctx._doc_caps = {
+                doc_id: _active_capabilities_from_grants(rows)
+                for doc_id, rows in doc_rows.items()
+            }
+            ctx._folder_caps = {
+                folder_id: _active_capabilities_from_grants(rows)
+                for folder_id, rows in folder_rows.items()
+            }
+        return ctx
+
+    # ── folder rules ─────────────────────────────────────────────────────
+
+    def folder_chain_ids(self, folder_id: str | None) -> list[str]:
+        """The folder and its ancestors, nearest first — `_folder_ancestor_ids`."""
+        if not folder_id:
+            return []
+        cached = self._chain_cache.get(folder_id)
+        if cached is not None:
+            return cached
+        ids: list[str] = []
+        seen: set[str] = set()
+        current_id: str | None = folder_id
+        while current_id and current_id not in seen:
+            seen.add(current_id)
+            folder = self._folder_by_id.get(current_id)
+            if folder is None:
+                break
+            ids.append(folder.id)
+            current_id = folder.parent_id
+        self._chain_cache[folder_id] = ids
+        return ids
+
+    def folder_capabilities(self, folder_id: str | None) -> set[str]:
+        """Active grant capabilities from the folder and its ancestors —
+        ``folder_grant_capabilities_for_user``."""
+        capabilities: set[str] = set()
+        for chain_id in self.folder_chain_ids(folder_id):
+            capabilities.update(self._folder_caps.get(chain_id, set()))
+        return capabilities
+
+    def can_read_folder(self, folder: DocumentFolder | None) -> bool:
+        """In-memory ``user_can_read_folder``."""
+        if not folder or folder.entity_id != self.entity_id:
+            return False
+        if not self.user_id:
+            return True
+        if self.is_admin:
+            return True
+        if getattr(folder, "owner_id", None) == self.user_id:
+            return True
+        if self.folder_capabilities(getattr(folder, "id", None)).intersection(
+            _FOLDER_READ_CAPABILITIES
+        ):
+            return True
+        visibility = getattr(folder, "visibility", None) or Visibility.ENTITY
+        if visibility == Visibility.PRIVATE:
+            return False
+        if visibility in (Visibility.WORKSPACE, Visibility.ENTITY, Visibility.PUBLIC):
+            return str(self.role or "") in _ENTITY_DOCUMENT_READ_ROLES
+        return False
+
+    def folder_path_readable(self, folder_id: str | None) -> bool:
+        """In-memory ``_document_folder_path_is_readable``."""
+        if not self.user_id or self.is_admin:
+            return True
+        for chain_id in self.folder_chain_ids(folder_id):
+            if not self.can_read_folder(self._folder_by_id.get(chain_id)):
+                return False
+        return True
+
+    # ── document rules ───────────────────────────────────────────────────
+
+    async def preload_documents(self, db: AsyncSession, documents: list[Document]) -> None:
+        """Load workspace-group links for a batch of documents in one query."""
+        if not self.user_id or self.is_admin:
+            return
+        wanted = [
+            document.id for document in documents
+            if document.id not in self._doc_group_links
+        ]
+        if not wanted:
+            return
+        for doc_id in wanted:
+            self._doc_group_links[doc_id] = set()
+        rows = (
+            await db.execute(
+                select(DocumentGroupMember.document_id, DocumentGroup.workspace_id)
+                .join(DocumentGroup, DocumentGroupMember.group_id == DocumentGroup.id)
+                .where(
+                    DocumentGroupMember.document_id.in_(wanted),
+                    DocumentGroup.entity_id == self.entity_id,
+                    DocumentGroup.workspace_id.isnot(None),
+                )
+            )
+        ).all()
+        for doc_id, workspace_id in rows:
+            if workspace_id:
+                self._doc_group_links[doc_id].add(str(workspace_id))
+
+    def _workspace_ids_for(self, document: Document) -> set[str]:
+        """``document_workspace_ids`` from the preloaded links + metadata."""
+        workspace_ids = set(self._doc_group_links.get(document.id, set()))
+        meta = document.metadata_ if isinstance(document.metadata_, dict) else {}
+        origin = meta.get("origin") if isinstance(meta.get("origin"), dict) else {}
+        for value in (origin.get("workspace_id"), meta.get("workspace_id")):
+            if value:
+                workspace_ids.add(str(value))
+        return workspace_ids
+
+    async def _workspace_readable(self, db: AsyncSession, workspace_id: str) -> bool:
+        cached = self._ws_readable.get(workspace_id)
+        if cached is None:
+            cached = await user_can_read_workspace_id(
+                db,
+                workspace_id=workspace_id,
+                entity_id=self.entity_id,
+                user_id=self.user_id,
+                role=self.role,
+            )
+            self._ws_readable[workspace_id] = cached
+        return cached
+
+    async def can_read_document(
+        self,
+        db: AsyncSession,
+        document: Document | None,
+        *,
+        workspace_id: str | None = None,
+        actor_type: str = "user",
+    ) -> bool:
+        """In-memory ``user_can_read_document``. Call ``preload_documents``
+        on the batch first, or workspace links fall back to empty."""
+        if not document or document.entity_id != self.entity_id:
+            return False
+        if not self.user_id:
+            return True
+        if self.is_admin:
+            return True
+        if document.owner_id and document.owner_id == self.user_id:
+            return True
+        if getattr(document, "quarantine_status", None) in _QUARANTINED_STATUSES:
+            return False
+        if getattr(document, "classification", None) == "restricted" and actor_type != "user":
+            return False
+        granted = set(self._doc_caps.get(document.id, set()))
+        granted.update(self.folder_capabilities(document.folder_id))
+        if granted.intersection(_DOCUMENT_READ_CAPABILITIES):
+            return True
+        if not self.folder_path_readable(document.folder_id):
+            return False
+
+        visibility = getattr(document, "visibility", None) or Visibility.ENTITY
+        if visibility == Visibility.PRIVATE:
+            return False
+
+        if visibility == Visibility.WORKSPACE:
+            if self.role == "client" and not getattr(document, "client_visible", False):
+                return False
+            linked_workspace_ids = self._workspace_ids_for(document)
+            if workspace_id:
+                return (
+                    workspace_id in linked_workspace_ids
+                    and await self._workspace_readable(db, workspace_id)
+                )
+            for linked_workspace_id in linked_workspace_ids:
+                if await self._workspace_readable(db, linked_workspace_id):
+                    return True
+            return False
+
+        if visibility in (Visibility.ENTITY, Visibility.PUBLIC):
+            if self.role == "client":
+                return bool(getattr(document, "client_visible", False))
+            if str(self.role or "") not in _ENTITY_DOCUMENT_READ_ROLES:
+                return False
+            if visibility == Visibility.PUBLIC:
+                return True
+            linked_workspace_ids = self._workspace_ids_for(document)
+            if not linked_workspace_ids:
+                return True
+            for linked_workspace_id in linked_workspace_ids:
+                if await self._workspace_readable(db, linked_workspace_id):
+                    return True
+            return False
+
+        return False
+
+    async def effective_document_capabilities(
+        self,
+        db: AsyncSession,
+        document: Document,
+    ) -> set[str]:
+        """In-memory ``effective_document_capabilities_for_user``."""
+        if not self.user_id:
+            return set()
+        if self.is_admin or document.owner_id == self.user_id:
+            return set(_DOCUMENT_OWNER_CAPABILITIES)
+        granted = set(self._doc_caps.get(document.id, set()))
+        granted.update(self.folder_capabilities(document.folder_id))
+        if await self.can_read_document(db, document):
+            granted.add(Capability.VIEW)
+        return granted
+
+
+async def unreadable_document_paths(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    rel_paths: "list[str]",
+    user_id: str | None,
+    role: str | None = None,
+    actor_type: str = "user",
+) -> set[str]:
+    """Of ``rel_paths`` (entity-root-relative FS paths), return the normalized
+    paths that map to a Knowledge ``Document`` the caller may NOT read.
+
+    Knowledge documents live as real files under the entity FS root, so raw
+    filesystem tools (agent ``read_file`` / ``list_files`` / ``grep`` / the
+    ``/fs`` router) would otherwise serve a document's bytes without consulting
+    ``Document.visibility``. This maps each path to its ``Document`` row and
+    gates it through :func:`user_can_read_document`.
+
+    Paths with no matching ``Document`` row (workspace artifacts, agent scratch,
+    avatars) are never returned — they are not Knowledge documents, and their
+    existing entity + hidden-path scoping applies. When ``user_id`` is falsy the
+    read guard falls back to its legacy background-caller allowance, so nothing
+    is blocked; callers that must fail closed should pass a real ``user_id``.
+    """
+    from packages.core.services.knowledge_visibility import normalize_rel_path
+
+    wanted = {normalize_rel_path(p) for p in rel_paths if p}
+    if not wanted:
+        return set()
+    rows = list((
+        await db.execute(
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.fs_path.in_(wanted),
+                Document.is_trashed == False,  # noqa: E712
+            )
+        )
+    ).scalars().all())
+    ctx = await DocumentAccessContext.load(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=role,
+    )
+    await ctx.preload_documents(db, rows)
+    blocked: set[str] = set()
+    for doc in rows:
+        if not await ctx.can_read_document(db, doc, actor_type=actor_type):
+            blocked.add(normalize_rel_path(doc.fs_path))
+    return blocked
 
 
 async def document_is_client_visible(
@@ -864,20 +1297,18 @@ async def list_visible_documents(
         offset=0,
     )
     candidates = await _filter_readable_local_documents(db, candidates)
-    resolved_role = await _resolve_user_role(
+    ctx = await DocumentAccessContext.load(
         db,
-        user_id=user_id,
         entity_id=entity_id,
+        user_id=user_id,
         role=role,
     )
+    await ctx.preload_documents(db, candidates)
     visible: list[Document] = []
     for document in candidates:
-        if await user_can_read_document(
+        if await ctx.can_read_document(
             db,
             document,
-            entity_id=entity_id,
-            user_id=user_id,
-            role=resolved_role,
             workspace_id=workspace_id,
             actor_type=actor_type,
         ):
@@ -902,10 +1333,10 @@ async def visible_storage_usage(
     """Return size/count for documents visible to the current user."""
     from packages.core.services.document_service import list_documents
 
-    resolved_role = await _resolve_user_role(
+    ctx = await DocumentAccessContext.load(
         db,
-        user_id=user_id,
         entity_id=entity_id,
+        user_id=user_id,
         role=role,
     )
     total_size = 0
@@ -927,13 +1358,11 @@ async def visible_storage_usage(
             break
         raw_batch_count = len(docs)
         docs = await _filter_readable_local_documents(db, docs)
+        await ctx.preload_documents(db, docs)
         for document in docs:
-            if await user_can_read_document(
+            if await ctx.can_read_document(
                 db,
                 document,
-                entity_id=entity_id,
-                user_id=user_id,
-                role=resolved_role,
                 workspace_id=workspace_id,
                 actor_type=actor_type,
             ):
@@ -960,10 +1389,10 @@ async def visible_document_counts_by_folder(
 
     if not folder_ids:
         return {}
-    resolved_role = await _resolve_user_role(
+    ctx = await DocumentAccessContext.load(
         db,
-        user_id=user_id,
         entity_id=entity_id,
+        user_id=user_id,
         role=role,
     )
     counts: dict[str, int] = {}
@@ -981,16 +1410,14 @@ async def visible_document_counts_by_folder(
             break
         raw_batch_count = len(docs)
         docs = await _filter_readable_local_documents(db, docs)
+        await ctx.preload_documents(db, docs)
         for document in docs:
             folder_id = getattr(document, "folder_id", None)
             if not folder_id or folder_id not in folder_ids:
                 continue
-            if await user_can_read_document(
+            if await ctx.can_read_document(
                 db,
                 document,
-                entity_id=entity_id,
-                user_id=user_id,
-                role=resolved_role,
                 workspace_id=workspace_id,
                 actor_type=actor_type,
             ):

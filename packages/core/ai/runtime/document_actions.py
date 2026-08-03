@@ -22,11 +22,12 @@ def runtime_document_to_dict(doc: Any, *, detail: str = "summary") -> dict[str, 
         "file_size": doc.file_size,
     }
     if detail == "details":
+        created_at = getattr(doc, "created_at", None)
         data.update({
             "mime_type": getattr(doc, "mime_type", None),
             "source": getattr(doc, "source", None),
             "vector_status": getattr(doc, "vector_status", None),
-            "created_at": doc.created_at.isoformat() if doc.created_at else None,
+            "created_at": created_at.isoformat() if created_at else None,
             "folder_id": getattr(doc, "folder_id", None),
             "fs_path": getattr(doc, "fs_path", None),
         })
@@ -83,28 +84,53 @@ def _runtime_bounded_document_offset(value: Any) -> int:
     return max(0, min(parsed, 10_000))
 
 
+def _runtime_document_search_text(raw_params: dict[str, Any]) -> str:
+    for key in ("query", "search", "name_search"):
+        value = raw_params.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _runtime_document_folder_id(raw_params: dict[str, Any]) -> str | None:
+    for key in ("folder_id", "folder"):
+        value = raw_params.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _runtime_document_want_details(raw_params: dict[str, Any]) -> bool:
+    return str(raw_params.get("detail") or raw_params.get("details") or "summary").lower() in {
+        "details", "detail", "full", "true", "1",
+    }
+
+
 async def runtime_search_documents_action(
     *,
     entity_id: str,
     user_id: str | None = None,
     workspace_id: str | None = None,
     params: dict[str, Any] | None = None,
+    db: Any = None,
 ) -> str:
     from packages.core.database import async_session
     from packages.core.services.document_access import list_visible_documents
 
     raw_params = dict(params or {})
     workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
-    query = raw_params.get("query", "")
+    query = _runtime_document_search_text(raw_params)
     limit = _runtime_bounded_document_limit(
         raw_params.get("limit"),
         default=RUNTIME_DOCUMENT_LIST_DEFAULT_LIMIT,
         maximum=RUNTIME_DOCUMENT_LIST_MAX_LIMIT,
     )
-    detail = "details" if raw_params.get("detail") == "details" else "summary"
+    offset = _runtime_bounded_document_offset(raw_params.get("offset"))
+    detail = "details" if _runtime_document_want_details(raw_params) else "summary"
     cache_params = {
         "query": query,
         "limit": limit,
+        "offset": offset,
         "detail": detail,
         "user_id": user_id,
         "workspace_id": workspace_scope,
@@ -113,21 +139,35 @@ async def runtime_search_documents_action(
     if cached is not None:
         return cached
 
-    async with async_session() as db:
+    if db is not None:
         docs, total = await list_visible_documents(
             db,
             entity_id,
             user_id=user_id,
             workspace_id=workspace_scope,
             actor_type="agent",
-            name_search=query,
+            name_search=query or None,
             limit=limit,
+            offset=offset,
         )
+    else:
+        async with async_session() as session:
+            docs, total = await list_visible_documents(
+                session,
+                entity_id,
+                user_id=user_id,
+                workspace_id=workspace_scope,
+                actor_type="agent",
+                name_search=query or None,
+                limit=limit,
+                offset=offset,
+            )
 
     result = json.dumps({
         "total": total,
         "count": len(docs),
-        "has_more": total > len(docs),
+        "next_offset": offset + len(docs) if offset + len(docs) < total else None,
+        "has_more": offset + len(docs) < total,
         "documents": [runtime_document_to_dict(doc, detail=detail) for doc in docs],
     })
     await _runtime_set_cached_document_action("search_documents", entity_id, cache_params, result)
@@ -140,20 +180,25 @@ async def runtime_list_documents_action(
     user_id: str | None = None,
     workspace_id: str | None = None,
     params: dict[str, Any] | None = None,
+    db: Any = None,
 ) -> str:
     from packages.core.database import async_session
     from packages.core.services.document_access import list_visible_documents
 
     raw_params = dict(params or {})
     workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
+    query = _runtime_document_search_text(raw_params)
+    folder_id = _runtime_document_folder_id(raw_params)
     limit = _runtime_bounded_document_limit(
         raw_params.get("limit"),
         default=RUNTIME_DOCUMENT_LIST_DEFAULT_LIMIT,
         maximum=RUNTIME_DOCUMENT_LIST_MAX_LIMIT,
     )
     offset = _runtime_bounded_document_offset(raw_params.get("offset"))
-    detail = "details" if raw_params.get("detail") == "details" else "summary"
+    detail = "details" if _runtime_document_want_details(raw_params) else "summary"
     cache_params = {
+        "query": query,
+        "folder_id": folder_id,
         "limit": limit,
         "offset": offset,
         "detail": detail,
@@ -164,16 +209,31 @@ async def runtime_list_documents_action(
     if cached is not None:
         return cached
 
-    async with async_session() as db:
+    if db is not None:
         docs, total = await list_visible_documents(
             db,
             entity_id,
             user_id=user_id,
             workspace_id=workspace_scope,
             actor_type="agent",
+            name_search=query or None,
+            folder_id=folder_id,
             limit=limit,
             offset=offset,
         )
+    else:
+        async with async_session() as session:
+            docs, total = await list_visible_documents(
+                session,
+                entity_id,
+                user_id=user_id,
+                workspace_id=workspace_scope,
+                actor_type="agent",
+                name_search=query or None,
+                folder_id=folder_id,
+                limit=limit,
+                offset=offset,
+            )
 
     result = json.dumps({
         "total": total,

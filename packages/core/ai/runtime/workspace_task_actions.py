@@ -9,6 +9,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from packages.core.constants.task import TaskLogType
 from packages.core.ai.runtime.task_actions import runtime_normalize_task_priority
 
 logger = logging.getLogger(__name__)
@@ -409,7 +410,7 @@ async def runtime_workspace_create_task_action(
             workspace = await _load_workspace(db, entity_id=entity_id, workspace_id=workspace_id)
             if not workspace:
                 return _dumps({"error": "workspace not found"})
-            author_created_by, author_meta = await task_service.agent_log_authorship(
+            author_created_by, author_meta, author_actor = await task_service.agent_log_authorship(
                 db, actor_agent_id, fallback=user_id,
             )
             owner_service_key, owner_subscription_id, available_service_keys = await _resolve_owner_binding(
@@ -502,8 +503,9 @@ async def runtime_workspace_create_task_action(
                 await task_service.add_task_log(
                     db,
                     task.id,
-                    "runtime_context",
+                    TaskLogType.RUNTIME_CONTEXT,
                     "Workspace Agent captured task runtime requirements.",
+                    actor=author_actor,
                     created_by=author_created_by,
                     metadata={"runtime_context": runtime_context, **(author_meta or {})},
                 )
@@ -513,8 +515,9 @@ async def runtime_workspace_create_task_action(
                     await task_service.add_task_log(
                         db,
                         task.id,
-                        "dependency_wait",
+                        TaskLogType.DEPENDENCY_WAIT,
                         "Workspace Agent queued task; predecessor task outputs are not ready yet.",
+                        actor=author_actor,
                         created_by=author_created_by,
                         metadata={
                             "depends_on_task_ids": dependency_task_ids,
@@ -654,14 +657,15 @@ async def runtime_workspace_update_task_runtime_action(
             )
             if not updated:
                 return _dumps({"error": "task not found"})
-            author_created_by, author_meta = await task_service.agent_log_authorship(
+            author_created_by, author_meta, author_actor = await task_service.agent_log_authorship(
                 db, actor_agent_id, fallback=user_id,
             )
             await task_service.add_task_log(
                 db,
                 task_id,
-                "runtime_context",
+                TaskLogType.RUNTIME_CONTEXT,
                 "Workspace Agent updated task runtime requirements.",
+                actor=author_actor,
                 created_by=author_created_by,
                 metadata={"runtime_context": runtime, **(author_meta or {})},
             )
@@ -690,29 +694,77 @@ async def runtime_workspace_request_strategist_review_action(
     user_id: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> str:
+    """Request a Strategist review on a person's behalf — a two-step contract.
+
+    A human asking for a review is never silently dropped. When proposals
+    from an earlier review are still undecided, this returns
+    ``needs_decision`` with the conflicting cohort instead of enqueueing,
+    so the agent can ask in chat. ``supersede=True`` on the follow-up call
+    rejects that cohort (reason_code SUPERSEDED) and runs the review.
+    """
+    from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
+
     raw_params = dict(params or {})
     if not workspace_id:
         return _dumps({"error": "workspace_id is required; use this tool only inside workspace chat"})
 
-    reason = str(raw_params.get("reason") or "user_request").strip()[:500]
+    reason = str(raw_params.get("reason") or "").strip()[:500]
+    supersede = bool(raw_params.get("supersede") is True)
     try:
         countdown = int(raw_params.get("countdown_seconds") if raw_params.get("countdown_seconds") is not None else 1)
     except (TypeError, ValueError):
         countdown = 1
     countdown = max(0, min(countdown, 300))
-    trigger = f"user_request: {reason}" if reason else "user_request"
+    trigger = ReviewTrigger(
+        kind=ReviewTriggerKind.HUMAN_REQUESTED,
+        detail=reason or "requested in chat",
+    )
 
     try:
         from packages.core.database import async_session
         from packages.core.services.workspace_service import record_activity
+        from packages.core.strategist.service import (
+            list_open_proposals,
+            open_proposal_conflict,
+            supersede_open_proposals,
+        )
         from packages.core.tasks.ai_tasks import run_strategist_review
 
         async with async_session() as db:
             workspace = await _load_workspace(db, entity_id=entity_id, workspace_id=workspace_id)
             if not workspace:
                 return _dumps({"error": "workspace not found"})
+
+            open_tasks = await list_open_proposals(db, workspace_id)
+            superseded: dict | None = None
+            if open_tasks and not supersede:
+                # Do NOT enqueue: the review would be blocked on arrival and
+                # the person would never hear back. Hand the conflict to the
+                # model so it can ask, then call again with supersede=true.
+                conflict = open_proposal_conflict(open_tasks)
+                return _dumps({
+                    "requested": False,
+                    "needs_decision": True,
+                    "workspace_id": workspace_id,
+                    "conflict": conflict,
+                    "next_step": (
+                        "Tell the user how many proposals are still open (and "
+                        "their titles), then ask whether to start a new review "
+                        "and reject the current ones. If they agree, call this "
+                        "tool again with supersede=true."
+                    ),
+                })
+            if open_tasks and supersede:
+                superseded = await supersede_open_proposals(
+                    db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    actor_id=user_id or None,
+                )
+
             async_result = run_strategist_review.apply_async(
-                args=[workspace_id, trigger],
+                args=[workspace_id],
+                kwargs=trigger.celery_kwargs(),
                 countdown=countdown,
             )
             await record_activity(
@@ -722,8 +774,10 @@ async def runtime_workspace_request_strategist_review_action(
                 event_type="workspace_agent.strategist_requested",
                 summary=f"Workspace Agent requested strategist review: {reason[:160]}",
                 details={
-                    "trigger": trigger,
+                    "trigger_kind": trigger.kind.value,
+                    "trigger_detail": trigger.detail,
                     "countdown_seconds": countdown,
+                    "superseded_task_ids": (superseded or {}).get("rejected_task_ids") or [],
                     "celery_task_id": getattr(async_result, "id", None),
                 },
                 user_id=user_id or None,
@@ -733,7 +787,9 @@ async def runtime_workspace_request_strategist_review_action(
         return _dumps({
             "requested": True,
             "workspace_id": workspace_id,
-            "trigger": trigger,
+            "trigger_kind": trigger.kind.value,
+            "trigger_detail": trigger.detail,
+            "superseded": superseded,
             "countdown_seconds": countdown,
             "celery_task_id": getattr(async_result, "id", None),
         })

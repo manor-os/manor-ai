@@ -118,7 +118,7 @@
         "description": "Runs the Productized Service OS workspace operating loop.",
         "system_prompt": "You operate a productized service workspace for an independent consultant. Keep the offer clear, prospecting consistent, proposals scoped, and cash-flow risk visible. Never send outreach, proposal terms, invoices, or payment reminders without operator approval.",
         "config": {
-          "model": "default",
+          "model_mode": "inherit",
           "temperature": 0.3,
           "default_review_mode": "operator_review_before_external_action"
         },

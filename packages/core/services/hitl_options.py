@@ -29,16 +29,74 @@ def normalize_approval_choice(value: Any) -> ApprovalChoice | None:
     return None
 
 
+#: Approve-once / reject. Not "this subject is too dangerous to blanket-approve"
+#: — the user is the authority on that, and ``never_allow`` is the only hard
+#: block. This is for cards whose subject has no STANDING VERSION at all: see
+#: ``one_time_approval_options``.
+ONE_TIME_APPROVAL_OPTIONS: list[ApprovalChoice] = [
+    APPROVAL_CHOICE_APPROVE,
+    APPROVAL_CHOICE_REJECT,
+]
+
+
 def approval_options(options: list[str] | None = None) -> list[str]:
     """Return canonical approval choices for HITL cards.
 
-    The UI should always offer approve-once, always-approve, and reject for
-    approval-style requests. Producers can still pass a richer explicit list
-    for non-standard cards, but plain approval fallbacks should use this helper
-    instead of hand-rolled two-button arrays.
+    The UI always offers approve-once, always-approve, and reject for
+    approval-style requests. "Always" is the user's to give: whatever the
+    capability, if they say always, they mean always. Producers can still pass
+    a richer explicit list for non-standard cards, but plain approval fallbacks
+    should use this helper instead of hand-rolled arrays.
     """
 
-    return options if isinstance(options, list) and options else list(DEFAULT_APPROVAL_OPTIONS)
+    return (
+        list(options)
+        if isinstance(options, list) and options
+        else list(DEFAULT_APPROVAL_OPTIONS)
+    )
+
+
+def one_time_approval_options(options: list[str] | None = None) -> list[str]:
+    """Approve-once / reject, for a card that HAS no standing version.
+
+    A ``review`` card is a verdict on ONE specific diff. "Always apply whatever
+    the next draft happens to say" is not a subject a person can consent to —
+    there is nothing stable for the grant to be about. That is a property of
+    the question, not a judgement about the user: any capability the user
+    clicks "Always" on gets a standing grant (see ``approval_options``).
+
+    An explicit ``options`` list is filtered too, so a producer hand-rolling
+    the vocabulary cannot put a standing button onto a card whose subject
+    cannot carry one.
+    """
+
+    chosen = (
+        list(options)
+        if isinstance(options, list) and options
+        else list(ONE_TIME_APPROVAL_OPTIONS)
+    )
+    return [
+        opt for opt in chosen
+        if normalize_approval_choice(opt) != APPROVAL_CHOICE_ALWAYS_APPROVE
+    ]
+
+
+#: What a ``hitl_type="error"`` card offers instead of approve/always/reject.
+#: An error card is not a "may I?" — the step already ran and failed, so
+#: "Approve" would misdescribe what the click does (and was how an operator
+#: approved the same steps 15 times). The honest pair is "I fixed it, run it
+#: again" and "give up on this step". ``always_approve`` is deliberately
+#: absent: a standing grant for a failure pre-authorizes nothing.
+ERROR_CHOICE_RETRY = "retry"
+ERROR_CHOICE_CANCEL = "cancel"
+
+ERROR_CARD_OPTIONS: list[str] = [ERROR_CHOICE_RETRY, ERROR_CHOICE_CANCEL]
+
+
+def error_card_options() -> list[str]:
+    """Choices for an ``error`` HITL card."""
+
+    return list(ERROR_CARD_OPTIONS)
 
 
 def approval_notification_actions() -> list[dict[str, object]]:

@@ -213,6 +213,7 @@ async def runtime_agent_memories_prompt(
     entity_id: str | None,
     agent_id: str | None = None,
     user_id: str | None = None,
+    active_user_message: str | None = None,
 ) -> str | None:
     """Render agent/user memories only when the runtime mounted them."""
     if not db or not entity_id:
@@ -227,6 +228,7 @@ async def runtime_agent_memories_prompt(
             entity_id,
             agent_id=agent_id,
             user_id=user_id,
+            query=active_user_message,
         )
         if memories:
             return f"## Agent Memories\n{memories}"

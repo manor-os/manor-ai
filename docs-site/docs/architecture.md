@@ -15,28 +15,30 @@ React web app
 FastAPI API  <----> PostgreSQL + pgvector
     |                 Redis
     |                 MinIO + JuiceFS
+    |                 Ollama (embeddings)
     v
-Celery worker
+Celery workers (control plane + work queue)
     |
-    +---- Sandbox service
-    +---- Integrations and webhooks
+    +---- Sandbox service (per-run containers)
+    +---- Integrations, channels, and webhooks
 ```
 
 ## Backend
 
-The API lives in `apps/api`. It exposes workspace, chat, agent, document,
-knowledge, integration, and operations endpoints.
+The API lives in `apps/api`. It exposes workspace, chat, agent, task, goal,
+workflow, document, knowledge, integration, channel, scheduling, and
+operations endpoints.
 
 Shared domain logic lives in `packages/core`:
 
 - SQLAlchemy models
 - services
-- agent runtime
-- tools
+- agent runtime (the agentic loop, tools, prompt context)
+- workflow engine (node-graph runner, importers)
 - skills
 - permissions
 - migrations
-- tasks
+- Celery tasks
 
 ## Frontend
 
@@ -46,18 +48,38 @@ directly with the API during local development.
 
 ## Worker Runtime
 
-The worker handles asynchronous jobs, agent execution, media generation,
-workflow steps, and integration callbacks. It shares the same codebase and
-configuration model as the API.
+Background execution is split across two Celery workers that share one image:
+
+- **Control plane** (`worker`): runs Celery beat, fires
+  [scheduled jobs](concepts/automations.md), dispatches work leases, and
+  monitors the deployment. Queue `celery`.
+- **Work queue** (`worker-work`): executes long agent plan steps and workflow
+  runs. Queue `work`.
+
+The split keeps a handful of long-running agent steps from stalling
+scheduling. Both workers mount the entity filesystem and share the API's
+codebase and configuration model.
 
 ## Isolation Boundaries
 
-- The sandbox service handles code execution in a constrained container.
-- Entity filesystem paths are scoped through the Manor file service.
-- Tool access is constrained by agent settings and HITL governance.
+- The [sandbox service](operations/sandbox.md) executes code in per-run
+  containers with memory/CPU/PID limits — never in the API or worker
+  processes.
+- Entity filesystem paths are scoped through the Manor file service on
+  JuiceFS.
+- Tool access is constrained by agent settings and
+  [HITL governance](concepts/hitl-governance.md).
+- Everything is entity-scoped (single-tenant per deployment in OSS mode),
+  with workspace-level permissions inside the entity.
 
 ## Data Stores
 
-PostgreSQL is the source of truth for structured data. Redis provides queue,
-cache, rate-limit, and JuiceFS metadata support. MinIO stores objects and
-document assets.
+| Store | Role |
+| --- | --- |
+| PostgreSQL (+pgvector) | Source of truth for structured data and chunk embeddings |
+| Redis | Cache, Celery broker/results, rate limits, JuiceFS metadata |
+| MinIO | Object storage: uploads, artifacts, JuiceFS data blocks |
+| JuiceFS | POSIX entity filesystem assembled from Redis metadata + MinIO blocks |
+| Ollama | Local embedding model (`mxbai-embed-large`) for document RAG |
+
+See [Storage](operations/storage.md) for operational detail.

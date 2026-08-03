@@ -4,13 +4,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from packages.core.constants.approvals import HitlType
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.task import Message
 from packages.core.services.hitl_options import (
     APPROVAL_CHOICE_ALWAYS_APPROVE,
     APPROVAL_CHOICE_APPROVE,
     APPROVAL_CHOICE_REJECT,
-    approval_options,
     normalize_approval_choice,
+    one_time_approval_options,
 )
 
 
@@ -44,7 +46,7 @@ def workspace_operation_pending_action_from_data(
             if isinstance(hitl.get("operation"), dict)
             else {}
         )
-    if operation.get("kind") != "workspace_operation_review":
+    if operation.get("kind") != PendingActionKind.WORKSPACE_OPERATION_REVIEW:
         return None
     draft_id = str(
         operation.get("draft_id")
@@ -55,7 +57,7 @@ def workspace_operation_pending_action_from_data(
     if not draft_id:
         return None
     return {
-        "kind": "workspace_operation_review",
+        "kind": PendingActionKind.WORKSPACE_OPERATION_REVIEW.value,
         "draft_id": draft_id,
         "approval_token": draft_id,
         "prompt": hitl.get("prompt") or "Apply this workspace operation draft?",
@@ -64,10 +66,16 @@ def workspace_operation_pending_action_from_data(
         "content": hitl.get("content"),
         "args_preview": hitl.get("args_preview"),
         "operation": operation,
-        "options": (
-            hitl.get("options")
-            if isinstance(hitl.get("options"), list)
-            else approval_options()
+        # The typed review payload — the diff the card renders and, when the
+        # draft removes a hard block, the sentence that says so. This blob is
+        # the DURABLE card: a payload dropped here is a warning that exists in
+        # the tool result and nowhere the operator will ever look.
+        "hitl_type": hitl.get("hitl_type") or HitlType.REVIEW.value,
+        "payload": hitl.get("payload") if isinstance(hitl.get("payload"), dict) else None,
+        # A review is a verdict on this specific diff; there is no standing
+        # version of it. See the producer in workspace_operation_actions.
+        "options": one_time_approval_options(
+            hitl.get("options") if isinstance(hitl.get("options"), list) else None,
         ),
     }
 

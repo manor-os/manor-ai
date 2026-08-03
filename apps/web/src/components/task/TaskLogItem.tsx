@@ -14,7 +14,13 @@
 import ChatMarkdown from "../ChatMarkdown";
 import UserAvatar from "../ui/UserAvatar";
 import { IconDocument } from "../icons";
-import { isMasterAgent, MANOR_AGENT_NAME } from "../../lib/constants";
+import {
+  isMasterAgent,
+  isLegacyAgentAuthorPlaceholder,
+  MANOR_AGENT_NAME,
+  TASK_ACTORS,
+  taskActorFromLog,
+} from "../../lib/constants";
 import type { Agent, Task, User } from "../../lib/types";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingStructuredText, friendlyPersonName, isAutomationIdentity } from "../../lib/taskDisplay";
@@ -120,6 +126,21 @@ function resolveAuthor(log: any, users: User[], agents: Agent[], staff: Array<Re
   const cb: string = log.created_by || "";
   const meta = log.meta || {};
 
+  // 0. The writer told us what kind of thing it was. Everything below this
+  // point is inference over a display string, kept for rows written before
+  // the kind was recorded — prefer the declaration when we have one.
+  const declared = taskActorFromLog(log);
+  if (declared === TASK_ACTORS.MANOR) return { name: MANOR_AGENT_NAME, kind: "manor" };
+  if (declared === TASK_ACTORS.SUPERVISOR) {
+    return { name: t("component.task_log_item.supervisor"), kind: "manor" };
+  }
+  if (declared === TASK_ACTORS.SYSTEM) {
+    // A step-execution row attributed to the platform still happened under
+    // an agent; name it if the task has one.
+    const fallback = isStepExecutionLog(log) ? taskAgentFallback(task) : null;
+    return fallback || { name: MANOR_AGENT_NAME, kind: "manor" };
+  }
+
   // 1. Explicit agent hints from the backend (preferred — covers the
   // case where multiple agents post on the same task).
   const hintAgentId: string | undefined = log.author_agent_id || meta.agent_id;
@@ -179,10 +200,13 @@ function resolveAuthor(log: any, users: User[], agents: Agent[], staff: Array<Re
     };
   }
 
-  // 4. Generic agent attributions ("AI Agent", "AI Supervisor", "Agent")
-  // — fall back to the task's assigned agent (older logs from before
-  // the meta hint was wired don't have author_agent_id).
-  if (cb.startsWith("AI ") || cb === "Agent") {
+  // 4. Unattributed agent authorship ("workspace-agent", "AI Agent",
+  // "AI Supervisor", …) — the backend saying "an agent wrote this" without
+  // saying which. Prefer the task's assigned agent (older logs from before
+  // the meta hint was wired don't have author_agent_id); otherwise this is
+  // Manor AI. Never render the sentinel: it is a machine label, and the
+  // author slot is styled as a person.
+  if (isLegacyAgentAuthorPlaceholder(cb) || cb.startsWith("AI ")) {
     if (task?.agent_id) {
       if (isMasterAgent(task.agent_id, task.agent_type)) {
         return { name: MANOR_AGENT_NAME, kind: "manor" };
@@ -196,7 +220,7 @@ function resolveAuthor(log: any, users: User[], agents: Agent[], staff: Array<Re
         };
       }
     }
-    return { name: cb || t("component.task_log_item.agent"), kind: "agent" };
+    return { name: MANOR_AGENT_NAME, kind: "manor" };
   }
 
   // 5. ``created_by`` may be an internal id. Prefer resolved task fields

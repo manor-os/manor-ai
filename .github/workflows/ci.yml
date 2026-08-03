@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # PRs run CI before merge. dev pushes already run Deploy, so do not run
+  # the full CI again for the merge commit.
   push:
-    branches: [dev, main]
+    branches: [main]
   pull_request:
     branches: [dev, main]
   workflow_dispatch:

@@ -1,0 +1,39 @@
+{
+  "id": "solo-business-idea-review",
+  "name": "solo-business-idea-review",
+  "display_name": "Solo Business Idea Review",
+  "type": "runtime_guidance",
+  "description": "Audit and stress-test a one-person business idea with current evidence, hard blockers, solo-operability scoring, an explicit verdict, and the next decisive test.",
+  "category": "one-person-company",
+  "output_format": "guidance",
+  "tags": [
+    "idea-validation",
+    "business-review",
+    "one-person-business",
+    "solo-founder",
+    "pre-mortem",
+    "experiments",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "invoke_skill",
+    "read_file",
+    "list_files",
+    "generate_file",
+    "web_search",
+    "web_fetch",
+    "browse_web",
+    "search_tools",
+    "manor"
+  ],
+  "bundle_roots": [
+    "references",
+    "examples"
+  ],
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the user presents or refers to one or more already-described business ideas and asks whether they are good, worth pursuing, viable, validated, risky, or suitable for a solo founder, or asks for a go/no-go review, evidence check, hard blockers, the riskiest assumption, comparison, or cheapest validation experiment, rather than open-ended generation of new ideas, regardless of language",
+    "result_authority": "primary_source"
+  }
+}

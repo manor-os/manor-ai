@@ -93,7 +93,7 @@ export default function JobLogs() {
   const job = jobs.find((j) => j.id === jobId);
 
   return (
-    <div style={{ maxWidth: 900, margin: "0 auto" }}>
+    <div style={{ maxWidth: 900 }}>
       {/* Header */}
       <div style={{ marginBottom: 24 }}>
         <button

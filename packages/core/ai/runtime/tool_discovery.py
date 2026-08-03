@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import copy
+import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 GENERIC_WEB_TOOLS = frozenset({"web_search", "web_fetch", "browse_web"})
@@ -108,6 +112,70 @@ MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
         "编程cli",
     ),
 }
+
+
+_SERVER_INDEX_CACHE: dict[str, dict] | None = None
+
+
+def runtime_server_index() -> dict[str, dict]:
+    """Per-server metadata for server-first search ranking.
+
+    Built lazily once per process from mcp_seed._MCP_CATALOG (name,
+    description \u2014 plain import, no DB), MCP_PROVIDER_ALIASES, and the live
+    _SERVER_TOOL_SCHEMAS keys. Servers registered in the schema catalog but
+    missing from the seed catalog degrade to key-only entries. Failure to
+    build degrades to {} \u2014 callers must treat that as "v1 behavior". A
+    FAILED build is never cached (only a successful one is), so a transient
+    failure (e.g. a circular import at an unlucky moment during boot) gets
+    retried on the next call instead of permanently degrading the process.
+    """
+    global _SERVER_INDEX_CACHE
+    if _SERVER_INDEX_CACHE is not None:
+        return _SERVER_INDEX_CACHE
+    try:
+        from packages.core.services.mcp_seed import _MCP_CATALOG
+        from packages.core.ai.tools.mcp_builtin import _SERVER_TOOL_SCHEMAS
+
+        catalog = {row[0]: row for row in _MCP_CATALOG}
+        index: dict[str, dict] = {}
+        for key, tools in _SERVER_TOOL_SCHEMAS.items():
+            row = catalog.get(key)
+            index[key] = {
+                "key": key,
+                "name": (row[1] if row else key),
+                "description": (row[2] if row else ""),
+                "aliases": MCP_PROVIDER_ALIASES.get(key, ()),
+                "tool_count": len(tools),
+            }
+    except Exception:  # degrade, never break search; don't cache the failure
+        logger.warning("runtime_server_index build failed", exc_info=True)
+        return {}
+    _SERVER_INDEX_CACHE = index
+    return index
+
+
+def runtime_server_query_score(server_entry: dict, query: str) -> int:
+    """Substring scorer over server name (+3), description (+1), aliases
+    (existing provider-text weights via runtime_mcp_provider_text_score)."""
+    terms = runtime_search_terms(query)
+    if not terms and query:
+        terms = [query.lower()]
+    name_lower = str(server_entry.get("name") or "").lower()
+    desc_lower = str(server_entry.get("description") or "").lower()
+    score = 0
+    for word in terms:
+        if word.startswith("+"):
+            word = word[1:]
+            if not word:
+                continue
+        if word in name_lower:
+            score += 3
+        if word in desc_lower:
+            score += 1
+    score += runtime_mcp_provider_text_score(
+        str(server_entry.get("key") or ""), query.lower()
+    )
+    return score
 
 
 def runtime_search_terms(text: str) -> list[str]:
@@ -226,14 +294,56 @@ def runtime_mcp_provider_options(matches: Iterable[dict]) -> list[dict]:
             "reason": match.get("reason"),
             "matched_tools": [],
         })
+        if match.get("account_options"):
+            option["account_options"] = list(match.get("account_options") or [])
+            option["default_account_id"] = match.get("default_account_id")
         if match.get("available"):
             option["ready"] = True
             option["available"] = True
             option["scope"] = match.get("scope")
             option["reason"] = match.get("reason")
+        if not option.get("account_options") and match.get("account_options"):
+            option["account_options"] = list(match.get("account_options") or [])
+            option["default_account_id"] = match.get("default_account_id")
         if name:
             option["matched_tools"].append(name)
     return list(grouped.values())
+
+
+def runtime_apply_integration_account_options_to_schema(
+    schema: dict,
+    account_options: Iterable[dict] | None,
+) -> dict:
+    """Add user-scoped connected-account choices to one MCP tool schema."""
+    options = [option for option in (account_options or []) if option.get("id")]
+    if not options:
+        return schema
+
+    out = copy.deepcopy(schema)
+    fn = out.get("function") if isinstance(out, dict) else None
+    if not isinstance(fn, dict):
+        return schema
+    parameters = fn.setdefault("parameters", {"type": "object", "properties": {}})
+    if not isinstance(parameters, dict):
+        return schema
+    properties = parameters.setdefault("properties", {})
+    if not isinstance(properties, dict):
+        return schema
+
+    labels = "; ".join(
+        f"{option['id']} = {option.get('display_name') or 'Connected account'}"
+        + (" (default)" if option.get("is_default") else "")
+        for option in options
+    )
+    properties["integration_account_id"] = {
+        "type": "string",
+        "enum": [str(option["id"]) for option in options],
+        "description": (
+            "Connected account to use for this operation. Omit it to use the "
+            f"default account. Available accounts: {labels}"
+        ),
+    }
+    return out
 
 
 def runtime_mark_match_available(match: dict) -> dict:
@@ -316,12 +426,42 @@ def runtime_prepare_search_tools_request(
     )
 
 
+def _runtime_empty_matches_suppression_hint(suppressed_mcp: list[dict]) -> str:
+    """Reason-aware hint for the zero-matches path.
+
+    browse_server: (B1) produces two distinct suppressed shapes —
+    'not_usable' and 'unknown_server' — that need different guidance than
+    the generic intent-suppression case ('outside_active_user_intent',
+    from ordinary keyword search). Blaming intent suppression for a
+    not_usable/unknown_server browse result was misleading (Important #4).
+    """
+    unknown = next(
+        (item for item in suppressed_mcp if item.get("reason") == "unknown_server"),
+        None,
+    )
+    if unknown is not None:
+        similar = list(unknown.get("similar_servers") or [])
+        closest = ", ".join(similar) if similar else "none found"
+        return f"Unknown server key '{unknown.get('server_key')}'. Closest: {closest}."
+    if suppressed_mcp and all(item.get("reason") == "not_usable" for item in suppressed_mcp):
+        key = suppressed_mcp[0].get("server_key")
+        return (
+            f"'{key}' is not connected. Connect the integration under "
+            "Settings → Integrations to browse its tools."
+        )
+    return (
+        "MCP providers matched the search query but were not loaded "
+        "because they do not match the user's current request."
+    )
+
+
 def runtime_search_tools_payload(
     *,
     matches: list[dict],
     query: str,
     suppressed_mcp: list[dict] | None = None,
     total_tool_count: int | None = None,
+    servers: list[dict] | None = None,
 ) -> dict:
     suppressed_mcp = list(suppressed_mcp or [])
     if not matches:
@@ -333,10 +473,7 @@ def runtime_search_tools_payload(
         }
         if suppressed_mcp:
             payload["suppressed_mcp"] = suppressed_mcp
-            payload["hint"] = (
-                "MCP providers matched the search query but were not loaded "
-                "because they do not match the user's current request."
-            )
+            payload["hint"] = _runtime_empty_matches_suppression_hint(suppressed_mcp)
         return payload
 
     unavailable = [
@@ -362,6 +499,8 @@ def runtime_search_tools_payload(
     }
     if suppressed_mcp:
         payload["suppressed_mcp"] = suppressed_mcp
+    if servers:
+        payload["servers"] = servers
     mcp_options = runtime_mcp_provider_options(matches)
     if mcp_options:
         payload["mcp_options"] = mcp_options
@@ -389,6 +528,7 @@ def runtime_finalize_search_tools_payload(
     request: RuntimeSearchToolsRequest,
     suppressed_mcp: list[dict] | None = None,
     total_tool_count: int | None = None,
+    servers: list[dict] | None = None,
 ) -> dict:
     visible_matches = list(matches)[:request.max_results]
     return runtime_search_tools_payload(
@@ -396,6 +536,7 @@ def runtime_finalize_search_tools_payload(
         query=request.query,
         suppressed_mcp=suppressed_mcp,
         total_tool_count=total_tool_count,
+        servers=servers,
     )
 
 
@@ -583,8 +724,11 @@ def runtime_tool_search_scope(
     local_coding_providers = local_coding_provider_route(active_user_message)
     if local_coding_providers:
         active_scores = {
-            provider: 100
-            for provider in local_coding_providers
+            **active_scores,
+            **{
+                provider: max(active_scores.get(provider, 0), 100)
+                for provider in local_coding_providers
+            },
         }
 
     preferred_local_providers: set[str] = set()
@@ -594,8 +738,11 @@ def runtime_tool_search_scope(
         preferred_chrome_tool_names = chrome_local_route.preferred_tool_names
     if preferred_local_providers:
         active_scores = {
-            provider: 100
-            for provider in preferred_local_providers
+            **active_scores,
+            **{
+                provider: max(active_scores.get(provider, 0), 100)
+                for provider in preferred_local_providers
+            },
         }
 
     return RuntimeToolSearchScope(

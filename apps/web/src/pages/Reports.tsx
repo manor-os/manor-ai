@@ -106,7 +106,7 @@ export default function Reports() {
   ];
 
   return (
-    <div style={{ maxWidth: 1060, margin: "0 auto" }}>
+    <div style={{ maxWidth: 1060 }}>
       <PageHeader
         title={t("page.reports.reports")}
         subtitle={t("page.reports.generate_and_export_operational_reports")}

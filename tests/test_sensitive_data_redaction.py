@@ -42,6 +42,40 @@ def test_redact_sensitive_text_covers_common_inline_key_shapes() -> None:
     assert "workspace_id=ok" in redacted
 
 
+def test_redaction_covers_proxy_auth_password_client_secret_and_private_key_blocks() -> None:
+    payload = {
+        "Proxy-Authorization": "Basic proxy-keyed-secret",
+        "safe": "ok",
+    }
+    text = "\n".join((
+        "password=password-inline-secret",
+        "client_secret=client-inline-secret",
+        "Proxy-Authorization: Basic proxy-inline-secret",
+        "-----BEGIN PRIVATE KEY-----",  # test fixture, not a real key
+        "unencrypted-private-key-secret",
+        "-----END PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        "encrypted-private-key-secret",
+        "-----END ENCRYPTED PRIVATE KEY-----",
+    ))
+
+    sanitized = sanitize_sensitive_payload(payload, replacement="[REDACTED]")
+    redacted = redact_sensitive_text(text, replacement="[REDACTED]")
+
+    assert sanitized["Proxy-Authorization"] == "[REDACTED]"
+    assert sanitized["safe"] == "ok"
+    assert redacted is not None
+    for secret in (
+        "password-inline-secret",
+        "client-inline-secret",
+        "proxy-inline-secret",
+        "unencrypted-private-key-secret",
+        "encrypted-private-key-secret",
+    ):
+        assert secret not in redacted
+    assert redacted.count("[REDACTED]") >= 5
+
+
 def test_runtime_envelope_message_meta_redacts_runtime_metadata_secrets() -> None:
     envelope = RuntimeEnvelope(
         surface=ChatSurface.GLOBAL_OWNER_CHAT,

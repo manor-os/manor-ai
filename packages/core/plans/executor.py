@@ -49,6 +49,23 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.task import TaskLogType, TaskStatus, plan_terminal_log_type
+from packages.core.constants.execution import (
+    ExecutionPlanStatus,
+    ExecutionStepStatus,
+)
+from packages.core.constants.supervisor import (
+    SUPERVISOR_STEP_RETRY_FLAG,
+    SUPERVISOR_VERDICT_LOG_TYPE,
+    SupervisorDecision,
+    SupervisorDecisionSource,
+    SupervisorVerdict,
+)
+from packages.core.constants.task_actors import TaskActor
+from packages.core.contracts.envelope import (
+    StepResultStatus,
+    normalize_step_result_status,
+)
 from packages.core.database import async_session
 from packages.core.ai.runtime import (
     RUNTIME_PLAN_EXECUTOR_SOURCE,
@@ -56,10 +73,11 @@ from packages.core.ai.runtime import (
     runtime_ensure_plan_executor_billing_context,
     runtime_ensure_task_billing_context,
     runtime_execute_plan_supervisor_completion,
-    runtime_parse_plan_supervisor_verdict,
+    runtime_parse_plan_supervisor_decision,
     runtime_record_plan_executor_task_evidence,
 )
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
+from packages.core.models.media_job import MediaJobStatus
 from packages.core.plans.refs import ReferenceError, resolve_refs
 from packages.core.workspace_chat import notifiers as chat_notify
 
@@ -109,7 +127,7 @@ _ARTIFACT_CREATION_FLAGS = {
 }
 _REFERENCE_ONLY_KEYS = {
     "context", "sources", "source_count", "scope", "groups", "knowledge_nets",
-    "entries", "matches",
+    "entries", "matches", "evidence_mode", "content_evidence_available",
 }
 _MATERIALIZED_ARTIFACT_SCHEMA_KEYS = {
     key
@@ -213,17 +231,41 @@ _MEDIA_TEXT_DELIVERABLE_TERMS = (
     "总结", "摘要", "备忘录", "笔记", "草稿",
 )
 
-_STRUCTURED_BLOCKER_STATUSES = {
+def _task_status_from_event(task_event: Optional[dict]) -> Optional[str]:
+    """The task status _finalize actually committed, if it reported one."""
+    if not isinstance(task_event, dict):
+        return None
+    payload = task_event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("task_status")
+    return str(status) if status else None
+
+
+#: Task statuses that mean the supervisor did NOT accept the run, even though
+#: the plan's steps all reached a terminal "done". Announcing completion for
+#: these is the UI lying about the outcome.
+#: Summaries that describe the hand-off rather than the work. Showing one
+#: of these to an operator says nothing about what happened.
+_NON_INFORMATIVE_SUMMARIES = {"Result submitted.", "Result submitted", ""}
+
+_SUPERVISOR_HELD_TASK_STATUSES = frozenset({
     "blocked",
-    "error",
     "failed",
-    "failure",
-    "incomplete",
+    "waiting_human",
+    "waiting_on_customer",
+})
+
+#: Free-form statuses that only appear on CUSTOM (non-envelope) schemas.
+#: Canonical outcomes are decided by ``StepResultStatus`` before this set is
+#: consulted — listing them here too would mean two judgements of one word.
+#: "blocked" / "error" / "failure" / "incomplete" are NOT here: they normalize
+#: onto the enum, so the enum branch owns them.
+_STRUCTURED_BLOCKER_STATUSES = {
     "needs_attention",
     "needs_confirmation",
     "needs_human",
     "needs_input",
-    "partial",
     "requires_confirmation",
     "requires_human",
     "requires_input",
@@ -378,6 +420,20 @@ def _artifact_refs_from_result(result: Any, *, step_key: str | None = None) -> l
     for key, ref_type in _ARTIFACT_RESULT_KEYS.items():
         add_ref(ref_type, result.get(key), source_key=key, document_id=result.get("document_id"))
 
+    # Async media jobs carry the produced file on each job, not at the root.
+    for item in result.get("jobs") or []:
+        if not isinstance(item, dict) or not MediaJobStatus.is_completed(item.get("status")):
+            continue
+        for value_key in ("fs_path", "document_id", "result_url"):
+            if item.get(value_key):
+                add_ref(
+                    str(item.get("kind") or "media"),
+                    item[value_key],
+                    source_key=value_key,
+                    document_id=item.get("document_id"),
+                )
+                break
+
     for key in ("files", "artifacts", "documents", "images"):
         values = result.get(key)
         if key in {"documents", "files"} and not _has_artifact_creation_signal(result):
@@ -415,6 +471,18 @@ def _artifact_refs_from_result(result: Any, *, step_key: str | None = None) -> l
             add_ref("image", url, source_key="image_urls")
 
     return _dedupe_artifact_refs(refs)
+
+
+def _step_result_summary(result: Any, *, limit: int = 500) -> str:
+    """Canonical text view of a step result.
+
+    Owned here because the executor is the canonical write path; the
+    read-time reconciler imports it so task output and replan context
+    describe a result the same way.
+    """
+    if not isinstance(result, dict):
+        return str(result or "")[:limit]
+    return str(result.get("text") or result.get("value") or result.get("summary") or "")[:limit]
 
 
 def _dedupe_artifact_refs(refs: list[dict]) -> list[dict]:
@@ -496,8 +564,109 @@ def _has_artifact_result(steps: list[ExecutionStep]) -> bool:
     return any(
         _artifact_refs_from_result(s.result, step_key=s.step_key)
         for s in steps
-        if s.step_status == "done"
+        if s.step_status == ExecutionStepStatus.DONE
     )
+
+
+# ── Replan context budget ─────────────────────────────────────────────
+# ``_replan_context`` is dumped verbatim into the planner prompt as part of
+# the task Details JSON, so the completed-step digest has to stay
+# prompt-sized. Worst case with these caps is roughly
+#   12 steps x (1500 summary chars + 6 refs x ~200 chars) capped by a
+#   12000-char global summary budget  ≈ 12000 + ~14k ref chars < 30k chars
+# and in practice far less, because most steps carry either text or files,
+# not both at full size. 1500 chars (~375 tokens) is the smallest cap that
+# still lets a downstream step consume a prior step's output directly
+# instead of only recognising it — 200 chars was a label, not content.
+_REPLAN_MAX_SUCCEEDED_STEPS = 12
+_REPLAN_MAX_ARTIFACTS_PER_STEP = 6
+_REPLAN_STEP_SUMMARY_CHARS = 1500
+_REPLAN_SUMMARY_TOTAL_CHARS = 12000
+
+
+def _succeeded_step_contexts(steps: list[ExecutionStep]) -> list[dict[str, Any]]:
+    """Describe already-completed steps so a replan can REUSE their work.
+
+    A truncated text blurb is a label, not a handle: it hides generated
+    files entirely, cuts usable text down to nothing, and — when the step
+    produced no output at all — hides the fact that the step ever ran, so
+    the planner re-runs it. Each entry therefore carries the step identity,
+    a bounded but usable text summary, the same structured artifact refs the
+    executor already mines for evidence, and an explicit ``no_output`` flag.
+    """
+    done = [s for s in steps if s.step_status == ExecutionStepStatus.DONE]
+    # Keep the tail: later steps are the ones a follow-up plan consumes,
+    # and upstream work is usually already folded into their output.
+    if len(done) > _REPLAN_MAX_SUCCEEDED_STEPS:
+        done = done[-_REPLAN_MAX_SUCCEEDED_STEPS:]
+
+    remaining_summary_chars = _REPLAN_SUMMARY_TOTAL_CHARS
+    contexts: list[dict[str, Any]] = []
+    for step in done:
+        entry: dict[str, Any] = {"step_key": step.step_key, "kind": step.kind}
+
+        summary = _step_result_summary(step.result, limit=_REPLAN_STEP_SUMMARY_CHARS)
+        if summary and remaining_summary_chars > 0:
+            entry["result_summary"] = summary[:remaining_summary_chars]
+            remaining_summary_chars -= len(entry["result_summary"])
+
+        refs = _artifact_refs_from_result(step.result, step_key=step.step_key)
+        if refs:
+            entry["artifacts"] = refs[:_REPLAN_MAX_ARTIFACTS_PER_STEP]
+
+        if isinstance(step.result, dict):
+            for key in ("document_id", "fs_path"):
+                if step.result.get(key):
+                    entry[key] = step.result[key]
+
+        if not step.result:
+            # Succeeded with no payload (pure side effect). Say so rather
+            # than omitting the step, which reads as "never ran".
+            entry["no_output"] = True
+
+        contexts.append(entry)
+    return contexts
+
+
+def _unmet_expects_issue(plan: ExecutionPlan, steps: list[ExecutionStep]) -> str | None:
+    """Deterministic completion check (envelope part ③): a done step whose
+    plan declared ``expects`` must have CAPTURED evidence for each
+    expectation — model claims never count, only step.evidence_refs mined
+    from successful tool results (and, for files, tool-proven artifact
+    fields already merged into the result)."""
+    dag_steps = (plan.plan_dag or {}).get("steps") or []
+    expects_by_key = {
+        str(ds.get("key")): [str(e) for e in (ds.get("expects") or []) if str(e or "").strip()]
+        for ds in dag_steps
+        if isinstance(ds, dict)
+    }
+    for step in steps:
+        if step.step_status != ExecutionStepStatus.DONE:
+            continue
+        expects = expects_by_key.get(step.step_key) or []
+        if not expects:
+            continue
+        evidence = [e for e in (step.evidence_refs or []) if isinstance(e, dict)]
+        if "publish" in expects and not any(
+            e.get("kind") == "tool_effect" and e.get("effect") == "publish"
+            for e in evidence
+        ):
+            return (
+                f"Step {step.step_key!r} expects a confirmed external publish, but no "
+                "successful publish tool result was captured as evidence. The model's "
+                "own claim does not count. Replan: actually perform the publish via an "
+                "integration tool so the effect is evidenced."
+            )
+        if "files" in expects and not (
+            any(e.get("kind") == "artifact" for e in evidence)
+            or _has_artifact_result([step])
+        ):
+            return (
+                f"Step {step.step_key!r} expects a saved file/artifact, but no artifact "
+                "evidence was captured. Replan: save the deliverable and return "
+                "artifact evidence (fs_path, document_id, file_url, or files)."
+            )
+    return None
 
 
 def _missing_artifact_issue(task: Any | None, steps: list[ExecutionStep]) -> str | None:
@@ -568,7 +737,17 @@ def _structured_result_blocker(
         return "step reported artifact_materialized=false"
 
     for key in _STRUCTURED_STATUS_KEYS:
-        status = _structured_status_value(result.get(key))
+        raw_status = result.get(key)
+        # Enum first: when the value is a member of the canonical vocabulary
+        # (or a word that normalizes onto one), the enum decides — SUCCEEDED
+        # is never a blocker, PARTIAL/FAILED always are. Keyword matching only
+        # covers statuses from custom, non-envelope schemas.
+        declared = normalize_step_result_status(raw_status)
+        if declared is not None:
+            if declared is StepResultStatus.SUCCEEDED:
+                continue
+            return f"step reported {key}={declared.value}"
+        status = _structured_status_value(raw_status)
         if status in _STRUCTURED_BLOCKER_STATUSES:
             return f"step reported {key}={status}"
 
@@ -591,10 +770,145 @@ def _structured_result_blocker(
     return None
 
 
+def _agent_summaries(steps: list[ExecutionStep], *, limit: int = 3) -> list[str]:
+    """The agents' own account of what happened, newest first.
+
+    A step's envelope summary is usually the most informative sentence
+    anywhere in the run — one staging step said plainly "未完成最终 MP4
+    交付;已启动 6 个场景片段生成,但尚未取得可保存的成片 artifact" while the
+    operator was shown "step reported status=partial".
+    """
+    out: list[str] = []
+    for step in reversed(steps):
+        result = step.result if isinstance(step.result, dict) else None
+        if not result:
+            continue
+        summary = str(result.get("summary") or "").strip()
+        # Bookkeeping notices are not an account of the work.
+        if not summary or summary in _NON_INFORMATIVE_SUMMARIES:
+            continue
+        label = (step.step_key or "step").replace("_", " ")
+        out.append(f"{label}: {summary[:300]}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _produced_artifact_labels(steps: list[ExecutionStep], *, limit: int = 6) -> list[str]:
+    """Filenames the run actually produced, for the "what you already have"
+    half of the message."""
+    labels: list[str] = []
+    seen: set[str] = set()
+    for step in steps:
+        for ref in _artifact_refs_from_result(step.result) or []:
+            if not isinstance(ref, dict):
+                continue
+            value = str(ref.get("fs_path") or ref.get("url") or ref.get("document_id") or "")
+            if not value:
+                continue
+            label = value.rsplit("/", 1)[-1] or value
+            if label in seen:
+                continue
+            seen.add(label)
+            labels.append(label)
+            if len(labels) >= limit:
+                return labels
+    return labels
+
+
+def _plain_language_blocker(issue: str) -> str:
+    """Rewrite a machine blocker into something an operator can act on.
+
+    ``_structured_result_blocker`` returns strings like
+    "render finished video: step reported status=partial" — precise for a
+    log, meaningless in a UI.
+    """
+    text = str(issue or "").strip()
+    label, _, detail = text.partition(": ")
+    detail = detail.strip() or text
+    step = label.strip() if _ else ""
+    for needle, phrasing in (
+        ("status=partial", "reported only partial progress"),
+        ("status=failed", "reported that it failed"),
+        ("status=blocked", "reported that it could not proceed"),
+        ("artifact_materialized=false", "did not save the file it produced"),
+        ("=false", "reported the work as not done"),
+        ("HITL request", "asked for a human decision"),
+        ("pending", "left a pending request unanswered"),
+    ):
+        if needle in detail:
+            return f"the “{step}” step {phrasing}." if step else f"a step {phrasing}."
+    return f"the “{step}” step did not complete." if step else "a step did not complete."
+
+
+def _hitl_request_message(
+    task: Any | None,
+    steps: list[ExecutionStep],
+    *,
+    structured_issue: str | None,
+    artifact_issue: str | None,
+    failed_steps: list[ExecutionStep],
+) -> str:
+    """Explain the hold in terms an operator can act on.
+
+    This message used to render an internal status word verbatim —
+    "recover or render finished video: step reported status=partial" — with
+    no statement of what was produced, what is missing, or what the operator
+    could do about it. Everything below is assembled from data the run
+    already recorded.
+    """
+    lines: list[str] = ["**This task stopped before it finished.**"]
+
+    produced = _produced_artifact_labels(steps)
+    if produced:
+        lines.append("")
+        lines.append("**Produced so far:** " + ", ".join(produced))
+
+    if artifact_issue:
+        lines.append("")
+        lines.append(
+            "**Missing:** the deliverable file this task was asked to produce. "
+            "No saved file path or document was recorded by any step."
+        )
+    elif structured_issue:
+        lines.append("")
+        lines.append(
+            "**Incomplete:** "
+            f"{_plain_language_blocker(structured_issue)}"
+        )
+    elif failed_steps:
+        detail = "; ".join(
+            f"{(fs.step_key or 'step').replace('_', ' ')}: "
+            f"{(fs.error or {}).get('message', 'failed')[:120]}"
+            for fs in failed_steps[:3]
+        )
+        lines.append("")
+        lines.append(f"**Failed:** {detail}")
+    else:
+        lines.append("")
+        lines.append(
+            "**Unverified:** every step reported done, but the supervisor "
+            "could not confirm the task objective was met."
+        )
+
+    said = _agent_summaries(steps)
+    if said:
+        lines.append("")
+        lines.append("**What the agent reported:**")
+        lines.extend(f"- {item}" for item in said)
+
+    lines.append("")
+    lines.append("**You can:**")
+    lines.append("- Retry the task — it will re-plan from what already exists.")
+    lines.append("- Reply below with guidance (a different approach, a narrower goal).")
+    lines.append("- Mark the task complete if what was produced is good enough.")
+    return "\n".join(lines)
+
+
 def _structured_blocking_issue(task: Any | None, steps: list[ExecutionStep]) -> str | None:
     artifact_required = _task_requires_artifact(task)
     for step in steps:
-        if step.step_status != "done" or not step.result:
+        if step.step_status != ExecutionStepStatus.DONE or not step.result:
             continue
         issue = _structured_result_blocker(
             step.result,
@@ -604,6 +918,109 @@ def _structured_blocking_issue(task: Any | None, steps: list[ExecutionStep]) -> 
             label = (getattr(step, "step_key", None) or "step").replace("_", " ")
             return f"{label}: {issue}"
     return None
+
+
+def _supervisor_attempt_infos(
+    prior_plans: list, steps_by_plan: dict[str, list],
+) -> list[dict]:
+    """Compact summaries of this task's earlier plans, oldest first.
+
+    The supervisor's scope is the TASK: when the current plan is a replan
+    (or a resumed retry), what the earlier attempts did and how they ended
+    is part of what it is judging. Without this it re-litigates each plan
+    from scratch and can keep prescribing what was already tried.
+    """
+    infos: list[dict] = []
+    for prior in prior_plans:
+        steps = steps_by_plan.get(prior.id) or []
+        infos.append({
+            "status": prior.status,
+            "steps": [
+                {
+                    "key": s.step_key,
+                    "status": s.step_status,
+                    "error": (
+                        f"{(s.error or {}).get('type', '')}: {(s.error or {}).get('message', '')}".strip(": ")
+                        if s.error else ""
+                    ),
+                }
+                for s in steps
+            ],
+        })
+    return infos
+
+
+def _supervisor_review_infos(verdict_logs: list) -> list[dict]:
+    """The supervisor's own earlier decisions on this task, oldest first.
+
+    Sourced from the ai_supervisor_verdict task logs it writes — the same
+    record a person reads. A supervisor that cannot see its own last review
+    will happily retry the same step against the same result again; the
+    once-per-step budget stops the loop mechanically, but the model should
+    also be able to REASON about it.
+    """
+    infos: list[dict] = []
+    for log in verdict_logs:
+        meta = getattr(log, "meta", None) or {}
+        if not meta.get("verdict"):
+            continue
+        infos.append({
+            "verdict": meta.get("verdict"),
+            "evidence": meta.get("evidence") or "",
+            "step_key": meta.get("step_key"),
+            "plan_id": meta.get("plan_id"),
+        })
+    return infos
+
+
+def _supervisor_step_infos(plan: ExecutionPlan, steps: list[ExecutionStep]) -> list[dict]:
+    """What the supervisor gets to see about each step.
+
+    The old view was one line per step with 150 characters of result — no
+    instruction, no artifacts — so the supervisor was judging deliverables
+    it could not observe. The production misjudgements were structural:
+    task 01KWRR5VGHYHQD3A116TZ8ET0W's step SAID it appended the entry, and
+    the supervisor had no artifact evidence in view to notice nothing was
+    written.
+
+    Everything here is data the system already records: the plan_dag's
+    per-step description and prompt (what the step was ASKED to do), the
+    step's own result preview, and the artifact refs extracted from its
+    result — the same refs actual_output aggregates. Rendering is runtime's
+    job; this only extracts.
+    """
+    dag_steps: dict[str, dict] = {}
+    for entry in (plan.plan_dag or {}).get("steps") or []:
+        if isinstance(entry, dict) and entry.get("key"):
+            dag_steps[str(entry["key"])] = entry
+
+    infos: list[dict] = []
+    for s in steps:
+        dag = dag_steps.get(s.step_key, {})
+        instruction_parts = [str(dag.get("description") or "").strip()]
+        prompt = (s.params or {}).get("prompt") or (dag.get("params") or {}).get("prompt") or ""
+        if str(prompt).strip():
+            instruction_parts.append(str(prompt).strip())
+        artifacts: list[str] = []
+        for ref in _artifact_refs_from_result(s.result, step_key=s.step_key):
+            label = ref.get("fs_path") or ref.get("document_id") or ref.get("url") or ref.get("file_url")
+            if label and str(label) not in artifacts:
+                artifacts.append(str(label))
+        error = ""
+        if s.error:
+            error = f"{s.error.get('type', '')}: {s.error.get('message', '')}".strip(": ")
+        infos.append({
+            "key": s.step_key,
+            "kind": s.kind,
+            "owner": s.service_key or s.action_key or "",
+            "status": s.step_status,
+            "attempts": s.attempt_count,
+            "instruction": " — ".join(part for part in instruction_parts if part),
+            "result": _supervisor_result_preview(s.result, max_chars=4000) if s.result else "",
+            "artifacts": artifacts,
+            "error": error,
+        })
+    return infos
 
 
 def _supervisor_result_preview(result: Any, *, max_chars: int = 1200) -> str:
@@ -664,18 +1081,18 @@ class PlanExecutor:
             else:
                 runtime_ensure_plan_executor_billing_context(plan)
 
-            if plan.status in ("completed", "failed", "cancelled"):
+            if plan.status in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.FAILED, ExecutionPlanStatus.CANCELLED,):
                 return {"plan_id": plan_id, "status": plan.status, "next_action": "stop"}
 
-            if plan.status == "pending_approval":
+            if plan.status == ExecutionPlanStatus.PENDING_APPROVAL:
                 return {
                     "plan_id": plan_id,
                     "status": "pending_approval",
                     "next_action": "wait_for_approval",
                 }
 
-            if plan.status == "draft":
-                plan.status = "running"
+            if plan.status == ExecutionPlanStatus.DRAFT:
+                plan.status = ExecutionPlanStatus.RUNNING.value
                 plan.started_at = datetime.now(timezone.utc)
                 announce_started = True
                 await db.flush()
@@ -683,7 +1100,9 @@ class PlanExecutor:
                 if plan.task_id:
                     steps = await self._all_steps(db, plan_id)
                     from packages.core.workspace_chat.notifiers import _render_dag
-                    dag_text = _render_dag(self._snapshot_steps(steps))
+                    dag_text = _render_dag(
+                        self._snapshot_steps(steps), entity_id=plan.entity_id or "",
+                    )
                     await self._task_log(db, plan, "plan_started",
                         f"▶ Execution plan started — {len(steps)} step(s)\n\n{dag_text}",
                         {"plan_id": plan.id, "step_count": len(steps), "execution_mode": plan.execution_mode})
@@ -703,6 +1122,11 @@ class PlanExecutor:
                     await db.commit()
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, "completed")
+                if plan.status == ExecutionPlanStatus.RUNNING:
+                    # The supervisor sent a step back for a re-run — the plan
+                    # is live again, so nothing terminal gets announced here.
+                    await db.commit()
+                    return {"plan_id": plan_id, "status": "supervisor_step_retry", "next_action": "stop"}
                 await db.commit()
                 self._emit_task_event(task_event)
                 await self._announce(
@@ -717,6 +1141,11 @@ class PlanExecutor:
                     plan_error=None,
                     task_title=task_title,
                     step_snapshots=self._snapshot_steps(steps),
+                    task_status=_task_status_from_event(task_event),
+                    task_issue=(
+                        ((task_event or {}).get("payload") or {}).get("issue")
+                        or ((task_event or {}).get("payload") or {}).get("prompt")
+                    ),
                 )
                 return {"plan_id": plan_id, "status": "completed", "next_action": "stop"}
             if terminal == "failed":
@@ -726,6 +1155,11 @@ class PlanExecutor:
                     await db.commit()
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, "failed")
+                if plan.status == ExecutionPlanStatus.RUNNING:
+                    # The supervisor sent a step back for a re-run — the plan
+                    # is live again, so nothing terminal gets announced here.
+                    await db.commit()
+                    return {"plan_id": plan_id, "status": "supervisor_step_retry", "next_action": "stop"}
                 await db.commit()
                 self._emit_task_event(task_event)
                 await self._announce(
@@ -740,6 +1174,11 @@ class PlanExecutor:
                     plan_error=plan.last_error,
                     task_title=task_title,
                     step_snapshots=self._snapshot_steps(steps),
+                    task_status=((task_event or {}).get("payload") or {}).get("task_status"),
+                    task_issue=(
+                        ((task_event or {}).get("payload") or {}).get("issue")
+                        or ((task_event or {}).get("payload") or {}).get("prompt")
+                    ),
                 )
                 return {"plan_id": plan_id, "status": "failed", "next_action": "stop"}
 
@@ -759,8 +1198,34 @@ class PlanExecutor:
                     else:
                         self._mark_waiting_human(step, str((step.params or {}).get("prompt") or ""))
                         chat_events.append({"kind": "step_needs_human", "step": step})
+                        # M9.2 — surface the wait as a HumanCommitment so the
+                        # human-queue / consolidator can see the blocking input.
+                        # Best-effort like the ledger adapters: never break the
+                        # executor. open_commitment dedupes per waiting step.
+                        if chat_ws:
+                            try:
+                                from packages.core.humans import open_commitment
+                                await open_commitment(
+                                    db,
+                                    entity_id=chat_entity,
+                                    workspace_id=chat_ws,
+                                    request_kind="input",
+                                    source_kind="execution_step",
+                                    source_id=step.id,
+                                    expected_input=(
+                                        step.human_input_prompt or task_title or None
+                                    ),
+                                    blocking_execution_ids=[
+                                        chat_task_id or chat_plan_id
+                                    ],
+                                )
+                            except Exception:  # noqa: BLE001 — never fatal
+                                logger.warning(
+                                    "human commitment open failed for step %s (ignored)",
+                                    step.id, exc_info=True,
+                                )
 
-                elif step.kind in ("action", "llm", "subagent", "code"):
+                elif step.kind in ("action", "llm", "subagent"):
                     # Resolve refs into step.params so the dispatcher
                     # hands the worker a self-contained payload.
                     try:
@@ -778,7 +1243,11 @@ class PlanExecutor:
                     # Dispatcher will pick this up on next checkout.
                     # No state change here — step stays pending.
 
-                elif step.kind in ("parallel_fanout", "gather"):
+                elif step.kind in ("parallel_fanout", "gather", "code"):
+                    # ``code`` used to fall into the dispatch branch above and
+                    # sit pending forever: no worker advertises it, so the
+                    # dispatcher could never lease it. Fail loudly instead —
+                    # a visible error beats a plan that silently never moves.
                     err = {
                         "type": "NotImplemented",
                         "message": f"step kind {step.kind!r} not in Demo A v0 scope",
@@ -814,6 +1283,11 @@ class PlanExecutor:
                         await db.commit()
                         return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, terminal)
+                if plan.status == ExecutionPlanStatus.RUNNING:
+                    # The supervisor sent a step back for a re-run — the plan
+                    # is live again, so nothing terminal gets announced here.
+                    await db.commit()
+                    return {"plan_id": plan_id, "status": "supervisor_step_retry", "next_action": "stop"}
                 await db.commit()
                 self._emit_task_event(task_event)
                 await self._announce(
@@ -828,6 +1302,11 @@ class PlanExecutor:
                     plan_error=plan.last_error,
                     task_title=task_title,
                     step_snapshots=self._snapshot_steps(steps),
+                    task_status=_task_status_from_event(task_event),
+                    task_issue=(
+                        ((task_event or {}).get("payload") or {}).get("issue")
+                        or ((task_event or {}).get("payload") or {}).get("prompt")
+                    ),
                 )
                 return {"plan_id": plan_id, "status": terminal, "next_action": "stop"}
 
@@ -836,7 +1315,7 @@ class PlanExecutor:
             self._emit_task_event(inline_hitl_event)
 
             # Decide re-enqueue cadence.
-            if any(s.step_status == "waiting_human" for s in steps):
+            if any(s.step_status == ExecutionStepStatus.WAITING_HUMAN for s in steps):
                 # Plan is paused on operator input. Don't burn a cycle
                 # slot — chat resolve_pending_action will wake us.
                 next_action = "wait"
@@ -907,7 +1386,7 @@ class PlanExecutor:
 
     @staticmethod
     def _mark_done(step: ExecutionStep, result: Any, cost: Optional[dict]) -> None:
-        step.step_status = "done"
+        step.step_status = ExecutionStepStatus.DONE.value
         step.result = result if isinstance(result, dict) else {"value": result}
         if cost:
             step.cost = cost
@@ -919,13 +1398,13 @@ class PlanExecutor:
         # PlanExecutor only marks failed for inline kinds (sleep/human
         # don't fail; ref errors always terminal). Worker-driven kinds
         # use Dispatcher.fail_lease which honours retries.
-        step.step_status = "failed"
+        step.step_status = ExecutionStepStatus.FAILED.value
         step.error = error
         step.finished_at = datetime.now(timezone.utc)
 
     @staticmethod
     def _mark_waiting_human(step: ExecutionStep, prompt: Optional[str]) -> None:
-        step.step_status = "waiting_human"
+        step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
         step.human_input_prompt = prompt
 
     # ── Reads ────────────────────────────────────────────────────────
@@ -965,15 +1444,15 @@ class PlanExecutor:
         excluded too (they wake via chat resolve)."""
         runnable: list[ExecutionStep] = []
         for s in steps:
-            if s.step_status != "pending":
+            if s.step_status != ExecutionStepStatus.PENDING:
                 continue
             deps = s.depends_on or []
-            if not all(by_key[d].step_status == "done" for d in deps if d in by_key):
+            if not all(by_key[d].step_status == ExecutionStepStatus.DONE for d in deps if d in by_key):
                 # Mark blocked-by-failure dependents as skipped so the
                 # plan can terminate. Otherwise just wait.
-                if any(by_key[d].step_status in ("failed", "cancelled", "skipped")
+                if any(by_key[d].step_status in (ExecutionStepStatus.FAILED, ExecutionStepStatus.CANCELLED, ExecutionStepStatus.SKIPPED)
                        for d in deps if d in by_key):
-                    s.step_status = "skipped"
+                    s.step_status = ExecutionStepStatus.SKIPPED.value
                     s.finished_at = datetime.now(timezone.utc)
                 continue
             runnable.append(s)
@@ -984,16 +1463,16 @@ class PlanExecutor:
         return {
             s.step_key: s.result
             for s in steps
-            if s.step_status == "done" and s.result is not None
+            if s.step_status == ExecutionStepStatus.DONE and s.result is not None
         }
 
     @staticmethod
     def _terminal_summary(steps: list[ExecutionStep]) -> Optional[str]:
-        any_pending = any(s.step_status == "pending" for s in steps)
-        any_running = any(s.step_status == "running" for s in steps)
-        any_waiting = any(s.step_status == "waiting_human" for s in steps)
-        any_paused = any(s.step_status == "paused" for s in steps)
-        any_failed = any(s.step_status == "failed" for s in steps)
+        any_pending = any(s.step_status == ExecutionStepStatus.PENDING for s in steps)
+        any_running = any(s.step_status == ExecutionStepStatus.RUNNING for s in steps)
+        any_waiting = any(s.step_status == ExecutionStepStatus.WAITING_HUMAN for s in steps)
+        any_paused = any(s.step_status == ExecutionStepStatus.PAUSED for s in steps)
+        any_failed = any(s.step_status == ExecutionStepStatus.FAILED for s in steps)
 
         if any_pending or any_running or any_waiting or any_paused:
             return None
@@ -1061,7 +1540,7 @@ class PlanExecutor:
             select(ExecutionPlan.id).where(
                 ExecutionPlan.task_id == plan.task_id,
                 ExecutionPlan.id != plan.id,
-                ExecutionPlan.status.in_(["completed", "failed", "cancelled", "replanned"]),
+                ExecutionPlan.status.in_((ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.FAILED, ExecutionPlanStatus.CANCELLED, ExecutionPlanStatus.REPLANNED,)),
             )
         )).scalars().all()
         if len(prior_count) >= PlanExecutor.MAX_REPLANS:
@@ -1069,7 +1548,7 @@ class PlanExecutor:
             return False
 
         # Don't replan on non-actionable errors (credits, permissions)
-        failed_steps = [s for s in steps if s.step_status == "failed"]
+        failed_steps = [s for s in steps if s.step_status == ExecutionStepStatus.FAILED]
         for fs in failed_steps:
             err_type = (fs.error or {}).get("type", "")
             if err_type in ("CreditExhaustedError", "PermissionError", "AuthenticationError"):
@@ -1095,15 +1574,9 @@ class PlanExecutor:
                 "params_summary": str(fs.params)[:300] if fs.params else None,
             })
 
-        # Collect what succeeded (planner can reuse)
-        succeeded = []
-        for s in steps:
-            if s.step_status == "done" and s.result:
-                succeeded.append({
-                    "step_key": s.step_key,
-                    "result_summary": str(s.result.get("text", s.result.get("value", "")))[:200]
-                        if isinstance(s.result, dict) else str(s.result)[:200],
-                })
+        # Collect what succeeded, with artifact handles the planner can
+        # actually reuse instead of regenerating.
+        succeeded = _succeeded_step_contexts(steps)
 
         try:
             from packages.core.models.task import Task
@@ -1143,7 +1616,7 @@ class PlanExecutor:
             task.details = details
 
             # Mark current plan as replanned (not failed)
-            plan.status = "replanned"
+            plan.status = ExecutionPlanStatus.REPLANNED.value
             plan.completed_at = datetime.now(timezone.utc)
             await db.flush()
 
@@ -1161,75 +1634,276 @@ class PlanExecutor:
             return False
 
     @staticmethod
+    async def _log_supervisor_verdict(
+        db: AsyncSession, task, plan: ExecutionPlan,
+        decision: SupervisorDecision, *, note: str = "",
+    ) -> None:
+        """Record every supervisor decision on the task, with its evidence.
+
+        Task 01KWRR5VGHYHQD3A116TZ8ET0W ended as failed with seven task_logs,
+        every one of them reporting success — the transition came from
+        ``apply_task_status_transition`` alone, which writes no task_log, so
+        the only record of WHY was a single verdict word that was never
+        stored. Now the decision itself is the record: the verdict, the
+        evidence behind it (the model must cite a step result; deterministic
+        gates state their finding), which mechanism produced it, and what
+        the code did with it. Best-effort: a logging failure must never
+        block the status transition it explains.
+        """
+        try:
+            from packages.core.services.task_service import add_task_log
+
+            steps = list((await db.execute(
+                select(ExecutionStep).where(ExecutionStep.plan_id == plan.id)
+                .order_by(ExecutionStep.created_at)
+            )).scalars().all())
+            done = [s for s in steps if s.step_status == ExecutionStepStatus.DONE]
+            failed = [s for s in steps if s.step_status == ExecutionStepStatus.FAILED]
+
+            source_label = {
+                SupervisorDecisionSource.GATE: "deterministic check",
+                SupervisorDecisionSource.MODEL: "supervisor review",
+                SupervisorDecisionSource.FALLBACK: "fallback — no review ran",
+            }[decision.source]
+            lines = [f"**Verdict:** {decision.verdict.value} ({source_label})"]
+            if decision.evidence:
+                lines.append(f"**Evidence:** {decision.evidence}")
+            if decision.step_key:
+                lines.append(f"**Step:** {decision.step_key}")
+
+            if failed:
+                names = ", ".join(s.step_key for s in failed[:5])
+                lines.append(f"{len(failed)} step(s) failed: {names}.")
+                if done:
+                    lines.append(f"{len(done)} step(s) completed before that.")
+            elif done and decision.verdict in (
+                SupervisorVerdict.FAILED,
+                SupervisorVerdict.NEEDS_REPLAN,
+                SupervisorVerdict.CANCELLED,
+                SupervisorVerdict.BLOCKED,
+            ):
+                lines.append(
+                    f"All {len(done)} step(s) in this plan completed with no "
+                    "error — this verdict overrides a mechanically successful run."
+                )
+            if note:
+                lines.append(note)
+
+            await add_task_log(
+                db, task.id, SUPERVISOR_VERDICT_LOG_TYPE, "\n".join(lines),
+                actor=TaskActor.SUPERVISOR,
+                created_by="AI Supervisor",
+                metadata={
+                    "verdict": decision.verdict.value,
+                    "evidence": decision.evidence,
+                    "source": decision.source.value,
+                    "step_key": decision.step_key,
+                    "plan_id": plan.id,
+                    "done_count": len(done),
+                    "failed_count": len(failed),
+                },
+            )
+        except Exception:
+            logger.warning(
+                "supervisor-verdict log write failed for plan %s (status transition still applies)",
+                plan.id, exc_info=True,
+            )
+
+    @staticmethod
+    async def _apply_supervisor_step_retry(
+        db: AsyncSession, task, plan: ExecutionPlan, decision: SupervisorDecision,
+    ) -> bool:
+        """Send one step back for a re-run instead of finalizing the task.
+
+        The named step was validated against the plan's real steps at parse
+        time; here it is validated again against the database, and against
+        its once-per-plan budget — the SUPERVISOR_STEP_RETRY_FLAG in the
+        step's params. Without that budget the supervisor could retry the
+        same step against the same result forever (the shape of the provider
+        approval loop, in a new place).
+
+        On success the step is reset exactly the way a manual retry resets
+        it, the plan goes back to running, and a fresh executor cycle is
+        scheduled. Returns False when the retry cannot apply, so the caller
+        downgrades the decision rather than silently dropping it.
+        """
+        if not decision.step_key:
+            return False
+        step = (await db.execute(
+            select(ExecutionStep).where(
+                ExecutionStep.plan_id == plan.id,
+                ExecutionStep.step_key == decision.step_key,
+            )
+        )).scalar_one_or_none()
+        if step is None:
+            return False
+        params = dict(step.params or {})
+        if params.get(SUPERVISOR_STEP_RETRY_FLAG):
+            return False
+        params[SUPERVISOR_STEP_RETRY_FLAG] = True
+        step.params = params  # reassignment marks the JSON column dirty
+
+        step.step_status = ExecutionStepStatus.PENDING.value
+        step.current_lease_id = None
+        step.error = None
+        step.result = None
+        step.finished_at = None
+        step.started_at = None
+        step.attempt_count = 0
+        step.human_input_prompt = None
+
+        plan.status = ExecutionPlanStatus.RUNNING.value
+        plan.completed_at = None
+        plan.last_error = None
+
+        await PlanExecutor._log_supervisor_verdict(
+            db, task, plan, decision,
+            note=f"Step '{decision.step_key}' was sent back for one re-run; the plan resumed.",
+        )
+
+        dispatched = False
+        try:
+            from packages.core.tasks.ai_tasks import run_plan
+            run_plan.delay(plan.id)
+            dispatched = True
+        except Exception:
+            logger.warning(
+                "supervisor step retry: dispatch failed for plan %s (monitor will pick it up)",
+                plan.id, exc_info=True,
+            )
+        logger.info(
+            "Supervisor step retry applied: plan=%s step=%s dispatched=%s",
+            plan.id, decision.step_key, dispatched,
+        )
+        return True
+
+    @staticmethod
     async def _supervise_outcome(
         db: AsyncSession, plan: ExecutionPlan, plan_status: str,
-    ) -> str:
+    ) -> SupervisorDecision:
         """Lightweight supervisor: reviews all step results after plan
         finishes and decides the task ticket status.
 
-        Returns one of: completed, failed, needs_replan, needs_human.
-
-        Deterministic gates handle structured blockers first. The supervisor
-        then validates finished plan output before the parent task status is
-        changed, including mechanically completed plans with all steps done.
+        Returns a SupervisorDecision — verdict, evidence, and which
+        mechanism produced it. Deterministic gates run first and state their
+        own findings as evidence; the model is asked only when no gate
+        fires, and must cite the step result that justifies its verdict.
         """
         steps = list((await db.execute(
             select(ExecutionStep).where(ExecutionStep.plan_id == plan.id)
             .order_by(ExecutionStep.created_at)
         )).scalars().all())
 
-        done_count = sum(1 for s in steps if s.step_status == "done")
-        failed_count = sum(1 for s in steps if s.step_status == "failed")
-        skipped_count = sum(1 for s in steps if s.step_status == "skipped")
+        done_count = sum(1 for s in steps if s.step_status == ExecutionStepStatus.DONE)
+        failed_count = sum(1 for s in steps if s.step_status == ExecutionStepStatus.FAILED)
+        skipped_count = sum(1 for s in steps if s.step_status == ExecutionStepStatus.SKIPPED)
 
         # Load task before the fast path so artifact-bearing deliverables
         # cannot be marked complete just because every step returned text.
         from packages.core.models.task import Task
         task = (await db.execute(select(Task).where(Task.id == plan.task_id))).scalar_one_or_none()
         task_title = task.title if task else "Unknown"
-        task_desc = (task.description or "")[:300] if task else ""
+        # The supervisor reviews a task a handful of times over its whole
+        # life — the full description costs nothing next to the wrong
+        # verdict a truncated one produces.
+        task_desc = (task.description or "")[:2000] if task else ""
+
+        from packages.core.constants.supervisor import MAX_EVIDENCE_CHARS
+
+        def gate(verdict: SupervisorVerdict, evidence: str) -> SupervisorDecision:
+            return SupervisorDecision(
+                verdict=verdict,
+                evidence=str(evidence)[:MAX_EVIDENCE_CHARS],
+                source=SupervisorDecisionSource.GATE,
+            )
 
         structured_issue = _structured_blocking_issue(task, steps)
-        if structured_issue and plan_status == "completed":
+        if structured_issue and plan_status == ExecutionPlanStatus.COMPLETED:
             logger.info(
                 "Supervisor held plan %s for structured blocker: %s",
                 plan.id, structured_issue,
             )
-            return "needs_human"
+            return gate(SupervisorVerdict.NEEDS_HUMAN, structured_issue)
         artifact_issue = _missing_artifact_issue(task, steps)
-        if artifact_issue and plan_status == "completed":
+        if artifact_issue and plan_status == ExecutionPlanStatus.COMPLETED:
             logger.info(
                 "Supervisor requested replan for plan %s missing artifact evidence: %s",
                 plan.id, artifact_issue,
             )
-            return "needs_replan"
+            return gate(SupervisorVerdict.NEEDS_REPLAN, artifact_issue)
+        expects_issue = _unmet_expects_issue(plan, steps)
+        if expects_issue and plan_status == ExecutionPlanStatus.COMPLETED:
+            logger.info(
+                "Supervisor requested replan for plan %s with unmet step expects: %s",
+                plan.id, expects_issue,
+            )
+            return gate(SupervisorVerdict.NEEDS_REPLAN, expects_issue)
 
         # Do not let the LLM supervisor turn a totally failed execution into a
         # completed task. Replanning is attempted before finalization; once we
         # are here, a failed plan with zero successful steps has no core
         # deliverable to accept.
-        if plan_status == "failed" and failed_count > 0 and done_count == 0:
-            return "failed"
+        if plan_status == ExecutionPlanStatus.FAILED and failed_count > 0 and done_count == 0:
+            return gate(
+                SupervisorVerdict.FAILED,
+                f"all {failed_count} executed step(s) failed; none completed",
+            )
 
         # Cancelled/blocked: pass through directly
-        if plan_status in ("cancelled", "blocked"):
-            return plan_status
+        if plan_status in (SupervisorVerdict.CANCELLED, SupervisorVerdict.BLOCKED):
+            return gate(
+                SupervisorVerdict(plan_status), f"the plan was {plan_status}",
+            )
 
         # Ask the supervisor before mapping a finished plan onto the parent
-        # task. A plan can be mechanically "completed" while the worker result
+        # task. A plan can be mechanically complete while the worker result
         # says the actual task goal was not achieved; the supervisor judges the
         # result in context before the task status changes.
         try:
-            # Build step summary for the supervisor
-            step_lines = []
-            for s in steps:
-                line = f"- {s.step_key} ({s.kind}): {s.step_status}"
-                if s.step_status == "done" and s.result:
-                    text = _supervisor_result_preview(s.result)
-                    line += f" — {str(text)[:150]}"
-                if s.step_status == "failed" and s.error:
-                    line += f" — ERROR: {s.error.get('type', '')}: {s.error.get('message', '')[:150]}"
-                step_lines.append(line)
+            step_infos = _supervisor_step_infos(plan, steps)
+            plan_rationale = str(
+                ((plan.plan_dag or {}).get("metadata") or {}).get("rationale") or ""
+            )
+
+            # The supervisor oversees the TASK, not one plan: earlier
+            # attempts and its own earlier reviews are part of the picture.
+            prior_attempts: list[dict] = []
+            prior_reviews: list[dict] = []
+            if plan.task_id:
+                prior_plans = list((await db.execute(
+                    select(ExecutionPlan).where(
+                        ExecutionPlan.task_id == plan.task_id,
+                        ExecutionPlan.id != plan.id,
+                    ).order_by(ExecutionPlan.created_at)
+                )).scalars().all())[-5:]
+                if prior_plans:
+                    prior_steps = list((await db.execute(
+                        select(ExecutionStep).where(
+                            ExecutionStep.plan_id.in_([p.id for p in prior_plans])
+                        ).order_by(ExecutionStep.created_at)
+                    )).scalars().all())
+                    steps_by_plan: dict[str, list] = {}
+                    for prior_step in prior_steps:
+                        steps_by_plan.setdefault(prior_step.plan_id, []).append(prior_step)
+                    prior_attempts = _supervisor_attempt_infos(prior_plans, steps_by_plan)
+
+                from packages.core.models.task import TaskLog
+                verdict_logs = list((await db.execute(
+                    select(TaskLog).where(
+                        TaskLog.task_id == plan.task_id,
+                        TaskLog.log_type == SUPERVISOR_VERDICT_LOG_TYPE,
+                    ).order_by(TaskLog.created_at)
+                )).scalars().all())
+                prior_reviews = _supervisor_review_infos(verdict_logs)
+
+            # A step may be offered for a supervisor re-run once per plan;
+            # a supervisor retrying the same step against the same result
+            # forever is a loop, not a review.
+            retryable_step_keys = [
+                s.step_key for s in steps
+                if s.step_status in (ExecutionStepStatus.DONE, ExecutionStepStatus.FAILED)
+                and not (s.params or {}).get(SUPERVISOR_STEP_RETRY_FLAG)
+            ]
 
             completion = await runtime_execute_plan_supervisor_completion(
                 task_title=task_title,
@@ -1237,22 +1911,101 @@ class PlanExecutor:
                 done_count=done_count,
                 failed_count=failed_count,
                 skipped_count=skipped_count,
-                step_lines=step_lines,
+                steps=step_infos,
                 entity_id=plan.entity_id,
                 workspace_id=getattr(plan, "workspace_id", None),
+                retryable_step_keys=retryable_step_keys,
+                plan_rationale=plan_rationale,
+                is_replan=bool(getattr(plan, "parent_plan_id", None)),
+                prior_attempts=prior_attempts,
+                prior_reviews=prior_reviews,
             )
-            verdict_raw = completion.content
-
-            verdict = runtime_parse_plan_supervisor_verdict(verdict_raw)
-            if verdict in ("completed", "needs_replan", "needs_human", "failed"):
-                logger.info("Supervisor verdict for plan %s: %s", plan.id, verdict)
-                return verdict
+            decision = runtime_parse_plan_supervisor_decision(
+                completion.content, retryable_step_keys=retryable_step_keys,
+            )
+            if decision is not None:
+                logger.info(
+                    "Supervisor verdict for plan %s: %s (%s)",
+                    plan.id, decision.verdict.value, decision.evidence[:120],
+                )
+                return decision
 
         except Exception:
             logger.warning("Supervisor LLM call failed for plan %s, falling back to plan_status", plan.id, exc_info=True)
 
         # Fallback: use the raw plan status
-        return plan_status
+        return SupervisorDecision(
+            verdict=SupervisorVerdict(plan_status),
+            evidence="the supervisor was unavailable or unparseable; the plan's own status was used",
+            source=SupervisorDecisionSource.FALLBACK,
+        )
+
+    @staticmethod
+    async def _resolved_config_versions(
+        db: AsyncSession, plan: ExecutionPlan, task,
+    ) -> Optional[dict]:
+        """Best-effort ``{"agent_revision": N, "skill_revision": N}`` for the
+        config that produced this plan (M11 ledger stamping).
+
+        Cheapest correct join: the LAST done step that resolved an agent
+        (``ExecutionStep.resolved_agent_id``) — falling back to
+        ``task.agent_id`` — then one lookup of that ``Agent.revision``.
+
+        Skill revision has no cheap source: ``ExecutionStep`` carries no
+        skill column (skills are invoked in-loop through ``invoke_skill``,
+        not modelled as steps). It is stamped only when a step explicitly
+        recorded a ``skill_id`` in its params/result; otherwise the stamp
+        carries ``agent_revision`` alone.
+
+        Never raises — a stamping failure must not break finalize.
+        """
+        try:
+            steps = list((await db.execute(
+                select(ExecutionStep)
+                .where(ExecutionStep.plan_id == plan.id)
+                .order_by(ExecutionStep.created_at)
+            )).scalars().all())
+
+            agent_id = next(
+                (
+                    s.resolved_agent_id
+                    for s in reversed(steps)
+                    if s.step_status == ExecutionStepStatus.DONE and s.resolved_agent_id
+                ),
+                None,
+            ) or next(
+                (s.resolved_agent_id for s in reversed(steps) if s.resolved_agent_id),
+                None,
+            ) or getattr(task, "agent_id", None)
+
+            skill_id = None
+            for s in reversed(steps):
+                for blob in (s.params, s.result):
+                    if isinstance(blob, dict) and blob.get("skill_id"):
+                        skill_id = str(blob["skill_id"])
+                        break
+                if skill_id:
+                    break
+
+            versions: dict = {}
+            if agent_id:
+                from packages.core.models.workspace import Agent
+                revision = (await db.execute(
+                    select(Agent.revision).where(Agent.id == agent_id)
+                )).scalar_one_or_none()
+                if revision is not None:
+                    versions["agent_revision"] = int(revision)
+            if skill_id:
+                from packages.core.models.skill import Skill
+                revision = (await db.execute(
+                    select(Skill.revision).where(Skill.id == skill_id)
+                )).scalar_one_or_none()
+                if revision is not None:
+                    versions["skill_revision"] = int(revision)
+            return versions or None
+        except Exception:
+            logger.debug("config_versions stamping skipped", exc_info=True)
+            return None
 
     @staticmethod
     async def _finalize(
@@ -1262,6 +2015,21 @@ class PlanExecutor:
         plan.completed_at = datetime.now(timezone.utc)
         task_event: Optional[dict] = None
 
+        # The plan is now terminal — no step will resume to consume its approval
+        # request — so expire any still-open HitlRequest attached to it.
+        # Without this, a step that was waiting_human when the plan was
+        # cancelled/failed/replanned leaves an orphaned "no longer attached to a
+        # waiting step" card. Best-effort: cleanup never blocks finalization.
+        try:
+            from packages.core.governance.approvals import resolve_origin_requests
+            from packages.core.governance.service import resolve_stale_hitl_cards
+            await resolve_origin_requests(db, plan_id=plan.id, reason="plan_terminal")
+            # ... and close the chat cards that rendered those requests, so
+            # they stop counting toward the sidebar pending-action badge.
+            await resolve_stale_hitl_cards(db, plan_id=plan.id, reason="plan_terminal")
+        except Exception:
+            logger.warning("approval-request cleanup on finalize failed", exc_info=True)
+
         # Auto-update the parent task status + aggregate output.
         # A lightweight supervisor reviews the step results and decides
         # the final task status: completed, failed, or needs_replan.
@@ -1269,21 +2037,57 @@ class PlanExecutor:
             from packages.core.models.task import Task
             from packages.core.services.task_service import add_task_log
             from packages.core.services.task_state_machine import TERMINAL_STATUSES, apply_task_status_transition
-            verdict: Optional[str] = None
+            attention_issue: Optional[str] = None
+            supervisor_decision: Optional[SupervisorDecision] = None
             result = await db.execute(
                 select(Task).where(Task.id == plan.task_id)
             )
             task = result.scalar_one_or_none()
+            # Ledger (M11): stamp the execution-config revisions that actually
+            # produced this run onto the terminal execution_* event, so
+            # outcome analysis can attribute the result to the exact agent /
+            # skill content. Best-effort — never blocks finalize.
+            config_versions = await PlanExecutor._resolved_config_versions(db, plan, task)
             if task and task.status in _PLAN_FINALIZABLE_TASK_STATUSES:
-                verdict = await PlanExecutor._supervise_outcome(db, plan, status)
-                if verdict == "completed":
-                    apply_task_status_transition(task, "completed")
-                elif verdict == "needs_replan":
+                decision = await PlanExecutor._supervise_outcome(db, plan, status)
+
+                if decision.verdict is SupervisorVerdict.RETRY_STEP:
+                    # The supervisor may send ONE step back for a re-run
+                    # instead of failing the whole task. If it applies, the
+                    # plan is running again and nothing here is terminal.
+                    if await PlanExecutor._apply_supervisor_step_retry(db, task, plan, decision):
+                        return None
+                    decision = decision.downgraded(
+                        SupervisorVerdict.NEEDS_REPLAN,
+                        "the named step could not be re-run (already retried once, or no longer present)",
+                    )
+
+                # Every verdict says why — evidence from the model or the
+                # gate, plus what the code did with it.
+                note = ""
+                if decision.verdict is SupervisorVerdict.NEEDS_REPLAN:
+                    note = (
+                        "the replan budget for this task is exhausted, so the "
+                        "requested replan did not run and the task lands as failed"
+                    )
+                await PlanExecutor._log_supervisor_verdict(db, task, plan, decision, note=note)
+                supervisor_decision = decision
+
+                if decision.verdict is SupervisorVerdict.COMPLETED:
+                    await apply_task_status_transition(
+                        task, "completed", db=db, config_versions=config_versions,
+                    )
+                elif decision.verdict is SupervisorVerdict.NEEDS_REPLAN:
                     # Replan was already attempted before _finalize.
                     # If we're here, budget is exhausted → fall to failed.
-                    apply_task_status_transition(task, "failed")
-                elif verdict == "needs_human":
-                    apply_task_status_transition(task, "waiting_on_customer")
+                    await apply_task_status_transition(
+                        task, "failed", db=db, config_versions=config_versions,
+                    )
+                elif decision.verdict is SupervisorVerdict.NEEDS_HUMAN:
+                    await apply_task_status_transition(
+                        task, "waiting_on_customer", db=db,
+                        config_versions=config_versions,
+                    )
                     # Notify workspace chat so user sees the HITL request
                     try:
                         steps_for_issue = list((await db.execute(
@@ -1295,36 +2099,39 @@ class PlanExecutor:
                         failed_steps = [s for s in (await db.execute(
                             select(ExecutionStep).where(
                                 ExecutionStep.plan_id == plan.id,
-                                ExecutionStep.step_status == "failed",
+                                ExecutionStep.step_status == ExecutionStepStatus.FAILED,
                             )
                         )).scalars().all()]
-                        issues = structured_issue or artifact_issue or "; ".join(
-                            f"{fs.step_key}: {(fs.error or {}).get('message', 'failed')[:100]}"
-                            for fs in failed_steps[:3]
-                        ) or (
-                            "The supervisor could not verify that the completed "
-                            "plan actually satisfied the task objective."
+                        message = _hitl_request_message(
+                            task, steps_for_issue,
+                            structured_issue=structured_issue,
+                            artifact_issue=artifact_issue,
+                            failed_steps=failed_steps,
                         )
-                        await add_task_log(db, task.id, "ai_hitl_requested",
-                            f"The plan ran into issues and needs your input:\n\n{issues}\n\n"
-                            f"Please add a comment with guidance, or change the task status.",
+                        attention_issue = structured_issue or artifact_issue or message
+                        await add_task_log(db, task.id, TaskLogType.AI_HITL_REQUESTED,
+                            message,
+                            actor=TaskActor.SUPERVISOR,
                             created_by="AI Supervisor",
                             metadata={
-                                "verdict": "needs_human",
+                                "verdict": decision.verdict.value,
+                                "evidence": decision.evidence,
+                                "source": decision.source.value,
                                 "plan_id": plan.id,
                                 "artifact_required": bool(artifact_issue),
                                 "structured_blocker": bool(structured_issue),
                             })
                     except Exception:
                         pass
-                elif verdict in ("failed", "cancelled", "blocked"):
-                    apply_task_status_transition(task, verdict)
                 else:
-                    # Unknown verdict — fall back to plan status
-                    if status == "completed":
-                        apply_task_status_transition(task, "completed")
-                    elif status == "failed":
-                        apply_task_status_transition(task, "failed")
+                    # FAILED / CANCELLED / BLOCKED — the decision is a member
+                    # of a closed enum, so there is no "unknown" branch left:
+                    # _supervise_outcome already folds an unparseable reply
+                    # into a FALLBACK decision on the plan's own status.
+                    await apply_task_status_transition(
+                        task, decision.verdict.value, db=db,
+                        config_versions=config_versions,
+                    )
 
             # Aggregate step results into task.actual_output so the
             # Strategist can learn from what the task actually produced.
@@ -1376,11 +2183,15 @@ class PlanExecutor:
                     "steps": step_summaries,
                     "files": _dedupe_task_artifact_refs(all_files) if all_files else None,
                 }
-                if verdict:
-                    actual_output["supervisor_verdict"] = verdict
-                    if verdict == "needs_human":
+                if supervisor_decision is not None:
+                    actual_output["supervisor_verdict"] = supervisor_decision.verdict.value
+                    actual_output["supervisor_evidence"] = supervisor_decision.evidence
+                    if supervisor_decision.verdict is SupervisorVerdict.NEEDS_HUMAN:
                         actual_output["needs_input"] = True
                 task.actual_output = actual_output
+                # Ledger (M1): one artifact_created per produced artifact ref.
+                from packages.core.ledger.adapters import record_task_artifacts
+                await record_task_artifacts(db, task, actual_output.get("files") or [])
                 try:
                     from packages.core.models.workspace import Workspace
                     from packages.core.services.workspace_state_files import refresh_workspace_state_files
@@ -1445,12 +2256,13 @@ class PlanExecutor:
                 from packages.core.workspace_chat.notifiers import _render_dag
                 step_snaps = PlanExecutor._snapshot_steps(steps)
                 if step_snaps:
-                    msg += "\n\n" + _render_dag(step_snaps)
+                    msg += "\n\n" + _render_dag(step_snaps, entity_id=plan.entity_id or "")
                 try:
-                    failed_steps_for_meta = [s for s in steps if s.step_status in ("failed", "skipped", "cancelled")]
+                    failed_steps_for_meta = [s for s in steps if s.step_status in (ExecutionStepStatus.FAILED, ExecutionStepStatus.SKIPPED, ExecutionStepStatus.CANCELLED,)]
                     first_error = next((s.error for s in failed_steps_for_meta if s.error), None)
                     await add_task_log(db, task.id,
-                        f"plan_{status}", msg,
+                        plan_terminal_log_type(status), msg,
+                        actor=TaskActor.SYSTEM,
                         created_by="system",
                         metadata={
                             "plan_id": plan.id,
@@ -1469,7 +2281,7 @@ class PlanExecutor:
                     # Collect final deliverables from step results
                     deliverables = []
                     for s in steps:
-                        if s.step_status == "done" and s.result:
+                        if s.step_status == ExecutionStepStatus.DONE and s.result:
                             text = ""
                             if isinstance(s.result, dict):
                                 text = s.result.get("text") or s.result.get("value") or ""
@@ -1479,24 +2291,34 @@ class PlanExecutor:
                     if deliverables:
                         summary = "## Task Completed\n\n" + "\n\n---\n\n".join(deliverables)
                         try:
+                            # The deliverables came from this task's agent;
+                            # the executor only assembled them.
+                            from packages.core.services.task_service import (
+                                agent_log_authorship,
+                            )
+
+                            author, author_meta, author_actor = await agent_log_authorship(
+                                db, task.agent_id,
+                            )
                             await add_task_log(db, task.id,
-                                "comment", summary,
-                                created_by="AI Agent",
-                                metadata={"auto_summary": True})
+                                TaskLogType.COMMENT, summary,
+                                actor=author_actor,
+                                created_by=author,
+                                metadata={"auto_summary": True, **(author_meta or {})})
                         except Exception:
                             pass
 
                 event_type = None
                 event_steps = steps
-                if task.status == "completed":
+                if task.status == TaskStatus.COMPLETED:
                     event_type = "task.succeeded"
-                    event_steps = [s for s in steps if s.step_status == "done"]
-                elif task.status in ("failed", "cancelled", "blocked"):
+                    event_steps = [s for s in steps if s.step_status == ExecutionStepStatus.DONE]
+                elif task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED,):
                     event_type = "task.failed"
-                    event_steps = [s for s in steps if s.step_status in ("failed", "skipped", "cancelled")]
-                elif task.status == "waiting_on_customer":
+                    event_steps = [s for s in steps if s.step_status in (ExecutionStepStatus.FAILED, ExecutionStepStatus.SKIPPED, ExecutionStepStatus.CANCELLED,)]
+                elif task.status == TaskStatus.WAITING_ON_CUSTOMER:
                     event_type = "task.hitl_requested"
-                    event_steps = [s for s in steps if s.step_status in ("waiting_human", "failed")]
+                    event_steps = [s for s in steps if s.step_status in (ExecutionStepStatus.WAITING_HUMAN, ExecutionStepStatus.FAILED,)]
 
                 if event_type:
                     first_error = next((s.error for s in event_steps if s.error), None)
@@ -1513,7 +2335,8 @@ class PlanExecutor:
                             "step_ids": [s.id for s in event_steps],
                             "error_type": (first_error or {}).get("type"),
                             "error_message": (first_error or {}).get("message"),
-                            "prompt": first_prompt,
+                            "prompt": first_prompt or attention_issue,
+                            "issue": attention_issue,
                         },
                     }
 
@@ -1571,7 +2394,10 @@ class PlanExecutor:
             return
         try:
             from packages.core.services.task_service import add_task_log
-            await add_task_log(db, plan.task_id, log_type, content, created_by="system", metadata=metadata)
+            await add_task_log(
+                db, plan.task_id, log_type, content,
+                actor=TaskActor.SYSTEM, created_by="system", metadata=metadata,
+            )
         except Exception:
             pass
 
@@ -1593,6 +2419,8 @@ class PlanExecutor:
         plan_error: Optional[dict],
         task_title: Optional[str] = None,
         step_snapshots: Optional[list[dict]] = None,
+        task_status: Optional[str] = None,
+        task_issue: Optional[str] = None,
     ) -> None:
         """Best-effort chat notifications for plan-level events.
 
@@ -1631,16 +2459,24 @@ class PlanExecutor:
                 )
 
         if plan_done == "completed":
-            duration = None
-            if plan_started_at and plan_completed_at:
-                duration = (plan_completed_at - plan_started_at).total_seconds()
-            await chat_notify.notify_plan_completed(
-                entity_id=entity_id, workspace_id=workspace_id,
-                plan_id=plan_id, task_id=task_id,
-                duration_seconds=duration, cost_usd=plan_cost,
-                task_title=task_title,
-                steps=step_snapshots,
-            )
+            if task_status in _SUPERVISOR_HELD_TASK_STATUSES:
+                await chat_notify.notify_plan_needs_attention(
+                    entity_id=entity_id, workspace_id=workspace_id,
+                    plan_id=plan_id, task_id=task_id,
+                    task_title=task_title, issue=task_issue,
+                    steps=step_snapshots,
+                )
+            else:
+                duration = None
+                if plan_started_at and plan_completed_at:
+                    duration = (plan_completed_at - plan_started_at).total_seconds()
+                await chat_notify.notify_plan_completed(
+                    entity_id=entity_id, workspace_id=workspace_id,
+                    plan_id=plan_id, task_id=task_id,
+                    duration_seconds=duration, cost_usd=plan_cost,
+                    task_title=task_title,
+                    steps=step_snapshots,
+                )
         elif plan_done == "failed":
             await chat_notify.notify_plan_failed(
                 entity_id=entity_id, workspace_id=workspace_id,

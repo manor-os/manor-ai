@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 
 async def runtime_generate_document_file(
@@ -43,12 +44,13 @@ async def runtime_generate_document_file(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     clean_name = runtime_normalize_entity_file_path(
         scope_workspace_artifact_path(
             clean_name,
             workspace_base_dir,
-            default_subdir="documents",
+            default_subdir=WorkspaceArtifactDir.DOCUMENTS.value,
         )
     )
 

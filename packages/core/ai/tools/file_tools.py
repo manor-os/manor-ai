@@ -5,6 +5,7 @@ All operations are scoped to the entity's directory: {MANOR_FS_ROOT}/{entity_id}
 from __future__ import annotations
 
 import asyncio
+import base64
 import fnmatch
 import hashlib
 import io
@@ -12,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from packages.core.ai.runtime.file_actions import (
@@ -24,6 +26,7 @@ from packages.core.ai.runtime.file_actions import (
     runtime_write_entity_file_atomic,
 )
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +34,22 @@ READ_FILE_DEFAULT_LINES = 120
 READ_FILE_MAX_LINES = 1000
 READ_FILE_DEFAULT_CHARS = 12_000
 READ_FILE_MAX_CHARS = 40_000
+READ_FILE_MAX_IMAGE_BYTES = 12_000_000
 LIST_FILES_DEFAULT_LIMIT = 100
 LIST_FILES_MAX_LIMIT = 200
 GLOB_FILES_DEFAULT_LIMIT = 100
 GREP_FILES_DEFAULT_LIMIT = 50
+
+# grep_files scan bounds. Production incident: a 1.9 GB / 2410-file workspace
+# was 99.7% binary (.mp4/.png/.wav) — the content scan opened and UTF-8-decoded
+# every one of those bytes because nothing skipped binaries. These bounds are
+# sized off that measurement: the real text in that workspace was 5.2 MB across
+# 1593 files (~3.4 KB average), so none of them fire in the common case.
+GREP_BINARY_SNIFF_BYTES = 8192  # same head-sniff size git/ripgrep use
+GREP_MAX_FILE_READ_BYTES = 8 * 1024 * 1024  # per-file read cap
+GREP_MAX_LINE_CHARS = 4096  # cap fed to regex.search per line/chunk
+GREP_SCAN_BYTE_BUDGET = 32 * 1024 * 1024  # total bytes read per call
+GREP_SCAN_WALL_CLOCK_SECONDS = 6.0  # total wall clock per call
 EXTRACT_ONLY_EXTENSIONS = {
     ".doc", ".docx", ".wps", ".pdf", ".xlsx", ".xls", ".et", ".pptx", ".ppt", ".dps",
 }
@@ -50,7 +65,7 @@ READ_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read a bounded slice of an entity file; page large files with offsets.",
+        "description": "Read text/images.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -202,6 +217,9 @@ GREP_FILES_SCHEMA = {
                     "type": "integer",
                     "description": "Match offset.",
                 },
+                "after": {
+                    "type": "string",
+                },
             },
             "required": ["pattern"],
         },
@@ -321,6 +339,33 @@ def _get_entity_root(entity_id: str) -> str | None:
     return runtime_entity_file_root(entity_id)
 
 
+async def _blocked_doc_paths(entity_id: str, rel_paths: list[str], kwargs: dict) -> set[str]:
+    """Normalized rel paths that map to a Knowledge document this agent turn's
+    user may not read.
+
+    Knowledge documents are real files under the entity root, so the raw file
+    tools would otherwise read a private document's bytes without honoring
+    ``Document.visibility``. We gate on the same guard the ``/documents`` API
+    uses. When the turn has no ``user_id`` (background/system agent) nothing is
+    blocked — matching the existing background-caller allowance.
+    """
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    user_id = kwargs.get("user_id") or runtime_context.user_id
+    if not user_id or not rel_paths:
+        return set()
+    from packages.core.database import async_session
+    from packages.core.services.document_access import unreadable_document_paths
+
+    async with async_session() as db:
+        return await unreadable_document_paths(
+            db,
+            entity_id=entity_id,
+            rel_paths=rel_paths,
+            user_id=user_id,
+            actor_type="agent",
+        )
+
+
 def _safe_path(entity_root: str, relative_path: str) -> str | None:
     """Resolve a path and ensure it stays within entity_root. Returns None if escape detected."""
     root = os.path.realpath(entity_root)
@@ -335,6 +380,7 @@ async def _workspace_scoped_new_file_path(
     entity_id: str,
     entity_root: str,
     workspace_id: str | None,
+    task_id: str | None = None,
     path: str,
     expected_sha256: str | None = None,
 ) -> str:
@@ -362,15 +408,118 @@ async def _workspace_scoped_new_file_path(
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        task_id=task_id,
     )
     if not workspace_base_dir:
         return rel_path
     scoped = scope_workspace_artifact_path(
         rel_path,
         workspace_base_dir,
-        default_subdir="documents",
+        default_subdir=WorkspaceArtifactDir.DOCUMENTS.value,
     )
     return runtime_normalize_entity_file_path(scoped) or rel_path
+
+
+async def _workspace_scoped_existing_path(
+    *,
+    entity_id: str,
+    entity_root: str,
+    workspace_id: str | None,
+    task_id: str | None = None,
+    path: str,
+) -> str | None:
+    """Where a prior *write* of this logical name would have been rerouted.
+
+    `_write_file` scopes NEW workspace files under the workspace artifact
+    folder; read/edit/delete must consult the SAME location so they address
+    the file the write created, not a non-existent literal path (the write-A
+    read-B fork). Returns the scoped abs_path if that file exists, else None.
+    """
+    if not workspace_id:
+        return None
+    rel = runtime_normalize_entity_file_path(path)
+    if not rel or not runtime_user_visible_file_path(rel):
+        return None
+    from packages.core.services.generated_media_naming import (
+        resolve_workspace_artifact_base_dir,
+        scope_workspace_artifact_path,
+    )
+
+    base = await resolve_workspace_artifact_base_dir(
+        entity_id=entity_id, workspace_id=workspace_id, task_id=task_id,
+    )
+    if not base:
+        return None
+    scoped = runtime_normalize_entity_file_path(
+        scope_workspace_artifact_path(rel, base, default_subdir=WorkspaceArtifactDir.DOCUMENTS.value)
+    ) or rel
+    scoped_abs = _safe_path(entity_root, scoped)
+    if scoped_abs and os.path.isfile(scoped_abs):
+        return scoped_abs
+    return None
+
+
+def _same_basename_candidates(entity_root: str, path: str, *, limit: int = 5) -> list[str]:
+    """Entity-relative paths of files sharing this basename — so a not-found
+    error tells the model where the file actually is instead of dead-ending."""
+    target = os.path.basename(str(path or "").replace("\\", "/").rstrip("/"))
+    if not target:
+        return []
+    root = os.path.realpath(entity_root)
+    found: list[str] = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for fn in filenames:
+            scanned += 1
+            if scanned > 5000:
+                return found
+            if fn == target:
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                found.append(rel.replace("\\", "/"))
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+async def _locate_entity_file(
+    *,
+    entity_id: str,
+    entity_root: str,
+    path: str,
+    workspace_id: str | None,
+    task_id: str | None = None,
+) -> tuple[str | None, list[str]]:
+    """Resolve an EXISTING file for read/edit/delete through ONE code path.
+
+    Order: the literal path, then the workspace-scoped location a prior write
+    may have rerouted it to. On miss, returns same-basename candidates so the
+    caller can emit a self-correcting error. Returns (abs_path|None, candidates).
+    """
+    literal = _safe_path(entity_root, path)
+    if literal and os.path.isfile(literal):
+        return literal, []
+    scoped = await _workspace_scoped_existing_path(
+        entity_id=entity_id,
+        entity_root=entity_root,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        path=path,
+    )
+    if scoped:
+        return scoped, []
+    return None, _same_basename_candidates(entity_root, path)
+
+
+def _not_found_result(path: str, candidates: list[str]) -> str:
+    payload: dict[str, Any] = {"error": f"File not found: {path}"}
+    if candidates:
+        payload["candidates"] = candidates
+        payload["hint"] = (
+            "No file at that exact path, but a file with the same name exists "
+            "elsewhere. Retry with one of `candidates` (these are the real paths)."
+        )
+    return json.dumps(payload)
 
 
 _FS_DISABLED_MSG = json.dumps({
@@ -818,17 +967,76 @@ async def _guard_expected_source_sha(
 # ---------------------------------------------------------------------------
 
 async def _read_file(entity_id: str, **kwargs: Any) -> str:
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
     root = _get_entity_root(entity_id)
     if not root:
         return _FS_DISABLED_MSG
 
-    path = kwargs.get("path", "")
-    abs_path = _safe_path(root, path)
-    if not abs_path:
+    requested_path = str(kwargs.get("path", "") or "")
+    if _safe_path(root, requested_path) is None:
         return json.dumps({"error": "Path traversal detected"})
+    abs_path, candidates = await _locate_entity_file(
+        entity_id=entity_id, entity_root=root, path=requested_path,
+        workspace_id=runtime_context.workspace_id,
+        task_id=runtime_context.task_id,
+    )
+    if not abs_path:
+        return _not_found_result(requested_path, candidates)
 
-    if not os.path.isfile(abs_path):
-        return json.dumps({"error": f"File not found: {path}"})
+    resolved_path = os.path.relpath(abs_path, root).replace(os.sep, "/")
+    if await _blocked_doc_paths(entity_id, [resolved_path], kwargs):
+        # Private Knowledge document the caller cannot read: report as missing
+        # so the tool never confirms that the document exists.
+        return json.dumps({"error": f"File not found: {requested_path}"})
+
+    image_mime_type = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }.get(os.path.splitext(abs_path)[1].lower())
+    if image_mime_type:
+        try:
+            with open(abs_path, "rb") as image_file:
+                image_bytes = image_file.read(READ_FILE_MAX_IMAGE_BYTES + 1)
+            if len(image_bytes) > READ_FILE_MAX_IMAGE_BYTES:
+                return json.dumps({
+                    "error": "image_too_large",
+                    "path": requested_path,
+                    "max_bytes": READ_FILE_MAX_IMAGE_BYTES,
+                })
+            stat = os.stat(abs_path)
+            source_sha256 = hashlib.sha256(image_bytes).hexdigest()
+            expected_sha256 = str(kwargs.get("expected_sha256") or "").strip()
+            if expected_sha256 and expected_sha256 != source_sha256:
+                return json.dumps({
+                    "error": "source_changed",
+                    "path": requested_path,
+                    "expected_sha256": expected_sha256,
+                    "source_sha256": source_sha256,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "hint": "The image changed since it was read; read it again before relying on it.",
+                })
+            data_url = (
+                f"data:{image_mime_type};base64,"
+                + base64.b64encode(image_bytes).decode("ascii")
+            )
+            return json.dumps({
+                "path": requested_path,
+                "resolved_path": resolved_path,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "source_sha256": source_sha256,
+                "image": {
+                    "data_url": data_url,
+                    "mime_type": image_mime_type,
+                    "bytes": len(image_bytes),
+                    "delivery": "ephemeral_multimodal",
+                },
+            })
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": str(exc)})
 
     offset = _bounded_int(kwargs.get("offset"), 0, 1_000_000, 0)
     char_offset_arg = kwargs.get("char_offset")
@@ -847,7 +1055,7 @@ async def _read_file(entity_id: str, **kwargs: Any) -> str:
         if expected_sha256 and expected_sha256 != meta["source_sha256"]:
             return json.dumps({
                 "error": "source_changed",
-                "path": path,
+                "path": requested_path,
                 "expected_sha256": expected_sha256,
                 "source_sha256": meta["source_sha256"],
                 "size": meta["size"],
@@ -914,7 +1122,8 @@ async def _read_file(entity_id: str, **kwargs: Any) -> str:
             hint = "Call read_file again with char_offset=next_char_offset and expected_sha256=source_sha256 to continue."
 
         return json.dumps({
-            "path": path,
+            "path": requested_path,
+            "resolved_path": resolved_path,
             "size": meta["size"],
             "mtime_ns": meta["mtime_ns"],
             "source_sha256": meta["source_sha256"],
@@ -950,6 +1159,7 @@ async def _write_file(entity_id: str, **kwargs: Any) -> str:
         entity_id=entity_id,
         entity_root=root,
         workspace_id=runtime_context.workspace_id,
+        task_id=runtime_context.task_id,
         path=requested_path,
         expected_sha256=str(kwargs.get("expected_sha256") or ""),
     )
@@ -1041,6 +1251,48 @@ async def _write_file(entity_id: str, **kwargs: Any) -> str:
         return json.dumps({"error": str(e)})
 
 
+def _scan_list_files(
+    root: str, abs_path: str, recursive: bool, limit: int, offset: int,
+) -> tuple[list[dict], int, bool]:
+    """Blocking directory listing. Runs in a worker thread — see the note on
+    ``_scan_grep_files``."""
+    entries: list[dict] = []
+    total_seen = 0
+    has_more = False
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(abs_path):
+            dirnames.sort()
+            for fn in sorted(filenames):
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, root)
+                total_seen += 1
+                if total_seen <= offset:
+                    continue
+                if len(entries) >= limit:
+                    has_more = True
+                    break
+                entries.append({
+                    "path": rel,
+                    "type": "file",
+                    "size": os.path.getsize(full),
+                })
+            if has_more:
+                break
+    else:
+        items = sorted(os.listdir(abs_path))
+        total_seen = len(items)
+        for item in items[offset : offset + limit]:
+            rel = os.path.relpath(os.path.join(abs_path, item), root)
+            full = os.path.join(abs_path, item)
+            entries.append({
+                "path": rel,
+                "type": "dir" if os.path.isdir(full) else "file",
+                "size": os.path.getsize(full) if os.path.isfile(full) else None,
+            })
+        has_more = offset + len(entries) < total_seen
+    return entries, total_seen, has_more
+
+
 async def _list_files(entity_id: str, **kwargs: Any) -> str:
     root = _get_entity_root(entity_id)
     if not root:
@@ -1058,43 +1310,19 @@ async def _list_files(entity_id: str, **kwargs: Any) -> str:
     if not os.path.isdir(abs_path):
         return json.dumps({"error": f"Directory not found: {rel_path}"})
 
-    entries = []
-    total_seen = 0
-    has_more = False
     try:
-        if recursive:
-            for dirpath, dirnames, filenames in os.walk(abs_path):
-                dirnames.sort()
-                for fn in sorted(filenames):
-                    full = os.path.join(dirpath, fn)
-                    rel = os.path.relpath(full, root)
-                    total_seen += 1
-                    if total_seen <= offset:
-                        continue
-                    if len(entries) >= limit:
-                        has_more = True
-                        break
-                    entries.append({
-                        "path": rel,
-                        "type": "file",
-                        "size": os.path.getsize(full),
-                    })
-                if has_more:
-                    break
-        else:
-            items = sorted(os.listdir(abs_path))
-            total_seen = len(items)
-            for item in items[offset : offset + limit]:
-                rel = os.path.relpath(os.path.join(abs_path, item), root)
-                full = os.path.join(abs_path, item)
-                entries.append({
-                    "path": rel,
-                    "type": "dir" if os.path.isdir(full) else "file",
-                    "size": os.path.getsize(full) if os.path.isfile(full) else None,
-                })
-            has_more = offset + len(entries) < total_seen
+        entries, total_seen, has_more = await asyncio.to_thread(
+            _scan_list_files, root, abs_path, recursive, limit, offset,
+        )
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+    blocked = await _blocked_doc_paths(
+        entity_id, [e["path"] for e in entries if e.get("type") == "file"], kwargs
+    )
+    if blocked:
+        from packages.core.services.knowledge_visibility import normalize_rel_path
+        entries = [e for e in entries if normalize_rel_path(e["path"]) not in blocked]
 
     return json.dumps({
         "count": len(entries),
@@ -1105,6 +1333,32 @@ async def _list_files(entity_id: str, **kwargs: Any) -> str:
         "total": total_seen if not recursive else None,
         "entries": entries,
     })
+
+
+def _scan_glob_files(
+    root: str, pattern: str, limit: int, offset: int,
+) -> tuple[list[str], bool]:
+    """Blocking name-only tree walk. Runs in a worker thread — see the note on
+    ``_scan_grep_files``."""
+    matches: list[str] = []
+    matched_seen = 0
+    has_more = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root)
+            if fnmatch.fnmatch(rel, pattern):
+                matched_seen += 1
+                if matched_seen <= offset:
+                    continue
+                if len(matches) >= limit:
+                    has_more = True
+                    break
+                matches.append(rel)
+        if has_more:
+            break
+    return matches, has_more
 
 
 async def _glob_files(entity_id: str, **kwargs: Any) -> str:
@@ -1118,27 +1372,17 @@ async def _glob_files(entity_id: str, **kwargs: Any) -> str:
 
     limit = _bounded_int(kwargs.get("limit"), GLOB_FILES_DEFAULT_LIMIT, LIST_FILES_MAX_LIMIT, 1)
     offset = _bounded_int(kwargs.get("offset"), 0, 100_000, 0)
-    matches = []
-    matched_seen = 0
-    has_more = False
     try:
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames.sort()
-            for fn in sorted(filenames):
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root)
-                if fnmatch.fnmatch(rel, pattern):
-                    matched_seen += 1
-                    if matched_seen <= offset:
-                        continue
-                    if len(matches) >= limit:
-                        has_more = True
-                        break
-                    matches.append(rel)
-            if has_more:
-                break
+        matches, has_more = await asyncio.to_thread(
+            _scan_glob_files, root, pattern, limit, offset,
+        )
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+    blocked = await _blocked_doc_paths(entity_id, matches, kwargs)
+    if blocked:
+        from packages.core.services.knowledge_visibility import normalize_rel_path
+        matches = [m for m in matches if normalize_rel_path(m) not in blocked]
 
     return json.dumps({
         "pattern": pattern,
@@ -1149,6 +1393,147 @@ async def _glob_files(entity_id: str, **kwargs: Any) -> str:
         "has_more": has_more,
         "files": matches,
     })
+
+
+def _grep_is_binary(full: str, sniff_bytes: int = GREP_BINARY_SNIFF_BYTES) -> bool:
+    """Same head-sniff git/ripgrep use: a NUL byte in the first chunk means
+    binary. An unreadable file is treated as skip, not as a scan failure."""
+    try:
+        with open(full, "rb") as fh:
+            return b"\x00" in fh.read(sniff_bytes)
+    except OSError:
+        return True
+
+
+def _scan_grep_files(
+    root: str,
+    search_root: str,
+    regex: "re.Pattern[str]",
+    file_glob: str,
+    max_matches: int,
+    offset: int,
+    after: str | None = None,
+) -> dict:
+    """Blocking content scan — MUST NOT run on the event loop (see #424).
+
+    Production incident: this walked a 1.9 GB / 2410-file workspace, opening and
+    UTF-8 decoding every file (1.4 GB of it .mp4), and took 8m48s. Measured on
+    that same workspace, 99.7% of the bytes were binary and the real text was
+    5.2 MB across 1593 files — so the binary skip below removes almost the
+    entire cost, and the byte/file/wall-clock bounds are sized generously
+    around that real text volume, not around the binary noise.
+
+    ``after`` resumes a budget-truncated scan: it is the exact relative path a
+    prior call returned as ``resume_cursor`` (the last file it fully scanned).
+    We replay the SAME walk (deterministic: sorted dirnames/filenames) and skip
+    every file until we see that exact path again — comparing path strings
+    directly, not re-deriving a lexicographic order, since os.walk's traversal
+    (all of a directory's own files before any subdirectory) is NOT plain
+    lexicographic order over full relative paths. Skipping does no file I/O, so
+    replaying up to the cursor is cheap regardless of how far in it is.
+
+    Residual risk, stated plainly rather than papered over: capping bytes fed to
+    a single regex.search call (``GREP_MAX_LINE_CHARS``) bounds the quadratic
+    blowup this incident's pattern shape could produce (``.*x.*y.*``-style), but
+    CPython's ``re`` has no timeout and cannot be interrupted mid-match, so a
+    genuinely pathological pattern (nested quantifiers, e.g. ``(a+)+$``) is not
+    fully bounded by truncation at any practical cap size. What actually
+    contains that case is #424: this now runs in a worker thread, so a hung
+    match burns one thread instead of freezing the event loop for every user.
+    """
+    start = time.monotonic()
+    matches: list[dict] = []
+    matched_seen = 0
+    has_more = False
+    files_scanned = 0
+    files_skipped_binary = 0
+    files_truncated = 0
+    bytes_scanned = 0
+    truncated = False
+    resume_cursor: str | None = None
+    # The file the budget check last saw fully handled (scanned OR skipped as
+    # binary) — NOT the file the budget trips on. If resume_cursor named the
+    # file we were about to look at when the budget ran out, resuming with
+    # `after` set to it would skip that exact file via the cursor-replay
+    # `continue` below and it would never get scanned at all.
+    last_covered_rel: str | None = None
+    cursor_found = after is None
+    stop = False
+
+    for dirpath, dirnames, filenames in os.walk(search_root):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            if file_glob and not fnmatch.fnmatch(fn, file_glob):
+                continue
+
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root)
+
+            if not cursor_found:
+                if rel == after:
+                    cursor_found = True
+                continue
+
+            if (
+                bytes_scanned >= GREP_SCAN_BYTE_BUDGET
+                or (time.monotonic() - start) >= GREP_SCAN_WALL_CLOCK_SECONDS
+            ):
+                truncated = True
+                resume_cursor = last_covered_rel
+                stop = True
+                break
+
+            if _grep_is_binary(full):
+                files_skipped_binary += 1
+                last_covered_rel = rel
+                continue
+
+            try:
+                with open(full, "rb") as fh:
+                    raw = fh.read(GREP_MAX_FILE_READ_BYTES + 1)
+            except OSError:
+                last_covered_rel = rel
+                continue
+
+            if len(raw) > GREP_MAX_FILE_READ_BYTES:
+                raw = raw[:GREP_MAX_FILE_READ_BYTES]
+                files_truncated += 1
+
+            files_scanned += 1
+            bytes_scanned += len(raw)
+            last_covered_rel = rel
+            text = raw.decode("utf-8", errors="replace")
+
+            for line_num, line in enumerate(text.split("\n"), 1):
+                line = line[:GREP_MAX_LINE_CHARS]
+                if regex.search(line):
+                    matched_seen += 1
+                    if matched_seen <= offset:
+                        continue
+                    if len(matches) >= max_matches:
+                        has_more = True
+                        break
+                    matches.append({
+                        "file": rel,
+                        "line": line_num,
+                        "text": line.rstrip()[:500],
+                    })
+            if has_more:
+                break
+        if has_more or stop:
+            break
+
+    return {
+        "matches": matches,
+        "has_more": has_more,
+        "files_scanned": files_scanned,
+        "files_skipped_binary": files_skipped_binary,
+        "files_truncated": files_truncated,
+        "bytes_scanned": bytes_scanned,
+        "truncated": truncated,
+        "resume_cursor": resume_cursor,
+        "cursor_found": cursor_found,
+    }
 
 
 async def _grep_files(entity_id: str, **kwargs: Any) -> str:
@@ -1164,6 +1549,7 @@ async def _grep_files(entity_id: str, **kwargs: Any) -> str:
     file_glob = kwargs.get("file_glob", "")
     max_matches = _bounded_int(kwargs.get("max_matches"), GREP_FILES_DEFAULT_LIMIT, LIST_FILES_MAX_LIMIT, 1)
     offset = _bounded_int(kwargs.get("offset"), 0, 100_000, 0)
+    after = str(kwargs.get("after") or "").strip() or None
 
     search_root = _safe_path(root, rel_path) if rel_path else root
     if not search_root or not os.path.isdir(search_root):
@@ -1174,45 +1560,32 @@ async def _grep_files(entity_id: str, **kwargs: Any) -> str:
     except re.error as e:
         return json.dumps({"error": f"Invalid regex: {e}"})
 
-    matches = []
-    matched_seen = 0
-    has_more = False
     try:
-        for dirpath, dirnames, filenames in os.walk(search_root):
-            dirnames.sort()
-            for fn in sorted(filenames):
-                if file_glob and not fnmatch.fnmatch(fn, file_glob):
-                    continue
-
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root)
-
-                try:
-                    with open(full, "r", encoding="utf-8", errors="replace") as f:
-                        for line_num, line in enumerate(f, 1):
-                            if regex.search(line):
-                                matched_seen += 1
-                                if matched_seen <= offset:
-                                    continue
-                                if len(matches) >= max_matches:
-                                    has_more = True
-                                    break
-                                matches.append({
-                                    "file": rel,
-                                    "line": line_num,
-                                    "text": line.rstrip()[:500],
-                                })
-                except (OSError, UnicodeDecodeError):
-                    continue
-
-                if has_more:
-                    break
-            if has_more:
-                break
+        result = await asyncio.to_thread(
+            _scan_grep_files, root, search_root, regex, file_glob, max_matches, offset, after,
+        )
+        if after and not result["cursor_found"]:
+            # The tree changed since the cursor was issued (file moved/deleted)
+            # and replay never found it. Skipping the rest of the tree in that
+            # state would silently report "no more matches" when we actually
+            # never looked — rescan from the start instead of trusting a stale
+            # cursor. Rare: a full rescan is cheap once binaries are skipped.
+            result = await asyncio.to_thread(
+                _scan_grep_files, root, search_root, regex, file_glob, max_matches, offset, None,
+            )
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-    return json.dumps({
+    matches = result["matches"]
+    has_more = result["has_more"]
+    blocked = await _blocked_doc_paths(
+        entity_id, [m["file"] for m in matches], kwargs
+    )
+    if blocked:
+        from packages.core.services.knowledge_visibility import normalize_rel_path
+        matches = [m for m in matches if normalize_rel_path(m["file"]) not in blocked]
+
+    payload: dict[str, Any] = {
         "pattern": pattern_str,
         "count": len(matches),
         "limit": max_matches,
@@ -1220,7 +1593,22 @@ async def _grep_files(entity_id: str, **kwargs: Any) -> str:
         "next_offset": offset + len(matches) if has_more else None,
         "has_more": has_more,
         "matches": matches,
-    })
+        "files_scanned": result["files_scanned"],
+        "files_skipped_binary": result["files_skipped_binary"],
+        "files_truncated": result["files_truncated"],
+        "bytes_scanned": result["bytes_scanned"],
+        "truncated": result["truncated"],
+        "resume_cursor": result["resume_cursor"],
+    }
+    if result["truncated"]:
+        # Keeping this out of GREP_FILES_SCHEMA (a fixed per-conversation token
+        # cost, budget-tested) and putting it here instead — it only costs
+        # anything on the rare truncated response, not on every conversation.
+        payload["hint"] = (
+            "Scan ran out of time/budget before covering every file. Retry "
+            "with after=resume_cursor to continue; do not report no match yet."
+        )
+    return json.dumps(payload)
 
 
 async def _edit_file(entity_id: str, **kwargs: Any) -> str:
@@ -1230,12 +1618,18 @@ async def _edit_file(entity_id: str, **kwargs: Any) -> str:
         return _FS_DISABLED_MSG
 
     path = kwargs.get("path", "")
-    abs_path = _safe_path(root, path)
-    if not abs_path:
+    if _safe_path(root, path) is None:
         return json.dumps({"error": "Path traversal detected"})
-
-    if not os.path.isfile(abs_path):
-        return json.dumps({"error": f"File not found: {path}"})
+    abs_path, candidates = await _locate_entity_file(
+        entity_id=entity_id, entity_root=root, path=path,
+        workspace_id=runtime_context.workspace_id,
+        task_id=runtime_context.task_id,
+    )
+    if not abs_path:
+        return _not_found_result(path, candidates)
+    # Address the file we actually located (a workspace-scoped write target),
+    # so the sync/knowledge write below updates the SAME projection.
+    path = os.path.relpath(abs_path, root).replace("\\", "/")
 
     try:
         ext = os.path.splitext(abs_path)[1].lower()
@@ -1541,7 +1935,16 @@ async def _delete_file(entity_id: str, **kwargs: Any) -> str:
         return json.dumps({"error": "Path traversal detected"})
 
     if not os.path.exists(abs_path):
-        return json.dumps({"error": f"Path not found: {path}"})
+        # A literal miss may still resolve to a workspace-scoped file (dirs
+        # only ever match literally).
+        located, candidates = await _locate_entity_file(
+            entity_id=entity_id, entity_root=root, path=path,
+            workspace_id=runtime_context.workspace_id,
+            task_id=runtime_context.task_id,
+        )
+        if not located:
+            return _not_found_result(path, candidates)
+        abs_path = located
 
     try:
         rel_for_trash = os.path.relpath(abs_path, root)

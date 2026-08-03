@@ -13,7 +13,11 @@ const config = {
   onBrokenMarkdownLinks: "warn",
   i18n: {
     defaultLocale: "en",
-    locales: ["en"],
+    locales: ["en", "zh-Hans"],
+    localeConfigs: {
+      en: { label: "English" },
+      "zh-Hans": { label: "简体中文" },
+    },
   },
   presets: [
     [
@@ -36,7 +40,7 @@ const config = {
       require.resolve("@easyops-cn/docusaurus-search-local"),
       {
         hashed: true,
-        language: ["en"],
+        language: ["en", "zh"],
         indexBlog: false,
         docsRouteBasePath: "/",
         highlightSearchTermsOnTargetPage: true,
@@ -61,6 +65,7 @@ const config = {
         { type: "docSidebar", sidebarId: "mainSidebar", position: "left", label: "Docs" },
         { to: "/quickstart", label: "Quickstart", position: "left" },
         { to: "/api-reference", label: "API", position: "left" },
+        { type: "localeDropdown", position: "right" },
         { href: "https://github.com/manor-os/manor-ai", label: "GitHub", position: "right" },
       ],
     },

@@ -78,7 +78,11 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                             "type": "integer",
                             "enum": VIDEO_DURATION_CHOICES,
                             "default": 5,
-                            "description": "Single clip seconds.",
+                            # Kept terse here: the canonical, tested wording
+                            # ("Single clip seconds.") lives on the top-level
+                            # "duration" property below; this nested alias
+                            # only needs its enum to match.
+                            "description": "Seconds.",
                         },
                         "resolution": {
                             "type": "string",
@@ -194,6 +198,10 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                         "voice": {
                             "type": "string",
                             "description": "Voice name.",
+                        },
+                        "voice_instructions": {
+                            "type": "string",
+                            "description": "Tone, pace, emphasis.",
                         },
                         "response_format": {
                             "type": "string",

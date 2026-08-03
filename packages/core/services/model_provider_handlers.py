@@ -12,6 +12,14 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from packages.core.services.model_provider_adapters import (
+    KIMI_CHINA_BASE_URL,
+    KIMI_GLOBAL_BASE_URL,
+    KIMI_NATIVE_CHAT_ADAPTER,
+    native_chat_adapter_for_base_url,
+    native_chat_adapter_for_provider,
+)
+
 
 @dataclass(frozen=True)
 class ModelProviderHandler:
@@ -23,6 +31,7 @@ class ModelProviderHandler:
     api_shape: str = "openai_compatible"
     roles: tuple[str, ...] = ("primary", "worker")
     generic_sk: bool = False
+    base_url_aliases: tuple[str, ...] = ()
 
     @property
     def is_openrouter(self) -> bool:
@@ -76,11 +85,13 @@ PROVIDER_HANDLERS: dict[str, ModelProviderHandler] = {
     "moonshotai": ModelProviderHandler(
         provider="moonshotai",
         display_name="Moonshot / Kimi",
-        base_url="https://api.moonshot.ai/v1",
+        base_url=KIMI_GLOBAL_BASE_URL,
         env_vars=("MOONSHOT_API_KEY", "KIMI_API_KEY"),
         key_prefixes=("sk-",),
+        api_shape=KIMI_NATIVE_CHAT_ADAPTER.api_shape,
         roles=("primary", "worker"),
         generic_sk=True,
+        base_url_aliases=(KIMI_CHINA_BASE_URL,),
     ),
     "groq": ModelProviderHandler(
         provider="groq",
@@ -118,6 +129,16 @@ PROVIDER_HANDLERS: dict[str, ModelProviderHandler] = {
         api_shape="kling_video",
         roles=("video",),
     ),
+    "atlascloud": ModelProviderHandler(
+        provider="atlascloud",
+        display_name="Atlas Cloud",
+        base_url="https://api.atlascloud.ai",
+        # BYOK-only on purpose: no platform env var, so official-route
+        # resolution can never pick up a Manor-side Atlas credential.
+        env_vars=(),
+        api_shape="atlascloud_video",
+        roles=("video",),
+    ),
     "zyphra": ModelProviderHandler(
         provider="zyphra",
         display_name="Zyphra",
@@ -135,6 +156,15 @@ PROVIDER_HANDLERS: dict[str, ModelProviderHandler] = {
         key_prefixes=("sk-or-",),
         api_shape="openrouter",
         roles=("primary", "worker", "image", "voice", "audio", "sfx", "stt", "video"),
+    ),
+    "vercel": ModelProviderHandler(
+        provider="vercel",
+        display_name="Vercel AI Gateway",
+        base_url="https://ai-gateway.vercel.sh/v1",
+        env_vars=(
+        ),
+        api_shape="vercel_ai_gateway",
+        roles=("primary", "worker"),
     ),
 }
 
@@ -197,11 +227,16 @@ def provider_from_base_url(base_url: str) -> str | None:
     lower = str(base_url or "").lower().rstrip("/")
     if not lower:
         return None
+    if adapter := native_chat_adapter_for_base_url(lower):
+        return adapter.provider
     for provider, handler in PROVIDER_HANDLERS.items():
-        provider_base = handler.base_url.lower().rstrip("/")
-        if provider_base and (lower == provider_base or lower.startswith(provider_base + "/")):
-            return provider
+        for candidate in (handler.base_url, *handler.base_url_aliases):
+            provider_base = candidate.lower().rstrip("/")
+            if provider_base and (lower == provider_base or lower.startswith(provider_base + "/")):
+                return provider
     host = urlsplit(lower).hostname or ""
+    if host.endswith("ai-gateway.vercel.sh"):
+        return "vercel"
     if host.endswith("openrouter.ai"):
         return "openrouter"
     if host.endswith("anthropic.com"):
@@ -257,10 +292,13 @@ def resolve_provider_base_url(model_id: str, api_key: str, user_base_url: str | 
 def normalize_model_for_provider(model_id: str, base_url: str) -> str:
     """Strip OpenRouter catalog provider prefixes for native provider APIs."""
 
-    if not model_id or provider_from_base_url(base_url) == "openrouter":
+    provider = provider_from_base_url(base_url)
+    if not model_id or provider in {"openrouter", "vercel"}:
         return model_id
+    if adapter := native_chat_adapter_for_provider(provider):
+        return adapter.normalize_model(model_id)
     normalized = model_id.split("/", 1)[1] if "/" in model_id else model_id
-    if provider_from_base_url(base_url) == "anthropic":
+    if provider == "anthropic":
         normalized = normalized.replace(".", "-")
     return normalized
 
@@ -280,6 +318,7 @@ def provider_catalog() -> list[dict[str, Any]]:
             "api_shape": handler.api_shape,
             "roles": list(handler.roles),
             "env_vars": list(handler.env_vars),
+            "base_url_aliases": list(handler.base_url_aliases),
         }
         for handler in PROVIDER_HANDLERS.values()
     ]

@@ -21,11 +21,14 @@ SEARCH_DOCUMENTS_SCHEMA = {
     "function": {
         "name": "search_documents",
         "description": (
-            "Search user-visible Knowledge documents by name or query text. "
+            "Search user-visible Knowledge documents by filename and metadata. "
             "Use this when the user asks what files/documents they can see, "
             "when resolving # references, or when searching uploaded / AI-created "
-            "deliverables. Do not use raw filesystem tools for user-visible "
-            "Knowledge lists."
+            "deliverables. This tool does not retrieve document-body evidence. "
+            "For facts, values, passages, summaries, comparisons, or calculations "
+            "from inside documents, use rag. If the intent is mixed or uncertain, "
+            "prefer rag; never infer document contents from a filename match. Do "
+            "not use raw filesystem tools for user-visible Knowledge lists."
         ),
         "parameters": {
             "type": "object",

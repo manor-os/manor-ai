@@ -6,11 +6,15 @@ import logging
 from typing import Any
 
 from packages.core.ai.runtime.approvals import RuntimeApprovalMiddleware
+from packages.core.ai.runtime.streams import runtime_tool_error_result
 from packages.core.ai.runtime.harness import RuntimeHarness
 from packages.core.ai.runtime.chrome_routing import (
     runtime_blocked_chrome_action_shortcut,
     runtime_blocked_chrome_open_shortcut,
+    runtime_blocked_chrome_workflow_contract,
     runtime_blocked_generic_web_for_chrome_local_browser,
+    runtime_record_chrome_tool_result,
+    runtime_record_chrome_workflow_tool,
 )
 from packages.core.ai.runtime.tool_availability import runtime_blocked_mcp_call_result
 from packages.core.ai.runtime.tool_context import runtime_injected_tool_context_args
@@ -53,6 +57,38 @@ class RuntimePreparedToolExecution:
         return self.blocked_result is not None
 
 
+def _record_successful_tool_workflow_step(
+    *,
+    harness: RuntimeHarness | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> None:
+    if harness is None:
+        return
+    runtime_record_chrome_workflow_tool(
+        tool_name=tool_name,
+        arguments=arguments,
+        runtime_metadata=harness.envelope.metadata,
+    )
+
+
+def _record_tool_result_for_workflow_recovery(
+    *,
+    harness: RuntimeHarness | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: Any,
+) -> None:
+    if harness is None:
+        return
+    runtime_record_chrome_tool_result(
+        tool_name=tool_name,
+        arguments=arguments,
+        result=result,
+        runtime_metadata=harness.envelope.metadata,
+    )
+
+
 async def runtime_execute_prepared_tool_handler(
     *,
     tool_name: str,
@@ -77,6 +113,17 @@ async def runtime_execute_prepared_tool_handler(
             result = await result
         if harness is not None:
             harness.record_event("tool_end", tool_name=tool_name)
+        _record_successful_tool_workflow_step(
+            harness=harness,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        _record_tool_result_for_workflow_recovery(
+            harness=harness,
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+        )
         return str(result)
     except TypeError:
         try:
@@ -85,19 +132,30 @@ async def runtime_execute_prepared_tool_handler(
                 result = await result
             if harness is not None:
                 harness.record_event("tool_end", tool_name=tool_name)
+            _record_successful_tool_workflow_step(
+                harness=harness,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+            _record_tool_result_for_workflow_recovery(
+                harness=harness,
+                tool_name=tool_name,
+                arguments=arguments,
+                result=result,
+            )
             return str(result)
         except Exception as exc:
             if harness is not None:
                 harness.record_event("error", tool_name=tool_name, message=str(exc))
             if logger is not None:
                 logger.error("Tool %s failed: %s", tool_name, exc, exc_info=True)
-            return f"Error: {exc}"
+            return runtime_tool_error_result(str(exc))
     except Exception as exc:
         if harness is not None:
             harness.record_event("error", tool_name=tool_name, message=str(exc))
         if logger is not None:
             logger.error("Tool %s failed: %s", tool_name, exc, exc_info=True)
-        return f"Error: {exc}"
+        return runtime_tool_error_result(str(exc))
 
 
 async def runtime_execute_scoped_dynamic_tool_handler(
@@ -149,7 +207,7 @@ async def runtime_prepare_tool_execution(
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     manual_skill_slugs: list[str] | None = None,
-    legacy_tool_profile: str | None = None,
+    tool_profile: str | None = None,
     allowed_tool_names: set[str] | None = None,
     llm_metadata: dict[str, Any] | None = None,
     llm_model: str | None = None,
@@ -194,6 +252,21 @@ async def runtime_prepare_tool_execution(
             arguments=arguments,
             harness=harness,
             blocked_result=blocked_chrome_open,
+        )
+
+    blocked_chrome_workflow = runtime_blocked_chrome_workflow_contract(
+        tool_name=tool_name,
+        arguments=arguments,
+        runtime_metadata=(runtime_envelope.metadata if runtime_envelope is not None else None),
+        active_user_message=active_user_message,
+    )
+    if blocked_chrome_workflow:
+        if harness is not None:
+            harness.record_tool_block_result(tool_name, blocked_chrome_workflow)
+        return RuntimePreparedToolExecution(
+            arguments=arguments,
+            harness=harness,
+            blocked_result=blocked_chrome_workflow,
         )
 
     blocked_chrome_action = runtime_blocked_chrome_action_shortcut(
@@ -274,7 +347,7 @@ async def runtime_prepare_tool_execution(
             dependency_artifact_urls=dependency_artifact_urls,
             manual_skill_selected=manual_skill_selected,
             manual_skill_slugs=manual_skill_slugs,
-            legacy_tool_profile=legacy_tool_profile,
+            tool_profile=tool_profile,
             runtime_envelope=injected_runtime_envelope,
             allowed_tool_names=allowed_tool_names,
             llm_metadata=llm_metadata if inject_runtime_context else None,
@@ -306,7 +379,7 @@ async def runtime_execute_registered_tool(
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     manual_skill_slugs: list[str] | None = None,
-    legacy_tool_profile: str | None = None,
+    tool_profile: str | None = None,
     allowed_tool_names: set[str] | None = None,
     llm_metadata: dict[str, Any] | None = None,
     llm_model: str | None = None,
@@ -317,7 +390,7 @@ async def runtime_execute_registered_tool(
 
     handler = handler_resolver(tool_name)
     if handler is None:
-        return f"Error: unknown tool '{tool_name}'"
+        return runtime_tool_error_result(f"unknown tool '{tool_name}'")
 
     prepared = await runtime_prepare_tool_execution(
         tool_name=tool_name,
@@ -333,7 +406,7 @@ async def runtime_execute_registered_tool(
         active_user_message=active_user_message,
         manual_skill_selected=manual_skill_selected,
         manual_skill_slugs=manual_skill_slugs,
-        legacy_tool_profile=legacy_tool_profile,
+        tool_profile=tool_profile,
         allowed_tool_names=allowed_tool_names,
         llm_metadata=llm_metadata,
         llm_model=llm_model,

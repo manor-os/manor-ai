@@ -1,13 +1,59 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
+import struct
+import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from packages.core.ai.tools import extended_tools
 from packages.core.ai.tools import generate_file_tool
+
+
+def _test_pcm_wav(samples: list[int]) -> bytes:
+    buffer = io.BytesIO()
+    frames = struct.pack(f"<{len(samples)}h", *samples)
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)
+        wav_file.writeframes(frames)
+    return buffer.getvalue()
+
+
+class _FakeHTTPStream:
+    def __init__(
+        self,
+        payload=None,
+        *,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        status_code: int = 200,
+        chunks: list[bytes] | None = None,
+    ):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.body = body if body is not None else json.dumps(payload).encode("utf-8")
+        self.chunks = chunks
+        self.iterated = False
+        self.chunks_yielded = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def aiter_bytes(self):
+        self.iterated = True
+        for chunk in self.chunks if self.chunks is not None else [self.body]:
+            self.chunks_yielded += 1
+            yield chunk
 
 
 def test_upload_text_document_alias_is_not_registered():
@@ -56,9 +102,13 @@ async def test_generated_image_save_reuses_existing_knowledge_document(
         entity_id = generate_ulid()
         workspace_id = generate_ulid()
         document_id = generate_ulid()
-        expected_path = "Workspaces/Image Workspace/images/hero.png"
 
-        db_session.add(Workspace(id=workspace_id, entity_id=entity_id, name="Image Workspace"))
+        workspace = Workspace(id=workspace_id, entity_id=entity_id, name="Image Workspace")
+        db_session.add(workspace)
+        await db_session.flush()
+        from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+        folder = await ensure_workspace_artifact_folder(db_session, workspace)
+        expected_path = f"Workspaces/_by_id/{folder.id}/images/hero.png"
         db_session.add(
             Document(
                 id=document_id,
@@ -107,6 +157,95 @@ async def test_generated_image_save_reuses_existing_knowledge_document(
         assert docs[0].file_size == len(b"image-bytes")
         assert docs[0].metadata_["origin"]["workspace_id"] == workspace_id
         assert docs[0].metadata_["generation"]["model"] == "gpt-image-1"
+        from packages.core.services.workspace_artifacts import resolve_workspace_folder_binding
+
+        binding = await resolve_workspace_folder_binding(
+            db_session,
+            entity_id=entity_id,
+            folder_id=docs[0].folder_id,
+        )
+        assert binding is not None
+        assert binding.workspace_id == workspace_id
+        assert binding.relative_parts == ("images",)
+    finally:
+        settings.MANOR_FS_ENABLED = old_enabled
+        settings.MANOR_FS_ROOT = old_root
+        settings.DEPLOYMENT_MODE = old_mode
+
+
+@pytest.mark.asyncio
+async def test_generated_audio_save_registers_workspace_logical_folder(
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    from sqlalchemy import select
+
+    from packages.core.config import get_settings
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_artifacts import (
+        ensure_workspace_artifact_folder,
+        resolve_workspace_folder_binding,
+    )
+
+    settings = get_settings()
+    old_enabled = settings.MANOR_FS_ENABLED
+    old_root = settings.MANOR_FS_ROOT
+    old_mode = settings.DEPLOYMENT_MODE
+    settings.MANOR_FS_ENABLED = True
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.DEPLOYMENT_MODE = "oss"
+
+    async def fake_bill_media(**_kwargs):
+        return None
+
+    monkeypatch.setattr(extended_tools, "_bill_media", fake_bill_media)
+
+    try:
+        entity_id = generate_ulid()
+        workspace_id = generate_ulid()
+        workspace = Workspace(id=workspace_id, entity_id=entity_id, name="Audio Workspace")
+        db_session.add(workspace)
+        await db_session.flush()
+        folder = await ensure_workspace_artifact_folder(db_session, workspace)
+        await db_session.commit()
+        expected_path = f"Workspaces/_by_id/{folder.id}/audio/narration.wav"
+
+        audio_url = await extended_tools._save_generated_audio_bytes(
+            entity_id=entity_id,
+            user_id="user_1",
+            prompt="Verbatim narration",
+            model="configured-audio-model",
+            purpose="narration",
+            audio_bytes=b"audio-bytes",
+            audio_format="wav",
+            is_byok=True,
+            output_name="narration.wav",
+            workspace_id=workspace_id,
+            task_id="task_1",
+            agent_id="agent_1",
+            conversation_id="conv_1",
+        )
+
+        assert audio_url == f"/api/v1/fs/{entity_id}/{expected_path}"
+        document = (
+            await db_session.execute(
+                select(Document).where(
+                    Document.entity_id == entity_id,
+                    Document.fs_path == expected_path,
+                )
+            )
+        ).scalar_one()
+        binding = await resolve_workspace_folder_binding(
+            db_session,
+            entity_id=entity_id,
+            folder_id=document.folder_id,
+        )
+        assert binding is not None
+        assert binding.workspace_id == workspace_id
+        assert binding.relative_parts == ("audio",)
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
@@ -247,7 +386,110 @@ async def test_generate_file_creates_code_bundle_with_real_file_structure(tmp_pa
     assert len(synced_paths) == 3
 
 
-def test_generate_image_aspect_ratio_defaults_and_crops():
+@pytest.mark.asyncio
+async def test_generate_file_creates_product_video_status_bundle_in_workspace(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    from packages.core.config import get_settings
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_artifacts import (
+        ensure_workspace_artifact_folder,
+    )
+
+    settings = get_settings()
+    old_enabled = settings.MANOR_FS_ENABLED
+    old_root = settings.MANOR_FS_ROOT
+    settings.MANOR_FS_ENABLED = True
+    settings.MANOR_FS_ROOT = str(tmp_path)
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Product Video Studio",
+    )
+    db_session.add(workspace)
+    await db_session.flush()
+    folder = await ensure_workspace_artifact_folder(db_session, workspace)
+    await db_session.commit()
+
+    monkeypatch.setattr(
+        "packages.core.services.ai_file_permissions.guard_ai_file_mutation",
+        AsyncMock(return_value=None),
+    )
+    synced_paths: list[str] = []
+
+    async def fake_sync_file_to_knowledge(**kwargs):
+        synced_paths.append(kwargs["abs_path"])
+        return SimpleNamespace(
+            synced=True,
+            document_id=f"doc_{len(synced_paths)}",
+            reason=None,
+        )
+
+    monkeypatch.setattr(
+        "packages.core.services.knowledge_sync.sync_file_to_knowledge",
+        fake_sync_file_to_knowledge,
+    )
+
+    try:
+        result = json.loads(
+            await generate_file_tool._generate_file_handler(
+                entity_id=entity_id,
+                user_id="user",
+                conversation_id="conversation",
+                workspace_id=workspace.id,
+                kind="code",
+                name="Product Videos/product-video-project-1",
+                params={
+                    "entry": "00-project-overview.md",
+                    "files": [
+                        {
+                            "path": "00-project-overview.md",
+                            "content": "# Project status",
+                        },
+                        {
+                            "path": "technical/run-state.json",
+                            "content": {"phase": "discovery"},
+                        },
+                        {
+                            "path": "technical/discovery-report.json",
+                            "content": {"ready_for_planning": False},
+                        },
+                    ],
+                },
+            )
+        )
+    finally:
+        settings.MANOR_FS_ENABLED = old_enabled
+        settings.MANOR_FS_ROOT = old_root
+
+    expected_bundle = (
+        f"Workspaces/_by_id/{folder.id}/"
+        "Product Videos/product-video-project-1"
+    )
+    assert result["bundle_path"] == expected_bundle
+    assert [item["path"] for item in result["files"]] == [
+        f"{expected_bundle}/00-project-overview.md",
+        f"{expected_bundle}/technical/run-state.json",
+        f"{expected_bundle}/technical/discovery-report.json",
+    ]
+    assert len(synced_paths) == 3
+
+
+def test_generate_image_never_crops_the_model_output():
+    """A generated image is a composition, not a texture.
+
+    This used to center-crop whatever came back to force the requested ratio:
+    a 1024x1024 poster requested as 9:16 became 576x1024 with the headline
+    and side labels sliced off both edges, and nothing said so. Cropping is
+    still forbidden — the requested ratio is now reached by padding, so every
+    pixel survives and the frame grows around it. See
+    tests/test_image_aspect_pads_never_crops.py for the full rule.
+    """
     assert extended_tools._image_size_for_aspect_ratio("16:9") == "1536x1024"
     assert extended_tools._image_size_for_aspect_ratio("9:16") == "1024x1536"
     assert extended_tools._image_size_for_aspect_ratio("16:9", "1024x1024") == "1024x1024"
@@ -258,17 +500,36 @@ def test_generate_image_aspect_ratio_defaults_and_crops():
     source = Image.new("RGB", (1024, 1024), "red")
     buffer = io.BytesIO()
     source.save(buffer, format="PNG")
+    original = buffer.getvalue()
 
-    normalized, mime, size = extended_tools._normalize_image_bytes_for_aspect_ratio(
-        buffer.getvalue(),
-        "image/png",
-        "16:9",
-    )
-    assert mime == "image/png"
-    assert size == "1024x576"
+    for ratio in ("16:9", "9:16", "1:1", ""):
+        delivered, mime, size = extended_tools._normalize_image_bytes_for_aspect_ratio(
+            original, "image/png", ratio,
+        )
+        assert mime == "image/png"
+        width, height = (int(part) for part in size.split("x"))
+        assert width >= 1024 and height >= 1024, (
+            f"{ratio!r} made the picture smaller — that is a crop"
+        )
+        if ratio in ("1:1", ""):
+            # already square, or nothing requested: nothing to do at all
+            assert delivered == original, f"{ratio!r} re-encoded an image it need not touch"
 
-    result = Image.open(io.BytesIO(normalized))
-    assert result.size == (1024, 576)
+
+def test_aspect_ratio_is_stated_in_the_prompt():
+    """The OpenRouter image route is a chat completion with no size field, so
+    the prompt is the only channel that can carry the requested shape."""
+    hint = extended_tools._aspect_ratio_prompt_hint("9:16")
+    assert "9:16" in hint
+    assert "portrait" in hint
+    assert "past the edges" in hint
+
+    assert "16:9" in extended_tools._aspect_ratio_prompt_hint("16:9")
+    assert "landscape" in extended_tools._aspect_ratio_prompt_hint("16:9")
+    assert "square" in extended_tools._aspect_ratio_prompt_hint("1:1")
+    # nothing requested, nothing appended
+    assert extended_tools._aspect_ratio_prompt_hint("") == ""
+    assert extended_tools._aspect_ratio_prompt_hint("banana") == ""
 
 
 @pytest.mark.asyncio
@@ -506,6 +767,1078 @@ async def test_gemini_tts_uses_pcm_request_and_wav_artifact(monkeypatch):
     assert captured["audio_prefix"] == b"RIFF"
     assert result["format"] == "wav"
     assert result["provider_response_format"] == "pcm"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_zyphra_tts_uses_provider_supported_mp3(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    captured: dict = {}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "zyphra/zonos-v0.1-hybrid", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-or-test", "", False
+
+    async def fake_platform_credential(_provider):
+        return "", ""
+
+    async def fake_speech_bytes(**kwargs):
+        captured["request_format"] = kwargs["audio_format"]
+        return b"ID3\x04audio"
+
+    async def fake_save_audio(**kwargs):
+        captured["storage_format"] = kwargs["audio_format"]
+        captured["audio_prefix"] = kwargs["audio_bytes"][:4]
+        return "/api/v1/fs/entity/audio/narration.wav"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(
+        extended_tools,
+        "_platform_native_media_credential_async",
+        fake_platform_credential,
+    )
+    monkeypatch.setattr(extended_tools, "_openrouter_speech_bytes", fake_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+            response_format="wav",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert captured["request_format"] == "mp3"
+    assert captured["storage_format"] == "mp3"
+    assert captured["audio_prefix"] == b"ID3\x04"
+    assert result["provider_response_format"] == "mp3"
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_uses_custom_byok_base_url_with_relay_shaped_key(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    captured: dict = {}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-or-relay-key", "https://apitokengate.com/v1", True
+
+    async def fake_openai_speech_bytes(**kwargs):
+        captured.update(kwargs)
+        return b"audio"
+
+    async def fake_openrouter_speech_bytes(**_kwargs):  # pragma: no cover - should not be called
+        raise AssertionError("Custom OpenAI-compatible BYOK must not use OpenRouter TTS")
+
+    async def fake_save_audio(**kwargs):
+        captured["saved_audio"] = kwargs["audio_bytes"]
+        return "/api/v1/fs/entity/audio/narration.mp3"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_openrouter_speech_bytes", fake_openrouter_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+            voice_instructions="Warm, conversational, with natural pauses.",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert captured["base_url"] == "https://apitokengate.com/v1"
+    assert captured["model"] == "openai/gpt-4o-mini-tts"
+    assert captured["voice_instructions"] == "Warm, conversational, with natural pauses."
+    assert captured["saved_audio"] == b"audio"
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_excludes_openrouter_base_for_non_openrouter_key(monkeypatch):
+    calls = {"speech": 0, "chat": 0, "save": 0}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-native-looking-key", "https://openrouter.ai/api/v1", True
+
+    async def fake_openai_speech_bytes(**_kwargs):  # pragma: no cover - should not be called
+        calls["speech"] += 1
+        return b"unexpected"
+
+    async def fake_chat_audio_bytes(**_kwargs):  # pragma: no cover - should not be called
+        calls["chat"] += 1
+        return b"unexpected"
+
+    async def fake_save_audio(**_kwargs):  # pragma: no cover - should not be called
+        calls["save"] += 1
+        return "/api/v1/fs/entity/audio/narration.mp3"
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_chat_audio_bytes", fake_chat_audio_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+        )
+    )
+
+    assert result == {"error": "Self-hosted audio generation requires a matching provider API key."}
+    assert calls == {"speech": 0, "chat": 0, "save": 0}
+
+
+@pytest.mark.asyncio
+async def test_gemini_tts_uses_openrouter_env_without_byok_in_oss(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    captured: dict = {}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "google/gemini-3.1-flash-tts-preview", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "", "", False
+
+    async def fake_primary_credentials(*_args, **_kwargs):
+        return "", "", False
+
+    async def fake_openrouter_speech_bytes(**kwargs):
+        captured.update(kwargs)
+        return b"\x00\x00" * 24
+
+    async def fake_save_audio(**kwargs):
+        captured["is_byok"] = kwargs["is_byok"]
+        captured["storage_format"] = kwargs["audio_format"]
+        return "/api/v1/fs/entity/audio/narration.wav"
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env-key")
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_primary_byok_media_credentials",
+        fake_primary_credentials,
+    )
+    monkeypatch.setattr(
+        extended_tools,
+        "_openrouter_speech_bytes",
+        fake_openrouter_speech_bytes,
+    )
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(await extended_tools._generate_audio_handler(
+        entity_id="",
+        user_id="user",
+        prompt="Narrate this line",
+        purpose="narration",
+    ))
+
+    assert result["status"] == "completed"
+    assert captured["api_key"] == "sk-or-env-key"
+    assert captured["model"] == "google/gemini-3.1-flash-tts-preview"
+    assert captured["is_byok"] is False
+    assert captured["storage_format"] == "wav"
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_reuses_compatible_primary_byok_when_voice_key_is_missing(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    captured: dict = {}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_voice_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-or-platform-key", "", False
+
+    async def fake_primary_credentials(_user_id, _entity_id, *, provider):
+        assert provider == "openai"
+        return "sk-primary-key", "https://apitokengate.com/v1", True
+
+    async def fake_openai_speech_bytes(**kwargs):
+        captured.update(kwargs)
+        return b"audio"
+
+    async def fake_openrouter_speech_bytes(**_kwargs):  # pragma: no cover - should not be called
+        raise AssertionError("Compatible primary BYOK must be used for OpenAI TTS")
+
+    async def fake_save_audio(**kwargs):
+        captured["is_byok"] = kwargs["is_byok"]
+        return "/api/v1/fs/entity/audio/narration.mp3"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_voice_credentials)
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_primary_byok_media_credentials",
+        fake_primary_credentials,
+        raising=False,
+    )
+    monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_openrouter_speech_bytes", fake_openrouter_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert captured["base_url"] == "https://apitokengate.com/v1"
+    assert captured["is_byok"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "response_text"),
+    [
+        (404, "404 page not found"),
+        (404, json.dumps({"detail": "Not Found"})),
+        (405, "endpoint unavailable"),
+        (501, "endpoint unavailable"),
+    ],
+)
+async def test_openai_tts_marks_only_unavailable_speech_endpoints_for_fallback(
+    monkeypatch,
+    status_code,
+    response_text,
+):
+    class FakeResponse:
+        content = b""
+
+        def __init__(self, status_code, response_text):
+            self.status_code = status_code
+            self.text = response_text
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse(status_code, response_text)
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(extended_tools._OpenAICompatibleSpeechEndpointUnavailable) as exc_info:
+        await extended_tools._openai_compatible_speech_bytes(
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            model="openai/gpt-4o-mini-tts",
+            prompt="Narrate this line",
+            voice="alloy",
+            audio_format="mp3",
+        )
+
+    assert f"({status_code})" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_model_not_found_404_does_not_fallback(monkeypatch):
+    calls = {"chat": 0, "save": 0}
+
+    class FakeResponse:
+        status_code = 404
+        content = b""
+        text = json.dumps(
+            {
+                "error": {
+                    "message": "The model gpt-4o-mini-tts does not exist",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            }
+        )
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-relay-key", "https://apitokengate.com/v1", True
+
+    async def fake_chat_audio_bytes(**_kwargs):  # pragma: no cover - should not be called
+        calls["chat"] += 1
+        return _test_pcm_wav([0, 1200, -1200])
+
+    async def fake_save_audio(**_kwargs):  # pragma: no cover - should not be called
+        calls["save"] += 1
+        return "/api/v1/fs/entity/audio/narration.wav"
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_chat_audio_bytes", fake_chat_audio_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "model_not_found" in result["error"]
+    assert calls == {"chat": 0, "save": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [500, 503])
+async def test_openai_tts_does_not_fallback_on_speech_provider_errors(
+    monkeypatch,
+    status_code,
+):
+    calls = {"chat": 0, "save": 0}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-relay-key", "https://apitokengate.com/v1", True
+
+    async def fake_openai_speech_bytes(**_kwargs):
+        raise RuntimeError(f"OpenAI-compatible speech generation failed ({status_code}): unavailable")
+
+    async def fake_chat_audio_bytes(**_kwargs):  # pragma: no cover - should not be called
+        calls["chat"] += 1
+        return b"unexpected"
+
+    async def fake_save_audio(**_kwargs):  # pragma: no cover - should not be called
+        calls["save"] += 1
+        return "/api/v1/fs/entity/audio/narration.mp3"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
+    monkeypatch.setattr(
+        extended_tools,
+        "_openai_compatible_chat_audio_bytes",
+        fake_chat_audio_bytes,
+        raising=False,
+    )
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert f"({status_code})" in result["error"]
+    assert calls == {"chat": 0, "save": 0}
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_falls_back_to_chat_audio_with_same_byok_route(monkeypatch):
+    captured: dict = {}
+    wav_bytes = _test_pcm_wav([0, 1200, -1200, 600, -600])
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-relay-key", "https://apitokengate.com/v1", True
+
+    async def fake_openai_speech_bytes(**kwargs):
+        captured["speech"] = kwargs
+        raise extended_tools._OpenAICompatibleSpeechEndpointUnavailable(
+            "OpenAI-compatible speech generation failed (404): Not Found"
+        )
+
+    async def fake_chat_audio_bytes(**kwargs):
+        captured["chat"] = kwargs
+        return wav_bytes
+
+    async def fake_openrouter_speech_bytes(**_kwargs):  # pragma: no cover - should not be called
+        raise AssertionError("OpenAI-compatible BYOK fallback must not use OpenRouter")
+
+    async def fake_save_audio(**kwargs):
+        captured["saved_audio"] = kwargs["audio_bytes"]
+        return "/api/v1/fs/entity/audio/narration.mp3"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
+    monkeypatch.setattr(
+        extended_tools,
+        "_openai_compatible_chat_audio_bytes",
+        fake_chat_audio_bytes,
+        raising=False,
+    )
+    monkeypatch.setattr(extended_tools, "_openrouter_speech_bytes", fake_openrouter_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert captured["chat"]["api_key"] == "sk-relay-key"
+    assert captured["chat"]["base_url"] == "https://apitokengate.com/v1"
+    assert captured["chat"]["model"] == captured["speech"]["model"]
+    assert captured["chat"]["prompt"] == captured["speech"]["prompt"]
+    assert captured["chat"]["voice"] == captured["speech"]["voice"]
+    assert captured["speech"]["audio_format"] == "mp3"
+    assert captured["chat"]["audio_format"] == "wav"
+    assert captured["saved_audio"] == wav_bytes
+    assert result["format"] == "wav"
+    assert result["provider_response_format"] == "wav"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_model", "advertised_models", "expected_model"),
+    [
+        (
+            "openai/gpt-audio-custom",
+            ["gpt-audio-mini", "gpt-4o-audio-preview", "gpt-audio-custom"],
+            "gpt-audio-custom",
+        ),
+        (
+            "openai/gpt-4o-mini-tts",
+            ["gpt-audio-mini", "gpt-4o-audio-preview"],
+            "gpt-4o-audio-preview",
+        ),
+        (
+            "openai/gpt-4o-mini-tts",
+            ["text-only-model", "gpt-audio-mini"],
+            "gpt-audio-mini",
+        ),
+    ],
+)
+async def test_openai_chat_audio_selects_model_in_priority_order_and_returns_wav(
+    monkeypatch,
+    requested_model,
+    advertised_models,
+    expected_model,
+):
+    requests: list[dict] = []
+    wav_bytes = _test_pcm_wav([0, 1200, -1200, 600, -600])
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **kwargs):
+            requests.append({"method": "GET", "url": url, **kwargs})
+            return FakeResponse({"data": [{"id": model} for model in advertised_models]})
+
+        def stream(self, method, url, **kwargs):
+            requests.append({"method": method, "url": url, **kwargs})
+            return _FakeHTTPStream(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "audio": {
+                                    "data": base64.b64encode(wav_bytes).decode("ascii")
+                                }
+                            }
+                        }
+                    ]
+                }
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    audio_bytes = await extended_tools._openai_compatible_chat_audio_bytes(
+        api_key="sk-relay-key",
+        base_url="https://apitokengate.com/v1",
+        model=requested_model,
+        prompt="Narrate this line",
+        voice="alloy",
+        audio_format="wav",
+    )
+
+    assert audio_bytes == wav_bytes
+    assert [request["url"] for request in requests] == [
+        "https://apitokengate.com/v1/models",
+        "https://apitokengate.com/v1/chat/completions",
+    ]
+    assert all(
+        request["headers"]["Authorization"] == "Bearer sk-relay-key"
+        for request in requests
+    )
+    assert requests[1]["json"] == {
+        "model": expected_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Speak the user's script exactly as written. Do not introduce, "
+                    "remove, paraphrase, explain, or comment on it. "
+                    "Use a natural, conversational delivery."
+                ),
+            },
+            {"role": "user", "content": "Narrate this line"},
+        ],
+        "modalities": ["text", "audio"],
+        "audio": {"voice": "alloy", "format": "wav"},
+        "stream": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid_stage", "expected_error"),
+    [
+        ("models", "model discovery returned invalid JSON"),
+        ("chat", "chat audio generation returned invalid JSON"),
+    ],
+)
+async def test_openai_chat_audio_rejects_invalid_json(
+    monkeypatch,
+    invalid_stage,
+    expected_error,
+):
+    class FakeResponse:
+        status_code = 200
+        text = "not-json"
+
+        def __init__(self, payload=None, *, invalid_json=False):
+            self._payload = payload
+            self._invalid_json = invalid_json
+
+        def json(self):
+            if self._invalid_json:
+                raise ValueError("invalid JSON")
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            if invalid_stage == "models":
+                return FakeResponse(invalid_json=True)
+            return FakeResponse({"data": [{"id": "gpt-4o-audio-preview"}]})
+
+        def stream(self, *_args, **_kwargs):
+            return _FakeHTTPStream(body=b"not-json")
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(
+        extended_tools._OpenAICompatibleAudioProviderBlocker,
+        match=expected_error,
+    ):
+        await extended_tools._openai_compatible_chat_audio_bytes(
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            model="openai/gpt-4o-mini-tts",
+            prompt="Narrate this line",
+            voice="alloy",
+            audio_format="wav",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("models_payload", "expected_error"),
+    [
+        ({"data": {}}, "model discovery field 'data' must be a list"),
+        (
+            {"data": [{"id": "gpt-4o-audio-preview"}, "not-an-object"]},
+            "model discovery field 'data' must contain only objects",
+        ),
+    ],
+)
+async def test_openai_chat_audio_rejects_invalid_model_list_shapes(
+    models_payload,
+    expected_error,
+):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return models_payload
+
+    class FakeClient:
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    with pytest.raises(
+        extended_tools._OpenAICompatibleAudioProviderBlocker,
+        match=expected_error,
+    ):
+        await extended_tools._discover_openai_compatible_chat_audio_model(
+            client=FakeClient(),
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            requested_model="openai/gpt-4o-mini-tts",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_payload", "expected_error"),
+    [
+        ({"choices": {}}, "chat response field 'choices' must be a non-empty list"),
+        ({"choices": []}, "chat response field 'choices' must be a non-empty list"),
+        ({"choices": ["not-an-object"]}, "chat response choice must be an object"),
+        ({"choices": [{"message": "not-an-object"}]}, "chat response message must be an object"),
+        (
+            {"choices": [{"message": {"audio": "not-an-object"}}]},
+            "chat response audio must be an object",
+        ),
+        (
+            {"choices": [{"message": {"audio": {"data": 123}}}]},
+            "chat response audio.data must be a string",
+        ),
+    ],
+)
+async def test_openai_chat_audio_rejects_invalid_chat_response_shapes(
+    monkeypatch,
+    chat_payload,
+    expected_error,
+):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"id": "gpt-4o-audio-preview"}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+        def stream(self, *_args, **_kwargs):
+            return _FakeHTTPStream(chat_payload)
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(
+        extended_tools._OpenAICompatibleAudioProviderBlocker,
+        match=expected_error,
+    ):
+        await extended_tools._openai_compatible_chat_audio_bytes(
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            model="openai/gpt-4o-mini-tts",
+            prompt="Narrate this line",
+            voice="alloy",
+            audio_format="wav",
+        )
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_audio_rejects_oversized_content_length_before_read(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"id": "gpt-4o-audio-preview"}]}
+
+    response_limit = extended_tools._MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_RESPONSE_BYTES
+    stream_response = _FakeHTTPStream(
+        body=b"must not be read",
+        headers={"Content-Length": str(response_limit + 1)},
+    )
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+        def stream(self, *_args, **_kwargs):
+            return stream_response
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(
+        extended_tools._OpenAICompatibleAudioProviderBlocker,
+        match=rf"response Content-Length exceeded the {response_limit}-byte limit",
+    ):
+        await extended_tools._openai_compatible_chat_audio_bytes(
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            model="openai/gpt-4o-mini-tts",
+            prompt="Narrate this line",
+            voice="alloy",
+            audio_format="wav",
+        )
+
+    assert stream_response.iterated is False
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_audio_rejects_stream_when_incremental_cap_is_exceeded(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"id": "gpt-4o-audio-preview"}]}
+
+    stream_response = _FakeHTTPStream(chunks=[b"1234", b"56789", b"must-not-be-read"])
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+        def stream(self, *_args, **_kwargs):
+            return stream_response
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(extended_tools, "_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_RESPONSE_BYTES", 8)
+
+    with pytest.raises(
+        extended_tools._OpenAICompatibleAudioProviderBlocker,
+        match="response exceeded the 8-byte limit while streaming",
+    ):
+        await extended_tools._openai_compatible_chat_audio_bytes(
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            model="openai/gpt-4o-mini-tts",
+            prompt="Narrate this line",
+            voice="alloy",
+            audio_format="wav",
+        )
+
+    assert stream_response.chunks_yielded == 2
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_audio_rejects_invalid_base64(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse({"data": [{"id": "gpt-4o-audio-preview"}]})
+
+        def stream(self, *_args, **_kwargs):
+            return _FakeHTTPStream({"choices": [{"message": {"audio": {"data": "%%%"}}}]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(
+        extended_tools._OpenAICompatibleAudioProviderBlocker,
+        match="invalid base64 audio data",
+    ):
+        await extended_tools._openai_compatible_chat_audio_bytes(
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            model="openai/gpt-4o-mini-tts",
+            prompt="Narrate this line",
+            voice="alloy",
+            audio_format="wav",
+        )
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_audio_rejects_oversized_decoded_audio(monkeypatch):
+    assert extended_tools._MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES == 50 * 1024 * 1024
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse({"data": [{"id": "gpt-4o-audio-preview"}]})
+
+        def stream(self, *_args, **_kwargs):
+            oversized = base64.b64encode(b"x" * 9).decode("ascii")
+            return _FakeHTTPStream({"choices": [{"message": {"audio": {"data": oversized}}}]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(extended_tools, "_MAX_OPENAI_COMPATIBLE_CHAT_AUDIO_BYTES", 8)
+
+    with pytest.raises(
+        extended_tools._OpenAICompatibleAudioProviderBlocker,
+        match="exceeded the 8-byte limit",
+    ):
+        await extended_tools._openai_compatible_chat_audio_bytes(
+            api_key="sk-relay-key",
+            base_url="https://apitokengate.com/v1",
+            model="openai/gpt-4o-mini-tts",
+            prompt="Narrate this line",
+            voice="alloy",
+            audio_format="wav",
+        )
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_audio_missing_data_returns_error_without_artifact(monkeypatch):
+    saved = False
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse({"data": [{"id": "gpt-4o-audio-preview"}]})
+
+        def stream(self, *_args, **_kwargs):
+            return _FakeHTTPStream({"choices": [{"message": {"content": "No audio available"}}]})
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-relay-key", "https://apitokengate.com/v1", True
+
+    async def fake_openai_speech_bytes(**_kwargs):
+        raise extended_tools._OpenAICompatibleSpeechEndpointUnavailable(
+            "OpenAI-compatible speech generation failed (404): Not Found"
+        )
+
+    async def fake_save_audio(**_kwargs):  # pragma: no cover - should not be called
+        nonlocal saved
+        saved = True
+        return "/api/v1/fs/entity/audio/narration.mp3"
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "provider_blocker"
+    assert "did not include audio data" in result["error"]
+    assert saved is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid_wav", "expected_error"),
+    [
+        (b"RIFF", "too short to be a WAV file"),
+        (_test_pcm_wav([]), "zero audio frames"),
+        (_test_pcm_wav([0, 0, 0, 0]), "digital silence"),
+    ],
+)
+async def test_openai_chat_audio_invalid_wav_blocks_artifact_save(
+    monkeypatch,
+    invalid_wav,
+    expected_error,
+):
+    saved = False
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/gpt-4o-mini-tts", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-relay-key", "https://apitokengate.com/v1", True
+
+    async def fake_openai_speech_bytes(**_kwargs):
+        raise extended_tools._OpenAICompatibleSpeechEndpointUnavailable(
+            "OpenAI-compatible speech generation failed (404): 404 page not found"
+        )
+
+    async def fake_chat_audio_bytes(**kwargs):
+        assert kwargs["audio_format"] == "wav"
+        return invalid_wav
+
+    async def fake_save_audio(**_kwargs):  # pragma: no cover - should not be called
+        nonlocal saved
+        saved = True
+        return "/api/v1/fs/entity/audio/narration.wav"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_openai_compatible_chat_audio_bytes", fake_chat_audio_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Narrate this line",
+            purpose="narration",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "provider_blocker"
+    assert expected_error in result["error"]
+    assert saved is False
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ import EmptyState from "../components/ui/EmptyState";
 import StatusBadge from "../components/ui/StatusBadge";
 import Button from "../components/ui/Button";
 import AiEditButton from "../components/ui/AiEditButton";
+import { PageHeaderTitle } from "../components/ui/PageHeader";
 import { IconArrowLeft, IconEdit, IconDownload, IconClose, IconDocument, IconPlus, IconShare, IconInfo, IconText, IconSignature, IconTrash, IconCheck, IconUndo, IconRedo, IconHighlighter, IconPenLine, IconEraser, IconCopy, IconRefresh, IconComment } from "../components/icons";
 import CommentThread from "../components/CommentThread";
 import {
@@ -170,38 +171,60 @@ function contentTextAnchor(content: string, selectedText: string, mode: string):
   };
 }
 
+function viewerSelectionRange(surface: HTMLElement): Range | null {
+  try {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+
+    const anchorNode = selection.anchorNode;
+    const focusNode = selection.focusNode;
+    if ((anchorNode && !surface.contains(anchorNode)) || (focusNode && !surface.contains(focusNode))) {
+      return null;
+    }
+
+    const range = selection.getRangeAt(0);
+    if (range.collapsed || !surface.contains(range.commonAncestorContainer)) return null;
+    return range;
+  } catch {
+    // Browser selections can briefly point at detached nodes while React rerenders.
+    return null;
+  }
+}
+
 function viewerSelectionAnchor(
   surface: HTMLElement | null,
   doc: Document | null,
   category: FileCategory,
   content: string,
 ): CommentAnchor | null {
-  const selection = window.getSelection();
-  if (!surface || !selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+  if (!surface) return null;
+  try {
+    const range = viewerSelectionRange(surface);
+    if (!range) return null;
 
-  const range = selection.getRangeAt(0);
-  if (!surface.contains(range.commonAncestorContainer)) return null;
+    const rawText = range.toString();
+    const quote = trimCommentQuote(rawText);
+    if (!quote) return null;
 
-  const rawText = range.toString();
-  const quote = trimCommentQuote(rawText);
-  if (!quote) return null;
+    if (["text", "code", "json", "csv"].includes(category)) {
+      return contentTextAnchor(content, rawText, category) || {
+        type: "text_selection",
+        mode: category,
+        label: t("component.comment_thread.selected_text"),
+        quote,
+      };
+    }
 
-  if (["text", "code", "json", "csv"].includes(category)) {
-    return contentTextAnchor(content, rawText, category) || {
-      type: "text_selection",
+    return {
+      type: "viewer_selection",
       mode: category,
+      source: doc?.name,
       label: t("component.comment_thread.selected_text"),
       quote,
     };
+  } catch {
+    return null;
   }
-
-  return {
-    type: "viewer_selection",
-    mode: category,
-    source: doc?.name,
-    label: t("component.comment_thread.selected_text"),
-    quote,
-  };
 }
 
 function flattenCommentTree(comments: Comment[]): Comment[] {
@@ -318,9 +341,20 @@ function quoteAnchoredComments(comments: Comment[]): Comment[] {
 
 function unwrapDocumentCommentMarks(root: HTMLElement) {
   root.querySelectorAll(".document-comment-mark").forEach((mark) => {
-    mark.replaceWith(document.createTextNode(mark.textContent || ""));
+    const parent = mark.parentNode;
+    if (!parent || !root.contains(mark)) return;
+    try {
+      parent.replaceChild(document.createTextNode(mark.textContent || ""), mark);
+    } catch {
+      // Comment marks are a view-only overlay. If React has already refreshed the
+      // preview tree, skip the stale node instead of crashing the viewer route.
+    }
   });
-  root.normalize();
+  try {
+    root.normalize();
+  } catch {
+    // Best effort only; the next render will rebuild marks from comment anchors.
+  }
 }
 
 function commentSearchParts(value: string): string[] {
@@ -453,6 +487,8 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
   });
 
   segmentsByNode.forEach((nodeSegments, node) => {
+    const parent = node.parentNode;
+    if (!parent || !root.contains(node)) return;
     const text = node.textContent || "";
     const fragment = document.createDocumentFragment();
     let cursor = 0;
@@ -469,8 +505,25 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
         cursor = segment.end;
       });
     if (cursor < text.length) fragment.append(document.createTextNode(text.slice(cursor)));
-    node.replaceWith(fragment);
+    try {
+      if (node.parentNode === parent && root.contains(node)) {
+        parent.replaceChild(fragment, node);
+      }
+    } catch {
+      // Quote highlighting is decorative. Stale TextNodes can appear while the
+      // markdown preview rerenders, so never let this take down the file viewer.
+    }
   });
+}
+
+async function readDocumentTextViaDownload(docId: string): Promise<string> {
+  const url = await api.documents.download(docId);
+  try {
+    const response = await fetch(url);
+    return await response.text();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 function encodeFsPath(path: string): string {
@@ -4255,7 +4308,7 @@ function PptxViewJsViewer({ url, onDownload }: { url: string; onDownload: () => 
 }
 
 // ── PPTX viewer ──
-function PptxViewer({ url, docId }: { url: string; docId?: string }) {
+function PptxViewer({ url, docId, onDownload }: { url: string; docId?: string; onDownload: () => void }) {
   const [slides, setSlides] = useState<PptxSlide[]>([]);
   const [slideImageUrls, setSlideImageUrls] = useState<string[]>([]);
   const [activeSlide, setActiveSlide] = useState(0);
@@ -4330,7 +4383,7 @@ function PptxViewer({ url, docId }: { url: string; docId?: string }) {
   }, [url, docId]);
 
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 64 }}><LoadingSpinner size={28} /></div>;
-  if (error) return <p style={{ color: "#c14a44", textAlign: "center", padding: 32 }}>{error}</p>;
+  if (error) return <PreviewDownloadFallback message={error} onDownload={onDownload} />;
 
   const totalSlides = renderMode === "server" ? slideImageUrls.length : slides.length;
   if (totalSlides === 0) return <p style={{ color: "#78716c", textAlign: "center", padding: 32 }}>{t("page.file_viewer.empty_presentation")}</p>;
@@ -4888,26 +4941,15 @@ function AccessLogSection({ docId }: { docId: string }) {
 function MarkdownViewer({
   content,
   commentRanges = [],
-  commentAnchors = [],
   activeCommentId,
   onSelectCommentId,
 }: {
   content: string;
   commentRanges?: CommentTextRange[];
-  commentAnchors?: Comment[];
   activeCommentId?: string | null;
   onSelectCommentId?: (commentId: string) => void;
 }) {
   const sourceLike = useMemo(() => looksLikeScriptMarkdown(content), [content]);
-  const previewRef = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    if (sourceLike) return;
-    const root = previewRef.current;
-    if (!root) return;
-    unwrapDocumentCommentMarks(root);
-    markQuoteCommentsInElement(root, quoteAnchoredComments(commentAnchors), activeCommentId);
-  }, [activeCommentId, commentAnchors, content, sourceLike]);
 
   if (sourceLike) {
     return (
@@ -4926,15 +4968,7 @@ function MarkdownViewer({
   return (
     <div className="markdown-viewer-stage">
       <article
-        ref={previewRef}
         className="md-preview markdown-viewer-page"
-        onClick={(event) => {
-          const target = event.target instanceof HTMLElement
-            ? event.target.closest<HTMLElement>(".document-comment-mark")
-            : null;
-          const commentId = target?.dataset.commentId;
-          if (commentId) onSelectCommentId?.(commentId);
-        }}
       >
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
@@ -5608,6 +5642,7 @@ export default function FileViewer() {
   const [downloadUrl, setDownloadUrl] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [previewError, setPreviewError] = useState("");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [commentAnchor, setCommentAnchor] = useState<CommentAnchor | null>(null);
@@ -5685,42 +5720,63 @@ export default function FileViewer() {
   const restrictDownload =
     doc?.classification === "restricted" ||
     (doc?.quarantine_status && doc.quarantine_status !== "clean");
-  const bannerReason: "legal_hold" | "quarantine" | "pii" | null =
-    doc?.legal_hold
-      ? "legal_hold"
-      : doc?.quarantine_status && doc.quarantine_status !== "clean"
-        ? "quarantine"
-        : doc?.pii_detected && doc?.classification === "confidential"
-          ? "pii"
-          : null;
+  const bannerReason: "quarantine" | "pii" | null =
+    doc?.quarantine_status && doc.quarantine_status !== "clean"
+      ? "quarantine"
+      : doc?.pii_detected && doc?.classification === "confidential"
+        ? "pii"
+        : null;
 
   const fetchDoc = useCallback(async () => {
     if (!docId) return;
     setLoading(true);
     setError("");
+    setPreviewError("");
     try {
       const meta = await api.documents.get(docId);
       setDoc(meta);
 
       const cat = detectCategory(meta);
       if (["text", "markdown", "code", "html", "csv", "json"].includes(cat)) {
-        const res = await api.documents.getContent(docId);
-        setContent(typeof res === "string" ? res : res.content);
+        try {
+          const res = await api.documents.getContent(docId);
+          setContent(typeof res === "string" ? res : res.content);
+        } catch (contentErr) {
+          try {
+            setContent(await readDocumentTextViaDownload(docId));
+          } catch {
+            setContent("");
+            setPreviewError(
+              contentErr instanceof Error
+                ? contentErr.message
+                : "This document exists, but its text content is not available yet.",
+            );
+          }
+        }
       }
 
       if (["image", "video", "audio", "pdf", "docx", "xlsx", "pptx"].includes(cat)) {
         // For video/audio, prefer streaming URL (avoids downloading entire file into memory)
-        if (["video", "audio"].includes(cat)) {
-          const streamUrl = api.documents.streamUrl(meta);
-          if (streamUrl) {
-            setDownloadUrl(streamUrl);
+        try {
+          if (["video", "audio"].includes(cat)) {
+            const streamUrl = api.documents.streamUrl(meta);
+            if (streamUrl) {
+              setDownloadUrl(streamUrl);
+            } else {
+              const url = await api.documents.download(docId);
+              setDownloadUrl(url);
+            }
           } else {
             const url = await api.documents.download(docId);
             setDownloadUrl(url);
           }
-        } else {
-          const url = await api.documents.download(docId);
-          setDownloadUrl(url);
+        } catch (downloadErr) {
+          setDownloadUrl("");
+          setPreviewError(
+            downloadErr instanceof Error
+              ? downloadErr.message
+              : "This document exists, but its file preview is not available yet.",
+          );
         }
       }
     } catch (err: any) {
@@ -5911,9 +5967,7 @@ export default function FileViewer() {
             <IconArrowLeft size={16} className="text-stone-600" />
           </button>
           <div style={{ minWidth: 0 }}>
-            <h1 className="manor-editor-title">
-              {doc?.name || t("page.file_viewer.document")}
-            </h1>
+            <PageHeaderTitle>{doc?.name || t("page.file_viewer.document")}</PageHeaderTitle>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
               <StatusBadge type={categoryBadgeType(category)}>{categoryLabel(category)}</StatusBadge>
               {doc?.file_size != null && (
@@ -6026,14 +6080,7 @@ export default function FileViewer() {
           For legal hold with a reason we use the dedicated i18n key; otherwise
           let PermissionBanner pick its own default message per reason. */}
       {bannerReason && (
-        <PermissionBanner
-          reason={bannerReason}
-          message={
-            bannerReason === "legal_hold" && doc?.legal_hold_reason
-              ? t("permissions.banner.legal_hold_with_reason", { reason: doc.legal_hold_reason })
-              : undefined
-          }
-        />
+        <PermissionBanner reason={bannerReason} />
       )}
 
       {/* Content + Details drawer */}
@@ -6041,6 +6088,9 @@ export default function FileViewer() {
         <div
           ref={viewerSurfaceRef}
           className="glass-panel manor-editor-viewer-surface"
+          data-selection-context="knowledge"
+          data-selection-source-label={doc?.name || "Knowledge Base"}
+          data-selection-source-path={`${location.pathname}${location.search}`}
           onMouseUp={captureCommentSelection}
           onKeyUp={captureCommentSelection}
           onContextMenu={(e) => {
@@ -6057,7 +6107,17 @@ export default function FileViewer() {
             density={watermarkDensity}
           />
         )}
-        {category === "text" && (
+        {previewError && (
+          <div style={{ padding: "64px 0" }}>
+            <EmptyState
+              icon={<IconDocument size={32} className="text-stone-400" />}
+              title={t("page.file_viewer.preview_not_available")}
+              description={previewError}
+              action={<Button variant="outline" onClick={fetchDoc}>{t("component.chat_message_actions.retry")}</Button>}
+            />
+          </div>
+        )}
+        {!previewError && category === "text" && (
           <TextViewer
             content={content}
             commentRanges={viewerCommentRanges}
@@ -6066,21 +6126,20 @@ export default function FileViewer() {
           />
         )}
 
-        {category === "markdown" && (
+        {!previewError && category === "markdown" && (
           <MarkdownViewer
             content={content}
             commentRanges={viewerCommentRanges}
-            commentAnchors={viewerAnchoredComments}
             activeCommentId={activeCommentId}
             onSelectCommentId={handleSelectViewerCommentId}
           />
         )}
 
-        {category === "html" && (
+        {!previewError && category === "html" && (
           <HtmlViewer content={content} doc={doc} />
         )}
 
-        {category === "code" && (
+        {!previewError && category === "code" && (
           <pre className="file-viewer-plain-code">
             <code>
               {renderCommentMarkedText(content, viewerCommentRanges, activeCommentId, handleSelectViewerCommentId)}
@@ -6088,7 +6147,7 @@ export default function FileViewer() {
           </pre>
         )}
 
-        {category === "image" && downloadUrl && (
+        {!previewError && category === "image" && downloadUrl && (
           <ImageEditor
             url={downloadUrl}
             docId={docId}
@@ -6100,7 +6159,7 @@ export default function FileViewer() {
           />
         )}
 
-        {category === "video" && downloadUrl && (
+        {!previewError && category === "video" && downloadUrl && (
           <div className="manor-editor-media-stage">
             <video
               src={downloadUrl}
@@ -6110,7 +6169,7 @@ export default function FileViewer() {
           </div>
         )}
 
-        {category === "audio" && downloadUrl && (
+        {!previewError && category === "audio" && downloadUrl && (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 24, padding: "48px 0" }}>
             <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ color: "#9079c2" }}><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
             <audio src={downloadUrl} controls style={{ width: "100%", maxWidth: 480 }} />
@@ -6118,7 +6177,7 @@ export default function FileViewer() {
           </div>
         )}
 
-        {category === "pdf" && (
+        {!previewError && category === "pdf" && (
           <div className="manor-editor-pdf-viewer-host">
             {downloadUrl ? (
               <PdfJsViewer
@@ -6139,7 +6198,7 @@ export default function FileViewer() {
           </div>
         )}
 
-        {category === "docx" && downloadUrl && (
+        {!previewError && category === "docx" && downloadUrl && (
           <DocxViewer
             url={downloadUrl}
             commentAnchors={viewerAnchoredComments}
@@ -6148,13 +6207,13 @@ export default function FileViewer() {
           />
         )}
 
-        {category === "xlsx" && downloadUrl && <XlsxViewer url={downloadUrl} />}
+        {!previewError && category === "xlsx" && downloadUrl && <XlsxViewer url={downloadUrl} />}
 
-        {category === "pptx" && (
-          downloadUrl && <PptxViewJsViewer url={downloadUrl} onDownload={handleDownload} />
+        {!previewError && category === "pptx" && (
+          downloadUrl && <PptxViewer url={downloadUrl} docId={docId} onDownload={handleDownload} />
         )}
 
-        {category === "csv" && content && (() => {
+        {!previewError && category === "csv" && content && (() => {
           const rows = parseCSV(content);
           if (rows.length === 0) return <p style={{ color: "#78716c" }}>{t("page.file_viewer.empty_csv_file")}</p>;
           const header = rows[0];
@@ -6175,7 +6234,7 @@ export default function FileViewer() {
           );
         })()}
 
-        {category === "json" && (
+        {!previewError && category === "json" && (
           <pre className="file-viewer-plain-code">
             <code>
               {renderCommentMarkedText(content, viewerCommentRanges, activeCommentId, handleSelectViewerCommentId)}
@@ -6183,7 +6242,7 @@ export default function FileViewer() {
           </pre>
         )}
 
-        {category === "unsupported" && (
+        {!previewError && category === "unsupported" && (
           <div style={{ padding: "64px 0" }}>
             <EmptyState
               icon={<IconDocument size={32} className="text-stone-400" />}
@@ -6294,13 +6353,6 @@ export default function FileViewer() {
               <span style={{ fontSize: 12, color: "#7c4a2e" }}>{doc.quarantine_status}</span>
             </DetailRow>
           )}
-          {doc.legal_hold && (
-            <DetailRow label={t("page.file_viewer.details.legal_hold")}>
-              <span style={{ fontSize: 12, color: "#76502c" }}>
-                {t("page.file_viewer.details.legal_hold_value")}{doc.legal_hold_reason ? ` · ${doc.legal_hold_reason}` : ""}
-              </span>
-            </DetailRow>
-          )}
 
           {canShareCurrentDoc && (
             <div style={{ borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 12 }}>
@@ -6335,6 +6387,13 @@ export default function FileViewer() {
           internalGrants={(grantsQuery.data || []).map((g) => _grantToInternalGrant(g, userById))}
           externalShares={(sharesQuery.data || []).map(_shareToExternalShare)}
           entityDomain={_entityDomain(currentUser?.email)}
+          onChangeVisibility={async (v) => {
+            // Same endpoint DocumentPropertiesDialog uses (manage_metadata-
+            // gated server-side). Keep the local doc snapshot in sync so a
+            // dialog reopen shows the new state without a refetch.
+            await api.permissionsV1.setVisibility(doc.id, v);
+            setDoc((prev) => (prev ? { ...prev, visibility: v } : prev));
+          }}
           onAddInternal={async (pick, role, opts) => {
             // Two paths:
             //   pick.kind="staff"          -> use staff.user_id directly

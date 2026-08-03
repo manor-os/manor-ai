@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manor AI Introduction"
+  short_description: "Public guide to Manor AI self-hosted features"
+  default_prompt: "Use $intro to explain a Manor AI OSS feature and guide an end user through it."

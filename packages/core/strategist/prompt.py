@@ -17,6 +17,7 @@ from packages.core.ai.runtime import (
     runtime_execute_strategist_completion,
     runtime_strategist_system_prompt,
     runtime_strategist_user_prompt,
+    runtime_strategist_user_prompt_v2,
     runtime_validation_retry_user_prompt,
 )
 from packages.core.strategist.context import StrategistContext
@@ -41,15 +42,30 @@ async def generate_proposal(
     *,
     review_id: str,
     db: Optional[AsyncSession] = None,
+    briefing_markdown: Optional[str] = None,
 ) -> Proposal:
-    """Single Claude call → validated Proposal, with one repair retry."""
+    """Single Claude call → validated Proposal, with one repair retry.
+
+    ``briefing_markdown`` (strategist_review_v2 only) swaps the legacy
+    context sections for the deterministic ReviewBriefing markdown (M5/M6).
+    ``None`` keeps the legacy prompt byte-identical.
+    """
     override = (ctx.strategist_template or {}).get("system_prompt_override")
     if isinstance(override, str) and override.strip():
         preamble = override
     else:
         preamble = await _load_skill_preamble(db, ctx.workspace.entity_id)
-    system_prompt = runtime_strategist_system_prompt(ctx, preamble=preamble)
-    user_prompt = runtime_strategist_user_prompt(ctx, review_id=review_id)
+    system_prompt = runtime_strategist_system_prompt(
+        ctx,
+        preamble=preamble,
+        briefing_mode=briefing_markdown is not None,
+    )
+    if briefing_markdown is None:
+        user_prompt = runtime_strategist_user_prompt(ctx, review_id=review_id)
+    else:
+        user_prompt = runtime_strategist_user_prompt_v2(
+            briefing_markdown, ctx, review_id=review_id,
+        )
 
     raw = await _safe_runtime_completion(ctx, system_prompt, user_prompt)
 

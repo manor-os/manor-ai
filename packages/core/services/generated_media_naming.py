@@ -6,12 +6,44 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+from packages.core.services.workspace_artifacts import (
+    WORKSPACE_FOLDER_ROOT,
+    WORKSPACE_STORAGE_SEGMENT,
+    workspace_artifact_storage_base,
+)
 
 
-WORKSPACE_ARTIFACT_ROOT = "Workspaces"
+WORKSPACE_ARTIFACT_ROOT = WORKSPACE_FOLDER_ROOT
 _PATH_SEGMENT_MAX_BYTES = 180
 _GENERATED_MEDIA_FILENAME_MAX_BYTES = 180
+
+#: Segment under a workspace's artifact root that groups output by the task
+#: that produced it. Without it, generated media lands in type buckets
+#: (images/ videos/ audio/) shared by every run the workspace ever made, and
+#: "which task produced this file" is unanswerable from the filesystem.
+TASK_ARTIFACT_SEGMENT = "tasks"
+
+
+def workspace_task_artifact_dir(
+    workspace_base_dir: str | None,
+    task_id: str | None,
+) -> str:
+    """Return the archive directory for one task's output.
+
+    Falls back to the workspace base when there is no task (ad-hoc chat
+    generation), so nothing loses its home.
+    """
+    base = _clean_rel_dir(workspace_base_dir or "")
+    if not base:
+        return base
+    # A task id is one identifier segment. Anything else (a path, traversal,
+    # punctuation) is not a task id — fall back to the workspace root rather
+    # than inventing a directory tree from it.
+    raw = str(task_id or "").strip()
+    task_segment = raw if raw.isalnum() else ""
+    if not task_segment:
+        return base
+    return _clean_rel_dir(f"{base}/{TASK_ARTIFACT_SEGMENT}/{task_segment}")
 
 
 @dataclass(frozen=True)
@@ -29,47 +61,56 @@ def build_workspace_artifact_base_dir(
     *,
     workspace_name: str | None = None,
     workspace_id: str | None = None,
+    artifact_folder_id: str | None = None,
 ) -> str:
-    """Return the visible Knowledge folder used for a workspace's artifacts."""
-    label = _clean_path_segment(workspace_name or "") or _clean_path_segment(_workspace_id_label(workspace_id))
-    return _clean_rel_dir(f"{WORKSPACE_ARTIFACT_ROOT}/{label or 'Workspace'}")
+    """Return the immutable physical folder used for workspace artifacts.
+
+    ``workspace_name`` and ``workspace_id`` remain accepted for call-site
+    compatibility, but storage identity is exclusively the DocumentFolder ID.
+    """
+    del workspace_name, workspace_id
+    return workspace_artifact_storage_base(artifact_folder_id)
 
 
 async def resolve_workspace_artifact_base_dir(
     *,
     entity_id: str | None,
     workspace_id: str | None,
+    task_id: str | None = None,
 ) -> str:
-    """Resolve ``Workspaces/<workspace name>`` for generated artifacts.
+    """Resolve the artifact base dir for generated output.
 
-    The helper is intentionally generic: it scopes any user-visible generated
-    artifact to its Workspace without making assumptions about product/domain.
+    ``Workspaces/_by_id/<folder id>`` scopes the artifact to its Workspace;
+    when ``task_id`` is known it is scoped one level further, to
+    ``.../tasks/<task id>``, so every file a task produced sits together and
+    the filesystem can answer "which task made this". A retry of the same
+    task resolves to the same directory, so intermediate artifacts from the
+    previous attempt are found in place instead of being regenerated.
     """
     workspace_id = (workspace_id or "").strip()
     if not workspace_id:
         return ""
 
-    workspace_name = ""
-    try:
-        from packages.core.database import async_session
-        from packages.core.models.workspace import Workspace
+    from sqlalchemy import select
 
-        async with async_session() as db:
-            stmt = select(Workspace).where(
-                Workspace.id == workspace_id,
-                Workspace.deleted_at.is_(None),
-            )
-            if entity_id:
-                stmt = stmt.where(Workspace.entity_id == entity_id)
-            workspace = (await db.execute(stmt.limit(1))).scalar_one_or_none()
-            workspace_name = str(getattr(workspace, "name", "") or "")
-    except Exception:
-        workspace_name = ""
+    from packages.core.database import async_session
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
 
-    return build_workspace_artifact_base_dir(
-        workspace_name=workspace_name,
-        workspace_id=workspace_id,
-    )
+    async with async_session() as db:
+        stmt = select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.deleted_at.is_(None),
+        )
+        if entity_id:
+            stmt = stmt.where(Workspace.entity_id == entity_id)
+        workspace = (await db.execute(stmt.with_for_update().limit(1))).scalar_one_or_none()
+        if workspace is None:
+            raise RuntimeError(f"Workspace artifact scope could not resolve workspace {workspace_id}")
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        await db.commit()
+        base = build_workspace_artifact_base_dir(artifact_folder_id=folder.id)
+        return workspace_task_artifact_dir(base, task_id)
 
 
 def workspace_artifact_default_dir(workspace_base_dir: str | None, default_dir: str) -> str:
@@ -92,7 +133,7 @@ def scope_workspace_artifact_path(
 
     ``preserve_leaf_default`` lets media filenames such as ``hero.png`` keep
     using the caller's default media directory, e.g.
-    ``Workspaces/<workspace>/images/hero.png``.
+    ``Workspaces/_by_id/<folder id>/images/hero.png``.
     """
     rel = _clean_rel_dir(path or "")
     workspace_base_dir = _clean_rel_dir(workspace_base_dir or "")
@@ -101,8 +142,16 @@ def scope_workspace_artifact_path(
 
     if rel == workspace_base_dir or rel.startswith(f"{workspace_base_dir}/"):
         return rel
-    if rel == WORKSPACE_ARTIFACT_ROOT or rel.startswith(f"{WORKSPACE_ARTIFACT_ROOT}/"):
-        return rel
+    if rel == WORKSPACE_ARTIFACT_ROOT:
+        return workspace_base_dir
+    if rel.startswith(f"{WORKSPACE_ARTIFACT_ROOT}/"):
+        legacy_parts = rel.split("/")
+        if len(legacy_parts) >= 3 and legacy_parts[1] == WORKSPACE_STORAGE_SEGMENT:
+            rel = "/".join(legacy_parts[3:])
+        else:
+            rel = "/".join(legacy_parts[2:])
+        if not rel:
+            return workspace_base_dir
     if preserve_leaf_default and "/" not in rel:
         return rel
 
@@ -287,10 +336,3 @@ def _dedupe_filename(directory: str, filename: str) -> str:
         candidate = f"{fitted_stem}{suffix}"
         index += 1
     return candidate
-
-
-def _workspace_id_label(workspace_id: str | None) -> str:
-    workspace_id = (workspace_id or "").strip()
-    if not workspace_id:
-        return ""
-    return f"workspace-{workspace_id[-8:]}"

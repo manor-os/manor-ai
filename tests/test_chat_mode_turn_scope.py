@@ -5,7 +5,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from packages.core.models.task import Message
-from packages.core.services.conversation_history import load_conversation_history
+from packages.core.services.conversation_history import (
+    COMPLETED_TOOL_ACTIVITY_FRAME,
+    load_conversation_history,
+)
 
 
 @pytest.mark.asyncio
@@ -97,8 +100,10 @@ async def test_new_hotel_ppt_request_does_not_replay_previous_job_search_tools(d
         latest_user_message="Writ a 5 pages hotel industry growth ppt / Slides",
     )
 
-    assert "Previous tool activity" not in history[1]["content"]
-    assert "Meta Senior Software Engineer" not in history[1]["content"]
+    # The most recent assistant turn's tool trace is kept as reusable context,
+    # but framed as completed so it is not replayed as active work.
+    assert COMPLETED_TOOL_ACTIVITY_FRAME in history[1]["content"]
+    assert "do not re-run" in history[1]["content"]
     assert history[-1]["content"] == "Writ a 5 pages hotel industry growth ppt / Slides"
 
 
@@ -158,5 +163,63 @@ async def test_new_turn_does_not_replay_previous_tool_activity_even_for_continue
         latest_user_message="继续上次的 job search",
     )
 
-    assert "Previous tool activity" not in history[0]["content"]
-    assert "Meta careers Senior Software Engineer" not in history[0]["content"]
+    # Kept (it is the latest assistant turn) but explicitly marked completed
+    # so "继续" cannot be read as re-running the finished search.
+    assert COMPLETED_TOOL_ACTIVITY_FRAME in history[0]["content"]
+    assert "Meta careers Senior Software Engineer" in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_older_tool_activity_is_still_dropped_on_new_turn(db_session):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db_session.add_all(
+        [
+            Message(
+                id="msg_old_tool_assistant",
+                conversation_id="conv_two_turn_scope",
+                role="assistant",
+                content="Searched jobs.",
+                created_at=start,
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "arguments": {"query": "old stale search"},
+                        "result": "stale search result payload",
+                    }
+                ],
+            ),
+            Message(
+                id="msg_mid_user",
+                conversation_id="conv_two_turn_scope",
+                role="user",
+                content="thanks",
+                created_at=start + timedelta(seconds=1),
+            ),
+            Message(
+                id="msg_new_tool_assistant",
+                conversation_id="conv_two_turn_scope",
+                role="assistant",
+                content="Listed the files.",
+                created_at=start + timedelta(seconds=2),
+                tool_calls=[
+                    {
+                        "name": "list_files",
+                        "arguments": {"path": ""},
+                        "result": "fresh file listing payload",
+                    }
+                ],
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    history = await load_conversation_history(
+        db_session,
+        "conv_two_turn_scope",
+        latest_user_message="move them into folders",
+    )
+
+    old_entry = next(h for h in history if "Searched jobs." in h["content"])
+    new_entry = next(h for h in history if "Listed the files." in h["content"])
+    assert "stale search result payload" not in old_entry["content"]
+    assert COMPLETED_TOOL_ACTIVITY_FRAME in new_entry["content"]

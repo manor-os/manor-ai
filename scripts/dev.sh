@@ -24,7 +24,12 @@ case "$MODE" in
     echo -e "${BLUE}Starting Celery worker + beat...${NC}"
     # -B embeds Celery Beat so scheduler.tick fires every 60s. Without
     # this, ScheduledJob rows never dispatch in local dev.
-    PYTHONPATH=. celery -A packages.core.celery_app worker -B -l info -c 2
+    #
+    # -Q lists BOTH declared queues (packages/core/queues.py). The deploy runs
+    # one worker per role; local dev keeps a single process, and without this
+    # it would consume only the default (control) queue and no plan step would
+    # ever execute.
+    PYTHONPATH=. celery -A packages.core.celery_app worker -B -l info -c 2 -Q celery,work
     ;;
   infra)
     echo -e "${BLUE}Starting infrastructure (postgres, redis, minio)...${NC}"
