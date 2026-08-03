@@ -178,6 +178,146 @@ def test_classify_tolerates_missing_and_malformed_input():
     assert classify_execution_error({"message": None}) is None
 
 
+# ── 生产真实失败样本 → 签名表 ───────────────────────────────────────
+#
+# 下面每一条都是线上 433 条失败步骤里数出来的原文,不是编的。
+# 签名表只能长在观测过的失败上,所以测试也只断言观测过的原文。
+
+def _llm_provider_failure(detail: str) -> dict:
+    """线上 55 条里那条误导性原文的真实形状。
+
+    ``_llm_call_failed_result``(packages/core/ai/agentic_loop.py)对**任何**
+    provider 失败都套这段话,包括真正的 401。这正是它不能被当作匹配依据的
+    原因 —— 见下面的 401/403 用例。
+    """
+    return {
+        "type": "StepResultFailed",
+        "message": (
+            "subagent stopped with error: Sorry, the request failed before "
+            "the model could respond. Please check the selected model and "
+            "API key configuration.\n\n"
+            f"Error detail: {detail}"
+        ),
+    }
+
+
+@pytest.mark.parametrize("detail", [
+    "HTTP 503: Service temporarily unavailab",   # 线上 ×29(原文即在此截断)
+    "HTTP 524: <html>origin timed out</html>",   # 线上 ×23
+    "HTTP 502: Bad Gateway",                     # 线上 ×1
+])
+def test_upstream_provider_outage_says_it_is_not_your_api_key(detail):
+    """最高频的那一类:上游挂了,消息却让用户去查自己的 API key。
+
+    卡片必须反过来说 —— 不是你的配置问题,Manor 自己在重试。
+    """
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    hint = classify_execution_error(_llm_provider_failure(detail))
+    assert hint is not None, f"{detail} 是上游故障,必须被认出来"
+    assert hint.is_transient is True, "上游抖动不该烧重试额度、也不该弹卡片"
+    assert "API key" in hint.what_happened, (
+        "这条签名存在的全部意义就是明说「不是你的 API key」"
+    )
+    assert "not" in hint.what_happened.lower()
+    # 用户此刻无事可做,别给他一个点了也没用的链接。
+    assert hint.action_link is None
+
+
+def test_service_temporarily_unavailable_wording_also_matches():
+    """503 的正文措辞,状态码被截掉时的兜底。"""
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    hint = classify_execution_error(
+        _llm_provider_failure("Service is temporarily unavailable, please retry")
+    )
+    assert hint is not None and hint.is_transient is True
+
+
+@pytest.mark.parametrize("detail", [
+    "HTTP 401: invalid x-api-key",
+    "HTTP 401: Incorrect API key provided",
+    "HTTP 403: permission denied for this key",
+])
+def test_real_auth_failure_is_not_swallowed_by_the_outage_signature(detail):
+    """遮蔽风险的正面测试。
+
+    401/403 套的是**同一段**误导性原文。如果上游故障那条签名去匹配那段
+    话,真正的密钥问题就会被判成瞬时失败,静默重试到超时,用户永远看不到
+    「你的密钥不对」。所以它只认状态码,不认措辞 —— 401/403 必须落到
+    None,退回原文;而对它们来说,「去查 API key」这句话恰好是对的。
+    """
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    assert classify_execution_error(_llm_provider_failure(detail)) is None
+
+
+def test_a_bare_503_from_somewhere_else_is_not_claimed():
+    """光有状态码不算数 —— 子代理抓的某个网页返回 503,不是模型挂了。"""
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    assert classify_execution_error({
+        "type": "StepResultFailed",
+        "message": "fetch https://example.com returned HTTP 503",
+    }) is None
+
+
+def test_integration_access_denied_points_at_reconnecting_the_app():
+    """线上 ×1:第三方应用把调用挡回来了。用户唯一能做的是重新授权。"""
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    hint = classify_execution_error({
+        "type": "StepResultFailed",
+        "message": (
+            "FINAL STATE: BLOCKED — Unable to check duplicate status because "
+            "mcp__linkedin__list_organizations returned ACCESS_DENIED for the "
+            "company page"
+        ),
+    })
+    assert hint is not None
+    assert hint.is_transient is False, "权限没给,重试一万次也还是没给"
+    assert hint.action_link == "/integrations"
+    assert "reconnect" in hint.action_to_take.lower()
+    # 文案里不能出现内部标识符。
+    assert "mcp__" not in hint.what_happened + hint.action_to_take
+
+
+def test_lowercase_access_denied_prose_is_not_claimed():
+    """自由文本里的 access denied 什么都可能是;只认大写错误码。"""
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    assert classify_execution_error({
+        "type": "StepResultFailed",
+        "message": "the site said access denied when we tried to log in",
+    }) is None
+
+
+
+
+
+
+def test_no_new_signature_shadows_another():
+    """每条生产原文只能命中「自己那条」。表是顺序匹配的,这条用例是
+    它唯一的护栏。"""
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    seen: dict[int, str] = {}
+    samples = {
+        "outage": _llm_provider_failure("HTTP 503: Service temporarily unavailab"),
+        "access_denied": {
+            "type": "StepResultFailed",
+            "message": "tool returned ACCESS_DENIED for the company page",
+        },
+    }
+    for label, error in samples.items():
+        hint = classify_execution_error(error)
+        assert hint is not None, label
+        assert id(hint) not in seen, (
+            f"{label} 命中了 {seen.get(id(hint))} 的签名 —— 顺序把它遮住了"
+        )
+        seen[id(hint)] = label
+
+
 
 
 @pytest.mark.asyncio
