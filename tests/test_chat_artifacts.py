@@ -54,6 +54,9 @@ def test_chat_attachments_from_generated_media_tool_results():
             "name": "hero.png",
             "id": "doc_img",
             "type": "knowledge",
+            "open_url": "/viewer/doc_img",
+            "markdown_link": "[hero.png](/viewer/doc_img)",
+            "fs_path": "images/hero.png",
             "fileType": "png",
             "mimeType": "image/png",
             "previewUrl": "/api/v1/fs/ent/images/hero.png",
@@ -62,6 +65,9 @@ def test_chat_attachments_from_generated_media_tool_results():
             "name": "intro.mp4",
             "id": "doc_vid",
             "type": "knowledge",
+            "open_url": "/viewer/doc_vid",
+            "markdown_link": "[intro.mp4](/viewer/doc_vid)",
+            "fs_path": "videos/intro.mp4",
             "fileType": "mp4",
             "mimeType": "video/mp4",
             "previewUrl": "/api/v1/fs/ent/videos/intro.mp4",
@@ -70,6 +76,9 @@ def test_chat_attachments_from_generated_media_tool_results():
             "name": "brief.pdf",
             "id": "doc_pdf",
             "type": "knowledge",
+            "open_url": "/viewer/doc_pdf",
+            "markdown_link": "[brief.pdf](/viewer/doc_pdf)",
+            "fs_path": "documents/brief.pdf",
             "fileType": "pdf",
             "mimeType": "application/pdf",
             "previewUrl": "/api/v1/fs/ent/documents/brief.pdf",
@@ -105,6 +114,9 @@ def test_chat_attachments_from_generated_code_bundle_files():
             "name": "index.html",
             "id": "doc_html",
             "type": "knowledge",
+            "open_url": "/viewer/doc_html",
+            "markdown_link": "[index.html](/viewer/doc_html)",
+            "fs_path": "code/site/index.html",
             "fileType": "html",
             "mimeType": "text/html",
             "previewUrl": "/api/v1/fs/ent/code/site/index.html",
@@ -113,6 +125,9 @@ def test_chat_attachments_from_generated_code_bundle_files():
             "name": "styles.css",
             "id": "doc_css",
             "type": "knowledge",
+            "open_url": "/viewer/doc_css",
+            "markdown_link": "[styles.css](/viewer/doc_css)",
+            "fs_path": "code/site/styles.css",
             "fileType": "css",
             "mimeType": "text/css",
             "previewUrl": "/api/v1/fs/ent/code/site/styles.css",
@@ -181,6 +196,9 @@ def test_sandbox_save_result_can_opt_into_final_chat_attachment():
             "name": "final-report.pdf",
             "id": "doc_pdf",
             "type": "knowledge",
+            "open_url": "/viewer/doc_pdf",
+            "markdown_link": "[final-report.pdf](/viewer/doc_pdf)",
+            "fs_path": "reports/final-report.pdf",
             "fileType": "pdf",
             "mimeType": "application/pdf",
             "previewUrl": "/api/v1/fs/ent/reports/final-report.pdf",
@@ -188,7 +206,7 @@ def test_sandbox_save_result_can_opt_into_final_chat_attachment():
     ]
 
 
-def test_chat_attachments_ignore_document_id_without_filesystem_reference():
+def test_chat_attachments_open_document_id_without_filesystem_reference():
     tool_results = [
         {
             "name": "generate_file",
@@ -204,10 +222,20 @@ def test_chat_attachments_ignore_document_id_without_filesystem_reference():
         }
     ]
 
-    assert chat_attachments_from_tool_results(tool_results) == []
+    assert chat_attachments_from_tool_results(tool_results) == [
+        {
+            "name": "draft.pdf",
+            "id": "doc_pdf",
+            "type": "knowledge",
+            "open_url": "/viewer/doc_pdf",
+            "markdown_link": "[draft.pdf](/viewer/doc_pdf)",
+            "fileType": "pdf",
+            "mimeType": "application/pdf",
+        }
+    ]
 
 
-def test_chat_attachments_ignore_external_url_without_filesystem_reference():
+def test_chat_attachments_open_external_url_without_filesystem_reference():
     tool_results = [
         {
             "name": "generate_file",
@@ -223,7 +251,17 @@ def test_chat_attachments_ignore_external_url_without_filesystem_reference():
         }
     ]
 
-    assert chat_attachments_from_tool_results(tool_results) == []
+    assert chat_attachments_from_tool_results(tool_results) == [
+        {
+            "name": "remote.png",
+            "type": "file",
+            "open_url": "https://cdn.example.com/remote.png",
+            "markdown_link": "[remote.png](https://cdn.example.com/remote.png)",
+            "fileType": "png",
+            "mimeType": "image/png",
+            "previewUrl": "https://cdn.example.com/remote.png",
+        }
+    ]
 
 
 def test_chat_attachments_ignore_non_terminal_generated_files():

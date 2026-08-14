@@ -1,17 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueries,
+  useQueryClient,
+  type QueryKey,
+} from "@tanstack/react-query";
 import { api } from "../../lib/api";
 import { t } from "../../lib/i18n";
-import { IconStop } from "../icons";
+import { IconPause, IconStop } from "../icons";
 import ConfirmDialog from "../ui/ConfirmDialog";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import Select from "../ui/Select";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
 import WorkflowRunProgress from "./WorkflowRunProgress";
 import {
+  canCancelWorkflowRun,
   formatWorkflowError,
   isWorkflowRunActive,
   workflowRunStatusPresentation,
+  type WorkflowHistoryRun,
   type WorkflowRunAction,
   type WorkflowRunNode,
   type WorkflowRunStatus,
@@ -28,14 +36,15 @@ export interface WorkspaceWorkflowRunMessageRef {
 }
 
 export interface WorkspaceWorkflowRunMessage {
-  id: string;
+  id?: string;
   created_at?: string;
   updated_at?: string | null;
-  message_kind?: string;
+  message_kind?: string | null;
   refs?: WorkspaceWorkflowRunMessageRef[] | null;
   meta?: Record<string, unknown> | null;
   pending_action?: WorkflowRunAction | null;
   resolved_at?: string | null;
+  resolution?: Record<string, unknown> | null;
 }
 
 export interface WorkspaceWorkflowRunGroup {
@@ -67,6 +76,7 @@ const ACTIONABLE_RUN_STATUSES = new Set([
 ]);
 const ACTIONABLE_COMPLETED_OUTCOMES = new Set([
   "needs_input",
+  "revision_required",
 ]);
 const NODE_STATUSES = new Set([
   "pending",
@@ -86,6 +96,10 @@ function recordValue(value: unknown): Record<string, unknown> | null {
 
 function nonEmptyString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeWorkflowActionChoice(value: unknown): string {
+  return nonEmptyString(value).toLowerCase().replace(/[-\s]+/g, "_");
 }
 
 function normalizeWorkflowRunStatus(value: unknown): WorkflowRunStatus {
@@ -200,6 +214,7 @@ export function buildWorkspaceWorkflowRunGroups(
   }>();
 
   messages.forEach((message, index) => {
+    if (message.meta?.workflow_run_accessible === false) return;
     const runId = workflowRunIdForMessage(message);
     if (!runId) return;
     const ownsActivity = message.message_kind === "workflow_activity";
@@ -221,7 +236,7 @@ export function buildWorkspaceWorkflowRunGroups(
     };
     group.latestIndex = index;
     group.latestCreatedAt = message.created_at || group.latestCreatedAt;
-    group.ownedMessageIds.push(message.id);
+    if (message.id) group.ownedMessageIds.push(message.id);
     const projectionUpdatedAt = nonEmptyString(message.updated_at);
     if (
       projectionUpdatedAt
@@ -293,6 +308,126 @@ export function actionableWorkflowRunGroups(
     !dismissedRunIds.has(group.id)
     && isWorkspaceWorkflowRunActionable(group.projection)
   ));
+}
+
+export function suppressUnverifiedWorkflowRunGroups(
+  groups: WorkspaceWorkflowRunGroup[],
+  unverifiedRunIds: ReadonlySet<string>,
+): WorkspaceWorkflowRunGroup[] {
+  return excludeSupersededWorkflowRunGroups(groups).filter((group) => {
+    if (!unverifiedRunIds.has(group.id)) return true;
+    const status = nonEmptyString(group.projection.status).toLowerCase();
+    return status === "pending" || status === "running";
+  });
+}
+
+function workflowFamilyAttemptTimestamp(run: WorkflowHistoryRun): number {
+  for (const value of [run.started_at, run.created_at, run.updated_at]) {
+    const timestamp = Date.parse(value || "");
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return 0;
+}
+
+function latestWorkflowFamilyAttempt(
+  runs: WorkflowHistoryRun[],
+): WorkflowHistoryRun | null {
+  return [...runs].sort((left, right) => (
+    Number(right.attempt_number || 1) - Number(left.attempt_number || 1)
+    || workflowFamilyAttemptTimestamp(right) - workflowFamilyAttemptTimestamp(left)
+    || right.id.localeCompare(left.id)
+  ))[0] || null;
+}
+
+function resetProjectionNodesForRetry(
+  nodes: WorkflowRunNode[],
+  run: WorkflowHistoryRun,
+): WorkflowRunNode[] {
+  const currentNodeId = nonEmptyString(run.current_step_id);
+  const currentStatus = normalizeWorkflowRunStatus(run.status);
+  return nodes.map((node) => ({
+    ...node,
+    status: currentNodeId && node.id === currentNodeId ? currentStatus : "pending",
+    error: undefined,
+  }));
+}
+
+export function reconcileWorkspaceWorkflowRunGroups(
+  groups: WorkspaceWorkflowRunGroup[],
+  familyRunsByGroupId: Record<string, WorkflowHistoryRun[]>,
+): WorkspaceWorkflowRunGroup[] {
+  const reconciledByRunId = new Map<string, WorkspaceWorkflowRunGroup>();
+
+  // Family queries are keyed by retry leaves. Keep superseded ancestors out of
+  // reconciliation so an unqueried failed root cannot reappear after its
+  // family reconciles to a newer terminal attempt.
+  for (const group of excludeSupersededWorkflowRunGroups(groups)) {
+    const latestRun = latestWorkflowFamilyAttempt(familyRunsByGroupId[group.id] || []);
+    const runIdChanged = Boolean(latestRun && latestRun.id !== group.id);
+    const projection = latestRun
+      ? {
+          ...group.projection,
+          id: latestRun.id,
+          title: nonEmptyString(latestRun.workflow_name) || group.projection.title,
+          status: normalizeWorkflowRunStatus(latestRun.status),
+          nodes: runIdChanged
+            ? resetProjectionNodesForRetry(group.projection.nodes, latestRun)
+            : group.projection.nodes,
+          workflowId: nonEmptyString(latestRun.workflow_id) || group.projection.workflowId,
+          currentNodeId: Object.hasOwn(latestRun, "current_step_id")
+            ? nonEmptyString(latestRun.current_step_id) || null
+            : group.projection.currentNodeId,
+          attemptNumber: Math.max(
+            1,
+            Number(latestRun.attempt_number || group.projection.attemptNumber || 1),
+          ),
+          startedAt: nonEmptyString(latestRun.started_at) || group.projection.startedAt,
+          completedAt: nonEmptyString(latestRun.completed_at) || null,
+          businessOutcome: nonEmptyString(latestRun.business_outcome).toLowerCase() || null,
+          error: Object.hasOwn(latestRun, "error")
+            ? latestRun.error
+            : latestRun.history_blocker ?? group.projection.error,
+          action: runIdChanged ? null : group.projection.action,
+        } satisfies WorkflowRunView
+      : group.projection;
+    const reconciled: WorkspaceWorkflowRunGroup = latestRun
+      ? {
+          ...group,
+          id: latestRun.id,
+          latestCreatedAt: nonEmptyString(
+            latestRun.started_at || latestRun.created_at || latestRun.updated_at,
+          ) || group.latestCreatedAt,
+          actionMessage: runIdChanged ? null : group.actionMessage,
+          projectionUpdatedAt: nonEmptyString(latestRun.updated_at) || group.projectionUpdatedAt,
+          retryOfRunId: nonEmptyString(latestRun.retry_of_run_id) || null,
+          projection,
+        }
+      : group;
+    const existing = reconciledByRunId.get(reconciled.id);
+    if (!existing) {
+      reconciledByRunId.set(reconciled.id, reconciled);
+      continue;
+    }
+    const newer = reconciled.latestIndex >= existing.latestIndex ? reconciled : existing;
+    reconciledByRunId.set(reconciled.id, {
+      ...newer,
+      latestIndex: Math.max(existing.latestIndex, reconciled.latestIndex),
+      ownedMessageIds: [...new Set([
+        ...existing.ownedMessageIds,
+        ...reconciled.ownedMessageIds,
+      ])],
+      actionMessages: [...existing.actionMessages, ...reconciled.actionMessages],
+    });
+  }
+
+  return [...reconciledByRunId.values()];
+}
+
+export function isWorkflowRunAlreadyTerminalError(error: unknown): boolean {
+  const message = error instanceof Error
+    ? error.message
+    : nonEmptyString(recordValue(error)?.message);
+  return /^run already (?:completed|cancelled)$/i.test(message);
 }
 
 export function selectForegroundWorkflowRunId(
@@ -455,6 +590,34 @@ export function mergeWorkflowRunView(
   };
 }
 
+export interface WorkflowApprovalReviewHydration {
+  review: unknown;
+  reviewTitle?: string;
+}
+
+export function workflowApprovalReviewFromRunDetail(
+  detailValue: unknown,
+  action: WorkflowRunAction | null | undefined,
+): WorkflowApprovalReviewHydration | null {
+  if (
+    action?.kind !== "workflow_approval"
+    || action.review_location !== "workflow_history"
+  ) {
+    return null;
+  }
+  const stepId = nonEmptyString(action.step_id);
+  const detail = recordValue(detailValue);
+  const stepResults = recordValue(detail?.step_results);
+  const stepResult = stepId ? recordValue(stepResults?.[stepId]) : null;
+  if (!stepResult || stepResult.review == null) return null;
+
+  const reviewTitle = nonEmptyString(stepResult.review_title || action.review_title);
+  return {
+    review: stepResult.review,
+    ...(reviewTitle ? { reviewTitle } : {}),
+  };
+}
+
 function directInterventionAction(run: WorkflowRunView): WorkflowRunAction | null {
   if (run.status === "failed") {
     return {
@@ -495,8 +658,14 @@ export async function resolveWorkspaceWorkflowMessageAction(
 
 /* End workspace workflow run host helpers */
 
+export interface WorkflowRunInvalidationContext {
+  runId: string;
+  workspaceId?: string;
+}
+
 interface WorkspaceWorkflowRunHostProps {
-  workspaceId: string;
+  workspaceId?: string;
+  conversationId?: string;
   groups: WorkspaceWorkflowRunGroup[];
   onResolveMessage: (
     messageId: string,
@@ -508,6 +677,8 @@ interface WorkspaceWorkflowRunHostProps {
   resolveLoading?: boolean;
   resolveError?: unknown;
   resolveMessageId?: string | null;
+  invalidationQueryKeys?: readonly QueryKey[];
+  onInvalidate?: (context: WorkflowRunInvalidationContext) => void | Promise<unknown>;
   onRunChange?: () => void;
 }
 
@@ -572,15 +743,59 @@ function runSwitcherLabel(run: WorkflowRunView): string {
 
 export default function WorkspaceWorkflowRunHost({
   workspaceId,
+  conversationId,
   groups,
   onResolveMessage,
   resolveLoading = false,
   resolveError,
   resolveMessageId,
+  invalidationQueryKeys = [],
+  onInvalidate,
   onRunChange,
 }: WorkspaceWorkflowRunHostProps) {
   const queryClient = useQueryClient();
-  const initialGroups = excludeSupersededWorkflowRunGroups(groups);
+  const familyQueryGroups = useMemo(
+    () => excludeSupersededWorkflowRunGroups(groups).filter((group) => (
+      isWorkspaceWorkflowRunActionable(group.projection)
+    )),
+    [groups],
+  );
+  const familyQueries = useQueries({
+    queries: familyQueryGroups.map((group) => ({
+      queryKey: ["workspace-chat-workflow-run-family", group.id],
+      queryFn: () => api.workflows.getRunFamily(group.id),
+      refetchInterval: (query: { state: { data?: WorkflowHistoryRun[] } }) => {
+        const latestRun = latestWorkflowFamilyAttempt(query.state.data || []);
+        return latestRun && ["pending", "running"].includes(
+          nonEmptyString(latestRun.status).toLowerCase(),
+        ) ? 1_000 : false;
+      },
+    })),
+  });
+  const familyRunsByGroupId = useMemo(
+    () => Object.fromEntries(familyQueryGroups.map((group, index) => [
+      group.id,
+      (familyQueries[index]?.data || []) as WorkflowHistoryRun[],
+    ])),
+    [familyQueries, familyQueryGroups],
+  );
+  const unverifiedFamilyRunIds = useMemo(
+    () => new Set(familyQueryGroups.flatMap((group, index) => (
+      familyQueries[index]?.isPending || familyQueries[index]?.isError
+        ? [group.id]
+        : []
+    ))),
+    [familyQueries, familyQueryGroups],
+  );
+  const verifiedGroups = useMemo(
+    () => suppressUnverifiedWorkflowRunGroups(groups, unverifiedFamilyRunIds),
+    [groups, unverifiedFamilyRunIds],
+  );
+  const reconciledGroups = useMemo(
+    () => reconcileWorkspaceWorkflowRunGroups(verifiedGroups, familyRunsByGroupId),
+    [familyRunsByGroupId, verifiedGroups],
+  );
+  const initialGroups = excludeSupersededWorkflowRunGroups(reconciledGroups);
   const initialForegroundRunId = selectForegroundWorkflowRunId(initialGroups, "");
   const [selectedRunId, setSelectedRunId] = useState(initialForegroundRunId);
   const [dismissedRunIds, setDismissedRunIds] = useState<Set<string>>(() => new Set());
@@ -589,29 +804,32 @@ export default function WorkspaceWorkflowRunHost({
   const [cancelConfirmationRunId, setCancelConfirmationRunId] = useState<string | null>(null);
   const cancelConfirmationIdentityRef = useRef<CancelConfirmationIdentity | null>(null);
   const cancelConfirmationGenerationRef = useRef(0);
-  const previousGroupSignatureRef = useRef(groups.map((group) => group.id).join("|"));
+  const previousGroupSignatureRef = useRef(
+    reconciledGroups.map((group) => group.id).join("|"),
+  );
   const previousForegroundRunIdRef = useRef(initialForegroundRunId);
-  const groupSignature = groups.map((group) => group.id).join("|");
+  const groupSignature = reconciledGroups.map((group) => group.id).join("|");
+  const scopeId = conversationId || workspaceId || "global";
 
   useEffect(() => {
     setDismissedRunIds(new Set());
     setRunDetailsById({});
     setSelectedRunId(selectForegroundWorkflowRunId(initialGroups, ""));
-  }, [workspaceId]);
+  }, [scopeId]);
 
   useEffect(() => {
     if (previousGroupSignatureRef.current === groupSignature) return;
     previousGroupSignatureRef.current = groupSignature;
-    setSelectedRunId(selectForegroundWorkflowRunId(groups, ""));
-  }, [groupSignature, groups]);
+    setSelectedRunId(selectForegroundWorkflowRunId(reconciledGroups, ""));
+  }, [groupSignature, reconciledGroups]);
 
   const actionableGroups = useMemo(
     () => actionableWorkflowRunGroups(
-      groups,
+      reconciledGroups,
       runDetailsById,
       dismissedRunIds,
     ),
-    [dismissedRunIds, groups, runDetailsById],
+    [dismissedRunIds, reconciledGroups, runDetailsById],
   );
   const foregroundRunId = selectForegroundWorkflowRunId(actionableGroups, selectedRunId);
   const foregroundGroup = actionableGroups.find((group) => group.id === foregroundRunId) || null;
@@ -638,7 +856,10 @@ export default function WorkspaceWorkflowRunHost({
         foregroundProjectionUpdatedAt,
       )
     : null;
-  const runCapabilities = recordValue(recordValue(runQuery.data)?.capabilities);
+  const runDetail = recordValue(runQuery.data);
+  const authoritativeWorkspaceId = nonEmptyString(runDetail?.workspace_id);
+  const resolvedWorkspaceId = authoritativeWorkspaceId || workspaceId || "";
+  const runCapabilities = recordValue(runDetail?.capabilities);
   const canControl = Boolean(runCapabilities?.can_control);
   const serverConfirmedTerminal = Boolean(
     runQuery.data
@@ -648,11 +869,45 @@ export default function WorkspaceWorkflowRunHost({
   const interventionAction = foregroundRun
     ? selectWorkspaceWorkflowInterventionAction(foregroundRun)
     : null;
-  const canCancelRunningRun = canControl && Boolean(
+  const approvalReviewStepId = nonEmptyString(interventionAction?.step_id);
+  const approvalReviewActionId = nonEmptyString(
+    interventionAction?.message_id
+      || interventionAction?.action_id
+      || interventionAction?.id,
+  );
+  const hydratesApprovalReview = interventionAction?.kind === "workflow_approval"
+    && interventionAction.review_location === "workflow_history"
+    && Boolean(approvalReviewStepId);
+  const approvalReviewQuery = useQuery({
+    queryKey: ["workflow-run-review", foregroundRunId, approvalReviewStepId, approvalReviewActionId],
+    queryFn: () => api.workflows.getRun(foregroundRunId),
+    enabled: Boolean(foregroundRunId && hydratesApprovalReview),
+    staleTime: Infinity,
+  });
+  const approvalReview = workflowApprovalReviewFromRunDetail(
+    approvalReviewQuery.data,
+    interventionAction,
+  );
+  const canCancelRun = canControl && Boolean(
+    foregroundRun
+    && canCancelWorkflowRun({
+      ...foregroundRun,
+      capabilities: { can_control: canControl },
+    }),
+  );
+  const canPauseRunningRun = canControl && Boolean(
     foregroundRun
     && !interventionAction
     && (foregroundRun.status === "pending" || foregroundRun.status === "running"),
   );
+  const headerInterventionAction = interventionAction && canCancelRun
+    ? {
+        ...interventionAction,
+        options: (interventionAction.options || []).filter(
+          (option) => normalizeWorkflowActionChoice(option) !== "cancel",
+        ),
+      }
+    : interventionAction;
 
   useEffect(() => {
     if (!foregroundRunId || !runQuery.data) return;
@@ -670,19 +925,52 @@ export default function WorkspaceWorkflowRunHost({
   }, [foregroundRunId, serverConfirmedTerminal]);
 
   const invalidateRunSurfaces = useCallback(async (runId: string) => {
-    await Promise.all([
+    const invalidations = [
       queryClient.invalidateQueries({ queryKey: ["workflow-run", runId] }),
-      queryClient.invalidateQueries({ queryKey: ["workspace-chat", workspaceId] }),
-      queryClient.invalidateQueries({ queryKey: ["workspace-workflow-runs", workspaceId] }),
       queryClient.invalidateQueries({ queryKey: ["workflow-runs"] }),
-    ]);
-  }, [queryClient, workspaceId]);
+      queryClient.invalidateQueries({ queryKey: ["workspace-chat-workflow-run-family"] }),
+      ...invalidationQueryKeys.map((queryKey: QueryKey) => (
+        queryClient.invalidateQueries({ queryKey })
+      )),
+    ];
+    if (workspaceId) {
+      invalidations.push(
+        queryClient.invalidateQueries({ queryKey: ["workspace-chat", workspaceId] }),
+        queryClient.invalidateQueries({ queryKey: ["workspace-workflow-runs", workspaceId] }),
+      );
+    }
+    if (resolvedWorkspaceId && resolvedWorkspaceId !== workspaceId) {
+      invalidations.push(
+        queryClient.invalidateQueries({ queryKey: ["workspace-chat", resolvedWorkspaceId] }),
+        queryClient.invalidateQueries({
+          queryKey: ["workspace-workflow-runs", resolvedWorkspaceId],
+        }),
+      );
+    }
+    await Promise.all(invalidations);
+    await onInvalidate?.({
+      runId,
+      workspaceId: resolvedWorkspaceId || undefined,
+    });
+  }, [
+    invalidationQueryKeys,
+    onInvalidate,
+    queryClient,
+    resolvedWorkspaceId,
+    workspaceId,
+  ]);
 
   const cancelMutation = useMutation({
     mutationFn: ({ runId }: CancelRunMutationVariables) => api.workflows.cancelRun(runId),
     onSuccess: async (_result, { runId }) => {
       setDismissedRunIds((current) => new Set(current).add(runId));
       await invalidateRunSurfaces(runId);
+    },
+  });
+  const pauseMutation = useMutation({
+    mutationFn: () => api.workflows.pauseRun(foregroundRunId),
+    onSuccess: async () => {
+      await invalidateRunSurfaces(foregroundRunId);
     },
   });
   const resumeMutation = useMutation({
@@ -699,19 +987,20 @@ export default function WorkspaceWorkflowRunHost({
     setCancelConfirmationOpen(false);
     setCancelConfirmationRunId(null);
     cancelMutation.reset();
+    pauseMutation.reset();
     resumeMutation.reset();
     onRunChange?.();
   }, [foregroundRunId, onRunChange]);
 
   useEffect(() => {
     if (!cancelConfirmationOpen) return;
-    if (!canCancelRunningRun || cancelConfirmationRunId !== foregroundRunId) {
+    if (!canCancelRun || cancelConfirmationRunId !== foregroundRunId) {
       cancelConfirmationIdentityRef.current = null;
       setCancelConfirmationOpen(false);
       setCancelConfirmationRunId(null);
     }
   }, [
-    canCancelRunningRun,
+    canCancelRun,
     cancelConfirmationOpen,
     cancelConfirmationRunId,
     foregroundRunId,
@@ -723,16 +1012,21 @@ export default function WorkspaceWorkflowRunHost({
   const interventionCancelError = cancelMutation.variables?.source === "intervention"
     ? cancelMutation.error
     : null;
-  const directActionError = interventionCancelError || resumeMutation.error;
+  const directActionError = interventionCancelError || pauseMutation.error || resumeMutation.error;
   const resolvingMessage = Boolean(
     actionMessageId && actionMessageId === resolveMessageId && resolveLoading,
   );
-  const resolving = resolvingMessage || cancelMutation.isPending || resumeMutation.isPending;
+  const resolving = resolvingMessage
+    || cancelMutation.isPending
+    || pauseMutation.isPending
+    || resumeMutation.isPending;
   const scopedResolveError = actionMessageId === resolveMessageId ? resolveError : null;
   const workflowHref = foregroundRun.workflowId
     ? `/flows?workflow=${encodeURIComponent(foregroundRun.workflowId)}`
     : undefined;
-  const historyHref = `/workspaces/${encodeURIComponent(workspaceId)}?tab=workflows&workflow_view=history&workflow_run=${encodeURIComponent(foregroundRun.id)}`;
+  const historyHref = resolvedWorkspaceId
+    ? `/workspaces/${encodeURIComponent(resolvedWorkspaceId)}?tab=workflows&workflow_view=history&workflow_run=${encodeURIComponent(foregroundRun.id)}`
+    : undefined;
   const cancelActionLabel = t("component.workflow_run.action.cancel");
   const cancelError = cancelMutation.variables?.source === "direct" && cancelMutation.error
     ? formatWorkflowError(
@@ -755,8 +1049,11 @@ export default function WorkspaceWorkflowRunHost({
       files,
       onResolveMessage,
     );
-    if (messageHandled) return;
-    const normalizedChoice = choice.toLowerCase().replace(/[-\s]+/g, "_");
+    if (messageHandled) {
+      if (conversationId) await invalidateRunSurfaces(foregroundRunId);
+      return;
+    }
+    const normalizedChoice = normalizeWorkflowActionChoice(choice);
     if (normalizedChoice === "resume") {
       await resumeMutation.mutateAsync();
     } else if (normalizedChoice === "cancel") {
@@ -786,7 +1083,7 @@ export default function WorkspaceWorkflowRunHost({
   };
 
   const openCancellationConfirmation = () => {
-    if (!canCancelRunningRun) return;
+    if (!canCancelRun) return;
     cancelMutation.reset();
     cancelConfirmationGenerationRef.current += 1;
     cancelConfirmationIdentityRef.current = {
@@ -800,7 +1097,7 @@ export default function WorkspaceWorkflowRunHost({
   const confirmCancellation = async () => {
     const expectedConfirmation = cancelConfirmationIdentityRef.current;
     if (
-      !canCancelRunningRun
+      !canCancelRun
       || !expectedConfirmation
       || expectedConfirmation.runId !== foregroundRunId
       || cancelConfirmationRunId !== foregroundRunId
@@ -814,8 +1111,14 @@ export default function WorkspaceWorkflowRunHost({
         source: "direct",
       });
       closeCancellationConfirmation(expectedConfirmation);
-    } catch {
-      // The mutation error remains visible in the run surface and dialog stays open.
+    } catch (error) {
+      if (isWorkflowRunAlreadyTerminalError(error)) {
+        setDismissedRunIds((current) => new Set(current).add(expectedConfirmation.runId));
+        closeCancellationConfirmation(expectedConfirmation);
+        cancelMutation.reset();
+        await invalidateRunSurfaces(expectedConfirmation.runId);
+      }
+      // Other mutation errors remain visible in the dialog so the user can retry.
     }
   };
 
@@ -862,19 +1165,35 @@ export default function WorkspaceWorkflowRunHost({
           run={foregroundRun}
           workflowHref={workflowHref}
           historyHref={historyHref}
-          headerAction={canCancelRunningRun ? (
-            <button
-              type="button"
-              className="workflow-run-cancel-action"
-              title={cancelActionLabel}
-              aria-label={cancelActionLabel}
-              disabled={resolving}
-              onClick={openCancellationConfirmation}
-            >
-              {cancelMutation.isPending
-                ? <LoadingSpinner size={13} />
-                : <IconStop size={13} aria-hidden="true" />}
-            </button>
+          headerAction={canCancelRun ? (
+            <div className="workflow-run-control-actions">
+              {canPauseRunningRun && (
+                <button
+                  type="button"
+                  className="workflow-run-pause-action"
+                  title={t("component.workflow_run.action.pause")}
+                  aria-label={t("component.workflow_run.action.pause")}
+                  disabled={resolving}
+                  onClick={() => pauseMutation.mutate()}
+                >
+                  {pauseMutation.isPending
+                    ? <LoadingSpinner size={13} />
+                    : <IconPause size={13} aria-hidden="true" />}
+                </button>
+              )}
+              <button
+                type="button"
+                className="workflow-run-cancel-action"
+                title={cancelActionLabel}
+                aria-label={cancelActionLabel}
+                disabled={resolving}
+                onClick={openCancellationConfirmation}
+              >
+                {cancelMutation.isPending
+                  ? <LoadingSpinner size={13} />
+                  : <IconStop size={13} aria-hidden="true" />}
+              </button>
+            </div>
           ) : undefined}
         />
         {!cancelConfirmationOpen && !interventionAction && cancelError && (
@@ -882,15 +1201,20 @@ export default function WorkspaceWorkflowRunHost({
             {cancelError}
           </p>
         )}
-        {interventionAction && (
+        {headerInterventionAction && (
           <WorkflowRunIntervention
-            key={`${foregroundRun.id}:${actionMessageId || interventionAction.kind}`}
+            key={`${foregroundRun.id}:${actionMessageId || headerInterventionAction.kind}`}
             run={foregroundRun}
-            action={interventionAction}
+            action={headerInterventionAction}
             onResolve={resolveIntervention}
             disabled={resolving || !canControl}
             loading={resolving}
             error={scopedResolveError || directActionError}
+            historyHref={historyHref}
+            historyReview={approvalReview?.review}
+            historyReviewTitle={approvalReview?.reviewTitle}
+            historyReviewLoading={approvalReviewQuery.isLoading}
+            historyReviewError={approvalReviewQuery.error}
           />
         )}
       </div>

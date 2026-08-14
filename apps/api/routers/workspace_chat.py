@@ -17,8 +17,6 @@ is not handled here.
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
@@ -35,11 +33,6 @@ from packages.core.constants.pending_actions import (
     WORKFLOW_RUN_ACTION_KINDS,
     PendingActionKind,
 )
-from packages.core.constants.task import TaskStatus
-from packages.core.constants.execution import (
-    ExecutionPlanStatus,
-    ExecutionStepStatus,
-)
 from packages.core.database import get_db
 from packages.core.models.task import Conversation, Message
 from packages.core.models.user import User
@@ -49,9 +42,20 @@ from packages.core.services.hitl_options import (
     APPROVAL_CHOICE_APPROVE,
     ERROR_CHOICE_RETRY,
 )
+from packages.core.services.step_resume import (
+    apply_step_cancel,
+    apply_step_resume,
+    cancel_step,
+    resume_step_for_retry,
+)
 from packages.core.services.workspace_access import (
-    user_can_control_workspace_run,
     user_can_read_workspace,
+)
+from packages.core.blueprints.simulation_runtime import (
+    SimulationRuntimeError,
+    get_simulation_run,
+    resolve_simulation_action,
+    start_simulation_run,
 )
 from packages.core.workspace_chat import service as chat_service
 
@@ -95,6 +99,15 @@ class MessageResponse(BaseModel):
     attachments: Optional[Any]
     meta: Optional[dict]
     pending_action: Optional[dict]
+    # The *other* HITL channel. `pending_action` carries cards posted by the
+    # governance/step gate; a tool that returns a `__hitl__` envelope mid-turn
+    # is recorded by chat_service into `messages.metadata->'hitl_requests'`
+    # instead, and never touches `pending_action`. Workspace chat used to read
+    # only the former, so a gated tool call (e.g. `email.send`) produced a
+    # record, a badge, and nothing the user could click. Typed here with the
+    # same name and shape the main-chat `MessageResponse` uses so the frontend
+    # contract stays single.
+    hitl_requests: Optional[list[dict]] = None
     resolved_at: Optional[datetime]
     resolution: Optional[dict]
     resolved_by_user_id: Optional[str] = None
@@ -137,6 +150,26 @@ class ResolveActionRequest(BaseModel):
     payload: Optional[dict] = None
     # ``payload`` covers free-form input (e.g. HITL prompt response);
     # ``choice`` covers button-style proposals ("approve" / "reject").
+
+
+class SimulationRunResponse(BaseModel):
+    workspace_id: str
+    enabled: bool
+    run_id: Optional[str] = None
+    status: Literal["idle", "running", "waiting", "completed"]
+    title: str
+    goal_title: str
+    stage_index: int
+    stage_count: int
+    stage_id: Optional[str] = None
+    stage_title: str
+    waiting_message_id: Optional[str] = None
+    last_message_id: Optional[str] = None
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    decision_count: int = 0
+    runtime_version: str
 
 
 class MessageFeedbackRequest(BaseModel):
@@ -184,6 +217,20 @@ async def _load_message_authors(
     return {user.id: user for user in rows}
 
 
+def _message_hitl_requests(m: Message) -> list[dict] | None:
+    """Tool-call HITL cards recorded in message metadata.
+
+    Mirrors ``apps/api/routers/chat.py::_message_hitl_requests`` — the same
+    column, the same shape, so both chat surfaces render from one contract.
+    """
+    meta = m.meta if isinstance(m.meta, dict) else {}
+    requests = meta.get("hitl_requests")
+    if not isinstance(requests, list):
+        return None
+    entries = [item for item in requests if isinstance(item, dict) and item.get("id")]
+    return entries or None
+
+
 def _to_message(
     m: Message,
     *,
@@ -213,6 +260,7 @@ def _to_message(
         attachments=m.attachments,
         meta=m.meta or {},
         pending_action=pending_action,
+        hitl_requests=_message_hitl_requests(m),
         resolved_at=m.resolved_at,
         resolution=m.resolution,
         resolved_by_user_id=m.resolved_by_user_id,
@@ -253,11 +301,6 @@ _INPUT_CARD_KINDS: frozenset[str] = frozenset({
     PendingActionKind.NEEDS_LOGIN.value,
 })
 
-#: A ``wait`` step inside a running workflow, of either flavour.
-_WORKFLOW_WAIT_KINDS: frozenset[str] = frozenset({
-    PendingActionKind.WORKFLOW_APPROVAL.value,
-    PendingActionKind.WORKFLOW_INPUT.value,
-})
 _ACTIONABLE_WORKFLOW_STATUSES = {"queued", "pending", "running", "paused", "failed"}
 _ACTIONABLE_WORKFLOW_OUTCOMES = {
     "needs_input",
@@ -359,6 +402,7 @@ _PROPOSAL_PERMISSION_BY_ITEM_KIND: dict[str, str] = {
     "automation_change": "approve_automation_changes",
     "workflow_change": "approve_automation_changes",
     "experiment": "approve_automation_changes",
+    "workflow_run": "approve_automation_changes",
     "goal_change": "approve_goal_changes",
 }
 
@@ -1085,6 +1129,7 @@ async def stream_chat_entrypoint(
     binding_id: str,
     message: str = Form(...),
     conversation_id: str | None = Form(None),
+    local_worker_id: str | None = Form(None),
     document_ids: str | None = Form(None),
     files: list[UploadFile] = File(default=[]),
     _gate=Depends(require_plan("ai_budget_usd")),
@@ -1128,11 +1173,84 @@ async def stream_chat_entrypoint(
         conversation_id=conversation_id,
         route_source="explicit",
     )
+    if local_worker_id:
+        from packages.core.services.local_worker_targeting import (
+            select_conversation_local_worker_target,
+        )
+
+        try:
+            await select_conversation_local_worker_target(
+                db,
+                conversation_id=started.conversation.id,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                worker_id=local_worker_id,
+            )
+            await db.commit()
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
     return StreamingResponse(
         _workspace_entrypoint_started_stream(started),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+@router.get("/simulation-run", response_model=SimulationRunResponse)
+async def simulation_run_status(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    workspace = await _verify_workspace(db, workspace_id, user)
+    try:
+        state = await get_simulation_run(db, workspace=workspace)
+    except SimulationRuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    # Legacy sandboxes may be repaired while their status is read.
+    await db.commit()
+    return state
+
+
+@router.post("/simulation-run/start", response_model=SimulationRunResponse)
+async def start_workspace_simulation_run(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    workspace = await _verify_workspace(db, workspace_id, user)
+    try:
+        state = await start_simulation_run(
+            db,
+            workspace=workspace,
+            user_id=user.id,
+        )
+    except SimulationRuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await db.commit()
+    return state
+
+
+@router.post("/simulation-run/restart", response_model=SimulationRunResponse)
+async def restart_workspace_simulation_run(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    workspace = await _verify_workspace(db, workspace_id, user)
+    try:
+        state = await start_simulation_run(
+            db,
+            workspace=workspace,
+            user_id=user.id,
+            restart=True,
+        )
+    except SimulationRuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await db.commit()
+    return state
+
 
 @router.get("/messages", response_model=list[MessageResponse])
 async def list_chat_messages(
@@ -1341,7 +1459,7 @@ async def resolve_chat_action(
     db: AsyncSession = Depends(get_db),
 ):
     """Resolve a ``pending_action`` (e.g. HITL response, plan approval)."""
-    await _verify_workspace(db, workspace_id, user)
+    workspace = await _verify_workspace(db, workspace_id, user)
 
     msg = (await db.execute(
         select(Message).where(Message.id == message_id)
@@ -1365,26 +1483,54 @@ async def resolve_chat_action(
     pa = msg.pending_action or {}
     kind = pa.get("kind")
     normalized_choice = (req.choice or "").lower()
-    workflow_run_to_enqueue: str | None = None
-    if kind in WORKSPACE_WORKFLOW_RUN_ACTION_KINDS and pa.get("workflow_run_id"):
-        from packages.core.models.workflow import WorkflowRun
-
-        controlled_run = (await db.execute(
-            select(WorkflowRun).where(
-                WorkflowRun.id == str(pa["workflow_run_id"]),
-                WorkflowRun.entity_id == user.entity_id,
-                WorkflowRun.workspace_id == workspace_id,
+    task_retry_result = None
+    if pa.get("simulation_runtime") is True:
+        if msg.resolved_at is not None:
+            return _to_message(
+                msg,
+                resolved_by_user=user if msg.resolved_by_user_id == user.id else None,
             )
-        )).scalar_one_or_none()
-        if controlled_run is None:
-            raise HTTPException(404, "Workflow Run not found")
-        if not await user_can_control_workspace_run(
-            db,
-            run=controlled_run,
-            user_id=user.id,
-            entity_role=user.role,
-        ):
-            raise HTTPException(403, "Workflow Run control permission required")
+        try:
+            resolved = await resolve_simulation_action(
+                db,
+                workspace=workspace,
+                message=msg,
+                user_id=user.id,
+                choice=req.choice,
+                note=req.note,
+                payload=req.payload,
+            )
+        except SimulationRuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        await db.commit()
+        return _to_message(resolved, resolved_by_user=user)
+    if kind in WORKSPACE_WORKFLOW_RUN_ACTION_KINDS:
+        from packages.core.services.workflow_message_actions import (
+            WorkflowMessageActionError,
+            resolve_workflow_message_action,
+        )
+
+        try:
+            workflow_action = await resolve_workflow_message_action(
+                db,
+                message=msg,
+                conversation=conv,
+                choice=req.choice,
+                note=req.note,
+                payload=req.payload,
+                user=user,
+            )
+        except WorkflowMessageActionError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+        if workflow_action is not None:
+            return _to_message(
+                workflow_action.message,
+                resolved_by_user=(
+                    user
+                    if workflow_action.message.resolved_by_user_id == user.id
+                    else None
+                ),
+            )
     proposal_always_approve = (
         kind == PendingActionKind.APPROVE_PROPOSALS
         and normalized_choice == APPROVAL_CHOICE_ALWAYS_APPROVE
@@ -1447,291 +1593,7 @@ async def resolve_chat_action(
     _lease_request_id = pa.get("approval_request_id")
     _lease_decision: Literal["grant", "deny"] | None = None
 
-    if kind == PendingActionKind.WORKFLOW_STARTER_INPUT and pa.get("workflow_run_id"):
-        from packages.core.models.workflow import WorkflowRun
-        from packages.core.services.workspace_workflow_router import (
-            assemble_workspace_workflow_inputs,
-            get_workspace_chat_entrypoint,
-            preserve_server_captured_workflow_inputs,
-            validate_workspace_workflow_inputs,
-        )
-
-        workflow_run = (await db.execute(
-            select(WorkflowRun).where(
-                WorkflowRun.id == str(pa["workflow_run_id"]),
-                WorkflowRun.entity_id == user.entity_id,
-                WorkflowRun.workspace_id == workspace_id,
-                WorkflowRun.binding_id == str(pa.get("workflow_binding_id") or ""),
-            ).with_for_update()
-        )).scalar_one_or_none()
-        if workflow_run is None:
-            raise HTTPException(404, "Workflow Run not found")
-        entrypoint_context = (
-            (workflow_run.trigger_data or {}).get("_workspace_chat_entrypoint")
-            if isinstance(workflow_run.trigger_data, dict)
-            else None
-        )
-        if not isinstance(entrypoint_context, dict) or entrypoint_context.get("conversation_id") != conv.id:
-            raise HTTPException(409, "Workflow Run does not belong to this Chat")
-        if workflow_run.status != "paused" or workflow_run.step_results:
-            raise HTTPException(409, "Workflow Run is no longer waiting for its inputs")
-
-        cancel_choices = {"cancel", "reject", "rejected", "decline", "deny", "no", "skip"}
-        if normalized_choice in cancel_choices:
-            workflow_run.status = "cancelled"
-            workflow_run.completed_at = datetime.now(timezone.utc)
-        else:
-            if normalized_choice not in {"run", "start", "submit", "confirm"}:
-                raise HTTPException(400, "Unsupported Workflow input choice")
-            resolved_entrypoint = await get_workspace_chat_entrypoint(
-                db,
-                entity_id=user.entity_id,
-                workspace_id=workspace_id,
-                binding_id=str(pa.get("workflow_binding_id") or ""),
-            )
-            if resolved_entrypoint is None:
-                raise HTTPException(404, "Workflow Starter not found")
-            entrypoint, _binding, _workflow = resolved_entrypoint
-            submitted_inputs = preserve_server_captured_workflow_inputs(
-                entrypoint,
-                (req.payload or {}).get("inputs"),
-                workflow_run.trigger_data,
-            )
-            try:
-                input_values = validate_workspace_workflow_inputs(
-                    entrypoint,
-                    submitted_inputs,
-                )
-            except ValueError as exc:
-                try:
-                    errors = json.loads(str(exc))
-                except Exception:
-                    errors = {"inputs": "Invalid workflow inputs."}
-                raise HTTPException(422, {
-                    "message": "Invalid workflow inputs",
-                    "errors": errors,
-                })
-            mapped_input_values = assemble_workspace_workflow_inputs(
-                entrypoint,
-                input_values,
-            )
-            updated_trigger_data = dict(workflow_run.trigger_data or {})
-            updated_trigger_data.update(input_values)
-            updated_trigger_data.update(mapped_input_values)
-            workflow_run.trigger_data = updated_trigger_data
-            updated_variables = dict(workflow_run.variables or {})
-            updated_variables.update(input_values)
-            updated_variables.update(mapped_input_values)
-            updated_variables["trigger"] = {
-                **deepcopy(input_values),
-                **deepcopy(mapped_input_values),
-            }
-            workflow_run.variables = updated_variables
-            workflow_run.status = "running"
-            workflow_run.error = None
-            workflow_run_to_enqueue = workflow_run.id
-        from packages.core.services.workflow_chat_projection import project_workflow_run_status
-
-        await project_workflow_run_status(db, run=workflow_run)
-
-    elif kind == PendingActionKind.WORKFLOW_RETRY and pa.get("workflow_run_id"):
-        from packages.core.models.workflow import WorkflowRun
-        from packages.core.services import workflow_service
-        from packages.core.services.conversation_messages import add_message
-        from packages.core.services.workflow_chat_projection import (
-            project_workflow_run_status,
-            workflow_progress_steps,
-        )
-
-        workflow_run = (await db.execute(
-            select(WorkflowRun).where(
-                WorkflowRun.id == str(pa["workflow_run_id"]),
-                WorkflowRun.entity_id == user.entity_id,
-                WorkflowRun.workspace_id == workspace_id,
-                WorkflowRun.binding_id == str(pa.get("workflow_binding_id") or ""),
-            ).with_for_update()
-        )).scalar_one_or_none()
-        if workflow_run is None:
-            raise HTTPException(404, "Workflow Run not found")
-        entrypoint_context = (
-            (workflow_run.trigger_data or {}).get("_workspace_chat_entrypoint")
-            if isinstance(workflow_run.trigger_data, dict)
-            else None
-        )
-        if not isinstance(entrypoint_context, dict) or entrypoint_context.get("conversation_id") != conv.id:
-            raise HTTPException(409, "Workflow Run does not belong to this Chat")
-        if normalized_choice not in {"retry", "retry_now"}:
-            if normalized_choice not in {"cancel", "skip"}:
-                raise HTTPException(400, "Unsupported Workflow retry choice")
-            workflow_run.status = "cancelled"
-            workflow_run.completed_at = datetime.now(timezone.utc)
-            await project_workflow_run_status(db, run=workflow_run)
-        else:
-            variables = (req.payload or {}).get("variables")
-            if variables is not None and not isinstance(variables, dict):
-                raise HTTPException(422, "Workflow retry variables must be an object")
-            try:
-                retry = await workflow_service.retry_workflow_run(
-                    db,
-                    run_id=workflow_run.id,
-                    entity_id=user.entity_id,
-                    started_by=user.id,
-                    from_step_id=str(pa.get("retry_from_step_id") or "") or None,
-                    variables=variables,
-                )
-            except ValueError as exc:
-                raise HTTPException(409, str(exc)) from exc
-            title = str((msg.meta or {}).get("workflow_title") or "Workflow")
-            activity_message = await add_message(
-                db,
-                conv.id,
-                role="system",
-                content=f"{title} retry attempt {retry.effective_attempt_number} is starting.",
-                message_kind="workflow_activity",
-                refs=[
-                    {"type": "workflow", "id": retry.workflow_id, "title": title},
-                    {"type": "workflow_run", "id": retry.id},
-                ],
-                meta={
-                    "workflow_run_id": retry.id,
-                    "workflow_binding_id": retry.binding_id,
-                    "workflow_title": title,
-                    "workflow_status": "running",
-                    "workflow_business_outcome": "in_progress",
-                    "workflow_attempt_number": retry.effective_attempt_number,
-                    "workflow_retry_of_run_id": workflow_run.id,
-                    "workflow_steps": workflow_progress_steps(
-                        retry,
-                        activity_status="running",
-                    ),
-                },
-            )
-            retry_trigger = dict(retry.trigger_data or {})
-            retry_context = dict(retry_trigger.get("_workspace_chat_entrypoint") or {})
-            retry_context["activity_message_id"] = activity_message.id
-            retry_trigger["_workspace_chat_entrypoint"] = retry_context
-            retry.trigger_data = retry_trigger
-            workflow_run = retry
-            workflow_run_to_enqueue = retry.id
-
-    elif kind in _WORKFLOW_WAIT_KINDS and pa.get("workflow_run_id"):
-        from packages.core.ai.workflow_runner import (
-            complete_workflow_stage_wait,
-            workflow_approval_decision_metadata,
-            workflow_stage_wait_context,
-        )
-        from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
-
-        workflow_run = (await db.execute(
-            select(WorkflowRun).where(
-                WorkflowRun.id == str(pa["workflow_run_id"]),
-                WorkflowRun.entity_id == user.entity_id,
-                WorkflowRun.workspace_id == workspace_id,
-                WorkflowRun.binding_id == str(pa.get("workflow_binding_id") or ""),
-            ).with_for_update()
-        )).scalar_one_or_none()
-        if workflow_run is None:
-            raise HTTPException(404, "Workflow Run not found")
-        entrypoint_context = (
-            (workflow_run.trigger_data or {}).get("_workspace_chat_entrypoint")
-            if isinstance(workflow_run.trigger_data, dict)
-            else None
-        )
-        if not isinstance(entrypoint_context, dict) or entrypoint_context.get("conversation_id") != conv.id:
-            raise HTTPException(409, "Workflow Run does not belong to this Chat")
-        if workflow_run.status != "paused" or workflow_run.current_step_id != pa.get("step_id"):
-            raise HTTPException(409, "Workflow Run is no longer waiting for this response")
-
-        cancel_choices = {"cancel", "reject", "rejected", "decline", "deny", "no", "skip"}
-        if normalized_choice in cancel_choices:
-            workflow_run.status = "cancelled"
-            workflow_run.completed_at = datetime.now(timezone.utc)
-        else:
-            if kind == PendingActionKind.WORKFLOW_INPUT and normalized_choice not in {"respond", "submit", "provide_answers", "ok"}:
-                raise HTTPException(400, "Unsupported Workflow input choice")
-            response_variable = str(pa.get("response_variable") or f"{pa['step_id']}_response")
-            response_value = {
-                "choice": normalized_choice,
-                **({"note": req.note} if req.note else {}),
-                **({"payload": req.payload} if req.payload is not None else {}),
-            }
-            updated_variables = dict(workflow_run.variables or {})
-            updated_variables[response_variable] = response_value
-            workflow_run.variables = updated_variables
-            workflow = (await db.execute(
-                select(WorkflowDefinition).where(
-                    WorkflowDefinition.id == workflow_run.workflow_id,
-                    WorkflowDefinition.entity_id == user.entity_id,
-                )
-            )).scalar_one_or_none()
-            current_step = next(
-                (
-                    step
-                    for step in (workflow.steps if workflow else [])
-                    if str(step.get("id") or "") == str(pa["step_id"])
-                ),
-                None,
-            )
-            stage_wait_context = workflow_stage_wait_context(
-                workflow_run,
-                current_step,
-            )
-            if (
-                isinstance(current_step, dict)
-                and current_step.get("type") == "stage"
-                and stage_wait_context is None
-            ):
-                raise HTTPException(409, "Workflow stage is no longer waiting")
-            current_config = (
-                stage_wait_context[1].get("config")
-                if stage_wait_context is not None
-                and isinstance(stage_wait_context[1].get("config"), dict)
-                else current_step.get("config")
-                if isinstance(current_step, dict)
-                and isinstance(current_step.get("config"), dict)
-                else {"options": pa.get("options") or []}
-            )
-            approval_metadata: dict[str, Any] = {}
-            if kind == PendingActionKind.WORKFLOW_APPROVAL:
-                try:
-                    approval_metadata = workflow_approval_decision_metadata(
-                        current_config,
-                        decision=normalized_choice,
-                        actor_id=user.id,
-                        decided_at=datetime.now(timezone.utc),
-                    )
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc)) from exc
-            if stage_wait_context is not None and isinstance(current_step, dict):
-                complete_workflow_stage_wait(
-                    workflow_run,
-                    current_step,
-                    stage_wait_context,
-                    metadata={
-                        "workflow_response": response_value,
-                        **approval_metadata,
-                    },
-                )
-            else:
-                step_results = dict(workflow_run.step_results or {})
-                previous = dict(step_results.get(str(pa["step_id"])) or {})
-                previous.update({
-                    "status": "completed",
-                    "resumed": True,
-                    "workflow_response": response_value,
-                    "resumed_at": datetime.now(timezone.utc).isoformat(),
-                    **approval_metadata,
-                })
-                step_results[str(pa["step_id"])] = previous
-                workflow_run.step_results = step_results
-            workflow_run.status = "running"
-            workflow_run.error = None
-            workflow_run_to_enqueue = workflow_run.id
-        from packages.core.services.workflow_chat_projection import project_workflow_run_status
-
-        await project_workflow_run_status(db, run=workflow_run)
-
-    elif kind == PendingActionKind.HUMAN_INPUT and pa.get("step_id"):
+    if kind == PendingActionKind.HUMAN_INPUT and pa.get("step_id"):
         # Lease-level HITL (legacy free-form text input): stash the
         # response on the step row + flip back to pending.
         await _resume_step_for_retry(
@@ -1894,10 +1756,25 @@ async def resolve_chat_action(
                         capability_id=str(pa.get("capability_id")),
                         changed_by=user.id,
                     )
+            # A retry note is guidance for the re-run, not commentary: write
+            # it into human_input_response so the worker renders it into the
+            # retried step's prompt. Without it, "Retry with guidance" would
+            # re-run the exact attempt the user just watched fail.
+            _retry_note = (req.note or "").strip()
             await _resume_step_for_retry(
                 db, user,
                 step_id=pa["step_id"],
                 plan_id=pa.get("plan_id"),
+                human_input_response=(
+                    {
+                        "choice": choice,
+                        "note": _retry_note,
+                        "user": _user_display_name(user),
+                        "via": "chat_card",
+                    }
+                    if _retry_note
+                    else None
+                ),
             )
         else:
             if _request_id:
@@ -1921,6 +1798,82 @@ async def resolve_chat_action(
                 reason="user rejected governance approval",
             )
 
+    elif kind == PendingActionKind.TASK_APPROVAL and pa.get("task_id"):
+        from packages.core.services.task_approval_service import (
+            TaskApprovalDecisionError,
+            apply_task_approval_decision,
+        )
+        from packages.core.services.task_chat_hitl import resolve_task_hitl
+        from packages.core.services.task_service import get_task
+
+        task = await get_task(db, str(pa["task_id"]), user.entity_id)
+        if task is None or task.workspace_id != workspace_id:
+            raise HTTPException(404, "task not found")
+        try:
+            await apply_task_approval_decision(
+                db,
+                task=task,
+                user_id=user.id,
+                actor=_user_display_name(user),
+                choice=req.choice,
+                note=req.note,
+            )
+        except TaskApprovalDecisionError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+        await resolve_task_hitl(
+            db,
+            task=task,
+            kind=PendingActionKind.TASK_APPROVAL,
+            choice=req.choice,
+            user_id=user.id,
+            note=req.note,
+        )
+
+    elif kind == PendingActionKind.TASK_RECOVERY and pa.get("task_id"):
+        from packages.core.constants.task import TaskRecoveryChoice, TaskStatus
+        from packages.core.services.task_chat_hitl import resolve_task_hitl
+        from packages.core.services.task_retry_service import (
+            TaskRetryError,
+            prepare_task_retry,
+        )
+        from packages.core.services.task_service import get_task, update_task
+
+        task = await get_task(db, str(pa["task_id"]), user.entity_id)
+        if task is None or task.workspace_id != workspace_id:
+            raise HTTPException(404, "task not found")
+        recovery_choices = {member.value for member in TaskRecoveryChoice}
+        if normalized_choice not in recovery_choices:
+            raise HTTPException(400, "choice must be retry or cancel")
+        if normalized_choice == TaskRecoveryChoice.RETRY.value:
+            try:
+                task_retry_result = await prepare_task_retry(
+                    db,
+                    task=task,
+                    user_id=user.id,
+                    user_label=_user_display_name(user),
+                    note=req.note,
+                )
+            except TaskRetryError as exc:
+                raise HTTPException(exc.status_code, exc.detail) from exc
+        else:
+            cancelled = await update_task(
+                db,
+                task.id,
+                task.entity_id,
+                user_id=user.id,
+                status=TaskStatus.CANCELLED.value,
+            )
+            if cancelled is None:
+                raise HTTPException(404, "task not found")
+        await resolve_task_hitl(
+            db,
+            task=task,
+            kind=PendingActionKind.TASK_RECOVERY,
+            choice=normalized_choice,
+            user_id=user.id,
+            note=req.note,
+        )
+
     elif kind == PendingActionKind.APPROVE_PROPOSALS and pa.get("review_id"):
         # Strategist proposal card: approve, approve_selected, reject, or feedback.
         from packages.core.strategist import approve_proposal, reject_proposal
@@ -1932,6 +1885,9 @@ async def resolve_chat_action(
         choice = normalized_choice
         payload = req.payload or {}
         approved_ids: list[str] | None = None
+        approved_item_ids: list[str] | None = None
+        rejected_ids: list[str] = []
+        rejected_item_ids: list[str] = []
 
         if choice == APPROVAL_CHOICE_ALWAYS_APPROVE:
             # Legacy workspace boolean — kept for compat with the flag-off
@@ -1963,11 +1919,24 @@ async def resolve_chat_action(
                         action_key=action_key,
                         changed_by=user.id,
                     )
+            # Proposal Always approve may also promote Blueprint-declared
+            # provider scopes. This is deliberately outside the v2 feature
+            # flag so legacy proposal cards get the same bounded behavior.
+            from packages.core.ai.runtime.approval_service import (
+                activate_blueprint_provider_scopes_for_proposal,
+            )
+            await activate_blueprint_provider_scopes_for_proposal(
+                db,
+                workspace_id=workspace_id,
+                task_ids=all_ids,
+                user_id=user.id,
+            )
             approved_ids = await approve_proposal(
                 db, entity_id=user.entity_id,
                 review_id=review_id, only_task_ids=all_ids or None,
                 actor_id=user.id,
             )
+            approved_item_ids = list(all_item_ids)
         elif choice in {APPROVAL_CHOICE_APPROVE, "approve_all"}:
             # ProposalCard historically submits ``approve_all`` while the
             # shared approval schema uses ``approve``.  Accept both so the
@@ -1977,6 +1946,7 @@ async def resolve_chat_action(
                 review_id=review_id, only_task_ids=all_ids or None,
                 actor_id=user.id,
             )
+            approved_item_ids = list(all_item_ids)
         elif choice == "approve_selected":
             # Approve only the selected tasks / items, reject the rest.
             # Same helper the authority gate above used, so the permissions
@@ -1990,6 +1960,7 @@ async def resolve_chat_action(
                 only_item_ids=list(selected_item_ids),
                 actor_id=user.id,
             )
+            approved_item_ids = list(selected_item_ids)
             approved_set = set(approved_ids)
             rejected_ids = [t for t in all_ids if t not in approved_set]
             approved_item_set = set(selected_item_ids)
@@ -2073,6 +2044,9 @@ async def resolve_chat_action(
                 )
             resolution_payload = dict(resolution.get("payload") or {})
             resolution_payload["approved_task_ids"] = approved_ids
+            resolution_payload["approved_item_ids"] = approved_item_ids or []
+            resolution_payload["rejected_task_ids"] = rejected_ids
+            resolution_payload["rejected_item_ids"] = rejected_item_ids
             resolution["payload"] = resolution_payload
             msg.resolution = dict(resolution)
 
@@ -2254,24 +2228,17 @@ async def resolve_chat_action(
     )
 
     await db.commit()
-    if workflow_run_to_enqueue:
-        from packages.core.ai.workflow_runner import WorkflowRunner
+    if task_retry_result is not None:
+        try:
+            from packages.core.services.task_retry_service import dispatch_task_retry
 
-        if WorkflowRunner.enqueue(workflow_run_to_enqueue) is False:
-            workflow_run.status = "failed"
-            workflow_run.error = "Workflow could not be queued. Please start it again."
-            workflow_run.completed_at = datetime.now(timezone.utc)
-            from packages.core.services.workflow_run_trace import (
-                update_workflow_history_summary,
+            dispatch_task_retry(task_retry_result)
+        except Exception:
+            logger.warning(
+                "Task retry dispatch failed after chat resolution: task=%s",
+                task_retry_result.task.id,
+                exc_info=True,
             )
-
-            update_workflow_history_summary(workflow_run)
-            from packages.core.services.workflow_chat_projection import (
-                project_workflow_run_status,
-            )
-
-            await project_workflow_run_status(db, run=workflow_run)
-            await db.commit()
     await _enqueue_learning_candidate_applies(
         db,
         user=user,
@@ -2368,37 +2335,20 @@ def _apply_step_resume(
     params_update: Optional[dict] = None,
     human_input_response: Optional[dict] = None,
 ) -> None:
-    """Mutate a step row to flip from waiting_human back to pending.
-    Pure — caller handles DB load, plan reset, and re-enqueue.
-
-    Extracted from ``_resume_step_for_retry`` so the pure
-    state-transition logic is unit-testable without a session."""
-    if params_update:
-        # Tool wrapper expects values inside step.params; preserve any
-        # unrelated existing keys (cookies path, original args, etc.).
-        merged = dict(step.params or {})
-        merged.update(params_update)
-        step.params = merged
-
-    if human_input_response is not None:
-        step.human_input_response = human_input_response
-
-    step.step_status = ExecutionStepStatus.PENDING.value
-    step.human_input_prompt = None
-    step.current_lease_id = None
-    step.error = None
-    step.finished_at = None
+    """Pure step-resume mutation. Logic lives in
+    ``packages.core.services.step_resume`` so non-HTTP callers (the
+    ``answer_task_blocker`` chat tool) share the exact same transitions;
+    this alias keeps the router's public (test-imported) name stable."""
+    apply_step_resume(
+        step,
+        params_update=params_update,
+        human_input_response=human_input_response,
+    )
 
 
 def _apply_step_cancel(step: Any, reason: str) -> None:
-    """Mutate a step row to fail it after a 'skip' / 'cancel'
-    resolution. Pure — caller handles DB load + re-enqueue."""
-    from datetime import datetime, timezone
-    step.step_status = ExecutionStepStatus.FAILED.value
-    step.error = {"type": "UserSkipped", "message": reason}
-    step.human_input_prompt = None
-    step.current_lease_id = None
-    step.finished_at = datetime.now(timezone.utc)
+    """Pure step-cancel mutation — see ``_apply_step_resume`` docstring."""
+    apply_step_cancel(step, reason)
 
 
 async def _resume_step_for_retry(
@@ -2410,72 +2360,17 @@ async def _resume_step_for_retry(
     params_update: Optional[dict] = None,
     human_input_response: Optional[dict] = None,
 ) -> None:
-    """Reset a waiting_human step back to pending so PlanExecutor /
-    Dispatcher pick it up next cycle. Optionally merges fresh values
-    into ``step.params`` (answers / confirm flags) before retry, and
-    optionally writes ``human_input_response`` for legacy free-form
-    HITL replies.
-
-    Caller commits.
-    """
-    from packages.core.models.execution import ExecutionStep, ExecutionPlan
-    from packages.core.models.task import Task
-    from packages.core.services.task_state_machine import apply_task_status_transition
-
-    step = (await db.execute(
-        select(ExecutionStep).where(ExecutionStep.id == step_id)
-    )).scalar_one_or_none()
-    if step is None:
-        return
-
-    _apply_step_resume(
-        step,
+    """Reset a waiting_human step back to pending. Delegates to
+    ``packages.core.services.step_resume``. Caller commits."""
+    await resume_step_for_retry(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        step_id=step_id,
+        plan_id=plan_id,
         params_update=params_update,
         human_input_response=human_input_response,
     )
-
-    # M9.2 — a resumed step means the awaited human input arrived: fulfil
-    # any open commitment rows for this step (best-effort, silent no-op).
-    try:
-        from packages.core.humans import resolve_commitments_for_step
-        await resolve_commitments_for_step(
-            db, step.id,
-            {"kind": "hitl_response"},
-        )
-    except Exception:
-        logger.warning(
-            "human commitment resolve failed for step %s (ignored)",
-            step.id, exc_info=True,
-        )
-
-    target_plan_id = plan_id or step.plan_id
-    if not target_plan_id:
-        return
-
-    plan = (await db.execute(
-        select(ExecutionPlan).where(ExecutionPlan.id == target_plan_id)
-    )).scalar_one_or_none()
-    if plan:
-        plan.status = ExecutionPlanStatus.RUNNING.value
-        plan.completed_at = None
-        plan.last_error = None
-        if plan.task_id:
-            task = (await db.execute(
-                select(Task).where(
-                    Task.id == plan.task_id,
-                    Task.entity_id == user.entity_id,
-                )
-            )).scalar_one_or_none()
-            if task and task.status == TaskStatus.WAITING_ON_CUSTOMER:
-                await apply_task_status_transition(
-                    task, "in_progress", db=db, actor_kind="user", actor_id=user.id,
-                )
-
-    try:
-        from packages.core.tasks.ai_tasks import run_plan
-        run_plan.delay(target_plan_id)
-    except Exception:
-        pass  # best-effort — next heartbeat will pick it up
 
 
 async def _cancel_step(
@@ -2486,31 +2381,6 @@ async def _cancel_step(
     plan_id: Optional[str] = None,
     reason: str = "user skipped",
 ) -> None:
-    """User chose 'skip' / 'cancel' on a pending_action — fail the
-    step so the plan can finalize. The PlanExecutor's terminal
-    summary handles the failed → replan-or-fail decision on the next
-    cycle.
-
-    Caller commits.
-    """
-    from packages.core.models.execution import ExecutionStep
-
-    step = (await db.execute(
-        select(ExecutionStep).where(ExecutionStep.id == step_id)
-    )).scalar_one_or_none()
-    if step is None:
-        return
-
-    _apply_step_cancel(step, reason)
-
-    target_plan_id = plan_id or step.plan_id
-    if not target_plan_id:
-        return
-
-    # Re-enqueue the executor so it sees the failed step and decides
-    # whether to replan or terminate the plan.
-    try:
-        from packages.core.tasks.ai_tasks import run_plan
-        run_plan.delay(target_plan_id)
-    except Exception:
-        pass
+    """Fail a waiting step after 'skip'/'cancel'. Delegates to
+    ``packages.core.services.step_resume``. Caller commits."""
+    await cancel_step(db, step_id=step_id, plan_id=plan_id, reason=reason)

@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 # Config helpers (inlined from apps/config.py — no external dependency)
 # ---------------------------------------------------------------------------
 
-DEFAULT_LLM_MODEL = "anthropic/claude-sonnet-4.6"
+# Keep in sync with ``packages.core.constants.models.DEFAULTS["primary"]``.
+DEFAULT_LLM_MODEL = "openai/gpt-5.6-luna"
 DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_LLM_TIMEOUT = 300.0  # user-facing chat should fail loudly instead of hanging for 30 minutes
 DEFAULT_LLM_STREAM_IDLE_TIMEOUT = 45.0
@@ -86,8 +87,11 @@ LLM_MODEL_ALIASES: Dict[str, str] = {
     "openai-40": "openai/gpt-4o",
     "claude": "anthropic/claude-sonnet-4",
     "claude-sonnet": "anthropic/claude-sonnet-4",
-    "claude-opus": "anthropic/claude-opus-4.7",
-    "opus": "anthropic/claude-opus-4.7",
+    # Bare "opus" tracks the newest Opus; pinned aliases stay on their version.
+    "claude-opus": "anthropic/claude-opus-5",
+    "opus": "anthropic/claude-opus-5",
+    "opus-5": "anthropic/claude-opus-5",
+    "claude-opus-5": "anthropic/claude-opus-5",
     "opus-4.7": "anthropic/claude-opus-4.7",
     "claude-opus-4.7": "anthropic/claude-opus-4.7",
     "fable": "anthropic/claude-fable-5",
@@ -422,7 +426,10 @@ def _anthropic_request_headers(api_key: str) -> Dict[str, str]:
 def _model_provider_prefix(model_id: str) -> str | None:
     if not model_id or "/" not in model_id:
         return None
-    return model_id.split("/", 1)[0].strip().lower() or None
+    # Resolve historical/gateway-specific namespaces (for example
+    # ``alibaba`` -> ``qwen``) through the provider registry before comparing
+    # a saved model with a native BYOK endpoint.
+    return provider_for_model_id(model_id) or model_id.split("/", 1)[0].strip().lower() or None
 
 
 def _metadata_model_id(metadata: Optional[Dict[str, Any]]) -> str:
@@ -524,8 +531,29 @@ def _validate_llm_key_model_compatibility(api_key: str, base_url: str, model_id:
 
 
 def get_llm_model() -> str:
-    """Return model ID from env var. Supports aliases."""
-    raw = (os.getenv("OPENROUTER_MODEL") or os.getenv("LLM_MODEL") or DEFAULT_LLM_MODEL).strip()
+    """Default primary model for calls that don't name one. Supports aliases.
+
+    Mirrors the tail of ``resolve_model_for_role``: an admin default
+    override outranks the env pin, so this path can't serve a different
+    model than the admin portal reports. Sync callers read the last-known
+    cached settings document (no DB round-trip on a hot path), so a fresh
+    override converges within the ``model_settings`` TTL.
+    """
+    override = ""
+    try:
+        from packages.core.services.model_settings import get_model_settings_sync
+
+        override = str(
+            (get_model_settings_sync().get("default_overrides") or {}).get("primary") or ""
+        ).strip()
+    except Exception:  # settings unavailable (OSS boot, no DB yet) — use env
+        override = ""
+    raw = (
+        override
+        or os.getenv("OPENROUTER_MODEL")
+        or os.getenv("LLM_MODEL")
+        or DEFAULT_LLM_MODEL
+    ).strip()
     return _resolve_llm_model(raw)
 
 
@@ -761,6 +789,55 @@ def get_llm_stream_idle_timeout() -> float:
         return float(DEFAULT_LLM_STREAM_IDLE_TIMEOUT)
 
 
+def _llm_stream_transport_enabled() -> bool:
+    """Use streaming transport even when nobody is watching the tokens.
+
+    A buffered completion holds the connection silent until the provider
+    finishes generating — and any proxy between us and the provider is free
+    to give up first. Cloudflare's default origin timeout is 100s, so a
+    reseller gateway behind it (apitokengate.com in production) kills every
+    generation longer than that with an HTTP 524, deterministically; the
+    retry loop then re-fails five more times, since retrying cannot make a
+    120-second generation fit a 100-second wall.
+
+    Streaming sends the first byte within seconds, which is all such
+    proxies actually require. The assembled result, billing recording, and
+    the buffered-fallback-on-failure behavior are identical to the
+    stream_handler path chat has always used. LLM_STREAM_TRANSPORT=0 turns
+    this off (background calls then only stream when a handler asks).
+    """
+    return (os.getenv("LLM_STREAM_TRANSPORT") or "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
+def _backfill_streamed_usage(
+    usage: Dict[str, Any],
+    *,
+    messages: List[Dict[str, Any]],
+    content: str,
+) -> None:
+    """Estimate tokens when a streamed response carried no usage chunk.
+
+    We ask for ``stream_options.include_usage``, but an OpenAI-compatible
+    gateway is free to ignore it — and silently recording zero tokens would
+    make every call through such a gateway free. A ~10%-off estimate keeps
+    billing honest; ``usage_estimated`` marks the row for anyone auditing.
+    """
+    if usage.get("prompt") or usage.get("completion"):
+        return
+    if not content:
+        return
+    prompt_tokens = sum(
+        _estimate_content_tokens(m.get("content")) for m in messages
+    )
+    completion_tokens = _estimate_tokens(content)
+    usage["prompt"] = prompt_tokens
+    usage["completion"] = completion_tokens
+    usage["total"] = prompt_tokens + completion_tokens
+    usage["usage_estimated"] = True
+
+
 # ---------------------------------------------------------------------------
 # LLMRateLimited exception
 # ---------------------------------------------------------------------------
@@ -865,13 +942,14 @@ class LLMBillingContext:
     call isn't workspace-scoped (e.g. account-level prompt previews)."""
     conversation_id: Optional[str] = None
     source: str = "system"
-    suppress: bool = False  # True = context is set but recording is suppressed (chat handles its own)
+    suppress: bool = False  # True = context is set but automatic recording is suppressed
+    durable_per_call: bool = False
+    """True when the caller settles each call through a durable callback."""
     byok: bool = False  # True = user's own API key; log usage for analytics but charge 0 credits
     in_flight_credits: int = 0
     """Credits consumed in this request but not necessarily visible in the
-    ledger yet. Chat suppresses per-round billing and writes aggregate usage
-    at the end, so this local counter lets preflight gates stop long loops
-    as soon as the current request has spent the remaining balance."""
+    ledger yet. Non-durable automatic billing uses this local counter while
+    its write is pending."""
 
 _billing_ctx_var: contextvars.ContextVar[Optional[LLMBillingContext]] = contextvars.ContextVar(
     "llm_billing_ctx", default=None,
@@ -1088,26 +1166,35 @@ def _route_metadata_for_resolved_model(
 def _openrouter_provider_block(base_url: str | None = None) -> Optional[Dict[str, Any]]:
     """Return the OpenRouter ``provider`` routing block, or None to skip.
 
+    Google Workspace Limited Use compliance requires that Workspace-derived
+    content is never routed to an inference endpoint that may collect inputs
+    for model training.  ``data_collection=deny`` is therefore unconditional
+    for OpenRouter calls; OpenRouter will fail closed when no compliant
+    endpoint is available instead of silently sending data to one that trains.
+
     Some OpenRouter back-end providers (Novita is the recurring offender)
     return HTTP 400 ``invalid_request_error`` on payloads other providers
     accept — different tolerance for tool schemas, message shapes, system
     prompt size. We default to excluding Novita for this reason.
 
-    Override with ``OPENROUTER_IGNORE_PROVIDERS`` (comma-separated). Set
-    to ``""`` to disable the block entirely. Only applied when the base
-    URL points at openrouter.ai (no-op otherwise so non-OR setups aren't
+    Override the provider exclusion with ``OPENROUTER_IGNORE_PROVIDERS``
+    (comma-separated). Set it to ``""`` to disable only the exclusion list;
+    the data-collection restriction remains active. Only applied when the
+    base URL points at openrouter.ai (no-op otherwise so non-OR setups aren't
     affected).
     """
     target_base_url = (base_url or os.getenv("LLM_BASE_URL") or DEFAULT_LLM_BASE_URL or "").lower()
     if "openrouter.ai" not in target_base_url:
         return None
     raw = os.getenv("OPENROUTER_IGNORE_PROVIDERS", "Novita").strip()
+    block: Dict[str, Any] = {"data_collection": "deny"}
     if not raw:
-        return None
+        return block
     ignored = [p.strip() for p in raw.split(",") if p.strip()]
     if not ignored:
-        return None
-    return {"ignore": ignored, "allow_fallbacks": True}
+        return block
+    block.update({"ignore": ignored, "allow_fallbacks": True})
+    return block
 
 
 # ---------------------------------------------------------------------------
@@ -2368,7 +2455,14 @@ def _record_llm_call(
             "pricing_source": pricing_source,
             "llm_pricing_source": pricing_source,
         }
-        reserved_credits = _track_in_flight_credits(billing, billing_payload, model, byok=is_byok)
+        reserved_credits = 0
+        if not billing.durable_per_call:
+            reserved_credits = _track_in_flight_credits(
+                billing,
+                billing_payload,
+                model,
+                byok=is_byok,
+            )
         if not billing.suppress:
             _schedule_billing_record(
                 billing,
@@ -2705,6 +2799,7 @@ _CACHE_MIN_TOKENS_DEFAULT = 1024
 _CACHE_MIN_TOKENS = {
     # Keep dotted OpenRouter IDs and hyphenated Anthropic-native IDs in sync.
     "claude-fable-5": 2048,
+    "claude-opus-5": 4096,
     "claude-opus-4.7": 4096,
     "claude-opus-4-7": 4096,
     "claude-opus-4.6": 4096,
@@ -3248,7 +3343,7 @@ async def chat_completion(
             return content, usage
 
         request_headers = _llm_request_headers(api_key, base_url)
-        if stream_handler is not None:
+        if stream_handler is not None or _llm_stream_transport_enabled():
             streamed_any_text = False
             try:
                 client = await get_llm_client()
@@ -3305,6 +3400,7 @@ async def chat_completion(
                 _attach_reasoning_to_usage(usage, "".join(reasoning_parts))
                 if _is_empty_provider_response(content, finish_reason, usage):
                     raise RuntimeError("empty streaming LLM response (no content, finish_reason, or usage)")
+                _backfill_streamed_usage(usage, messages=sanitized_messages, content=content)
                 _record_llm_call(
                     call_type="chat_completion",
                     model=resolved_model,
@@ -3528,7 +3624,7 @@ async def chat_completion_with_tools(
             )
 
         request_headers = _llm_request_headers(api_key, base_url)
-        if stream_handler is not None:
+        if stream_handler is not None or _llm_stream_transport_enabled():
             streamed_any_text = False
             try:
                 client = await get_llm_client()
@@ -3607,6 +3703,13 @@ async def chat_completion_with_tools(
                 content = "".join(content_parts)
                 usage["finish_reason"] = finish_reason
                 _attach_reasoning_to_usage(usage, "".join(reasoning_parts))
+                streamed_completion_text = content + "".join(
+                    str(entry.get("arguments_text") or "")
+                    for entry in tool_call_parts.values()
+                )
+                _backfill_streamed_usage(
+                    usage, messages=sanitized_messages, content=streamed_completion_text,
+                )
 
                 parsed_tool_calls: Optional[List[Dict[str, Any]]] = None
                 if tool_call_parts:

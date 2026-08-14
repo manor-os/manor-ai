@@ -16,6 +16,7 @@ from packages.core.credentials import CredentialError
 from packages.core.constants.plans import is_dev
 from packages.core.database import get_db
 from packages.core.models.user import User
+from packages.core.services.integration_health import is_credential_rejection
 from packages.core.services.integration_service import (
     list_integrations, get_integration, create_integration, update_integration,
     list_channels, get_channel, create_channel, update_channel, delete_channel,
@@ -174,6 +175,21 @@ class MCPServerStatus(BaseModel):
     # of connections[] so existing UIs don't break.
     user_connected: bool = False
     user_expires_at: str | None = None
+
+
+class MCPToolOperation(BaseModel):
+    name: str
+    label: str
+    resource: str
+    description: str = ""
+    effect: str
+    input_schema: dict = {}
+
+
+class MCPToolCatalogResponse(BaseModel):
+    server_key: str
+    source: str
+    operations: list[MCPToolOperation] = []
 
 
 def _first_display_value(*values: object) -> str | None:
@@ -357,10 +373,21 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                         "docs_url": "https://developers.weixin.qq.com/doc/offiaccount/Getting_Started/Overview.html",
                         "setup_hint": "Create a Subscription or Service Account at mp.weixin.qq.com; copy AppID + AppSecret.",
                         "color_hex": "#07C160", "supports_multi_account": False},
-    "whatsapp": {"category": "Messaging", "tagline": "Send WhatsApp messages (Twilio-backed).",
-                 "docs_url": "https://www.twilio.com/docs/whatsapp",
-                 "setup_hint": "Register a WhatsApp sender in Twilio.",
-                 "color_hex": "#25D366", "supports_multi_account": True},
+    "whatsapp": {"category": "Messaging", "tagline": "Send messages and manage templates with the WhatsApp Business Cloud API.",
+                 "docs_url": "https://developers.facebook.com/docs/whatsapp/cloud-api/",
+                 "setup_hint": "Add WhatsApp to a Meta app, then copy its access token, phone number ID, and business account ID.",
+                 "color_hex": "#25D366", "supports_multi_account": True,
+                 "capabilities": [
+                     "Send text, template, image, document, audio, and video messages",
+                     "List, create, and delete WhatsApp message templates",
+                     "Receive inbound messages and delivery/read status via webhooks",
+                     "Read and update the public WhatsApp Business profile",
+                 ],
+                 "example_prompts": [
+                     "Send the approved hello_world template to my test recipient.",
+                     "Create a utility template for order status updates.",
+                     "Show my WhatsApp phone quality rating and approved templates.",
+                 ]},
     "twilio": {"category": "Messaging", "tagline": "SMS and voice calls.",
                "docs_url": "https://www.twilio.com/docs/usage/api",
                "setup_hint": "Find Account SID + Auth Token at console.twilio.com.",
@@ -479,7 +506,9 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                            "Whenever a comment is negative, draft a polite reply for me to approve.",
                            "Pull last week's reach + engagement and summarize trends.",
                        ]},
-    "youtube":        {"category": "Social", "tagline": "Search YouTube, read video & channel stats, manage comments and playlists.",
+    "youtube":        {"category": "Social",
+                       "description": "YouTube Data API v3 — search videos and channels, read video, channel, comment, and caption data, upload videos from a user-approved public HTTPS URL, and manage owned video metadata, privacy, scheduling, comments, ratings, and playlists.",
+                       "tagline": "Search YouTube, upload videos, and manage video metadata, comments, ratings, and playlists.",
                        "docs_url": "https://developers.google.com/youtube/v3",
                        "setup_hint": "Rides on your Google OAuth client — enable the YouTube Data API v3 and whitelist this provider's redirect URI.",
                        "color_hex": "#FF0000",
@@ -487,10 +516,12 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "capabilities": [
                            "Search videos, channels, and playlists",
                            "Read video/channel stats, comments, and captions",
+                           "Upload videos from a user-approved public HTTPS URL",
                            "Post, reply to, and delete comments; like/dislike videos",
-                           "Edit your video's title/description/tags and manage playlists",
+                           "Edit your video's metadata, privacy, scheduling, and playlists",
                        ],
                        "example_prompts": [
+                           "Upload this approved HTTPS video URL as Private with this title and description.",
                            "Find the top comments on my latest video and draft replies in my voice.",
                            "Pull view + like stats for my last 10 uploads and tell me what's trending.",
                        ]},
@@ -892,6 +923,27 @@ async def list_mcp_server_status(
                 agent_can_use = False
                 hint = f"Connect {s.name} to let agents act on your behalf."
 
+        # A credential the provider has actually refused is not usable, no
+        # matter that a row exists. Only refusals count: a health check can
+        # also fail because the network was down, and taking a working
+        # integration away from agents over a DNS blip is worse than
+        # letting one call fail.
+        if agent_can_use:
+            primary_health = next(
+                (a.health for a in entity_accounts if a.is_default),
+                entity_accounts[0].health if entity_accounts else None,
+            )
+            if (
+                primary_health
+                and primary_health.ok is False
+                and is_credential_rejection(primary_health.detail)
+            ):
+                agent_can_use = False
+                hint = (
+                    f"{s.name} credentials were rejected by the provider — "
+                    "re-enter them to let agents use this again."
+                )
+
         # Warn on expired tokens (the first/default one)
         if oauth_rows:
             primary = next((r for r in oauth_rows if (r.profile or {}).get("is_default")), oauth_rows[0])
@@ -921,7 +973,7 @@ async def list_mcp_server_status(
             server_key=s.server_key,
             name=s.name,
             category=display.get("category"),
-            description=s.description,
+            description=display.get("description", s.description),
             auth_type=s.auth_type,
             scopes=s.scopes,
             tagline=display.get("tagline"),
@@ -1000,6 +1052,47 @@ async def list_mcp_server_status(
     cat_rank = {name: i for i, name in enumerate(_CATEGORY_ORDER)}
     out.sort(key=lambda m: (cat_rank.get(m.category or "", 999), m.name))
     return out
+
+
+@router.get(
+    "/mcp-servers/{server_key}/tools",
+    response_model=MCPToolCatalogResponse,
+)
+async def list_mcp_server_tools(
+    server_key: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return credential-free operation schemas for the Workflow editor.
+
+    Built-in servers are read from their executable ``list_tools()`` surface;
+    remote MCP servers use the last discovered tools cache. Authentication is
+    still resolved only when the Workflow executes the selected operation.
+    """
+    from packages.core.models.mcp import MCPServer
+    from packages.core.services.integration_operation_catalog import (
+        integration_operation_catalog,
+    )
+
+    server = (await db.execute(
+        select(MCPServer).where(
+            MCPServer.server_key == server_key,
+            MCPServer.status == "active",
+        )
+    )).scalar_one_or_none()
+    if server is None or _is_hidden_catalog_server_key(server.server_key):
+        raise HTTPException(404, "Integration operation catalog not found")
+
+    operations, source = integration_operation_catalog(
+        server_key=server.server_key,
+        transport=server.transport,
+        tools_cached=server.tools_cached,
+    )
+    return MCPToolCatalogResponse(
+        server_key=server.server_key,
+        source=source,
+        operations=operations,
+    )
 
 
 
@@ -1903,9 +1996,13 @@ async def oauth_callback(
     if existing:
         existing.provider = server_key
         existing.provider_user_id = provider_user_id
-        existing.access_token = access_token
-        if refresh_token:
-            existing.refresh_token = refresh_token
+        from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
+        store_oauth_account_tokens(
+            existing,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            requester_id=user_id,
+        )
         existing.token_expires_at = token_expires_at
         profile = dict(existing.profile or {})
         profile.update(identity_profile)
@@ -1930,10 +2027,16 @@ async def oauth_callback(
             user_id=user_id,
             provider=server_key,
             provider_user_id=provider_user_id,
-            access_token=access_token,
-            refresh_token=refresh_token,
             token_expires_at=token_expires_at,
             profile=profile,
+        )
+        from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
+        store_oauth_account_tokens(
+            new_row,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            preserve_existing_refresh=False,
+            requester_id=user_id,
         )
         db.add(new_row)
         oauth_row_id = new_row.id

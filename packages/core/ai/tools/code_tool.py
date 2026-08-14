@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import time
+import contextvars
 from typing import Any
 
 from packages.core.ai.runtime.tool_context import (
@@ -37,6 +38,9 @@ from packages.core.ai.runtime.tool_context import (
 )
 
 logger = logging.getLogger(__name__)
+_CURRENT_ENTITY_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "code_tool_entity_id", default="",
+)
 
 # ── Action catalog ──────────────────────────────────────────────────────────
 
@@ -148,11 +152,29 @@ def _search_actions(query: str, max_results: int = 8) -> list[dict]:
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _get_cwd(params: dict) -> str:
-    """Get working directory from params, or fall back to cwd/home."""
-    cwd = params.get("cwd", "")
-    if cwd and os.path.isdir(cwd):
-        return cwd
-    return os.getcwd()
+    """Resolve a working directory strictly inside the active entity root."""
+    entity_id = _CURRENT_ENTITY_ID.get().strip()
+    if not entity_id:
+        raise ValueError("entity context is required for filesystem actions")
+
+    from packages.core.services.entity_fs import get_entity_root
+
+    entity_root = os.path.realpath(get_entity_root(entity_id))
+    requested = str(params.get("cwd") or "").strip()
+    candidate = (
+        os.path.realpath(requested)
+        if requested and os.path.isabs(requested)
+        else os.path.realpath(os.path.join(entity_root, requested))
+    )
+    try:
+        inside_root = os.path.commonpath([entity_root, candidate]) == entity_root
+    except ValueError:
+        inside_root = False
+    if not inside_root:
+        raise ValueError("cwd must stay inside the active entity workspace")
+    if not os.path.isdir(candidate):
+        raise ValueError("cwd does not exist inside the active entity workspace")
+    return candidate
 
 
 def _run_cmd(cmd: list[str], cwd: str, timeout: int = 30) -> dict:
@@ -1106,30 +1128,17 @@ async def _handle_refactor_move(params: dict, entity_id: str) -> str:
 # ── Monitor ──────────────────────────────────────────────────────────────────
 
 async def _handle_monitor_start(params: dict, entity_id: str) -> str:
-    global _MONITOR_COUNTER
-    cmd = params.get("command", "")
-    if not cmd:
-        return "command required"
-
-    cwd = _get_cwd(params)
-    _MONITOR_COUNTER += 1
-    mid = f"mon_{_MONITOR_COUNTER}"
-
-    try:
-        proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=cwd, text=True, bufsize=1,
+    del params, entity_id
+    # User-controlled commands must never execute in the API process. A
+    # future monitor implementation must call the isolated sandbox service
+    # and return a remote job id; there is deliberately no environment flag
+    # that can re-enable host execution here.
+    return json.dumps({
+        "error": (
+            "monitor execution is unavailable on the API host; use an "
+            "isolated sandbox execution tool"
         )
-        _MONITORS[mid] = {
-            "process": proc,
-            "cmd": cmd,
-            "cwd": cwd,
-            "started": time.time(),
-            "pid": proc.pid,
-        }
-        return json.dumps({"id": mid, "pid": proc.pid, "command": cmd, "status": "running"})
-    except Exception as e:
-        return json.dumps({"error": f"Failed to start: {e}"})
+    })
 
 
 async def _handle_monitor_output(params: dict, entity_id: str) -> str:
@@ -1512,11 +1521,14 @@ async def _code_handler(entity_id: str = "", **kwargs: Any) -> str:
     if not handler:
         return json.dumps({"error": f"Action '{action}' handler not yet implemented."})
 
+    context_token = _CURRENT_ENTITY_ID.set(entity_id)
     try:
         return await handler(params, entity_id)
     except Exception as e:
         logger.exception("code action=%s failed: %s", action, e)
         return json.dumps({"error": f"Action '{action}' failed: {e}"})
+    finally:
+        _CURRENT_ENTITY_ID.reset(context_token)
 
 
 def get_tools():

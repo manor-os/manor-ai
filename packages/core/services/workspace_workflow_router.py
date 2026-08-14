@@ -7,14 +7,12 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from jsonschema import Draft202012Validator, FormatChecker
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 
 
@@ -132,6 +130,12 @@ def normalize_chat_entrypoint(
             "progress": bool(projection.get("progress", True)),
             "step_outputs": str(projection.get("step_outputs") or "explicit"),
             "final_output": bool(projection.get("final_output", True)),
+            "approval_review": str(projection.get("approval_review") or "inline"),
+            "final_output_fields": [
+                field
+                for field in _strings(projection.get("final_output_fields"))[:32]
+                if len(field) <= 128
+            ],
         },
         wait_bridge=bool(raw.get("wait_bridge", True)),
     )
@@ -152,18 +156,40 @@ def _run_input_default(value: Any, variables: dict[str, Any]) -> Any:
     return current
 
 
-def _run_input_prefill(value: Any) -> dict[str, str] | None:
+def _run_input_prefill(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     source = str(value.get("source") or "").strip().lower()
     mode = str(value.get("mode") or "").strip().lower()
-    if source != "chat_message" or mode not in {"raw", "structured"}:
+    if source == "chat_message" and mode in {"raw", "structured"}:
+        result = {"source": source, "mode": mode}
+        instructions = str(value.get("instructions") or "").strip()
+        if instructions:
+            result["instructions"] = instructions[:_PREFILL_INSTRUCTIONS_MAX_CHARS]
+        return result
+    if source != "workflow_result" or mode not in {"", "latest"}:
         return None
-    result = {"source": source, "mode": mode}
-    instructions = str(value.get("instructions") or "").strip()
-    if instructions:
-        result["instructions"] = instructions[:_PREFILL_INSTRUCTIONS_MAX_CHARS]
-    return result
+    workflow_slug = str(
+        value.get("workflow_slug") or value.get("workflow") or ""
+    ).strip()
+    terminal_step_id = str(value.get("terminal_step_id") or "").strip()
+    path = str(value.get("path") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", workflow_slug):
+        return None
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,99}", terminal_step_id):
+        return None
+    if path and not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*){0,7}",
+        path,
+    ):
+        return None
+    return {
+        "source": source,
+        "mode": "latest",
+        "workflow_slug": workflow_slug,
+        "terminal_step_id": terminal_step_id,
+        "path": path,
+    }
 
 
 def workflow_run_inputs(workflow: Any) -> tuple[dict[str, Any], ...]:
@@ -192,7 +218,13 @@ def workflow_run_inputs(workflow: Any) -> tuple[dict[str, Any], ...]:
                 continue
             seen.add(key)
             raw_type = str(row.get("type") or "string").strip().lower()
-            input_type = raw_type if raw_type in {"string", "number", "boolean", "json"} else "string"
+            input_type = (
+                "number"
+                if raw_type == "integer"
+                else raw_type
+                if raw_type in {"string", "number", "boolean", "json"}
+                else "string"
+            )
             raw_default = row.get("defaultValue", row.get("default", row.get("value")))
             normalized = {
                 "key": key,
@@ -211,6 +243,8 @@ def workflow_run_inputs(workflow: Any) -> tuple[dict[str, Any], ...]:
                 normalized["target"] = target
             if isinstance(row.get("schema"), dict):
                 normalized["schema"] = deepcopy(row["schema"])
+            elif raw_type == "integer":
+                normalized["schema"] = {"type": "integer"}
             prefill = (
                 _run_input_prefill(row.get("prefill"))
                 if "prefill" in row
@@ -260,7 +294,16 @@ def prefill_workspace_workflow_inputs(
                 for key in ("request", "message", "prompt", "chatInput")
                 if (item := by_key.get(key)) in legacy_string_inputs
             ),
-            legacy_string_inputs[0] if legacy_string_inputs else None,
+            # Legacy definitions did not declare an explicit chat-message
+            # prefill. Preserve the useful old behavior for a required text
+            # intake, but never pour the whole user message into an arbitrary
+            # optional field such as ``knowledge_query`` or ``canonical_url``.
+            # Those fields already have workflow defaults and a routing
+            # instruction is not their value.
+            next(
+                (item for item in legacy_string_inputs if item.get("required")),
+                None,
+            ),
         )
         if preferred is not None:
             values[str(preferred["key"])] = text
@@ -717,6 +760,89 @@ async def list_workspace_chat_entrypoints(
     return sorted(entrypoints, key=lambda item: (item.order, item.title.lower(), item.binding_id))
 
 
+async def list_global_chat_flow_entrypoints(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    user: Any,
+    require_control: bool = True,
+) -> list[tuple[WorkspaceChatEntrypoint, WorkflowBinding, WorkflowDefinition, Any]]:
+    """Return Workspace-published Flows the current user may invoke from Chat.
+
+    Global Chat has no implicit Workspace boundary, so every option carries its
+    owning Workspace and is filtered by the same read/control policy used when
+    the run is actually launched. This keeps the ``%`` picker from advertising
+    a Flow that would fail authorization after selection.
+    """
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_access import (
+        user_can_read_workspace,
+        user_can_write_workspace_artifacts,
+    )
+
+    if user is None or str(getattr(user, "entity_id", "") or "") != entity_id:
+        return []
+    rows = (await db.execute(
+        select(WorkflowBinding, WorkflowDefinition, Workspace)
+        .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
+        .join(Workspace, Workspace.id == WorkflowBinding.workspace_id)
+        .where(
+            WorkflowBinding.entity_id == entity_id,
+            WorkflowBinding.enabled.is_(True),
+            WorkflowBinding.status == "active",
+            WorkflowDefinition.is_active.is_(True),
+            WorkflowDefinition.status == "active",
+            Workspace.deleted_at.is_(None),
+        )
+        .order_by(Workspace.name.asc(), WorkflowBinding.name.asc(), WorkflowBinding.id.asc())
+    )).all()
+    visible: list[
+        tuple[WorkspaceChatEntrypoint, WorkflowBinding, WorkflowDefinition, Any]
+    ] = []
+    for binding, workflow, workspace in rows:
+        entrypoint = normalize_chat_entrypoint(binding, workflow)
+        if entrypoint is None:
+            continue
+        if not await user_can_read_workspace(db, workspace=workspace, user=user):
+            continue
+        if require_control and not await user_can_write_workspace_artifacts(
+            db,
+            workspace_id=workspace.id,
+            user_id=user.id,
+            entity_role=user.role,
+        ):
+            continue
+        visible.append((entrypoint, binding, workflow, workspace))
+    return sorted(
+        visible,
+        key=lambda item: (
+            str(getattr(item[3], "name", "") or "").lower(),
+            item[0].order,
+            item[0].title.lower(),
+            item[0].binding_id,
+        ),
+    )
+
+
+async def get_global_chat_flow_entrypoint(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    user: Any,
+    binding_id: str,
+) -> tuple[WorkspaceChatEntrypoint, WorkflowBinding, WorkflowDefinition, Any] | None:
+    rows = await list_global_chat_flow_entrypoints(
+        db,
+        entity_id=entity_id,
+        user=user,
+        require_control=True,
+    )
+    return next(
+        (item for item in rows if item[0].binding_id == binding_id),
+        None,
+    )
+
+
 async def get_workspace_chat_entrypoint(
     db: AsyncSession,
     *,
@@ -872,11 +998,10 @@ async def start_workspace_chat_entrypoint(
     confidence: float | None = None,
     reason: str | None = None,
 ) -> WorkspaceEntrypointRun:
-    from packages.core.ai.workflow_runner import WorkflowRunner
     from packages.core.services.conversation_lifecycle import get_or_create_conversation
     from packages.core.services.conversation_messages import add_message
     from packages.core.services.runtime_file_context import runtime_saved_message_with_file_references
-    from packages.core.services.workflow_service import start_workflow_from_binding
+    from packages.core.services.workspace_flow_launcher import launch_workspace_flow
 
     conversation = await get_or_create_conversation(
         db,
@@ -898,132 +1023,29 @@ async def start_workspace_chat_entrypoint(
             "workflow_binding_id": binding.id,
         },
     )
-    attachment_descriptors = workflow_attachment_descriptors(attachments)
-    initial_values = await prepare_workspace_workflow_inputs(
-        entrypoint,
-        message=message,
-        attachment_refs=attachment_descriptors,
+    launched = await launch_workspace_flow(
+        db,
+        source=route_source,
+        entrypoint=entrypoint,
+        binding=binding,
         entity_id=entity_id,
         user_id=user_id,
         workspace_id=workspace_id,
-    )
-    initial_variables = assemble_workspace_workflow_inputs(
-        entrypoint,
-        initial_values,
-    )
-    requires_input = bool(entrypoint.run_inputs)
-    entrypoint_context = {
-        "enabled": True,
-        "route_source": route_source,
-        "conversation_id": conversation.id,
-        "user_message_id": user_message.id,
-        "projection": entrypoint.projection,
-        "wait_bridge": entrypoint.wait_bridge,
+        conversation_id=conversation.id,
+        origin_message_id=user_message.id,
+        source_brief=message,
+        attachments=attachments,
+        starter_policy="always_review",
+        origin_metadata={
         **({"confidence": confidence} if confidence is not None else {}),
         **({"reason": reason} if reason else {}),
-    }
-    run = await start_workflow_from_binding(
-        db,
-        binding,
-        variables=None,
-        trigger_data={
-            **deepcopy(initial_values),
-            **deepcopy(initial_variables),
-            "runtime_context": {
-                "workspace_id": workspace_id,
-                "conversation_id": conversation.id,
-            },
-            "_workspace_chat_entrypoint": entrypoint_context,
-        },
-        trigger_source="workspace_chat",
-        started_by=user_id,
-        execution_workspace_id=workspace_id,
-    )
-    if requires_input:
-        run.status = "paused"
-    route_label = "Automatically selected" if route_source == "intent" else "Selected"
-    activity_status = "paused" if requires_input else "queued"
-    from packages.core.services.workflow_chat_projection import workflow_progress_steps
-
-    activity_message = await add_message(
-        db,
-        conversation.id,
-        role="system",
-        content=(
-            f"{route_label} {entrypoint.title}. Review the workflow inputs to continue."
-            if requires_input
-            else f"{route_label} {entrypoint.title}. Preparing the first workflow step."
-        ),
-        message_kind="workflow_activity",
-        refs=[
-            {"type": "workflow", "id": run.workflow_id, "title": entrypoint.title},
-            {"type": "workflow_run", "id": run.id},
-        ],
-        meta={
-            "workflow_run_id": run.id,
-            "workflow_binding_id": binding.id,
-            "workflow_title": entrypoint.title,
-            "workflow_status": activity_status,
-            "workflow_route_source": route_source,
-            "workflow_steps": workflow_progress_steps(
-                run,
-                activity_status=activity_status,
-            ),
         },
     )
-    updated_trigger_data = dict(run.trigger_data or {})
-    entrypoint_context = dict(updated_trigger_data.get("_workspace_chat_entrypoint") or {})
-    entrypoint_context["activity_message_id"] = activity_message.id
-    updated_trigger_data["_workspace_chat_entrypoint"] = entrypoint_context
-    run.trigger_data = updated_trigger_data
-    if requires_input:
-        await add_message(
-            db,
-            conversation.id,
-            role="system",
-            content=f"Provide the inputs required to run {entrypoint.title}.",
-            message_kind="hitl_request",
-            refs=[
-                {"type": "workflow", "id": run.workflow_id, "title": entrypoint.title},
-                {"type": "workflow_run", "id": run.id},
-            ],
-            pending_action={
-                "kind": PendingActionKind.WORKFLOW_STARTER_INPUT.value,
-                "title": entrypoint.title,
-                "description": entrypoint.description,
-                "workflow_run_id": run.id,
-                "workflow_binding_id": binding.id,
-                "inputs": [dict(item) for item in entrypoint.run_inputs],
-                "values": initial_values,
-                "options": ["run", "cancel"],
-            },
-            meta={
-                "workflow_run_id": run.id,
-                "workflow_input_stage": "starter",
-            },
-        )
-    await db.commit()
-    if not requires_input:
-        if WorkflowRunner.enqueue(run.id) is False:
-            run.status = "failed"
-            run.error = "Workflow could not be queued. Please start it again."
-            run.completed_at = datetime.now(timezone.utc)
-            from packages.core.services.workflow_run_trace import (
-                update_workflow_history_summary,
-            )
-
-            update_workflow_history_summary(run)
-            from packages.core.services.workflow_chat_projection import (
-                project_workflow_run_status,
-            )
-
-            await project_workflow_run_status(db, run=run)
-            await db.commit()
     return WorkspaceEntrypointRun(
-        run=run,
+        run=launched.run,
         conversation=conversation,
         user_message=user_message,
-        activity_message=activity_message,
+        activity_message=launched.activity_message,
     )
 
 

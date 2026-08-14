@@ -29,6 +29,7 @@ STRATEGIST_TASK_CAPABILITY_IDS = (
     "automation.manage",
     "workflow.manage",
     "manor.composite",
+    "external.social",
 )
 
 
@@ -58,6 +59,23 @@ def _as_clean_capability_ids(values: Any) -> tuple[str, ...]:
             seen.add(text)
             out.append(text)
     return tuple(out)
+
+
+def _task_capability_available(
+    capability_id: str,
+    *,
+    profile: RuntimeProfile | None,
+) -> bool:
+    capability = capability_for_id(capability_id)
+    if capability is None:
+        return False
+    if profile is not None and capability.profiles and profile not in capability.profiles:
+        return False
+    if profile is None or tool_names_for_capability_ids({capability_id}, profile=profile):
+        return True
+    # External capabilities can be governance-only markers. Their provider
+    # tools are resolved dynamically through an installed Skill/MCP binding.
+    return bool((capability.metadata or {}).get("action_key_prefixes"))
 
 
 def task_runtime_capability_validation_errors(
@@ -90,7 +108,7 @@ def task_runtime_capability_validation_errors(
                 "message": f"runtime capability {capability_id!r} is not allowed for strategist tasks",
             })
             continue
-        if profile is not None and not tool_names_for_capability_ids({capability_id}, profile=profile):
+        if not _task_capability_available(capability_id, profile=profile):
             errors.append({
                 "path": path,
                 "message": f"runtime capability {capability_id!r} is not available for profile {profile.value}",
@@ -119,8 +137,7 @@ def normalize_task_runtime_capability_ids(
         if capability_for_id(capability_id) is not None
         and (not allowed or capability_id in allowed)
         and (
-            profile is None
-            or bool(tool_names_for_capability_ids({capability_id}, profile=profile))
+            _task_capability_available(capability_id, profile=profile)
         )
     )
 

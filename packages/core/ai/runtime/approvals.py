@@ -36,6 +36,7 @@ _ACTION_KEY_CAPABILITY_ALIASES: dict[str, str] = {
     "sandbox_write_file": "sandbox.execute",
     "sandbox_save_result": "sandbox.execute",
     "sandbox_destroy": "sandbox.execute",
+    "video_edit": "sandbox.execute",
     "create_scheduled_job": "automation.manage",
     "list_scheduled_jobs": "automation.manage",
     "cancel_scheduled_job": "automation.manage",
@@ -102,6 +103,7 @@ class RuntimeApprovalRequest:
     workspace_id: str | None = None
     conversation_id: str | None = None
     task_id: str | None = None
+    step_id: str | None = None
     envelope: RuntimeEnvelope | None = None
 
 
@@ -271,6 +273,7 @@ class LegacyWorkspaceApprovalPolicyAdapter:
             workspace_id=request.workspace_id,
             conversation_id=request.conversation_id,
             task_id=request.task_id,
+            step_id=request.step_id,
         )
 
 
@@ -312,6 +315,7 @@ class RuntimeApprovalMiddleware:
         workspace_id: str | None,
         conversation_id: str | None,
         task_id: str | None = None,
+        step_id: str | None = None,
     ) -> str | None:
         """Run the Manor runtime approval gate for a concrete tool call.
 
@@ -326,6 +330,7 @@ class RuntimeApprovalMiddleware:
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
+            step_id=step_id,
         ))
         return decision.blocked_result
 

@@ -186,6 +186,51 @@ async def test_update_workspace(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_update_workspace_explicit_null_clears_optional_field(client: AsyncClient):
+    _, headers = await _register(client, "workspace_null_clear")
+    create_resp = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Nullable", "identity_label": "keep-me"},
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    ws_id = create_resp.json()["id"]
+    assert create_resp.json()["identity_label"] == "keep-me"
+
+    cleared = await client.put(
+        f"/api/v1/workspaces/{ws_id}",
+        headers=headers,
+        json={"identity_label": None},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["identity_label"] is None
+
+    refreshed = await client.get(f"/api/v1/workspaces/{ws_id}", headers=headers)
+    assert refreshed.status_code == 200
+    assert refreshed.json()["identity_label"] is None
+
+
+@pytest.mark.asyncio
+async def test_update_workspace_omitted_optional_field_is_preserved(client: AsyncClient):
+    _, headers = await _register(client, "workspace_omitted_preserved")
+    create_resp = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Preserve", "identity_label": "keep-me"},
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    ws_id = create_resp.json()["id"]
+
+    updated = await client.put(
+        f"/api/v1/workspaces/{ws_id}",
+        headers=headers,
+        json={"name": "Preserved name"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["identity_label"] == "keep-me"
+
+
+@pytest.mark.asyncio
 async def test_delete_workspace(client: AsyncClient):
     _, headers = await _register(client)
     create_resp = await client.post("/api/v1/workspaces", headers=headers, json={"name": "ToDelete"})

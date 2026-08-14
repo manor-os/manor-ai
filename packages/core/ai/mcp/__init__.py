@@ -39,6 +39,7 @@ from . import (
     jimeng,
     producthunt,
     facebook,
+    whatsapp,
     youtube,
     tiktok,
     shopify,
@@ -95,6 +96,7 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     "producthunt": producthunt,
     # Social platforms (OAuth via Nango)
     "facebook": facebook,
+    "whatsapp": whatsapp,
     # Video platforms (official API + OAuth). Instagram Reels publishing
     # lives in the `facebook` module (Meta Graph API).
     "youtube": youtube,

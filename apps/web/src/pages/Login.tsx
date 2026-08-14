@@ -1,8 +1,9 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
 import { api, ApiError } from "../lib/api";
-import { IconEye, IconEyeOff, IconInfo, IconCheckCircle } from "../components/icons";
+import { IconEye, IconEyeOff, IconInfo } from "../components/icons";
+import AuthShell, { AuthBrand } from "../components/auth/AuthShell";
 import { t } from "../lib/i18n";
 
 type Tab = "login" | "register";
@@ -79,6 +80,7 @@ export default function Login() {
       const state = crypto.randomUUID();
       sessionStorage.setItem("oauth_state", state);
       sessionStorage.setItem("oauth_next", inviteRedirectPath);
+      sessionStorage.setItem("oauth_remember_me", rememberMe ? "1" : "0");
       if (teamInviteToken) {
         sessionStorage.setItem("oauth_team_invite", teamInviteToken);
         sessionStorage.removeItem("oauth_invitation_code");
@@ -96,36 +98,9 @@ export default function Login() {
       setError(t("page.login.could_not_start_google_sign_in_please_check_the"));
       setGoogleLoading(false);
     }
-  }, [invitationCode, inviteRedirectPath, teamInviteToken]);
+  }, [invitationCode, inviteRedirectPath, rememberMe, teamInviteToken]);
 
   const { login, login2fa, register, verifyEmail, resendVerification, pendingVerificationEmail, pending2fa } = useAuthStore();
-
-  /* ---------- mouse tracking ---------- */
-  const wrapperRef = useRef<HTMLDivElement>(null);
-  const spotlightRef = useRef<HTMLDivElement>(null);
-  const perspRef = useRef<HTMLDivElement>(null);
-  const handleMouseMove = useCallback((e: React.MouseEvent) => {
-    if (spotlightRef.current) {
-      spotlightRef.current.style.background = `radial-gradient(800px circle at ${e.clientX}px ${e.clientY}px, rgba(79,125,117,0.06), transparent 60%)`;
-    }
-    if (perspRef.current) {
-      const rect = perspRef.current.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      const rotY = ((e.clientX - cx) / rect.width) * 6;
-      const rotX = -((e.clientY - cy) / rect.height) * 6;
-      perspRef.current.style.transform = `perspective(1200px) rotateX(${rotX}deg) rotateY(${rotY}deg)`;
-    }
-  }, []);
-
-  const handleMouseLeave = useCallback(() => {
-    if (perspRef.current) {
-      perspRef.current.style.transform = "perspective(1200px) rotateX(0deg) rotateY(0deg)";
-    }
-    if (spotlightRef.current) {
-      spotlightRef.current.style.background = "transparent";
-    }
-  }, []);
 
   /* ---------- submit ---------- */
   const handleSubmit = async (e: React.FormEvent) => {
@@ -211,55 +186,21 @@ export default function Login() {
   };
 
   return (
-    <div
-      ref={wrapperRef}
-      onMouseMove={handleMouseMove}
-      onMouseLeave={handleMouseLeave}
-      className="min-h-screen w-full flex items-center justify-center relative overflow-hidden"
-    >
-      {/* Tech grid background */}
-      <div className="tech-bg" />
-      {/* Spotlight */}
-      <div ref={spotlightRef} className="spotlight" />
-      {/* Blob animations */}
-      <div className="blob blob-1" />
-      <div className="blob blob-2" />
+    <AuthShell>
+      {/* Sticky header */}
+      <div className="sticky top-0 z-20 flex items-center justify-between p-8 bg-transparent">
+        <AuthBrand />
+        <button
+          type="button"
+          onClick={() => { setTab(tab === "login" ? "register" : "login"); setError(""); useAuthStore.setState({ pendingVerificationEmail: null }); setVerificationCode(""); setShowForgotPassword(false); }}
+          style={{ fontSize: 13, fontWeight: 600, color: "#4f7d75", background: "transparent", border: "none", cursor: "pointer" }}
+        >
+          {tab === "login" ? t("page.login.create_account") : t("page.login.sign_in")}
+        </button>
+      </div>
 
-      {/* Main panel */}
-      <div
-        className="login-shell-panel relative z-10 w-full flex overflow-hidden"
-        style={{
-          maxWidth: 1152,
-          height: "85vh",
-          borderRadius: 40,
-        }}
-      >
-        {/* ========== LEFT COLUMN — FORM (5/12) ========== */}
-        <div className="w-full lg:w-5/12 flex flex-col overflow-y-auto">
-          {/* Sticky header */}
-          <div className="sticky top-0 z-20 flex items-center justify-between p-8 bg-transparent">
-            <div className="flex items-center gap-2">
-              <div
-                className="flex items-center justify-center"
-                style={{ width: 32, height: 32, borderRadius: 10, background: "#292524" }}
-              >
-                <svg viewBox="0 0 1024 1024" width="16" height="16" fill="white">
-                  <path d="M295.152941 0l224.376471 224.376471L743.905882 0H1024v63.247059L519.529412 567.717647 0 49.694118V0h295.152941zM0 256l243.952941 243.952941V1024H0V256z m1024 15.058824v752.941176H780.047059V515.011765L1024 271.058824z" />
-                </svg>
-              </div>
-              <span style={{ fontSize: 18, fontWeight: 800, color: "#292524" }}>{t("page.chat_history.manor_ai")}</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => { setTab(tab === "login" ? "register" : "login"); setError(""); useAuthStore.setState({ pendingVerificationEmail: null }); setVerificationCode(""); setShowForgotPassword(false); }}
-              style={{ fontSize: 13, fontWeight: 600, color: "#4f7d75", background: "transparent", border: "none", cursor: "pointer" }}
-            >
-              {tab === "login" ? t("page.login.create_account") : t("page.login.sign_in")}
-            </button>
-          </div>
-
-          {/* Form body */}
-          <div className="flex-1 flex flex-col justify-center px-8 pb-8" style={{ maxWidth: 420 }}>
+      {/* Form body */}
+      <div className="flex-1 flex flex-col justify-center px-8 pb-8" style={{ maxWidth: 420 }}>
             <h1 style={{ fontSize: 30, fontWeight: 900, color: "#292524", marginBottom: 8 }}>
               {pending2fa ? t("page.login.two_factor_auth") : pendingVerificationEmail ? t("page.login.verify_email") : showForgotPassword ? t("page.login.reset_password") : tab === "login" ? t("page.login.sign_in") : t("page.login.create_account")}
             </h1>
@@ -363,18 +304,21 @@ export default function Login() {
                     <input
                       type="text"
                       required
-                      maxLength={6}
+                      maxLength={8}
                       value={verificationCode}
-                      onChange={(e) => setVerificationCode(e.target.value.replace(/\D/g, ""))}
+                      onChange={(e) => setVerificationCode(
+                        e.target.value.replace(/[^A-Za-z0-9]/g, "").toUpperCase(),
+                      )}
                       className="login-input"
-                      style={{ textAlign: "center", fontSize: 24, letterSpacing: 8, fontWeight: 700 }}
-                      placeholder="000000"
+                      style={{ textAlign: "center", fontSize: 22, letterSpacing: 5, fontWeight: 700 }}
+                      placeholder="AB12CD34"
+                      autoComplete="one-time-code"
                       autoFocus
                     />
                   </div>
                 </div>
 
-                <button type="submit" disabled={loading || verificationCode.length !== 6} className="login-submit-btn">
+                <button type="submit" disabled={loading || verificationCode.length !== 8} className="login-submit-btn">
                   {loading ? t("page.login.verifying") : t("page.login.verify_email")}
                 </button>
 
@@ -491,6 +435,8 @@ export default function Login() {
                       <input
                         type={showPassword ? "text" : "password"}
                         required
+                        minLength={12}
+                        maxLength={72}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
                         className="login-input"
@@ -694,118 +640,7 @@ export default function Login() {
 
             </>
             )}
-          </div>
-        </div>
-
-        {/* ========== RIGHT COLUMN — SHOWCASE (7/12, hidden mobile) ========== */}
-        <div
-          className="hidden lg:flex lg:w-7/12 relative items-center justify-center overflow-hidden"
-          style={{
-            borderRadius: "0 40px 40px 0",
-          }}
-        >
-          {/* Soft ambient wash */}
-          <div
-            className="login-showcase-wash"
-            style={{
-              position: "absolute",
-              inset: 0,
-              zIndex: 1,
-            }}
-          />
-
-          {/* 3D perspective container */}
-          <div
-            ref={perspRef}
-            style={{
-              position: "relative",
-              zIndex: 2,
-              width: "100%",
-              height: "100%",
-              transition: "transform 0.15s ease-out",
-              transformStyle: "preserve-3d",
-            }}
-          >
-            {/* Floating card 1 — top left */}
-            <div
-              className="login-float-card float"
-              style={{
-                position: "absolute",
-                top: "14%",
-                left: "8%",
-                transform: "translateZ(40px)",
-                animationDelay: "0s",
-              }}
-            >
-              <div style={{ width: 40, height: 40, borderRadius: 12, background: "#5f84bd", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 10 }}>
-                <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 18L9 11.25l4.306 4.307a11.95 11.95 0 015.814-5.519l2.74-1.22m0 0l-5.94-2.28m5.94 2.28l-2.28 5.941" />
-                </svg>
-              </div>
-              <p style={{ color: "#1c1917", fontWeight: 700, fontSize: 15, marginBottom: 2 }}>{t("page.login.efficiency_up")}</p>
-              <p style={{ color: "#78716c", fontSize: 13 }}>{t("page.login.plus_24_percent_this_week")}</p>
-            </div>
-
-            {/* Floating card 2 — bottom right */}
-            <div
-              className="login-float-card float"
-              style={{
-                position: "absolute",
-                bottom: "16%",
-                right: "8%",
-                transform: "translateZ(40px)",
-                animationDelay: "-2s",
-              }}
-            >
-              <div style={{ width: 40, height: 40, borderRadius: 12, background: "#54a176", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 10 }}>
-                <IconCheckCircle size={20} className="text-white" />
-              </div>
-              <p style={{ color: "#1c1917", fontWeight: 700, fontSize: 15, marginBottom: 2 }}>{t("page.login.tasks_completed")}</p>
-              <p style={{ color: "#78716c", fontSize: 13 }}>{t("page.login.12_today")}</p>
-            </div>
-
-            {/* Floating card 3 — center */}
-            <div
-              className="login-float-card float"
-              style={{
-                position: "absolute",
-                top: "40%",
-                left: "50%",
-                marginLeft: -80,
-                transform: "translateZ(40px)",
-                animationDelay: "-4s",
-              }}
-            >
-              <div style={{ width: 40, height: 40, borderRadius: 12, background: "#9079c2", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 10 }}>
-                <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
-                </svg>
-              </div>
-              <p style={{ color: "#1c1917", fontWeight: 700, fontSize: 15, marginBottom: 2 }}>{t("page.login.ai_agents_active")}</p>
-              <p style={{ color: "#78716c", fontSize: 13 }}>{t("page.login.8_running_now")}</p>
-            </div>
-
-            {/* Hero text */}
-            <div style={{ position: "absolute", bottom: "10%", left: "8%", right: "8%", zIndex: 3 }}>
-              <h2 style={{ fontSize: "3rem", fontWeight: 900, color: "#1c1917", lineHeight: 1.1, marginBottom: 12 }}>
-                {t("page.onboarding.step_welcome")}{" "}
-                <span
-                  style={{
-                    background: "linear-gradient(135deg, #5d7f77, #82ada4)",
-                    WebkitBackgroundClip: "text",
-                    WebkitTextFillColor: "transparent",
-                  }}
-                >
-                  {t("page.onboarding.back")}
-                </span>
-              </h2>
-              <p style={{ color: "#57534e", fontSize: 14, lineHeight: 1.6, maxWidth: 360 }}>
-                {t("page.login.your_ai_powered_business_management_platform_str")}
-              </p>
-            </div>
-          </div>
-        </div>
       </div>
-    </div>
+    </AuthShell>
   );
 }

@@ -75,6 +75,8 @@ async def test_blueprint_favorites_are_cross_tenant_marketplace_signals(
     entry = next(item for item in listing.json() if item["id"] == blueprint.id)
     assert entry["favorite_count"] == 1
     assert entry["is_favorited"] is True
+    assert entry["cover_template"]["motif"] == "workspace"
+    assert entry["cover_template"]["variant"] in {0, 1, 2}
 
     response = await client.post(
         f"/api/v1/blueprints/{blueprint.id}/favorite",

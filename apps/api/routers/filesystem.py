@@ -31,6 +31,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response as RawResponse
@@ -66,6 +67,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/fs", tags=["filesystem"])
 
+_ACTIVE_PUBLIC_EXTENSIONS = {
+    ".html", ".htm", ".svg", ".xml", ".xhtml", ".js", ".mjs", ".css",
+}
+_ACTIVE_PUBLIC_MEDIA_TYPES = {
+    "text/html", "image/svg+xml", "application/xml", "text/xml",
+    "application/javascript", "text/javascript", "text/css",
+}
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -89,6 +98,28 @@ def _require_fs_ready_for_mutation() -> None:
 def _file_not_found() -> HTTPException:
     """Return an uncacheable 404 for file-serving misses."""
     return HTTPException(404, "File not found", headers={"Cache-Control": "no-store"})
+
+
+def _signed_file_response_metadata(
+    file_path: _Path,
+    content_type: str,
+) -> tuple[str, dict[str, str]]:
+    headers = {
+        "Cache-Control": "private, max-age=900",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if (
+        file_path.suffix.lower() in _ACTIVE_PUBLIC_EXTENSIONS
+        or content_type.split(";", 1)[0].lower() in _ACTIVE_PUBLIC_MEDIA_TYPES
+    ):
+        safe_name = file_path.name.replace('"', "").replace("\r", "").replace("\n", "")
+        headers["Content-Disposition"] = (
+            f"attachment; filename=\"{safe_name}\"; "
+            f"filename*=UTF-8''{quote(file_path.name)}"
+        )
+        headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        return "application/octet-stream", headers
+    return content_type, headers
 
 
 # Strong refs to the in-flight avatar cleanup tasks so they don't get
@@ -683,6 +714,19 @@ async def upload_file(
                 total += len(chunk)
                 await f.write(chunk)
 
+        from packages.core.services.upload_security import (
+            UploadSecurityError,
+            inspect_upload_path,
+        )
+        try:
+            await inspect_upload_path(
+                tmp_path,
+                filename=filename,
+                declared_content_type=file.content_type,
+            )
+        except UploadSecurityError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+
         def _persist_upload():
             target = copy_entity_file_atomic(
                 user.entity_id,
@@ -1229,14 +1273,13 @@ def _resolve_signed_entity_file(token: str) -> tuple[_Path, str, int]:
 @router.head("/public/{token}/{filename:path}")
 async def head_signed_entity_file(token: str, filename: str | None = None):
     """Allow media providers to preflight signed image URLs before GET."""
-    _file_path, content_type, file_size = _resolve_signed_entity_file(token)
+    file_path, content_type, file_size = _resolve_signed_entity_file(token)
+    response_type, headers = _signed_file_response_metadata(file_path, content_type)
+    headers["Content-Length"] = str(file_size)
     return RawResponse(
         status_code=200,
-        media_type=content_type,
-        headers={
-            "Cache-Control": "private, max-age=900",
-            "Content-Length": str(file_size),
-        },
+        media_type=response_type,
+        headers=headers,
     )
 
 
@@ -1245,10 +1288,11 @@ async def head_signed_entity_file(token: str, filename: str | None = None):
 async def serve_signed_entity_file(token: str, filename: str | None = None):
     """Serve a short-lived signed file URL for external media providers."""
     file_path, content_type, _file_size = _resolve_signed_entity_file(token)
+    response_type, headers = _signed_file_response_metadata(file_path, content_type)
     return FileResponse(
         path=str(file_path),
-        media_type=content_type,
-        headers={"Cache-Control": "private, max-age=900"},
+        media_type=response_type,
+        headers=headers,
     )
 
 
@@ -1315,12 +1359,12 @@ async def serve_entity_file(
         await _assert_path_readable(db, entity_id, rel_path, user)
 
     content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    response_type, security_headers = _signed_file_response_metadata(file_path, content_type)
+    security_headers["Cache-Control"] = (
+        "public, max-age=86400" if is_public else "private, no-store"
+    )
     return FileResponse(
         path=str(file_path),
-        media_type=content_type,
-        headers={
-            "Cache-Control": (
-                "public, max-age=86400" if is_public else "private, no-store"
-            )
-        },
+        media_type=response_type,
+        headers=security_headers,
     )

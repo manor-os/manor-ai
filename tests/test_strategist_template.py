@@ -73,6 +73,8 @@ class _StubCtx:
 class _StubTask:
     title: str
     task_key: str = ""
+    owner_service_key: str = ""
+    delegate_service_keys: list = field(default_factory=list)
     depends_on_task_keys: list = field(default_factory=list)
     details: dict = field(default_factory=dict)
 
@@ -327,6 +329,33 @@ def test_proposal_shape_no_template_noops():
     assert len(proposal.tasks) == 5
 
 
+def test_proposal_shape_enforces_configured_task_owner_contract():
+    ctx = _StubCtx(
+        strategist_template={
+            "proposal_shape": {
+                "task_contracts": {
+                    "publish_youtube_public": {
+                        "owner_service_key": "stickman.production",
+                        "delegate_service_keys": [],
+                    }
+                }
+            }
+        }
+    )
+    publish = _StubTask(
+        title="Publish the verified MP4 publicly on YouTube",
+        task_key="publish_youtube_public",
+        owner_service_key="stickman.distribution",
+        delegate_service_keys=["stickman.production"],
+    )
+    proposal = _StubProposal(tasks=[publish])
+
+    _enforce_proposal_shape(proposal, ctx)
+
+    assert publish.owner_service_key == "stickman.production"
+    assert publish.delegate_service_keys == []
+
+
 # ── Prompt block rendering ────────────────────────────────────────────
 
 
@@ -354,6 +383,25 @@ def test_format_template_business_model_block():
     assert "weekly" in out
 
 
+def test_format_template_business_model_accepts_blueprint_metric_aliases():
+    ctx = _StubCtx(
+        strategist_template={
+            "business_model": {
+                "model_type": "content_publishing",
+                "primary_metric": "daily_topic_video_completed",
+                "secondary_metrics": [
+                    "youtube_upload_completed",
+                    "youtube_basic_metrics_captured",
+                ],
+            }
+        }
+    )
+    out = _format_strategist_template(ctx)
+    assert "daily_topic_video_completed" in out
+    assert "youtube_upload_completed" in out
+    assert "youtube_basic_metrics_captured" in out
+
+
 def test_format_template_proposal_shape_block():
     ctx = _StubCtx(
         strategist_template={
@@ -368,6 +416,29 @@ def test_format_template_proposal_shape_block():
     assert "Propose at most 3" in out
     assert "content" in out
     assert "4-48 hours" in out
+
+
+def test_format_template_priors_block_preserves_required_task_chain():
+    ctx = _StubCtx(
+        strategist_template={
+            "priors": [
+                "Every daily Proposal must use the dependency chain "
+                "select_daily_topic -> create_verified_video -> "
+                "publish_youtube_public -> register_daily_metrics_handoff.",
+                "The publish_youtube_public task carries one approved "
+                "Proposal authorization and must not ask for confirmation again.",
+            ],
+        }
+    )
+
+    out = _format_strategist_template(ctx)
+
+    assert "Workspace-specific proposal requirements" in out
+    assert (
+        "select_daily_topic -> create_verified_video -> "
+        "publish_youtube_public -> register_daily_metrics_handoff"
+    ) in out
+    assert "must not ask for confirmation again" in out
 
 
 def test_format_template_do_not_propose_block():

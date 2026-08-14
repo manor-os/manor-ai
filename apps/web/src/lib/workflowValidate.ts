@@ -22,7 +22,9 @@ interface Step {
 }
 
 const ENTRY_TYPES = new Set(["trigger", "webhook"]);
-const TERMINAL_TYPES = new Set(["end"]);
+// Both END (successful result) and STOP (intentional failure / unsupported
+// branch) complete a path. Neither needs an outgoing connection.
+const TERMINAL_TYPES = new Set(["end", "stop"]);
 
 // Required config key per node type → issue level when missing/empty.
 const REQUIRED: Record<string, { key: string; level: IssueLevel; label: string }[]> = {
@@ -81,9 +83,14 @@ export function validateWorkflow(steps: Step[]): ValidationIssue[] {
       }
     }
     for (const req of REQUIRED[s.type] || []) {
-      // An agent can either reference a saved Agent or be configured inline
-      // with its own prompt/model. Imported n8n AI agents use the inline form.
-      if (s.type === "agent" && req.key === "agent_id" && !isEmpty(s.config?.prompt)) continue;
+      // An agent can reference a saved Agent, resolve a Workspace service at
+      // run time, run a Skill, or be configured inline with its own prompt.
+      // Imported n8n AI agents use the inline form.
+      if (
+        s.type === "agent" &&
+        req.key === "agent_id" &&
+        (!isEmpty(s.config?.service_key) || !isEmpty(s.config?.skill) || !isEmpty(s.config?.prompt))
+      ) continue;
       if (isEmpty(s.config?.[req.key])) {
         issues.push({ level: req.level, nodeId: s.id, nodeName: name(s), message: `"${name(s)}" is missing ${req.label}.` });
       }

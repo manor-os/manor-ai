@@ -1040,6 +1040,8 @@ def test_document_tool_summary_omits_detail_fields_by_default():
         "name": "brief.md",
         "file_type": "md",
         "file_size": 123,
+        "viewer_url": "/viewer/doc_1",
+        "markdown_link": "[brief.md](/viewer/doc_1)",
     }
     assert details["mime_type"] == "text/markdown"
     assert details["vector_status"] == "ready"
@@ -1140,7 +1142,9 @@ def test_generate_file_schema_stays_compact_but_keeps_video_refs():
     schema_size = len(json.dumps(GENERATE_FILE_SCHEMA, ensure_ascii=False))
     props = GENERATE_FILE_SCHEMA["function"]["parameters"]["properties"]
 
-    assert schema_size < 4000
+    # Task-stable segmented narration is exposed in both the flat compatibility
+    # surface and params, while keeping the composite schema bounded.
+    assert schema_size < 4400
     assert "code" in props["kind"]["enum"]
     assert props["duration"]["enum"] == props["params"]["properties"]["duration"]["enum"]
     assert "files" in props["params"]["properties"]
@@ -1230,16 +1234,9 @@ def test_master_always_loaded_tool_schema_budget():
     schema_size = sum(len(json.dumps(schema, ensure_ascii=False)) for schema in schemas)
     names = {schema["function"]["name"] for schema in schemas}
 
-    # Nudged from 16_500: restoring generate_file's description keywords
-    # (see commit "fix(generate_file): restore keyword-rich schema
-    # descriptions") fixed a real search-reachability regression — without
-    # "videos/mp4" etc. in its top-level description, generate_file couldn't
-    # be found by a "video" search, defeating its role as the preferred
-    # composite tool over generate_image/generate_video. That legitimate
-    # content pushes the always-loaded total ~17 bytes past the old ceiling;
-    # this still guards against uncontrolled growth, just with headroom for
-    # the now-correct content.
-    assert schema_size < 16_650
+    # The eager surface now includes the bounded native video editor schema
+    # (about 3.1 KB) plus task-stable segmented narration on generate_file.
+    assert schema_size < 20_250
     assert "generate_file" in names
     assert "rag" in names
     assert "search_tools" in names

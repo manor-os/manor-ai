@@ -204,6 +204,38 @@ async def test_trigger_emits_runtime_payload(runner):
 
 
 @pytest.mark.asyncio
+async def test_wait_node_honors_standing_always_approval(runner, monkeypatch):
+    async def standing(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.workflow_chat_approvals.workflow_wait_has_standing_approval",
+        standing,
+    )
+    run = _run()
+    run.started_by = "user-1"
+    result = await runner._execute_step(
+        {
+            "id": "approve_publish",
+            "type": "wait",
+            "name": "Approve publish",
+            "config": {
+                "wait_type": "approval",
+                "allow_always": True,
+                "approval_action_key": "social_post.publish",
+                "response_variable": "publish_decision",
+            },
+        },
+        run,
+        object(),
+    )
+    assert result["status"] == "completed"
+    assert result["standing_approval"] is True
+    assert result["output"] == {"choice": "always_approve", "standing": True}
+    assert result["output_var"] == "publish_decision"
+
+
+@pytest.mark.asyncio
 async def test_run_loop_appends_trace_before_best_effort_chat_projection(
     runner,
     monkeypatch,
@@ -213,7 +245,11 @@ async def test_run_loop_appends_trace_before_best_effort_chat_projection(
     run.trigger_source = "workspace_chat"
     run.trigger_data = {
         "attempt_number": 2,
-        "_workspace_chat_entrypoint": {"enabled": True},
+        "_workspace_chat_entrypoint": {
+            "enabled": True,
+            "conversation_id": "conversation-1",
+            "activity_message_id": "message-1",
+        },
     }
     run.definition_snapshot = {"nodes": [{"id": "start"}]}
     run.execution_trace = []
@@ -578,6 +614,66 @@ async def test_llm_node_routes_to_agent_step(runner, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_provider_failure_is_not_reparsed_as_invalid_json(runner, monkeypatch):
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(
+            prompt_appendix="",
+            tool_schemas=[],
+            allowed_tool_names=set(),
+            envelope=None,
+        )
+
+    async def fake_loop(**kwargs):
+        return SimpleNamespace(
+            content=(
+                "Sorry, the request failed before the model could respond. "
+                "Please check the selected model and API key configuration.\n\n"
+                "Error detail: ConnectError:"
+            ),
+            usage={},
+            tool_calls_made=[],
+            rounds=1,
+            stop_reason="error",
+            error="llm_call_failed",
+            error_detail=None,
+        )
+
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "runtime_prepare_prompt_appendix_for_turn",
+        fake_appendix,
+    )
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "runtime_execute_workflow_agent_loop",
+        fake_loop,
+    )
+
+    result = await runner._execute_agent_step(
+        {
+            "id": "prepare",
+            "type": "agent",
+            "config": {
+                "prompt": "Prepare the project.",
+                "output_format": "json",
+                "output_schema": {"type": "object"},
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == (
+        "Model provider request failed before producing a response. ConnectError:"
+    )
+    assert "valid JSON" not in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_llm_batch_runs_once_per_item_and_wraps_output(runner, monkeypatch):
     prompts = []
 
@@ -651,6 +747,36 @@ async def test_condition_compound_or(runner):
     assert yes["next_override"] == ["a"]
     no = await runner._execute_step(step, _run({"tier": "free", "score": 0.1}), None)
     assert no["next_override"] == ["b"]
+
+
+@pytest.mark.asyncio
+async def test_condition_compound_parentheses_preserve_precedence(runner):
+    step = {
+        "id": "c",
+        "type": "condition",
+        "config": {
+            "expression": (
+                'upload.success == true and '
+                '(upload.dialog == "details" or upload.dialog == "Details")'
+            )
+        },
+        "true_next": ["metadata"],
+        "false_next": ["blocked"],
+    }
+
+    yes = await runner._execute_step(
+        step,
+        _run({"upload": {"success": True, "dialog": "Details"}}),
+        None,
+    )
+    assert yes["next_override"] == ["metadata"]
+
+    no = await runner._execute_step(
+        step,
+        _run({"upload": {"success": False, "dialog": "Details"}}),
+        None,
+    )
+    assert no["next_override"] == ["blocked"]
 
 
 # ── ComfyUI-style fingerprint caching / incremental re-execution ──
@@ -1042,6 +1168,8 @@ def test_workflow_tools_exposed():
     tools = get_tools()
     names = {s["function"]["name"] for s, _ in tools}
     assert names == {
+        "list_workspace_flows",
+        "start_workspace_flow",
         "list_workflows",
         "run_workflow",
         "list_workflow_definitions",
@@ -1158,8 +1286,18 @@ def test_sort_dedupe_stop_extract(runner):
     assert [x["n"] for x in s["output"]] == [3, 2, 1, 1]
     d = runner._execute_dedupe_step({"id": "d", "config": {"items": "{{r}}", "field": "n"}}, {"r": rows})
     assert [x["n"] for x in d["output"]] == [3, 1, 2]
-    stop = runner._execute_stop_step({"id": "x", "config": {"message": "halt {{why}}"}}, {"why": "now"})
-    assert stop["status"] == "failed" and stop["error"] == "halt now"
+    stop = runner._execute_stop_step(
+        {
+            "id": "x",
+            "config": {"message": "halt {{why}}", "retry_from_step_id": "producer"},
+        },
+        {"why": "now"},
+    )
+    assert stop == {
+        "status": "failed",
+        "error": "halt now",
+        "retry_from_step_id": "producer",
+    }
     j = runner._execute_extractfromfile_step({"id": "e", "config": {"input": '{{body}}'}}, {"body": '{"a": 1}'})
     assert j["output"] == {"a": 1}
     csv = runner._execute_extractfromfile_step({"id": "e", "config": {"input": "{{c}}", "format": "csv"}}, {"c": "a,b\n1,2\n3,4"})
@@ -1464,6 +1602,16 @@ def test_foreach_subworkflow_is_a_canonical_node_type():
     ("step_type", "config", "missing_field"),
     [
         ("workflow_project", {"operation": "create"}, "project_type"),
+        (
+            "workflow_project",
+            {
+                "operation": "claim",
+                "project_type": "daily_content_batch",
+                "schema_version": 1,
+                "state_schema": {"type": "object"},
+            },
+            "project_key",
+        ),
         (
             "workflow_project",
             {
@@ -1816,6 +1964,70 @@ def test_named_outputs_expose_result_fields(runner):
     assert run.variables["h"] == {"status_code": 200, "body": "ok"}  # auto var
     assert run.variables["status"] == 200  # single ref preserves the int type
     assert run.variables["raw"] == {"status_code": 200, "body": "ok"}
+
+
+def test_trigger_named_outputs_resolve_from_trigger_payload(runner):
+    """Run-input outputs must read from the trigger node's recorded payload.
+
+    A self-reference such as ``{{source}}`` leaves the literal placeholder in
+    scope because run inputs initially live under the trigger output object.
+    """
+    run = _run()
+    runner._record_step_result(
+        {
+            "id": "start",
+            "next": [],
+            "config": {
+                "outputs": [
+                    {"key": "source", "value": "{{start.source}}", "type": "text"},
+                ],
+            },
+        },
+        {"status": "completed", "output": {"source": "approved topic"}},
+        run,
+    )
+
+    assert run.variables["source"] == "approved topic"
+
+
+@pytest.mark.asyncio
+async def test_trigger_projects_declared_manual_run_inputs_into_its_output(runner):
+    run = _run({
+        "youtube_visibility": "public",
+        "request": {"target_duration": "120s"},
+    })
+    run.trigger_data = {"source": "manual"}
+    step = {
+        "id": "start",
+        "type": "trigger",
+        "config": {
+            "run_inputs": [
+                {"key": "youtube_visibility", "type": "string"},
+                {
+                    "key": "target_duration",
+                    "target": "request.target_duration",
+                    "type": "string",
+                },
+            ],
+            "outputs": [
+                {
+                    "key": "youtube_visibility",
+                    "value": "{{start.youtube_visibility}}",
+                    "type": "text",
+                },
+            ],
+        },
+    }
+
+    result = await runner._execute_step(step, run, db=None)
+    assert result["output"] == {
+        "source": "manual",
+        "youtube_visibility": "public",
+        "target_duration": "120s",
+    }
+
+    runner._record_step_result(step, result, run)
+    assert run.variables["youtube_visibility"] == "public"
 
 
 def test_step_output_stored_as_auto_var(runner):

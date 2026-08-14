@@ -27,12 +27,20 @@ upgrade instead).
 
 Exports are sanitized: IDs, credentials, and runtime state are stripped, and
 a recursive scan rejects any payload containing secret-shaped keys.
+Active workspace workflow bindings and workspace-scoped workflow graphs are
+included. Knowledge groups export as structure by default; operators can opt
+in to inline Markdown bodies, but only public, clean, non-PII Knowledge text is
+eligible. Browser-session requirements are limited to providers, labels, or
+session references found in the exported workspace configuration.
 
 ## Exporting and Installing
 
 - **Export**: on a workspace page, **Export as Blueprint** creates a draft
   blueprint from the workspace's current configuration
   (`POST /api/v1/workspaces/{id}/export-blueprint`).
+  To re-freeze an editable draft from the same workspace, use the same slug
+  with **Replace an existing draft** (`replace_existing: true`). Published or
+  pending-review payloads cannot be replaced.
 - **Install**: `POST /api/v1/blueprints/{id}/install` creates a new
   workspace. Two modes: `simulate` (a sandboxed `[SIM]` workspace for a dry
   run — inspect the simulation report before going live) and `live`. Choose
@@ -45,7 +53,7 @@ a recursive scan rejects any payload containing secret-shaped keys.
 - **Share**: an owner can mint a share token; the link installs the
   blueprint for any authenticated user without publishing it.
 
-Five built-in "solo company" blueprints ship with the platform as immutable
+Built-in "solo company" blueprints ship with the platform as immutable
 starting points.
 
 ## Versioning and Upgrades

@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "templates": [
+    {
+      "id": "business-report",
+      "name": "Editorial Market Report",
+      "description": "A landscape insight dashboard for research, trends, and executive reporting.",
+      "style": "Editorial dashboard",
+      "orientation": "landscape",
+      "accent_color": "#FF6B5A",
+      "sample_data": "examples/business-report.json"
+    },
+    {
+      "id": "project-proposal",
+      "name": "Bold Creative Proposal",
+      "description": "A vibrant two-page proposal for brand, product, and campaign engagements.",
+      "style": "Color-block creative",
+      "orientation": "portrait",
+      "accent_color": "#FFE45E",
+      "sample_data": "examples/project-proposal.json"
+    },
+    {
+      "id": "invoice",
+      "name": "Swiss Studio Invoice",
+      "description": "A crisp grid-based invoice for independent studios and professional services.",
+      "style": "Swiss grid",
+      "orientation": "portrait",
+      "accent_color": "#16C7FF",
+      "sample_data": "examples/invoice.json"
+    },
+    {
+      "id": "academic-paper",
+      "name": "Two-Column Academic Paper",
+      "description": "A restrained serif manuscript with abstract, methods, findings, tables, and references.",
+      "style": "Classic research journal",
+      "orientation": "portrait",
+      "accent_color": "#7B2838",
+      "sample_data": "examples/academic-paper.json"
+    }
+  ]
+}

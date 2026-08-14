@@ -145,3 +145,57 @@ async def test_viewer_is_read_only_but_contributor_can_write(client: AsyncClient
         json={"title": "contributor edit"},
     )
     assert r.status_code == 200, f"contributor wrongly blocked on update: {r.text}"
+
+
+@pytest.mark.asyncio
+async def test_non_member_cannot_read_task_detail_logs_or_attachment(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    from packages.core.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    owner_headers = await _auth(client, "wsdetail_owner")
+    me = await _me(client, owner_headers)
+    ws_id = await _make_workspace(me["entity_id"], "Private Detail", me.get("user_id") or me.get("id"))
+
+    created = await client.post(
+        "/api/v1/tasks",
+        headers=owner_headers,
+        json={"title": "private task", "workspace_id": ws_id},
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    uploaded = await client.post(
+        f"/api/v1/tasks/{task_id}/attachments",
+        headers=owner_headers,
+        files={"file": ("private.txt", b"private attachment", "text/plain")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    filename = uploaded.json()["filename"]
+
+    outsider = await _create_entity_user(me["entity_id"], "wsdetail_outsider", role="member")
+    for path in (
+        f"/api/v1/tasks/{task_id}",
+        f"/api/v1/tasks/{task_id}/history",
+        f"/api/v1/tasks/{task_id}/logs",
+        f"/api/v1/tasks/{task_id}/attachments/{filename}",
+    ):
+        response = await client.get(path, headers=outsider["headers"])
+        assert response.status_code == 404, f"private task path leaked: {path} {response.status_code}"
+
+    response = await client.post(
+        f"/api/v1/tasks/{task_id}/logs",
+        headers=outsider["headers"],
+        json={"content": "leak", "log_type": "comment"},
+    )
+    assert response.status_code == 403
+
+    response = await client.post(
+        f"/api/v1/tasks/{task_id}/attachments",
+        headers=outsider["headers"],
+        files={"file": ("blocked.txt", b"blocked", "text/plain")},
+    )
+    assert response.status_code == 403

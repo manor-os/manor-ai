@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manor Workspace Blueprint"
+  short_description: "Keep Workspace Blueprint lifecycle semantically equivalent"
+  default_prompt: "Use $manor-workspace-blueprint to create, export, install, or upgrade a Workspace Blueprint without semantic drift."

@@ -21,11 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
 from packages.core.proposals.constants import (
+    EXTERNAL_TASK_ACTION_KEY,
     EXPERIMENT_ACTION_KEY,
     EXPERIMENT_MEDIUM_RISK_MAX_COST,
     HUMAN_REQUEST_ACTION_KEY,
     REASON_CODES,
     TASK_ACTION_KEY,
+    WORKFLOW_RUN_ACTION_KEY,
     change_action_key,
     change_risk_level,
 )
@@ -90,6 +92,7 @@ async def create_proposal_with_items(
             item_key_by_task_key.setdefault(str(raw_key), key)
         resolved_keys.append(key)
 
+    persisted_items: list[tuple[object, object, ProposalItemRecord]] = []
     for (proposed, task), item_key in zip(persisted_tasks, resolved_keys):
         payload = proposed.model_dump(mode="json")
         payload["task_id"] = task.id
@@ -102,7 +105,8 @@ async def create_proposal_with_items(
             item_key_by_task_key.get(dep) or _normalize_item_key(dep)
             for dep in (proposed.depends_on_task_keys or [])
         ]
-        db.add(ProposalItemRecord(
+        external = getattr(proposed, "external_action", None) is not None
+        item = ProposalItemRecord(
             proposal_id=record.id,
             entity_id=entity_id,
             workspace_id=workspace_id,
@@ -111,11 +115,19 @@ async def create_proposal_with_items(
             payload=payload,
             basis=basis,
             correlation_key=getattr(proposed, "correlation_key", None),
-            risk_level="low",
-            action_key=TASK_ACTION_KEY,
+            risk_level="high" if external else "low",
+            action_key=EXTERNAL_TASK_ACTION_KEY if external else TASK_ACTION_KEY,
             depends_on_item_keys=deps or None,
             status="proposed",
-        ))
+        )
+        db.add(item)
+        persisted_items.append((proposed, task, item))
+    await db.flush()
+    for _proposed, task, item in persisted_items:
+        details = dict(getattr(task, "details", None) or {})
+        details["strategist_proposal_id"] = record.id
+        details["strategist_proposal_item_id"] = item.id
+        task.details = details
     await db.flush()
     return record
 
@@ -169,6 +181,47 @@ async def create_human_request_items(
                 "reason_code": None,
                 "decided_at": now.isoformat(),
             },
+        )
+        db.add(item)
+        items.append(item)
+    await db.flush()
+    return items
+
+
+async def create_workflow_run_items(
+    db: AsyncSession,
+    *,
+    record: ProposalRecord,
+    proposed_runs: list,
+) -> list[ProposalItemRecord]:
+    """Persist deterministic Flow launches as governed Proposal items."""
+    existing_keys = set((await db.execute(
+        select(ProposalItemRecord.item_key).where(
+            ProposalItemRecord.proposal_id == record.id,
+        )
+    )).scalars().all())
+    items: list[ProposalItemRecord] = []
+    for proposed in proposed_runs:
+        key = _normalize_item_key(f"wr_{proposed.run_key}", fallback="wr")
+        suffix_n = 1
+        base_key = key
+        while key in existing_keys:
+            suffix_n += 1
+            suffix = f"_{suffix_n}"
+            key = base_key[: _ITEM_KEY_MAX - len(suffix)] + suffix
+        existing_keys.add(key)
+        payload = proposed.model_dump(mode="json")
+        item = ProposalItemRecord(
+            proposal_id=record.id,
+            entity_id=record.entity_id,
+            workspace_id=record.workspace_id,
+            item_key=key,
+            kind="workflow_run",
+            payload=payload,
+            basis=payload.get("basis"),
+            risk_level="medium",
+            action_key=WORKFLOW_RUN_ACTION_KEY,
+            status="proposed",
         )
         db.add(item)
         items.append(item)

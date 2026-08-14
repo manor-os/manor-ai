@@ -10,18 +10,14 @@ import {
 import { createPortal } from "react-dom";
 import {
   IconChevronDown,
-  IconAudioWave,
-  IconDocument,
-  IconGrid4,
-  IconImage,
-  IconLayers,
-  IconPlay,
-  IconReport,
+  IconFlow,
+  IconSearch,
   IconSparkles,
-  IconWorkspace,
   type IconProps,
 } from "./icons";
+import { CONTENT_TYPE_ICONS } from "./contentTypeIcons";
 import { t } from "../lib/i18n";
+import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 
 export type ChatBoxMode =
   | "auto"
@@ -29,10 +25,12 @@ export type ChatBoxMode =
   | "video"
   | "audio"
   | "document"
+  | "pdf"
   | "slides"
   | "sheet"
   | "website"
-  | "research";
+  | "research"
+  | "flows";
 
 export type ChatBoxModeConfig = {
   key: ChatBoxMode;
@@ -52,59 +50,73 @@ export const CHAT_BOX_MODES: ChatBoxModeConfig[] = [
   },
   {
     key: "image",
-    icon: IconImage,
+    icon: CONTENT_TYPE_ICONS.image,
     label: t("component.chat_mode.image"),
     helper: t("component.chat_mode.image_helper"),
     placeholder: t("component.chat_mode.image_placeholder"),
   },
   {
     key: "video",
-    icon: IconPlay,
+    icon: CONTENT_TYPE_ICONS.video,
     label: t("component.chat_mode.video"),
     helper: t("component.chat_mode.video_helper"),
     placeholder: t("component.chat_mode.video_placeholder"),
   },
   {
     key: "audio",
-    icon: IconAudioWave,
+    icon: CONTENT_TYPE_ICONS.audio,
     label: t("component.chat_mode.audio"),
     helper: t("component.chat_mode.audio_helper"),
     placeholder: t("component.chat_mode.audio_placeholder"),
   },
   {
     key: "document",
-    icon: IconDocument,
+    icon: CONTENT_TYPE_ICONS.document,
     label: t("component.chat_mode.document"),
     helper: t("component.chat_mode.document_helper"),
     placeholder: t("component.chat_mode.document_placeholder"),
   },
   {
+    key: "pdf",
+    icon: CONTENT_TYPE_ICONS.pdf,
+    label: t("component.chat_mode.pdf"),
+    helper: t("component.chat_mode.pdf_helper"),
+    placeholder: t("component.chat_mode.pdf_placeholder"),
+  },
+  {
     key: "slides",
-    icon: IconLayers,
+    icon: CONTENT_TYPE_ICONS.slides,
     label: t("component.chat_mode.slides"),
     helper: t("component.chat_mode.slides_helper"),
     placeholder: t("component.chat_mode.slides_placeholder"),
   },
   {
     key: "sheet",
-    icon: IconGrid4,
+    icon: CONTENT_TYPE_ICONS.sheet,
     label: t("component.chat_mode.sheet"),
     helper: t("component.chat_mode.sheet_helper"),
     placeholder: t("component.chat_mode.sheet_placeholder"),
   },
   {
     key: "website",
-    icon: IconWorkspace,
+    icon: CONTENT_TYPE_ICONS.website,
     label: t("component.chat_mode.website"),
     helper: t("component.chat_mode.website_helper"),
     placeholder: t("component.chat_mode.website_placeholder"),
   },
   {
     key: "research",
-    icon: IconReport,
+    icon: IconSearch,
     label: t("component.chat_mode.research"),
     helper: t("component.chat_mode.research_helper"),
     placeholder: t("component.chat_mode.research_placeholder"),
+  },
+  {
+    key: "flows",
+    icon: IconFlow,
+    label: t("component.chat_mode.flows"),
+    helper: t("component.chat_mode.flows_helper"),
+    placeholder: t("component.chat_mode.flows_placeholder"),
   },
 ];
 
@@ -114,13 +126,15 @@ export function getChatBoxModeConfig(mode: ChatBoxMode): ChatBoxModeConfig {
 
 export function chatModeFromCapability(capability: string): ChatBoxMode {
   if (capability === "docs") return "document";
+  if (capability === "pdf") return "pdf";
   if (capability === "sheets") return "sheet";
   if (capability === "slides") return "slides";
   if (
     capability === "image" ||
     capability === "video" ||
     capability === "website" ||
-    capability === "research"
+    capability === "research" ||
+    capability === "flows"
   ) {
     return capability;
   }
@@ -147,8 +161,15 @@ export default function ChatModeSelector({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const flowsAccess = usePreviewFeatureAccess("flows");
   const selected = getChatBoxModeConfig(value);
   const SelectedIcon = selected.icon;
+
+  useEffect(() => {
+    if (flowsAccess.loaded && !flowsAccess.enabled && value === "flows") {
+      onChange("auto");
+    }
+  }, [flowsAccess.enabled, flowsAccess.loaded, onChange, value]);
 
   const updateMenuCoords = useCallback(() => {
     if (typeof window === "undefined" || !buttonRef.current) return;
@@ -239,14 +260,27 @@ export default function ChatModeSelector({
             {CHAT_BOX_MODES.map((mode) => {
               const ModeIcon = mode.icon;
               const active = mode.key === value;
+              const unavailable = mode.key === "flows" && !flowsAccess.enabled;
+              const comingSoon =
+                mode.key === "flows" &&
+                flowsAccess.loaded &&
+                !flowsAccess.released;
               return (
                 <button
                   key={mode.key}
-                  className={`chat-mode-option ${active ? "chat-mode-option--active" : ""}`}
+                  className={`chat-mode-option ${active ? "chat-mode-option--active" : ""} ${unavailable ? "chat-mode-option--disabled" : ""}`}
                   type="button"
                   role="option"
                   aria-selected={active}
+                  aria-disabled={unavailable}
+                  disabled={unavailable}
+                  title={
+                    comingSoon
+                      ? t("component.chat_mode.flows_coming_soon")
+                      : undefined
+                  }
                   onClick={() => {
+                    if (unavailable) return;
                     onChange(mode.key);
                     setOpen(false);
                   }}
@@ -258,6 +292,11 @@ export default function ChatModeSelector({
                     <strong>{mode.label}</strong>
                     <small>{mode.helper}</small>
                   </span>
+                  {comingSoon ? (
+                    <span className="chat-mode-option-badge">
+                      {t("component.chat_mode.soon")}
+                    </span>
+                  ) : null}
                 </button>
               );
             })}

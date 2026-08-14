@@ -1308,3 +1308,51 @@ async def test_dependency_gate_blocks_missing_predecessor_ids(db_session) -> Non
 
     assert status == "blocked"
     assert statuses == {}
+
+
+@pytest.mark.asyncio
+async def test_dependency_status_reconciles_stale_failed_task_from_completed_plan(db_session) -> None:
+    from packages.core.services.task_dependencies import dependency_status
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+
+    entity_id = generate_ulid()
+    task_id = generate_ulid()
+    plan_id = generate_ulid()
+    db_session.add(Task(
+        id=task_id,
+        entity_id=entity_id,
+        title="Choose topic",
+        status="failed",
+        details={},
+    ))
+    db_session.add(ExecutionPlan(
+        id=plan_id,
+        entity_id=entity_id,
+        task_id=task_id,
+        status="completed",
+        plan_dag={"steps": []},
+    ))
+    db_session.add(ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan_id,
+        entity_id=entity_id,
+        step_key="choose_topic",
+        kind="subagent",
+        step_status="done",
+        result={"result": {"chosen_topic": "Start tiny"}},
+        depends_on=[],
+        evidence_refs=[],
+        cost={},
+        attempt_count=1,
+        max_attempts=3,
+    ))
+    await db_session.flush()
+
+    status, statuses = await dependency_status(
+        db_session,
+        entity_id=entity_id,
+        dependency_ids=[task_id],
+    )
+
+    assert status == "completed"
+    assert statuses == {task_id: "completed"}

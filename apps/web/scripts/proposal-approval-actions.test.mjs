@@ -41,7 +41,19 @@ test("partial approval sends both halves of the unified selection", () => {
     /onResolve\("approve_selected", undefined, \{\s+selected_task_ids: picked\.filter\(\(row\) => row\.isTask\)\.map\(\(row\) => row\.id\),\s+selected_item_ids: picked\.filter\(\(row\) => !row\.isTask\)\.map\(\(row\) => row\.id\),/,
   );
   // Select-all / clear operate over every row, not just the tasks.
-  assert.match(chatActionCard, /const selectAll = \(\) => setSelected\(new Set\(rowIds\)\);/);
+  assert.match(chatActionCard, /const selectAll = \(\) => updateSelected\(new Set\(rowIds\)\);/);
+});
+
+test("resolved proposal labels every row instead of summarizing only a count", () => {
+  assert.match(chatActionCard, /export function ProposalResolution/);
+  assert.match(chatActionCard, /rows\.map\(\(row\) =>/);
+  assert.match(chatActionCard, /const approved = approvedIds\.has\(row\.id\)/);
+  assert.match(chatActionCard, /chat-proposal-resolution-title">\{row\.label\}/);
+  assert.doesNotMatch(chatActionCard, /proposal_approved_count/);
+  assert.match(
+    chatActionCard,
+    /setLocalResolution\(\{ choice, note, payload \}\)/,
+  );
 });
 
 test("proposal payload advertises approve, always approve, and reject", () => {

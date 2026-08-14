@@ -293,6 +293,10 @@ async def _workspace_group_to_dict(
     include_documents: bool = True,
     limit: int = 20,
 ) -> dict[str, Any]:
+    from packages.core.ai.runtime.document_actions import (
+        runtime_document_markdown_link,
+        runtime_document_viewer_url,
+    )
     from packages.core.models.document import Document, DocumentGroupMember
 
     docs: list[dict[str, Any]] = []
@@ -332,6 +336,8 @@ async def _workspace_group_to_dict(
                 "file_size": row.file_size,
                 "vector_status": row.vector_status,
                 "source": row.source,
+                "viewer_url": runtime_document_viewer_url(row.id),
+                "markdown_link": runtime_document_markdown_link(row.name, row.id),
             }
             for row in rows
         ]

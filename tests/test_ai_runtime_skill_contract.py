@@ -126,6 +126,8 @@ async def test_builtin_sandbox_skill_contract_embeds_complete_external_skill_md(
     assert "PowerPoint" not in content
     assert "SVG" not in content
     assert "ad-hoc generator" in content
+    assert '`artifact_role="final"` so Chat receives a clickable file card' in content
+    assert '`artifact_role="intermediate"` for supporting files' in content
 
 
 @pytest.mark.asyncio

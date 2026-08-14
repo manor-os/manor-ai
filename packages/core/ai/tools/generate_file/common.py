@@ -60,6 +60,8 @@ def _merge_params(kwargs: dict[str, Any]) -> dict[str, Any]:
         "purpose",
         "duration_seconds",
         "voice",
+        "language",
+        "narration_voice_mode",
         "voice_instructions",
         "response_format",
         "format",

@@ -10,7 +10,7 @@ import { useNavigate } from "react-router-dom";
 import Modal from "./Modal";
 import { t } from "../../lib/i18n";
 import type { PlanLimitKind } from "../../lib/api";
-import { planLimitOffersCredits, planLimitTitle } from "../../lib/planLimit";
+import { planLimitOffersCredits, planLimitResetText, planLimitTitle } from "../../lib/planLimit";
 
 interface UpgradePromptProps {
   open: boolean;
@@ -18,11 +18,13 @@ interface UpgradePromptProps {
   message?: string;
   /** Limit type — drives the title and whether "Buy Credits" is offered. */
   kind?: PlanLimitKind;
+  resetsAt?: string | null;
 }
 
-export default function UpgradePrompt({ open, onClose, message, kind }: UpgradePromptProps) {
+export default function UpgradePrompt({ open, onClose, message, kind, resetsAt }: UpgradePromptProps) {
   const navigate = useNavigate();
   const offersCredits = planLimitOffersCredits(kind);
+  const resetText = planLimitResetText(kind, resetsAt);
 
   return (
     <Modal open={open} onClose={onClose} title={planLimitTitle(kind)} maxWidth="420px"
@@ -59,6 +61,11 @@ export default function UpgradePrompt({ open, onClose, message, kind }: UpgradeP
         <p style={{ fontSize: 14, color: "#57534e", lineHeight: 1.6, margin: 0 }}>
           {message || t("component.upgrade_prompt.default_message")}
         </p>
+        {resetText && (
+          <p className="upgrade-prompt-reset" role="status">
+            {resetText}
+          </p>
+        )}
       </div>
     </Modal>
   );

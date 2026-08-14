@@ -1,0 +1,27 @@
+{
+  "id": "academic-paper",
+  "renderer": "academic_paper",
+  "page_size": "A4",
+  "orientation": "P",
+  "font_family": "Times",
+  "required": ["journal", "title", "authors", "affiliations", "abstract", "keywords", "sections", "results_table", "references"],
+  "palette": {
+    "primary": "7B2838",
+    "accent": "C49A6C",
+    "ink": "211E1B",
+    "muted": "716A63",
+    "surface": "F6F1EA",
+    "line": "D7CEC3"
+  },
+  "labels": {
+    "abstract": "ABSTRACT",
+    "keywords": "KEYWORDS",
+    "introduction": "1. INTRODUCTION",
+    "methods": "2. MATERIALS AND METHODS",
+    "results": "3. RESULTS",
+    "discussion": "4. DISCUSSION",
+    "conclusion": "5. CONCLUSION",
+    "references": "REFERENCES",
+    "data_note": "DATA AND ETHICS NOTE"
+  }
+}

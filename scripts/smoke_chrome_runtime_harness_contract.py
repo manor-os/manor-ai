@@ -46,7 +46,11 @@ async def main() -> int:
     from packages.core.ai.runtime import tool_execution
     from packages.core.ai.runtime.approvals import RuntimeApprovalDecision
     from packages.core.ai.runtime import approvals as runtime_approvals
+    from packages.core.ai.runtime.envelope import RuntimeEnvelope
     from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
+    from packages.core.ai.runtime.principals import RuntimePrincipal, RuntimePrincipalKind
+    from packages.core.ai.runtime.profiles import RuntimeProfile
+    from packages.core.ai.runtime.surfaces import ChatSurface
     from packages.core.ai.tool_pool import tool_pool
 
     async def _no_credit_preflight() -> None:
@@ -100,8 +104,29 @@ async def main() -> int:
     chrome._local_worker_runner.dispatch_local_action = fake_dispatch_local_action
 
     user_message = "打开当前 Chrome 页面并识别内容"
+    runtime_envelope = RuntimeEnvelope(
+        surface=ChatSurface.WORKSPACE_CHAT,
+        principal=RuntimePrincipal(
+            kind=RuntimePrincipalKind.WORKSPACE_MEMBER,
+            entity_id="ent-runtime-smoke",
+            actor_user_id="user-runtime-smoke",
+            execution_user_id="user-runtime-smoke",
+            agent_id="agent-runtime-smoke",
+            workspace_id="ws-runtime-smoke",
+        ),
+        profile=RuntimeProfile.OWNER_COPILOT,
+        entity_id="ent-runtime-smoke",
+        user_id="user-runtime-smoke",
+        agent_id="agent-runtime-smoke",
+        workspace_id="ws-runtime-smoke",
+        conversation_id="conv-runtime-smoke",
+        task_id="task-runtime-smoke",
+        metadata={},
+        tool_names=("mcp__chrome__read_page",),
+        allowed_tool_names=("mcp__chrome__read_page",),
+    )
     result = await runtime_execute_agentic_loop(
-        runtime_envelope=None,
+        runtime_envelope=runtime_envelope,
         system_prompt="You operate Chrome through Manor tools.",
         user_message=user_message,
         tools=[tool_pool.get_schema("mcp__chrome__read_page")],
@@ -155,7 +180,7 @@ async def main() -> int:
             "method": "tools/call",
             "params": {
                 "name": "mcp__chrome__read_page",
-                "arguments": {"tabId": 321},
+                "arguments": {"tabId": 321, "task_id": "task-runtime-smoke"},
             },
         },
         "timeout": 600,
@@ -167,6 +192,15 @@ async def main() -> int:
     request_id = dispatch_compare.get("params", {}).pop("id", "")
     if not request_id:
         raise AssertionError(f"dispatch missing JSON-RPC id: {dispatch}")
+    dispatched_arguments = dispatch_compare.get("params", {}).get("params", {}).get("arguments", {})
+    control_epoch = dispatched_arguments.pop("control_epoch", "")
+    if not isinstance(control_epoch, str) or len(control_epoch) < 24:
+        raise AssertionError(f"dispatch missing Runtime-generated opaque control_epoch: {dispatch}")
+    contract_state = runtime_envelope.metadata.get("chrome_runtime_contract_v1") or {}
+    if contract_state.get("control_epoch") != control_epoch:
+        raise AssertionError(
+            f"Runtime metadata and dispatched control_epoch differ: metadata={contract_state} dispatch={dispatch}"
+        )
     if dispatch_compare != expected_dispatch:
         raise AssertionError(
             "dispatch mismatch\n"
@@ -180,6 +214,7 @@ async def main() -> int:
         "rounds": result.rounds,
         "tool_calls_made": result.tool_calls_made,
         "dispatch": dispatch,
+        "control_epoch_generated": True,
         "ctx": ctx,
     }, ensure_ascii=False, indent=2))
     return 0

@@ -272,13 +272,44 @@ async def _send_email(
     if aiosmtplib is None:
         return {"error": "aiosmtplib is not installed"}
 
-    smtp_host = config.config.get("smtp_host", os.getenv("SMTP_HOST", "localhost"))
-    smtp_port = int(config.config.get("smtp_port", os.getenv("SMTP_PORT", "587")))
-    username = config.credentials.get("username", config.credentials.get("email", os.getenv("SMTP_USER", "")))
-    password = config.credentials.get("password", os.getenv("SMTP_PASSWORD", ""))
-    from_email = config.config.get("from_email", config.config.get("email", os.getenv("SMTP_FROM_EMAIL", "noreply@example.com")))
-    from_name = config.config.get("from_name", os.getenv("SMTP_FROM_NAME", "Manor AI"))
-    use_tls = config.config.get("use_tls", True)
+    # The Integration→ChannelConfig bridge stores the whole IMAP+SMTP
+    # bundle in ``credentials``; older hand-made rows put the non-secret
+    # half in ``config``. Check both before falling back to platform env,
+    # otherwise an entity's own mail server is silently ignored.
+    cfg = config.config or {}
+    creds = config.credentials or {}
+
+    def _setting(key: str, env: str, default: str = "") -> str:
+        value = cfg.get(key, creds.get(key))
+        if value in (None, ""):
+            return os.getenv(env, default)
+        return str(value)
+
+    smtp_host = _setting("smtp_host", "SMTP_HOST", "localhost")
+    smtp_port = int(_setting("smtp_port", "SMTP_PORT", "587"))
+    username = creds.get("username", creds.get("email", os.getenv("SMTP_USER", "")))
+    password = creds.get("password", os.getenv("SMTP_PASSWORD", ""))
+    from_email = (
+        cfg.get("from_email")
+        or cfg.get("email")
+        or creds.get("from_address")
+        or username
+        or os.getenv("SMTP_FROM_EMAIL", "noreply@example.com")
+    )
+    from_name = cfg.get("from_name", os.getenv("SMTP_FROM_NAME", "Manor AI"))
+
+    # aiosmtplib's ``use_tls`` means implicit TLS from the first byte
+    # (port 465). Port 587 starts in plaintext and upgrades via STARTTLS —
+    # passing use_tls there fails the handshake with WRONG_VERSION_NUMBER.
+    explicit_ssl = cfg.get("use_ssl_smtp", creds.get("use_ssl_smtp"))
+    if explicit_ssl is not None:
+        use_ssl = bool(explicit_ssl)
+    else:
+        use_ssl = smtp_port == 465
+    # Legacy rows carry a single ambiguous ``use_tls`` flag; an explicit
+    # False there means "plaintext relay, no encryption at all".
+    legacy_tls = cfg.get("use_tls")
+    use_starttls = (not use_ssl) and (legacy_tls is None or bool(legacy_tls))
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -297,7 +328,8 @@ async def _send_email(
             port=smtp_port,
             username=username or None,
             password=password or None,
-            use_tls=use_tls,
+            use_tls=use_ssl,
+            start_tls=use_starttls,
         )
         return {"from_address": from_email}
     except Exception as exc:

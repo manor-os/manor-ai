@@ -70,9 +70,9 @@ CELERY_BUILTIN_TASK_QUEUES: dict[str, CeleryQueue] = {
 #
 # Read the two blocks as the two roles. The question to ask of a new task is
 # not "is it beat-driven?" but "can it occupy a worker slot for an unbounded
-# time?". A beat-driven task that fans out network calls (integrations.health_tick,
-# embeddings.sweep_pending) belongs on WORK even though beat fires it: beat lives
-# in the control-plane worker, but the task itself must not run there.
+# time?". A beat-driven task that performs unbounded network work
+# (integrations.health_tick) belongs on WORK. Short recovery sweeps that only
+# lock/update DB rows and enqueue work remain on CONTROL.
 
 TASK_QUEUES: dict[str, CeleryQueue] = {
     # ── control plane: short, bounded, must run on schedule ──────────
@@ -87,6 +87,7 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "monitor.sla_breach_check": CeleryQueue.CONTROL,
     "monitor.workspace_readiness_check": CeleryQueue.CONTROL,
     "experiments.guardrail_tick": CeleryQueue.CONTROL,
+    "embeddings.sweep_pending": CeleryQueue.CONTROL,
     "ops.collect_snapshot": CeleryQueue.CONTROL,
     "ops.alert_tick": CeleryQueue.CONTROL,
     "ops.log_scan": CeleryQueue.CONTROL,
@@ -102,6 +103,7 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "packages.core.tasks.ai_tasks.run_morning_briefing": CeleryQueue.WORK,
     "packages.core.tasks.ai_tasks.run_strategist_review": CeleryQueue.WORK,
     "packages.core.tasks.ai_tasks.run_goal_measurement": CeleryQueue.WORK,
+    "packages.core.tasks.ai_tasks.run_workspace_stat_collection": CeleryQueue.WORK,
     "packages.core.tasks.ai_tasks.run_outcome_evaluation": CeleryQueue.WORK,
     "packages.core.tasks.ai_tasks.run_chat_insight_extraction": CeleryQueue.WORK,
     "packages.core.tasks.ai_tasks.generate_job_skill": CeleryQueue.WORK,
@@ -112,7 +114,6 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "memory.entity_chat_extraction_sweep": CeleryQueue.WORK,
     "learning.apply_candidate": CeleryQueue.WORK,
     "embeddings.batch_index": CeleryQueue.WORK,
-    "embeddings.sweep_pending": CeleryQueue.WORK,
     "media.cleanup_media_references": CeleryQueue.WORK,
     "media.process_video_job": CeleryQueue.WORK,
     "media.recover_stale_jobs": CeleryQueue.WORK,

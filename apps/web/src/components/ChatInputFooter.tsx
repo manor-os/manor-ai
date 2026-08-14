@@ -18,6 +18,7 @@ import {
   type CSSProperties,
 } from "react";
 import { createPortal } from "react-dom";
+import { createRoot, type Root } from "react-dom/client";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { useAuthStore } from "../stores/auth";
@@ -42,6 +43,7 @@ import {
   IconStore,
   IconBox,
   IconFolder,
+  IconFlow,
   IconGitHub,
   IconLinkedIn,
   IconPayPal,
@@ -60,12 +62,15 @@ import {
   IconExcelGrid,
   type IconProps,
 } from "./icons";
+import Select from "./ui/Select";
 import { t } from "../lib/i18n";
+import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 
 
 export interface AttachedItem {
   name: string;
   id?: string;
+  fsPath?: string;
   type?: "file" | "knowledge";
   file?: File;
   fileType?: string;
@@ -120,6 +125,7 @@ export async function createChatMessageAttachmentSnapshot(
   return {
     name: item.name,
     id: item.id,
+    fsPath: item.fsPath,
     type: item.type,
     fileType: item.fileType,
     mimeType: item.mimeType || item.file?.type,
@@ -232,6 +238,19 @@ export interface ManualSkillItem {
   type?: string | null;
 }
 
+export interface WorkflowInvokeItem {
+  bindingId: string;
+  workflowId: string;
+  title: string;
+  description?: string | null;
+  placeholder?: string | null;
+}
+
+export interface ChatComposerSendContext {
+  localWorkerId?: string;
+  localWorkerName?: string;
+}
+
 function slugifySkillToken(value: string) {
   const slug = value
     .trim()
@@ -270,6 +289,39 @@ export function stripManualSkillTokens(
       .replace(/\s{2,}/g, " ");
   });
   return next.trim();
+}
+
+function slugifyWorkflowToken(value: string) {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "flow";
+}
+
+export function workflowInvokeToken(workflow: WorkflowInvokeItem) {
+  return `%${slugifyWorkflowToken(workflow.title)}`;
+}
+
+export function workflowInvokeMessage(workflow: WorkflowInvokeItem) {
+  const title = workflow.title.trim() || "Flow";
+  return /[.!?。！？]$/.test(title) ? title : `${title}.`;
+}
+
+export function stripWorkflowInvokeToken(
+  text: string,
+  workflow?: WorkflowInvokeItem | null,
+) {
+  if (!workflow) return text.trim();
+  const escaped = workflowInvokeToken(workflow).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  return text
+    .replace(new RegExp(`(^|\\s)${escaped}(?=\\s|$)`, "gu"), " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function hasSkillEnvVars(skill: any) {
@@ -385,6 +437,14 @@ interface ChatInputFooterProps {
     text: string,
     attachments: AttachedItem[],
     manualSkills: ManualSkillItem[],
+    context?: ChatComposerSendContext,
+  ) => void;
+  onSendWorkflow?: (
+    text: string,
+    attachments: AttachedItem[],
+    manualSkills: ManualSkillItem[],
+    workflow: WorkflowInvokeItem,
+    context?: ChatComposerSendContext,
   ) => void;
   onStop: () => void;
   placeholder?: string;
@@ -399,6 +459,8 @@ interface ChatInputFooterProps {
   /** Rendered inside the input row before the textarea (e.g., @mention pill). */
   beforeTextarea?: React.ReactNode;
   mentions?: MentionOption[];
+  /** Workspace-scoped Flows available through the `%` inline trigger. */
+  workflows?: WorkflowInvokeItem[];
   selectedMentions?: MentionOption[];
   onMentionSelect?: (mention: MentionOption) => void;
   onMentionRemove?: (mention: MentionOption) => void;
@@ -504,7 +566,7 @@ function isOffsetInRanges(
   return ranges.some((range) => offset >= range.start && offset < range.end);
 }
 
-type ComposerTrigger = "@" | "#" | "/";
+type ComposerTrigger = "@" | "#" | "/" | "%";
 
 function findLastTriggerOutsideTokens(
   text: string,
@@ -680,6 +742,42 @@ function setPlainOffset(root: HTMLElement | null, target: number) {
   selection.addRange(range);
 }
 
+function adjacentInlineTokenForDeletion(
+  root: HTMLElement | null,
+  direction: "backward" | "forward",
+) {
+  if (!root) return null;
+  const selection = window.getSelection();
+  if (!selection || !selection.isCollapsed || selection.rangeCount === 0)
+    return null;
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.startContainer)) return null;
+
+  const node = range.startContainer;
+  const offset = range.startOffset;
+  let candidate: Node | null = null;
+  if (node.nodeType === Node.TEXT_NODE) {
+    const length = node.textContent?.length || 0;
+    if (direction === "backward") {
+      if (offset > 0) return null;
+      candidate = node.previousSibling;
+    } else {
+      if (offset < length) return null;
+      candidate = node.nextSibling;
+    }
+  } else {
+    candidate =
+      direction === "backward"
+        ? node.childNodes[offset - 1] || null
+        : node.childNodes[offset] || null;
+  }
+
+  return candidate?.nodeType === Node.ELEMENT_NODE &&
+    (candidate as HTMLElement).dataset?.token
+    ? (candidate as HTMLElement)
+    : null;
+}
+
 function extensionFromMimeType(mimeType: string) {
   if (!mimeType) return "file";
   const subtype = mimeType.split("/")[1] || "file";
@@ -718,6 +816,7 @@ export default function ChatInputFooter({
   enterToSend = false,
   streaming,
   onSend,
+  onSendWorkflow,
   onStop,
   placeholder,
   disabled = false,
@@ -727,6 +826,7 @@ export default function ChatInputFooter({
   replaceActionButtons = false,
   beforeTextarea,
   mentions = [],
+  workflows = [],
   selectedMentions = [],
   onMentionSelect,
   onMentionRemove,
@@ -738,6 +838,9 @@ export default function ChatInputFooter({
   className,
 }: ChatInputFooterProps) {
   const queryClient = useQueryClient();
+  const flowsAccess = usePreviewFeatureAccess("flows");
+  const flowsAvailable = flowsAccess.enabled;
+  const flowsComingSoon = flowsAccess.loaded && !flowsAccess.released;
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
   const privateApiEnabled = !authLoading && Boolean(authToken);
@@ -749,6 +852,7 @@ export default function ChatInputFooter({
   const pendingHashTriggerPosRef = useRef<number | null>(null);
   const pendingMentionTriggerPosRef = useRef<number | null>(null);
   const pendingSkillTriggerPosRef = useRef<number | null>(null);
+  const pendingWorkflowTriggerPosRef = useRef<number | null>(null);
   const appliedSeedAttachmentsKeyRef = useRef<string | undefined>();
   const lastNativeValueRef = useRef(value);
   const sendLockedRef = useRef(false);
@@ -756,10 +860,12 @@ export default function ChatInputFooter({
   const syncingEditorRef = useRef(false);
   const selectedKnowledgeNamesRef = useRef<Set<string>>(new Set());
   const inlineThumbnailUrlsRef = useRef<string[]>([]);
+  const inlineAvatarRootsRef = useRef<Root[]>([]);
   const [selectedManualSkills, setSelectedManualSkills] = useState<
     ManualSkillItem[]
   >([]);
-
+  const [selectedWorkflow, setSelectedWorkflow] =
+    useState<WorkflowInvokeItem | null>(null);
   const attachedFilesRef = useRef<AttachedItem[]>([]);
   const [attachedFiles, setAttachedFilesState] = useState<AttachedItem[]>([]);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
@@ -772,16 +878,23 @@ export default function ChatInputFooter({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const attachMenuRef = useRef<HTMLDivElement>(null);
   const integrationsMenuRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
   const attachMenuButtonRef = useRef<HTMLButtonElement>(null);
   const integrationsMenuButtonRef = useRef<HTMLButtonElement>(null);
   const attachMenuPortalRef = useRef<HTMLDivElement>(null);
   const integrationsMenuPortalRef = useRef<HTMLDivElement>(null);
+  const kbPickerPortalRef = useRef<HTMLDivElement>(null);
   const [attachMenuCoords, setAttachMenuCoords] = useState<{
     top: number;
     left: number;
     width: number;
   } | null>(null);
   const [integrationsMenuCoords, setIntegrationsMenuCoords] = useState<{
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
+  const [kbPickerCoords, setKbPickerCoords] = useState<{
     top: number;
     left: number;
     width: number;
@@ -802,6 +915,11 @@ export default function ChatInputFooter({
   const [skillTriggerPos, setSkillTriggerPos] = useState(-1);
   const skillReplaceEndRef = useRef(-1);
   const [skillActiveIdx, setSkillActiveIdx] = useState(0);
+  const [workflowDropdownOpen, setWorkflowDropdownOpen] = useState(false);
+  const [workflowQuery, setWorkflowQuery] = useState("");
+  const [workflowTriggerPos, setWorkflowTriggerPos] = useState(-1);
+  const workflowReplaceEndRef = useRef(-1);
+  const [workflowActiveIdx, setWorkflowActiveIdx] = useState(0);
 
   const [listening, setListening] = useState(false);
   const [focused, setFocused] = useState(false);
@@ -816,6 +934,11 @@ export default function ChatInputFooter({
     return () => {
       inlineThumbnailUrlsRef.current.forEach(revokeObjectUrl);
       inlineThumbnailUrlsRef.current = [];
+      const avatarRoots = inlineAvatarRootsRef.current;
+      inlineAvatarRootsRef.current = [];
+      queueMicrotask(() =>
+        avatarRoots.forEach((avatarRoot) => avatarRoot.unmount()),
+      );
     };
   }, []);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
@@ -898,10 +1021,20 @@ export default function ChatInputFooter({
         getPortalMenuCoords(integrationsMenuButtonRef.current, 390, "left"),
       );
     }
-  }, [attachMenuOpen, getPortalMenuCoords, integrationsMenuOpen]);
+    if (kbPickerOpen) {
+      setKbPickerCoords(
+        getPortalMenuCoords(composerRef.current, 360, "left"),
+      );
+    }
+  }, [
+    attachMenuOpen,
+    getPortalMenuCoords,
+    integrationsMenuOpen,
+    kbPickerOpen,
+  ]);
 
   useLayoutEffect(() => {
-    if (!attachMenuOpen && !integrationsMenuOpen) return;
+    if (!attachMenuOpen && !integrationsMenuOpen && !kbPickerOpen) return;
     updatePortalMenuCoords();
     window.addEventListener("resize", updatePortalMenuCoords);
     window.addEventListener("scroll", updatePortalMenuCoords, true);
@@ -909,7 +1042,12 @@ export default function ChatInputFooter({
       window.removeEventListener("resize", updatePortalMenuCoords);
       window.removeEventListener("scroll", updatePortalMenuCoords, true);
     };
-  }, [attachMenuOpen, integrationsMenuOpen, updatePortalMenuCoords]);
+  }, [
+    attachMenuOpen,
+    integrationsMenuOpen,
+    kbPickerOpen,
+    updatePortalMenuCoords,
+  ]);
 
   const portalMenuStyle = useCallback(
     (coords: { top: number; left: number; width: number }): CSSProperties => ({
@@ -942,7 +1080,7 @@ export default function ChatInputFooter({
 
   /* Close composer menus on outside click */
   useEffect(() => {
-    if (!attachMenuOpen && !integrationsMenuOpen) return;
+    if (!attachMenuOpen && !integrationsMenuOpen && !kbPickerOpen) return;
     const handler = (e: MouseEvent) => {
       const target = e.target as Node;
       if (
@@ -961,10 +1099,19 @@ export default function ChatInputFooter({
       ) {
         setIntegrationsMenuOpen(false);
       }
+      if (
+        kbPickerOpen &&
+        attachMenuRef.current &&
+        !attachMenuRef.current.contains(target) &&
+        !kbPickerPortalRef.current?.contains(target)
+      ) {
+        setKbPickerOpen(false);
+        setKbSearch("");
+      }
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [attachMenuOpen, integrationsMenuOpen]);
+  }, [attachMenuOpen, integrationsMenuOpen, kbPickerOpen]);
 
   /* # autocomplete */
   const debouncedHashQuery = useDebounced(hashQuery, 250);
@@ -1034,6 +1181,25 @@ export default function ChatInputFooter({
         .join(" ")
         .toLowerCase();
       return haystack.includes(q);
+    })
+    .slice(0, 20);
+  const selectedWorkflowIsInline = Boolean(
+    selectedWorkflow && hasInlineToken(value, workflowInvokeToken(selectedWorkflow)),
+  );
+  const workflowFiltered = workflows
+    .filter((workflow) => {
+      if (selectedWorkflowIsInline) return false;
+      const q = workflowQuery.trim().toLowerCase();
+      if (!q) return true;
+      return [
+        workflow.title,
+        workflow.description,
+        workflowInvokeToken(workflow),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(q);
     })
     .slice(0, 20);
   const mentionFiltered = mentions
@@ -1109,6 +1275,9 @@ export default function ChatInputFooter({
           (name) => `#${name}`,
         ),
         ...selectedManualSkills.map((skill) => manualSkillToken(skill)),
+        ...(selectedWorkflow
+          ? [workflowInvokeToken(selectedWorkflow)]
+          : []),
       ];
       const protectedTokenRanges = collectTokenRanges(before, protectedTokens);
       const allProtectedTokenRanges = collectTokenRanges(val, protectedTokens);
@@ -1151,6 +1320,8 @@ export default function ChatInputFooter({
           hashReplaceEndRef.current = -1;
           setSkillDropdownOpen(false);
           skillReplaceEndRef.current = -1;
+          setWorkflowDropdownOpen(false);
+          workflowReplaceEndRef.current = -1;
           return;
         }
       } else {
@@ -1187,6 +1358,8 @@ export default function ChatInputFooter({
           setHashActiveIdx(0);
           setSkillDropdownOpen(false);
           skillReplaceEndRef.current = -1;
+          setWorkflowDropdownOpen(false);
+          workflowReplaceEndRef.current = -1;
           return;
         }
       } else {
@@ -1228,13 +1401,68 @@ export default function ChatInputFooter({
           mentionReplaceEndRef.current = -1;
           setHashDropdownOpen(false);
           hashReplaceEndRef.current = -1;
+          setWorkflowDropdownOpen(false);
+          workflowReplaceEndRef.current = -1;
+          return;
         }
       } else {
         setSkillDropdownOpen(false);
         skillReplaceEndRef.current = -1;
       }
+
+      const forcedWorkflowIdx = pendingWorkflowTriggerPosRef.current;
+      pendingWorkflowTriggerPosRef.current = null;
+      const activeWorkflowTrigger = findActiveTextTrigger("%");
+      const workflowIdx =
+        activeWorkflowTrigger?.index ??
+        (forcedWorkflowIdx != null
+          ? val[forcedWorkflowIdx] === "%"
+            ? forcedWorkflowIdx
+            : findLastTriggerOutsideTokens(val, "%", allProtectedTokenRanges)
+          : findLastTriggerOutsideTokens(before, "%", protectedTokenRanges));
+      if (
+        workflows.length > 0 &&
+        workflowIdx >= 0 &&
+        (workflowIdx === 0 || /\s/.test(val[workflowIdx - 1]))
+      ) {
+        const workflowCursor = activeWorkflowTrigger
+          ? workflowIdx + 1 + activeWorkflowTrigger.query.length
+          : forcedWorkflowIdx != null || cursorPos < workflowIdx + 1
+            ? Math.max(cursorPos, workflowIdx + 1)
+            : cursorPos;
+        const q =
+          activeWorkflowTrigger?.query ??
+          val.substring(workflowIdx + 1, workflowCursor);
+        if (selectedWorkflowIsInline || q.includes(" ") || q.includes("\n")) {
+          setWorkflowDropdownOpen(false);
+          workflowReplaceEndRef.current = -1;
+        } else {
+          setWorkflowDropdownOpen(true);
+          setWorkflowQuery(q);
+          setWorkflowTriggerPos(workflowIdx);
+          workflowReplaceEndRef.current = workflowCursor;
+          setWorkflowActiveIdx(0);
+          setMentionDropdownOpen(false);
+          mentionReplaceEndRef.current = -1;
+          setHashDropdownOpen(false);
+          hashReplaceEndRef.current = -1;
+          setSkillDropdownOpen(false);
+          skillReplaceEndRef.current = -1;
+        }
+      } else {
+        setWorkflowDropdownOpen(false);
+        workflowReplaceEndRef.current = -1;
+      }
     },
-    [mentions.length, onChange, selectedManualSkills, selectedMentions],
+    [
+      mentions.length,
+      onChange,
+      selectedManualSkills,
+      selectedMentions,
+      selectedWorkflow,
+      selectedWorkflowIsInline,
+      workflows.length,
+    ],
   );
 
   const handleEditorBeforeInput = useCallback(
@@ -1247,6 +1475,8 @@ export default function ChatInputFooter({
         pendingMentionTriggerPosRef.current = getPlainOffset(editorRef.current);
       } else if (nativeEvent.data === "/") {
         pendingSkillTriggerPosRef.current = getPlainOffset(editorRef.current);
+      } else if (nativeEvent.data === "%") {
+        pendingWorkflowTriggerPosRef.current = getPlainOffset(editorRef.current);
       }
     },
     [],
@@ -1276,6 +1506,13 @@ export default function ChatInputFooter({
         previousVal,
         val,
         "/",
+      );
+    }
+    if (pendingWorkflowTriggerPosRef.current == null) {
+      pendingWorkflowTriggerPosRef.current = findInsertedTriggerPosition(
+        previousVal,
+        val,
+        "%",
       );
     }
     lastNativeValueRef.current = val;
@@ -1411,6 +1648,41 @@ export default function ChatInputFooter({
     [onChange, skillTriggerPos, value],
   );
 
+  const selectWorkflow = useCallback(
+    (workflow: WorkflowInvokeItem) => {
+      if (!flowsAvailable) return;
+      const start =
+        workflowTriggerPos >= 0
+          ? workflowTriggerPos
+          : getPlainOffset(editorRef.current);
+      const before = value.substring(0, start);
+      const replaceEnd =
+        workflowReplaceEndRef.current >= start
+          ? workflowReplaceEndRef.current
+          : Math.max(start, getPlainOffset(editorRef.current));
+      const after = value.substring(replaceEnd);
+      const token = workflowInvokeToken(workflow);
+      const prefixSpacer =
+        before && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
+      const spacer = after.startsWith(" ") || after.startsWith("\n") ? "" : " ";
+      onChange(`${before}${prefixSpacer}${token}${spacer}${after}`);
+      const nextCursor =
+        before.length + prefixSpacer.length + token.length + spacer.length;
+      pendingCursorRef.current = nextCursor;
+      setSelectedWorkflow(workflow);
+      setWorkflowDropdownOpen(false);
+      setWorkflowQuery("");
+      setWorkflowTriggerPos(-1);
+      workflowReplaceEndRef.current = -1;
+      setWorkflowActiveIdx(0);
+      setTimeout(() => {
+        editorRef.current?.focus();
+        setPlainOffset(editorRef.current, nextCursor);
+      }, 0);
+    },
+    [flowsAvailable, onChange, value, workflowTriggerPos],
+  );
+
   const openSkillPicker = useCallback(() => {
     if (skillDropdownOpen) {
       setSkillDropdownOpen(false);
@@ -1427,6 +1699,8 @@ export default function ChatInputFooter({
     mentionReplaceEndRef.current = -1;
     setHashDropdownOpen(false);
     hashReplaceEndRef.current = -1;
+    setWorkflowDropdownOpen(false);
+    workflowReplaceEndRef.current = -1;
     setAttachMenuOpen(false);
     setIntegrationsMenuOpen(false);
     setTimeout(() => editorRef.current?.focus(), 0);
@@ -1434,7 +1708,7 @@ export default function ChatInputFooter({
 
   const removeAutocompleteTriggerRange = useCallback(
     (
-      trigger: "@" | "/",
+      trigger: "@" | "/" | "%",
       start: number,
       replaceEnd: number,
       refocus: boolean,
@@ -1493,6 +1767,22 @@ export default function ChatInputFooter({
         removeAutocompleteTriggerRange("/", start, replaceEnd, refocus);
     },
     [removeAutocompleteTriggerRange, skillTriggerPos],
+  );
+
+  const dismissWorkflowAutocomplete = useCallback(
+    (removeTrigger = false, refocus = true) => {
+      const start = workflowTriggerPos;
+      const replaceEnd = workflowReplaceEndRef.current;
+      setWorkflowDropdownOpen(false);
+      setWorkflowQuery("");
+      setWorkflowTriggerPos(-1);
+      workflowReplaceEndRef.current = -1;
+      setWorkflowActiveIdx(0);
+      if (removeTrigger) {
+        removeAutocompleteTriggerRange("%", start, replaceEnd, refocus);
+      }
+    },
+    [removeAutocompleteTriggerRange, workflowTriggerPos],
   );
 
   const removeTokenText = useCallback(
@@ -1582,6 +1872,23 @@ export default function ChatInputFooter({
   const addKbDoc = (doc: ComposerDocumentOption) => {
     if (attachedFiles.some((f) => f.id === doc.id)) return;
     setAttachedFiles((prev) => [...prev, composerPreviewItemFromDoc(doc)]);
+    // The inline `#name` token is the composer's only visible, removable
+    // representation of a knowledge attachment (the chip row skips
+    // type === "knowledge", and triggerSend drops items without a token),
+    // so insert it just like the `#` autocomplete path does.
+    const token = `#${doc.name}`;
+    if (!hasInlineToken(value, token)) {
+      const spacer =
+        value && !value.endsWith(" ") && !value.endsWith("\n") ? " " : "";
+      const next = `${value}${spacer}${token} `;
+      selectedKnowledgeNamesRef.current.add(doc.name);
+      onChange(next);
+      pendingCursorRef.current = next.length;
+      setTimeout(() => {
+        editorRef.current?.focus();
+        setPlainOffset(editorRef.current, next.length);
+      }, 0);
+    }
     setKbPickerOpen(false);
     setKbSearch("");
   };
@@ -1731,10 +2038,17 @@ export default function ChatInputFooter({
     const manualSkillSnapshot = selectedManualSkills.filter((skill) =>
       hasInlineToken(value, manualSkillToken(skill)),
     );
+    const workflowSnapshot =
+      flowsAvailable &&
+      selectedWorkflow &&
+      hasInlineToken(value, workflowInvokeToken(selectedWorkflow))
+        ? selectedWorkflow
+        : null;
     if (
       (!text &&
         currentAttachments.length === 0 &&
-        manualSkillSnapshot.length === 0) ||
+        manualSkillSnapshot.length === 0 &&
+        !workflowSnapshot) ||
       streaming ||
       disabled ||
       sendLockedRef.current
@@ -1751,7 +2065,12 @@ export default function ChatInputFooter({
     );
     setAttachedFiles([]);
     setSelectedManualSkills([]);
-    onSend(text, snapshot, manualSkillSnapshot);
+    setSelectedWorkflow(null);
+    if (workflowSnapshot && onSendWorkflow) {
+      onSendWorkflow(text, snapshot, manualSkillSnapshot, workflowSnapshot);
+    } else {
+      onSend(text, snapshot, manualSkillSnapshot);
+    }
     window.setTimeout(() => {
       if (!streamingRef.current) {
         sendLockedRef.current = false;
@@ -1761,8 +2080,11 @@ export default function ChatInputFooter({
     value,
     streaming,
     selectedManualSkills,
+    selectedWorkflow,
+    flowsAvailable,
     listening,
     onSend,
+    onSendWorkflow,
     disabled,
     setAttachedFiles,
   ]);
@@ -1771,6 +2093,28 @@ export default function ChatInputFooter({
     (e: React.KeyboardEvent<HTMLDivElement>) => {
       if (onKeyDown) onKeyDown(e);
       if (e.defaultPrevented) return;
+
+      if (
+        (e.key === "Backspace" || e.key === "Delete") &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey
+      ) {
+        const token = adjacentInlineTokenForDeletion(
+          editorRef.current,
+          e.key === "Backspace" ? "backward" : "forward",
+        );
+        const mentionId = token?.dataset.mentionId;
+        const mentionType = token?.dataset.mentionType;
+        const mention = selectedMentions.find(
+          (item) => item.id === mentionId && item.type === mentionType,
+        );
+        if (mention) {
+          e.preventDefault();
+          removeMentionToken(mention);
+          return;
+        }
+      }
 
       if (mentionDropdownOpen) {
         if (e.key === "ArrowDown" && mentionFiltered.length > 0) {
@@ -1826,6 +2170,35 @@ export default function ChatInputFooter({
         }
       }
 
+      if (workflowDropdownOpen) {
+        if (e.key === "ArrowDown" && workflowFiltered.length > 0) {
+          e.preventDefault();
+          setWorkflowActiveIdx((i) =>
+            Math.min(i + 1, workflowFiltered.length - 1),
+          );
+          return;
+        }
+        if (e.key === "ArrowUp" && workflowFiltered.length > 0) {
+          e.preventDefault();
+          setWorkflowActiveIdx((i) => Math.max(i - 1, 0));
+          return;
+        }
+        if (
+          (e.key === "Enter" || e.key === "Tab") &&
+          flowsAvailable &&
+          workflowFiltered.length > 0
+        ) {
+          e.preventDefault();
+          selectWorkflow(workflowFiltered[workflowActiveIdx]);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          dismissWorkflowAutocomplete(true);
+          return;
+        }
+      }
+
       if (hashDropdownOpen && hashFiltered.length > 0) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
@@ -1868,6 +2241,8 @@ export default function ChatInputFooter({
     },
     [
       onKeyDown,
+      removeMentionToken,
+      selectedMentions,
       mentionDropdownOpen,
       mentionFiltered,
       mentionActiveIdx,
@@ -1878,6 +2253,12 @@ export default function ChatInputFooter({
       skillActiveIdx,
       selectManualSkill,
       dismissSkillAutocomplete,
+      workflowDropdownOpen,
+      workflowFiltered,
+      workflowActiveIdx,
+      flowsAvailable,
+      selectWorkflow,
+      dismissWorkflowAutocomplete,
       hashDropdownOpen,
       hashFiltered,
       hashActiveIdx,
@@ -1892,17 +2273,21 @@ export default function ChatInputFooter({
     setFocused(false);
     if (mentionDropdownOpen) dismissMentionAutocomplete(true, false);
     if (skillDropdownOpen) dismissSkillAutocomplete(true, false);
+    if (workflowDropdownOpen) dismissWorkflowAutocomplete(true, false);
   }, [
     dismissMentionAutocomplete,
     dismissSkillAutocomplete,
     mentionDropdownOpen,
     skillDropdownOpen,
+    workflowDropdownOpen,
+    dismissWorkflowAutocomplete,
   ]);
 
   const canSend =
     value.trim().length > 0 ||
     attachedFiles.length > 0 ||
-    selectedManualSkills.length > 0;
+    selectedManualSkills.length > 0 ||
+    selectedWorkflowIsInline;
   const inlineKnowledgeRefs = attachedFiles.filter(
     (item) =>
       item.type === "knowledge" && hasInlineToken(value, `#${item.name}`),
@@ -1913,12 +2298,15 @@ export default function ChatInputFooter({
   const inlineSkillRefs = selectedManualSkills.filter((skill) =>
     hasInlineToken(value, manualSkillToken(skill)),
   );
+  const inlineWorkflowRef =
+    selectedWorkflow && selectedWorkflowIsInline ? selectedWorkflow : null;
   const inlineCardParts = (() => {
     type InlinePart =
       | { kind: "text"; text: string; key: string }
       | { kind: "mention"; token: string; mention: MentionOption; key: string }
       | { kind: "document"; token: string; item: AttachedItem; key: string }
-      | { kind: "skill"; token: string; skill: ManualSkillItem; key: string };
+      | { kind: "skill"; token: string; skill: ManualSkillItem; key: string }
+      | { kind: "workflow"; token: string; workflow: WorkflowInvokeItem; key: string };
     const matches: Array<{ start: number; end: number; part: InlinePart }> = [];
     inlineMentionRefs.forEach((mention) => {
       const token = `@${mention.name}`;
@@ -1965,6 +2353,21 @@ export default function ChatInputFooter({
         });
       });
     });
+    if (inlineWorkflowRef) {
+      const token = workflowInvokeToken(inlineWorkflowRef);
+      findInlineTokenMatches(value, token).forEach(({ start, end }, count) => {
+        matches.push({
+          start,
+          end,
+          part: {
+            kind: "workflow",
+            token,
+            workflow: inlineWorkflowRef,
+            key: `workflow-${inlineWorkflowRef.bindingId}-${count}`,
+          },
+        });
+      });
+    }
 
     const parts: InlinePart[] = [];
     let cursor = 0;
@@ -2001,6 +2404,8 @@ export default function ChatInputFooter({
       return;
     inlineThumbnailUrlsRef.current.forEach(revokeObjectUrl);
     inlineThumbnailUrlsRef.current = [];
+    inlineAvatarRootsRef.current.forEach((avatarRoot) => avatarRoot.unmount());
+    inlineAvatarRootsRef.current = [];
     let cancelled = false;
 
     const makeTokenNode = (part: (typeof inlineCardParts)[number]) => {
@@ -2013,7 +2418,9 @@ export default function ChatInputFooter({
           ? `chat-composer-inline-token chat-composer-inline-token--mention chat-composer-inline-token--${part.mention.type}`
           : part.kind === "document"
             ? "chat-composer-inline-token chat-composer-inline-token--document"
-            : "chat-composer-inline-token chat-composer-inline-token--skill";
+            : part.kind === "skill"
+              ? "chat-composer-inline-token chat-composer-inline-token--skill"
+              : "chat-composer-inline-token chat-composer-inline-token--workflow";
 
       const badge = document.createElement("span");
       badge.className =
@@ -2026,19 +2433,26 @@ export default function ChatInputFooter({
       const small = document.createElement("small");
 
       if (part.kind === "mention") {
+        const prefix = document.createElement("span");
+        prefix.className = "chat-composer-inline-mention-prefix";
+        prefix.textContent = "@";
         token.dataset.mentionId = part.mention.id;
         token.dataset.mentionType = part.mention.type;
         token.dataset.mentionName = part.mention.name;
-        if (part.mention.avatarUrl) {
-          const img = document.createElement("img");
-          img.src = part.mention.avatarUrl;
-          img.alt = "";
-          badge.appendChild(img);
-        } else {
-          badge.textContent = part.mention.name.charAt(0).toUpperCase();
-        }
-        strong.textContent = `@${part.mention.name}`;
-        small.textContent = part.mention.type;
+        const avatarRoot = createRoot(badge);
+        avatarRoot.render(
+          <UserAvatar
+            name={part.mention.name}
+            avatarUrl={part.mention.avatarUrl}
+            type={part.mention.type}
+            seed={part.mention.id}
+            size={18}
+          />,
+        );
+        inlineAvatarRootsRef.current.push(avatarRoot);
+        strong.textContent = part.mention.name;
+        main.append(strong);
+        token.append(prefix, badge, main);
       } else if (part.kind === "document") {
         token.dataset.documentId = part.item.id || "";
         token.dataset.documentName = part.item.name;
@@ -2074,15 +2488,22 @@ export default function ChatInputFooter({
         strong.textContent = `#${part.item.name}`;
         small.textContent =
           part.item.mimeType || part.item.fileType || "knowledge";
-      } else {
+      } else if (part.kind === "skill") {
         token.dataset.skillId = part.skill.id;
         token.dataset.skillSlug = part.skill.slug || "";
         token.dataset.skillName = part.skill.name;
         badge.textContent = "SK";
         strong.textContent = part.token;
         small.textContent = part.skill.category || part.skill.type || "skill";
+      } else {
+        token.dataset.workflowBindingId = part.workflow.bindingId;
+        token.dataset.workflowId = part.workflow.workflowId;
+        badge.textContent = "FL";
+        strong.textContent = part.token;
+        small.textContent = t("nav.flows");
       }
 
+      if (part.kind === "mention") return token;
       main.append(strong, small);
       token.append(badge, main);
       return token;
@@ -2190,188 +2611,109 @@ export default function ChatInputFooter({
         )
       : null;
 
+  const kbPickerPortal =
+    kbPickerOpen && kbPickerCoords && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            ref={kbPickerPortalRef}
+            className="chat-composer-menu chat-composer-menu--knowledge chat-composer-menu--portal"
+            style={portalMenuStyle(kbPickerCoords)}
+            role="dialog"
+            aria-label={t("component.chat_input_footer.add_from_knowledge_base")}
+          >
+            <div className="chat-composer-knowledge-search">
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.7}
+                aria-hidden="true"
+              >
+                <circle cx="11" cy="11" r="8" />
+                <path d="M21 21l-4.35-4.35" />
+              </svg>
+              <input
+                value={kbSearch}
+                onChange={(e) => setKbSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== "Escape") return;
+                  setKbPickerOpen(false);
+                  setKbSearch("");
+                  attachMenuButtonRef.current?.focus();
+                }}
+                placeholder={t("component.chat_input_footer.search_knowledge_base")}
+                aria-label={t("component.chat_input_footer.search_knowledge_base")}
+                autoFocus
+              />
+              <button
+                onClick={() => {
+                  setKbPickerOpen(false);
+                  setKbSearch("");
+                  attachMenuButtonRef.current?.focus();
+                }}
+                className="chat-composer-autocomplete-close"
+                type="button"
+                aria-label={t("action.close")}
+                title={t("action.close")}
+              >
+                <IconClose size={12} />
+              </button>
+            </div>
+            <div className="chat-composer-knowledge-list">
+              {kbDocsLoading ? (
+                <div className="chat-composer-hash-empty chat-composer-knowledge-loading">
+                  <InlineRowsSkeleton rows={4} dense />
+                </div>
+              ) : (kbDocs?.items || []).length === 0 ? (
+                <div className="chat-composer-hash-empty">
+                  {t("component.chat_input_footer.no_documents_found")}
+                </div>
+              ) : null}
+              {!kbDocsLoading &&
+                (kbDocs?.items || []).map((doc: ComposerDocumentOption) => {
+                  const ext = (
+                    doc.file_type ||
+                    doc.name?.split(".").pop() ||
+                    ""
+                  ).toUpperCase();
+                  const alreadyAttached = attachedFiles.some(
+                    (file) => file.id === doc.id,
+                  );
+                  return (
+                    <button
+                      key={doc.id}
+                      onClick={() => addKbDoc(doc)}
+                      disabled={alreadyAttached}
+                      className="chat-composer-hash-item chat-composer-knowledge-item"
+                      type="button"
+                      aria-label={doc.name}
+                    >
+                      <ComposerReferenceThumbnail
+                        item={composerPreviewItemFromDoc(doc)}
+                        className="chat-composer-hash-thumb"
+                      />
+                      <span className="chat-composer-hash-name">
+                        {doc.name}
+                      </span>
+                      <span className="chat-composer-hash-ext">
+                        {ext.slice(0, 4) || "?"}
+                      </span>
+                    </button>
+                  );
+                })}
+            </div>
+          </div>,
+          document.body,
+        )
+      : null;
+
   return (
     <>
       {attachMenuPortal}
       {integrationsMenuPortal}
-
-      {/* KB picker — sits above the footer */}
-      {kbPickerOpen && (
-        <div
-          style={{
-            maxHeight: 200,
-            borderTop: "1px solid rgba(28,25,23,0.06)",
-            display: "flex",
-            flexDirection: "column",
-            flexShrink: 0,
-          }}
-        >
-          <div
-            style={{
-              padding: "8px 16px",
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-            }}
-          >
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="#78716c"
-              strokeWidth={1.5}
-            >
-              <circle cx="11" cy="11" r="8" />
-              <path d="M21 21l-4.35-4.35" />
-            </svg>
-            <input
-              value={kbSearch}
-              onChange={(e) => setKbSearch(e.target.value)}
-              placeholder={t("component.chat_input_footer.search_knowledge_base")}
-              autoFocus
-              style={{
-                flex: 1,
-                border: "none",
-                outline: "none",
-                background: "transparent",
-                fontSize: 12,
-                color: "#292524",
-                fontFamily: "inherit",
-              }}
-            />
-            <button
-              onClick={() => {
-                setKbPickerOpen(false);
-                setKbSearch("");
-              }}
-              style={{
-                border: "none",
-                background: "transparent",
-                cursor: "pointer",
-                color: "#a8a29e",
-                display: "flex",
-                padding: 2,
-              }}
-            >
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={2.5}
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M6 18L18 6M6 6l12 12"
-                />
-              </svg>
-            </button>
-          </div>
-          <div style={{ flex: 1, overflowY: "auto", padding: "0 12px 8px" }}>
-            {kbDocsLoading ? (
-              <div style={{ padding: "8px 4px" }}>
-                <InlineRowsSkeleton rows={4} dense />
-              </div>
-            ) : (kbDocs?.items || []).length === 0 ? (
-              <div
-                style={{
-                  textAlign: "center",
-                  padding: 16,
-                  fontSize: 12,
-                  color: "#a8a29e",
-                }}
-              >
-                {t("component.chat_input_footer.no_documents_found")}</div>
-            ) : null}
-            {!kbDocsLoading && (kbDocs?.items || []).map((doc: any) => {
-              const ext = (
-                doc.file_type ||
-                doc.name?.split(".").pop() ||
-                ""
-              ).toLowerCase();
-              const alreadyAttached = attachedFiles.some(
-                (f) => f.id === doc.id,
-              );
-              return (
-                <button
-                  key={doc.id}
-                  onClick={() => addKbDoc(doc)}
-                  disabled={alreadyAttached}
-                  style={{
-                    width: "100%",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    padding: "6px 8px",
-                    borderRadius: 8,
-                    border: "none",
-                    background: alreadyAttached ? "#f5f5f4" : "transparent",
-                    cursor: alreadyAttached ? "default" : "pointer",
-                    textAlign: "left",
-                    fontFamily: "inherit",
-                    transition: "background 0.1s",
-                    opacity: alreadyAttached ? 0.5 : 1,
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!alreadyAttached)
-                      e.currentTarget.style.background = "#fafaf9";
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!alreadyAttached)
-                      e.currentTarget.style.background = "transparent";
-                  }}
-                >
-                  <svg
-                    width="14"
-                    height="14"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="#4869ac"
-                    strokeWidth={1.5}
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"
-                    />
-                  </svg>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div
-                      style={{
-                        fontSize: 12,
-                        fontWeight: 600,
-                        color: "#44403c",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {doc.name}
-                    </div>
-                  </div>
-                  <span
-                    style={{
-                      fontSize: 9,
-                      fontWeight: 700,
-                      padding: "1px 4px",
-                      borderRadius: 4,
-                      background: "#e7e5e4",
-                      color: "#78716c",
-                      textTransform: "uppercase",
-                      flexShrink: 0,
-                    }}
-                  >
-                    {ext.slice(0, 4) || "?"}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      {kbPickerPortal}
 
       <div
         className={className || "embedded-chat-footer"}
@@ -2389,6 +2731,7 @@ export default function ChatInputFooter({
         />
 
         <div
+          ref={composerRef}
           className={`chat-composer ${focused ? "chat-composer--focused" : ""} ${streaming ? "chat-composer--streaming" : ""}`}
         >
           {attachedFiles.some((file) => file.type !== "knowledge") && (
@@ -2568,6 +2911,69 @@ export default function ChatInputFooter({
                 )}
               </div>
             )}
+            {workflowDropdownOpen && (
+              <div className="chat-composer-mention-menu chat-composer-workflow-menu">
+                <div className="chat-composer-hash-title">
+                  <span>
+                    {t("nav.flows")}
+                    {flowsComingSoon
+                      ? ` · ${t("component.chat_mode.soon")}`
+                      : ""}
+                  </span>
+                  <button
+                    type="button"
+                    className="chat-composer-autocomplete-close"
+                    aria-label={t("component.chat_input_footer.cancel_flow")}
+                    title={t("component.chat_input_footer.cancel_flow")}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => dismissWorkflowAutocomplete(true)}
+                  >
+                    <IconClose size={12} />
+                  </button>
+                </div>
+                {workflowFiltered.length === 0 ? (
+                  <div className="chat-composer-hash-empty">
+                    {workflowQuery
+                      ? t("component.chat_input_footer.no_matching_flows")
+                      : t("component.chat_input_footer.no_flows_available")}
+                  </div>
+                ) : (
+                  workflowFiltered.map((workflow, idx) => (
+                    <button
+                      key={workflow.bindingId}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => selectWorkflow(workflow)}
+                      onMouseEnter={() => setWorkflowActiveIdx(idx)}
+                      className={`chat-composer-mention-item ${idx === workflowActiveIdx ? "active" : ""}`}
+                      type="button"
+                      disabled={!flowsAvailable}
+                      aria-disabled={!flowsAvailable}
+                      title={
+                        flowsComingSoon
+                          ? t("component.chat_mode.flows_coming_soon")
+                          : undefined
+                      }
+                    >
+                      <span className="chat-composer-mention-avatar chat-composer-mention-avatar--workflow">
+                        <IconFlow size={14} />
+                      </span>
+                      <span className="chat-composer-mention-main">
+                        <strong>{workflow.title}</strong>
+                        <small>
+                          {workflow.description ||
+                            t("component.chat_input_footer.run_this_flow_for_the_next_message")}
+                        </small>
+                      </span>
+                      <span className="chat-composer-mention-type">
+                        {flowsComingSoon
+                          ? t("component.chat_mode.soon")
+                          : "%"}
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
             {hashDropdownOpen && (
               <div className="chat-composer-hash-menu">
                 <div className="chat-composer-hash-title">
@@ -2640,7 +3046,11 @@ export default function ChatInputFooter({
             <div style={{ position: "relative" }} ref={attachMenuRef}>
               <button
                 ref={attachMenuButtonRef}
-                onClick={() => setAttachMenuOpen(!attachMenuOpen)}
+                onClick={() => {
+                  setKbPickerOpen(false);
+                  setKbSearch("");
+                  setAttachMenuOpen(!attachMenuOpen);
+                }}
                 disabled={streaming || disabled}
                 title={
                   attachmentButtonIcon === "paperclip"
@@ -2652,6 +3062,8 @@ export default function ChatInputFooter({
                     ? t("page.task_detail.attachments")
                     : t("component.chat_input_footer.add_context_or_tools")
                 }
+                aria-haspopup="menu"
+                aria-expanded={attachMenuOpen || kbPickerOpen}
                 className={`chat-composer-icon-btn ${attachMenuOpen ? "chat-composer-icon-btn--active" : ""}`}
                 type="button"
               >

@@ -9,6 +9,7 @@ import PageHeader from "../components/ui/PageHeader";
 import { ListRowsSkeleton, PanelLoading } from "../components/ui/Skeleton";
 import DeveloperTab from "../components/settings/DeveloperTab";
 import {
+  IconArrowLeft,
   IconBell,
   IconBrain,
   IconCalendar,
@@ -27,6 +28,53 @@ import {
   SecuritySection as PasswordSection,
 } from "./Account";
 import { t } from "../lib/i18n";
+import { formatUserFacingLabel } from "../lib/taskDisplay";
+
+/** One bar of the daily consumption chart with a styled hover tooltip. */
+function DailyUsageBar({
+  d,
+  heightPct,
+  inputPct,
+  day,
+}: {
+  d: { date: string; input: number; output: number; total: number };
+  heightPct: number;
+  inputPct: number;
+  day: string;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ flex: 1, position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, height: "100%", cursor: "default" }}
+    >
+      {hover && (
+        <div style={{ position: "absolute", bottom: "100%", left: "50%", transform: "translate(-50%, -6px)", zIndex: 20, background: "#292524", color: "#fafaf9", borderRadius: 10, padding: "8px 12px", fontSize: 11, lineHeight: 1.6, whiteSpace: "nowrap", boxShadow: "0 8px 24px rgba(28,25,23,0.22)", pointerEvents: "none" }}>
+          <div style={{ fontWeight: 700, marginBottom: 2 }}>{d.date}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: "#5f928a", flexShrink: 0 }} />
+            {t("page.settings.output")}: <span style={{ fontWeight: 700 }}>{d.output.toLocaleString()}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: "#a8a29e", flexShrink: 0 }} />
+            {t("page.agent_dashboard.input")}: <span style={{ fontWeight: 700 }}>{d.input.toLocaleString()}</span>
+          </div>
+          <div style={{ marginTop: 2, paddingTop: 2, borderTop: "1px solid rgba(250,250,249,0.2)" }}>
+            {t("page.settings.total_tokens")}: <span style={{ fontWeight: 700 }}>{d.total.toLocaleString()}</span>
+          </div>
+        </div>
+      )}
+      <div style={{ width: "100%", flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
+        <div style={{ width: "100%", borderRadius: 4, height: `${heightPct}%`, display: "flex", flexDirection: "column", overflow: "hidden", boxShadow: "0 4px 12px rgba(28,25,23,0.08)", outline: hover ? "2px solid rgba(95,146,138,0.45)" : "none", outlineOffset: 1 }}>
+          <div style={{ flex: 100 - inputPct, background: "linear-gradient(180deg,#abccc4,#5f928a)" }} />
+          <div style={{ flex: inputPct, background: "linear-gradient(180deg,#d6d3d1,#a8a29e)" }} />
+        </div>
+      </div>
+      <span style={{ fontSize: 9, fontWeight: 700, color: hover ? "#57534e" : "#a8a29e" }}>{day}</span>
+    </div>
+  );
+}
 
 /* ═══════════════════════════════════════════════════════════════════
    Shared components
@@ -555,7 +603,23 @@ function SecurityTab() {
   const enabled = tfaStatus?.enabled ?? (tfaStatus as any)?.totp_enabled ?? false;
 
   const handleSetup = async () => { setError(""); try { const d = await api.twoFactor.setup(); setSetupData(d); setStep("verify"); } catch (e: any) { setError(e.message); } };
-  const handleVerify = async () => { setError(""); try { const r = await api.twoFactor.verify(code.trim()); if (r.backup_codes) setBackupCodes(r.backup_codes); setStep("idle"); setCode(""); setSetupData(null); refetch(); } catch (e: any) { setError(e.message); } };
+  const handleVerify = async () => {
+    setError("");
+    try {
+      const result = await api.twoFactor.verify(code.trim());
+      if (result.access_token) {
+        localStorage.setItem("manor_token", result.access_token);
+        useAuthStore.setState({ token: result.access_token });
+      }
+      if (result.backup_codes) setBackupCodes(result.backup_codes);
+      setStep("idle");
+      setCode("");
+      setSetupData(null);
+      await refetch();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
   const handleDisable = async () => { setError(""); try { await api.twoFactor.disable(code.trim()); setStep("idle"); setCode(""); setBackupCodes(null); refetch(); } catch (e: any) { setError(e.message); } };
 
   if (isLoading) {
@@ -776,7 +840,7 @@ export default function Settings() {
             className="settings-back-to-app"
             onClick={() => navigate("/dashboard")}
           >
-            <span aria-hidden="true">{"<"}</span>
+            <IconArrowLeft size={16} aria-hidden />
             Back to app
           </button>
 

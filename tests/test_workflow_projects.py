@@ -4,6 +4,7 @@ from packages.core.models.workflow import WorkflowActionGrant, WorkflowProject
 from packages.core.services.workflow_project_service import (
     WorkflowProjectConflict,
     WorkflowProjectNotFound,
+    claim_workflow_project,
     create_workflow_project,
     get_workflow_project,
     patch_workflow_project,
@@ -24,6 +25,39 @@ def test_workflow_project_defaults():
     assert WorkflowProject.__table__.c.current_stage.default.arg == "draft"
     assert WorkflowProject.__table__.c.revision.default.arg == 0
     assert project.last_run_id is None
+    assert project.project_key is None
+
+
+@pytest.mark.asyncio
+async def test_claim_workflow_project_dedupes_one_workspace_business_key(db_session):
+    first, first_claimed = await claim_workflow_project(
+        db_session,
+        entity_id="ent1",
+        workspace_id="ws1",
+        project_type="daily_content_batch",
+        project_key="2026-08-03",
+        state={"status": "planning"},
+        created_by="user1",
+        last_run_id="run1",
+    )
+    await db_session.commit()
+
+    duplicate, duplicate_claimed = await claim_workflow_project(
+        db_session,
+        entity_id="ent1",
+        workspace_id="ws1",
+        project_type="daily_content_batch",
+        project_key="2026-08-03",
+        state={"status": "duplicate"},
+        created_by="user1",
+        last_run_id="run2",
+    )
+
+    assert first_claimed is True
+    assert duplicate_claimed is False
+    assert duplicate.id == first.id
+    assert duplicate.state == {"status": "planning"}
+    assert duplicate.last_run_id == "run1"
 
 
 def test_workflow_action_grant_fields():

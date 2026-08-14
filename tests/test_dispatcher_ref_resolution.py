@@ -433,14 +433,32 @@ async def test_dispatcher_rejects_action_not_bound_to_resolved_service_agent(cli
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_coerces_worker_output_before_validation(client) -> None:
+async def test_dispatcher_coerces_worker_output_before_validation(
+    client, tmp_path, monkeypatch,
+) -> None:
     import packages.core.database as dbmod
+    from types import SimpleNamespace
+
+    from packages.core.services import artifact_knowledge
 
     entity_id = generate_ulid()
     plan_id = generate_ulid()
     step_id = generate_ulid()
     lease_id = generate_ulid()
     worker_id = generate_ulid()
+    artifact = tmp_path / "workspace" / "social" / "draft-pack.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("Draft pack", encoding="utf-8")
+    monkeypatch.setattr(
+        artifact_knowledge,
+        "get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+
+    async def sync_artifact(**_kwargs):
+        return SimpleNamespace(synced=True, document_id="doc_draft_pack", reason=None)
+
+    monkeypatch.setattr(artifact_knowledge, "sync_file_to_knowledge", sync_artifact)
     schema = {
         "type": "object",
         "required": ["files", "summary", "draft_count"],
@@ -530,6 +548,7 @@ async def test_dispatcher_coerces_worker_output_before_validation(client) -> Non
         assert step.step_status == "done"
         assert step.result["draft_count"] == 3
         assert step.result["files"][0]["path"] == "workspace/social/draft-pack.md"
+        assert step.result["document_id"] == "doc_draft_pack"
         assert lease.status == "completed"
         assert lease.result == step.result
 

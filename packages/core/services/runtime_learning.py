@@ -2458,7 +2458,7 @@ def _tool_pattern_key(tools: list[str]) -> str:
 
 
 def _stable_hash(value: str) -> str:
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1(value.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
 
 
 def _compact_text(value: Any, *, max_chars: int = _MAX_EXCERPT_CHARS) -> str:

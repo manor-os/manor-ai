@@ -370,21 +370,12 @@ def _runtime_staff_summary(
 
 
 def _runtime_doc_summary(doc: Any, *, details: bool = False) -> dict[str, Any]:
-    data = {
-        "id": doc.id,
-        "name": doc.name,
-        "file_type": doc.file_type,
-        "file_size": doc.file_size,
-    }
-    if details:
-        data.update({
-            "mime_type": getattr(doc, "mime_type", None),
-            "source": getattr(doc, "source", None),
-            "vector_status": getattr(doc, "vector_status", None),
-            "folder_id": getattr(doc, "folder_id", None),
-            "fs_path": getattr(doc, "fs_path", None),
-        })
-    return data
+    from packages.core.ai.runtime.document_actions import runtime_document_to_dict
+
+    return runtime_document_to_dict(
+        doc,
+        detail="details" if details else "summary",
+    )
 
 
 def _runtime_folder_rel_path(folder: Any, folder_by_id: Mapping[str, Any]) -> str:
@@ -1463,7 +1454,8 @@ async def runtime_manor_list_workspace_artifacts(
         meta = doc.metadata_ or {}
         origin = metadata_origin(meta)
         artifact = metadata_artifact(meta)
-        artifacts.append({
+        document_reference = _runtime_doc_summary(doc, details=True)
+        document_reference.update({
             "id": doc.id,
             "name": doc.name,
             "source": doc.source,
@@ -1478,6 +1470,7 @@ async def runtime_manor_list_workspace_artifacts(
             "tool_name": origin.get("tool_name"),
             "created_at": doc.created_at.isoformat() if getattr(doc, "created_at", None) else None,
         })
+        artifacts.append(document_reference)
     result = json.dumps({
         "workspace_id": workspace_id_value,
         "count": len(artifacts),
@@ -1729,10 +1722,18 @@ async def runtime_manor_upload_document(
     except Exception:
         pass
 
+    from packages.core.ai.runtime.document_actions import (
+        runtime_document_markdown_link,
+        runtime_document_viewer_url,
+    )
+
+    uploaded_name = os.path.basename(target)
     return json.dumps(
         {
             "id": sync.document_id,
-            "name": os.path.basename(name),
+            "name": uploaded_name,
+            "viewer_url": runtime_document_viewer_url(sync.document_id),
+            "markdown_link": runtime_document_markdown_link(uploaded_name, sync.document_id),
             "status": "uploaded" if sync.synced else "skipped",
             "reason": sync.reason,
         },

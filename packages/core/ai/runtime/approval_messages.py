@@ -293,15 +293,24 @@ def describe_runtime_approval_action(tool_name: str, arguments: dict[str, Any]) 
         "mcp__outlook__send_email",
         "mcp__outlook__send_message",
         "mcp__email__send",
+        "mcp__email__send_email",
         "mcp__email__send_message",
     ):
         to = _str("to") or _str("recipient") or "(unspecified)"
         subject = _trunc(_str("subject"), 80) or "(no subject)"
         return f'Send email to {to}: "{subject}"'
     if tool_name in (
+        "mcp__email__reply_to_message",
+        "mcp__email__reply_all",
+    ):
+        uid = _str("uid") or _str("message_id") or "?"
+        mode = "Reply all" if tool_name.endswith("reply_all") else "Reply"
+        return f"{mode} to email message ({uid})"
+    if tool_name in (
         "mcp__gmail__delete_message",
         "mcp__outlook__delete_message",
         "mcp__email__delete",
+        "mcp__email__delete_message",
     ):
         return f'Delete email message ({_str("message_id") or _str("id") or "?"})'
 

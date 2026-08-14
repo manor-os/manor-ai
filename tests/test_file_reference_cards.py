@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -102,23 +103,99 @@ def test_agents_are_told_to_cite_the_returned_address():
         has_tools=True,
     )
     assert guidance
-    assert "fs_path" in guidance
+    assert "[filename](/viewer/{document_id})" in guidance
+    assert "markdown_link" in guidance
     assert "document_id" in guidance
+    assert "internal routing metadata" in guidance
+    assert "Never print it separately" in guidance
+    assert "never add a `Document ID`" in guidance
+    assert "task, generation, or search" in guidance
+    assert "treat its destination as opaque" in guidance
+    assert "open_url" in guidance
     # The specific failure: inventing a path instead of quoting the tool's.
     assert "reconstruct" in guidance
 
 
-def test_guidance_is_absent_when_the_turn_cannot_produce_files():
+def test_link_contract_is_present_even_without_a_file_tool_on_this_turn():
     from packages.core.ai.runtime.prompt_guidance import (
         runtime_artifact_reference_guidance,
     )
 
-    assert runtime_artifact_reference_guidance(
-        envelope=None, tool_names=["rag", "manor"], has_tools=True,
-    ) is None
-    assert runtime_artifact_reference_guidance(
+    guidance = runtime_artifact_reference_guidance(
+        envelope=None, tool_names=["create_task"], has_tools=True,
+    )
+    no_tools_guidance = runtime_artifact_reference_guidance(
         envelope=None, tool_names=["generate_video"], has_tools=False,
-    ) is None
+    )
+
+    assert guidance
+    assert no_tools_guidance
+    assert "[filename](/viewer/{document_id})" in no_tools_guidance
+
+
+def test_knowledge_lookup_tools_receive_the_same_link_contract():
+    from packages.core.ai.runtime.prompt_guidance import (
+        runtime_artifact_reference_guidance,
+    )
+
+    guidance = runtime_artifact_reference_guidance(
+        envelope=None,
+        tool_names=["rag", "search_documents"],
+        has_tools=True,
+    )
+    assert guidance
+    assert "resolve it with a Knowledge document list/search tool" in guidance
+
+
+def test_knowledge_document_payload_includes_canonical_viewer_markdown():
+    from packages.core.ai.runtime.document_actions import runtime_document_to_dict
+
+    payload = runtime_document_to_dict(
+        SimpleNamespace(
+            id="01KQDCA7E9E7G20HNYE51VJECQ",
+            name="Q3 [final].pdf",
+            file_type="pdf",
+            file_size=42,
+        )
+    )
+
+    assert payload["viewer_url"] == "/viewer/01KQDCA7E9E7G20HNYE51VJECQ"
+    assert payload["markdown_link"] == (
+        r"[Q3 \[final\].pdf](/viewer/01KQDCA7E9E7G20HNYE51VJECQ)"
+    )
+
+
+def test_every_generated_file_reference_gets_fixed_markdown_when_openable():
+    from packages.core.services.generated_file_refs import (
+        canonical_generated_file_ref,
+    )
+
+    knowledge = canonical_generated_file_ref({
+        "name": "final-review.mp4",
+        "document_id": "01KZQBAVMH7DZE4Q3CD8GTPT34",
+        "markdown_link": "[wrong-name.mp4](/viewer/wrong-id)",
+    })
+    task_file = canonical_generated_file_ref({
+        "name": "frame-05-at-16s.png",
+        "fs_path": (
+            "Videos/manor-video-contract-e2e-20260810/"
+            "snapshots/manor-review/frame-05-at-16s.png"
+        ),
+    }, entity_id="01KXVW5YZRHMDSB9MN4VV6KRV3")
+
+    assert knowledge["markdown_link"] == (
+        "[final-review.mp4](/viewer/01KZQBAVMH7DZE4Q3CD8GTPT34)"
+    )
+    assert task_file["open_url"] == (
+        "/api/v1/fs/01KXVW5YZRHMDSB9MN4VV6KRV3/"
+        "Videos/manor-video-contract-e2e-20260810/"
+        "snapshots/manor-review/frame-05-at-16s.png"
+    )
+    assert task_file["markdown_link"] == (
+        "[frame-05-at-16s.png](/api/v1/fs/01KXVW5YZRHMDSB9MN4VV6KRV3/"
+        "Videos/manor-video-contract-e2e-20260810/"
+        "snapshots/manor-review/frame-05-at-16s.png)"
+    )
 
 
 def test_the_guidance_section_is_wired_into_prompt_assembly():

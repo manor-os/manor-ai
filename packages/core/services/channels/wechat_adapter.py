@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -290,7 +290,9 @@ class WeChatAdapter:
         """Generate SHA1 signature for WeChat callback verification."""
         parts = sorted([token, timestamp, nonce])
         raw = "".join(parts)
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        # WeChat's callback protocol mandates SHA-1; this is not a selectable
+        # application password/hash primitive.
+        return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 # ── Polymorphic ChannelAdapter wrapper ──────────────────────────────────────

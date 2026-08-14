@@ -28,7 +28,8 @@ SEARCH_DOCUMENTS_SCHEMA = {
             "For facts, values, passages, summaries, comparisons, or calculations "
             "from inside documents, use rag. If the intent is mixed or uncertain, "
             "prefer rag; never infer document contents from a filename match. Do "
-            "not use raw filesystem tools for user-visible Knowledge lists."
+            "not use raw filesystem tools for user-visible Knowledge lists. Each "
+            "result includes a markdown_link; copy it verbatim when mentioning a file."
         ),
         "parameters": {
             "type": "object",
@@ -62,7 +63,8 @@ LIST_DOCUMENTS_SCHEMA = {
             "created files, and AI-created deliverables that are visible in "
             "Knowledge. Hidden/system paths, trash, sandbox output, and internal "
             "filesystem files are excluded. Use list_files only for internal "
-            "filesystem inspection, never as the user's visible Knowledge list."
+            "filesystem inspection, never as the user's visible Knowledge list. "
+            "Each result includes a markdown_link; copy it verbatim when mentioning a file."
         ),
         "parameters": {
             "type": "object",

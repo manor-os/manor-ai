@@ -386,6 +386,63 @@ def test_step_infos_list_recorded_artifacts():
     assert info["attempts"] == 2
 
 
+def test_step_infos_read_canonical_envelope_output_text():
+    """The StepResult summary is metadata; outputs.text is the deliverable."""
+    from packages.core.plans.executor import _supervisor_step_infos
+
+    plan = types.SimpleNamespace(plan_dag={})
+    step = types.SimpleNamespace(
+        step_key="select_daily_topic",
+        kind="subagent",
+        step_status="done",
+        service_key="stickman.topic",
+        action_key=None,
+        attempt_count=1,
+        params={},
+        result={
+            "status": "succeeded",
+            "summary": "Selected today's topic.",
+            "text": "Selected today's topic.",
+            "outputs": {
+                "text": (
+                    "Chosen title\nThe Two-Minute Reset\n\n"
+                    "Target viewer\nBusy adults recovering from a difficult morning.\n\n"
+                    "Core curiosity hook\nCan two minutes rescue the rest of the day?"
+                )
+            },
+        },
+        error=None,
+    )
+
+    info = _supervisor_step_infos(plan, [step])[0]
+
+    assert "Chosen title\nThe Two-Minute Reset" in info["result"]
+    assert "Core curiosity hook" in info["result"]
+
+
+def test_step_infos_read_canonical_envelope_output_data():
+    """A structured task deliverable must not collapse to its short summary."""
+    from packages.core.plans.executor import _supervisor_result_preview
+
+    preview = _supervisor_result_preview({
+        "status": "succeeded",
+        "summary": "Selected one producer-ready topic.",
+        "outputs": {
+            "data": {
+                "topic_title": "The Two-Minute Reset for a Stuck Task",
+                "core_promise": "Turn an avoided task into one visible next move.",
+                "intended_viewer": "Busy solo workers",
+                "narrative_angle": "Shrink the wall by choosing one corner.",
+                "visual_beats": ["Face the wall", "Choose one corner", "Start"],
+            },
+        },
+    }, max_chars=4000)
+
+    assert "Selected one producer-ready topic" in preview
+    assert '"topic_title": "The Two-Minute Reset for a Stuck Task"' in preview
+    assert '"visual_beats"' in preview
+
+
 def test_the_supervisor_call_passes_the_full_view():
     import inspect
 
@@ -478,3 +535,53 @@ def test_the_outcome_call_carries_the_task_history():
     assert "_supervisor_review_infos(" in body
     assert "prior_attempts=prior_attempts" in body
     assert "prior_reviews=prior_reviews" in body
+
+
+# ── The headline follows the verdict, not the plan ────────────────────
+#
+# Production task 01KZ8A43NZSZCYNTD46A2G8C24 ("Produce today's finished
+# stickman video") posted BOTH of these into one thread, from the same
+# transaction, microseconds apart:
+#
+#   Manor AI            ## Task Completed …
+#   Manor AI Supervisor This task stopped before it finished.
+#                       Missing: the deliverable file …
+#
+# The plan really had reached `completed` — its one step reported `done`
+# while its own text said the MP4 never materialised. The supervisor
+# caught exactly that and ruled NEEDS_HUMAN. But the deliverable summary
+# was gated on the PLAN's mechanical status, so it announced completion
+# over the top of the card that had just withheld it.
+
+
+def _finalize_summary_source() -> str:
+    import inspect
+
+    from packages.core.plans.executor import PlanExecutor
+
+    return inspect.getsource(PlanExecutor._finalize)
+
+
+def test_the_completion_headline_is_gated_on_the_supervisor_verdict():
+    source = _finalize_summary_source()
+    assert "supervisor_decision.verdict is SupervisorVerdict.COMPLETED" in source, (
+        "the deliverable summary must consult the verdict; gating on the "
+        "plan's own status is what let 'Task Completed' contradict a "
+        "needs_human card in the same thread"
+    )
+
+
+def test_a_withheld_verdict_gets_a_heading_that_does_not_claim_completion():
+    source = _finalize_summary_source()
+    assert "## Work so far (not accepted as finished)" in source
+    # The work still gets posted — only the claim changes.
+    assert "deliverables" in source
+
+
+def test_the_plan_status_gate_uses_the_enum():
+    """`status == "completed"` here is the plan's terminal status as a bare
+    local, which the first enum sweep's attribute-anchored scan could not
+    see. The guard test now covers this receiver inside executor.py."""
+    source = _finalize_summary_source()
+    assert 'status == "completed"' not in source
+    assert "status == ExecutionPlanStatus.COMPLETED" in source

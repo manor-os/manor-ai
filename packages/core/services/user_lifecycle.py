@@ -199,10 +199,19 @@ async def _revoke_user_oauth_tokens(
         return 0
 
     revoked = 0
+    from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+
     async with httpx.AsyncClient(timeout=8.0) as cx:
         for acct in accounts:
             try:
-                ok = await _revoke_oauth_token(cx, acct.provider, acct.access_token or "")
+                creds = lease_oauth_account_tokens(
+                    acct,
+                    requester_id=user_id,
+                    reason="oauth.account_delete_revoke",
+                )
+                ok = await _revoke_oauth_token(
+                    cx, acct.provider, creds.get("access_token", ""),
+                )
                 if ok:
                     revoked += 1
             except Exception as exc:  # noqa: BLE001

@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import bcrypt
-from jose import JWTError, jwt
+import jwt
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +19,43 @@ from packages.core.models.user import Entity, User, UserMembership
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+_COMMON_PASSWORDS = frozenset({
+    "123456789012",
+    "adminadminadmin",
+    "letmeinletmein",
+    "password1234",
+    "qwertyqwerty",
+    "welcome12345",
+    "manor-demo",
+})
+
+
+def password_policy_enabled() -> bool:
+    if settings.DEPLOYMENT_MODE.strip().lower() == "cloud":
+        return True
+    configured = os.getenv("PASSWORD_POLICY_ENFORCED")
+    if configured is not None:
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def validate_password_strength(password: str) -> None:
+    """Enforce the production password baseline without logging the value."""
+    if not password_policy_enabled():
+        return
+    minimum = max(12, int(os.getenv("PASSWORD_MIN_LENGTH", "12")))
+    if len(password or "") < minimum:
+        raise ValueError(f"Password must be at least {minimum} characters")
+    if len(password.encode("utf-8")) > 72:
+        raise ValueError("Password must be at most 72 UTF-8 bytes")
+    normalized = password.strip().lower()
+    if normalized in _COMMON_PASSWORDS or normalized in {
+        "password" * 2,
+        "qwerty" * 2,
+        "123456" * 2,
+    }:
+        raise ValueError("Choose a password that is not commonly breached")
 
 
 # ── Password hashing ──
@@ -40,17 +78,41 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ── JWT ──
 
-_DEFAULT_EXPIRE = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))  # 24h
-_REMEMBER_EXPIRE = int(os.getenv("JWT_REMEMBER_MINUTES", "10080"))  # 7 days
+_DEFAULT_EXPIRE = min(int(os.getenv("JWT_EXPIRE_MINUTES", "60")), 60)
+_JWT_ISSUER = os.getenv("JWT_ISSUER", "manor-api")
+_JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "manor-api")
 
 
-def create_access_token(user_id: str, entity_id: str, role: str, remember: bool = False) -> str:
-    minutes = _REMEMBER_EXPIRE if remember else _DEFAULT_EXPIRE
-    expire = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+def create_access_token(
+    user_id: str,
+    entity_id: str,
+    role: str,
+    remember: bool = False,
+    *,
+    token_version: int = 0,
+    expires_minutes: int | None = None,
+    mfa_authenticated: bool = False,
+) -> str:
+    """Create a short-lived, server-revocable API access token.
+
+    ``remember`` is retained for client compatibility, but no longer creates a
+    seven-day bearer token. Persistence belongs to a future rotating refresh
+    session; access tokens are capped at 60 minutes.
+    """
+    del remember
+    minutes = min(max(1, expires_minutes or _DEFAULT_EXPIRE), 60)
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(minutes=minutes)
     payload = {
         "sub": user_id,
         "entity_id": entity_id,
         "role": role,
+        "jti": secrets.token_urlsafe(24),
+        "iat": now,
+        "iss": _JWT_ISSUER,
+        "aud": _JWT_AUDIENCE,
+        "token_version": int(token_version or 0),
+        "amr": ["mfa"] if mfa_authenticated else [],
         "exp": expire,
     }
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
@@ -60,20 +122,14 @@ def create_access_token(user_id: str, entity_id: str, role: str, remember: bool 
 
 def decode_token(token: str) -> Optional[dict]:
     try:
-        # Don't verify the `aud` claim: Manor's OAuth authorization-code exchange
-        # mints tokens carrying `aud=<client_id>` (for clients with a token TTL,
-        # which the seeder defaults on), yet Manor validates its own tokens here
-        # without passing an audience — python-jose then rejects them with
-        # "Invalid audience". Since every Manor JWT is signed with our own
-        # symmetric secret, `aud` is informational, not a trust boundary, so we
-        # accept tokens regardless of audience.
         return jwt.decode(
             token,
             settings.JWT_SECRET_KEY,
             algorithms=[settings.JWT_ALGORITHM],
-            options={"verify_aud": False},
+            issuer=_JWT_ISSUER,
+            audience=_JWT_AUDIENCE,
         )
-    except JWTError:
+    except jwt.PyJWTError:
         return None
 
 
@@ -98,7 +154,7 @@ def mark_user_login(user: User, *, source: str = "auth_service") -> None:
 def _generate_avatar_url(name: str) -> str:
     """Generate a deterministic avatar URL from a display name using DiceBear API."""
     import hashlib
-    seed = hashlib.md5(name.encode()).hexdigest()[:8]
+    seed = hashlib.md5(name.encode(), usedforsecurity=False).hexdigest()[:8]
     # DiceBear initials style — generates SVG avatars server-side
     return f"https://api.dicebear.com/9.x/initials/svg?seed={seed}&backgroundColor=0f766e,14b8a6,0d9488,0ea5e9,6366f1,8b5cf6&backgroundType=gradientLinear&fontSize=40"
 
@@ -322,6 +378,8 @@ async def activate_user_membership(
     return user
 
 
+
+
 async def register_user(
     db: AsyncSession,
     *,
@@ -331,6 +389,7 @@ async def register_user(
     display_name: str = "",
 ) -> tuple[User, Entity]:
     """Register a new user + create their entity."""
+    validate_password_strength(password)
     existing = await db.execute(select(User).where(User.email == email))
     if existing.scalar_one_or_none():
         raise ValueError("Email already registered")
@@ -366,6 +425,7 @@ async def register_user(
         status="active",
         is_primary=True,
     )
+
 
     # Provision JuiceFS entity filesystem (MANOR.md, index.md, log.md, .ai/)
     from packages.core.services.entity_fs import is_fs_enabled, provision_entity_filesystem
@@ -529,16 +589,19 @@ async def deactivate_user(db: AsyncSession, user_id: str, entity_id: str) -> boo
         membership.status = "inactive"
     if user.entity_id == entity_id:
         user.status = "inactive"
+        user.token_version = int(user.token_version or 0) + 1
     await db.flush()
     return True
 
 
 async def change_password(db: AsyncSession, user_id: str, old_password: str, new_password: str) -> bool:
+    validate_password_strength(new_password)
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user or not verify_password(old_password, user.password_hash):
         return False
     user.password_hash = hash_password(new_password)
+    user.token_version = int(user.token_version or 0) + 1
     await db.flush()
     return True
 
@@ -592,6 +655,7 @@ async def get_or_create_oauth_user(
     OAuth users are always 'active' (Google already verified their email).
     """
     from packages.core.models.user import OAuthAccount
+    from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
 
     # Check existing OAuth link
     result = await db.execute(
@@ -602,10 +666,12 @@ async def get_or_create_oauth_user(
     )
     oauth = result.scalar_one_or_none()
     if oauth:
-        if access_token:
-            oauth.access_token = access_token
-        if refresh_token:
-            oauth.refresh_token = refresh_token
+        store_oauth_account_tokens(
+            oauth,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            requester_id=oauth.user_id or "oauth_login",
+        )
         await db.flush()
         user_result = await db.execute(select(User).where(User.id == oauth.user_id))
         user = user_result.scalar_one()
@@ -650,7 +716,13 @@ async def get_or_create_oauth_user(
         oauth = OAuthAccount(
             id=generate_ulid(), user_id=user.id,
             provider=provider, provider_user_id=provider_user_id,
-            access_token=access_token, refresh_token=refresh_token,
+        )
+        store_oauth_account_tokens(
+            oauth,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            preserve_existing_refresh=False,
+            requester_id=user.id,
         )
         db.add(oauth)
         await db.flush()
@@ -687,6 +759,7 @@ async def get_or_create_oauth_user(
         is_primary=True,
     )
 
+
     # Provision JuiceFS entity filesystem
     from packages.core.services.entity_fs import is_fs_enabled, provision_entity_filesystem
     if is_fs_enabled():
@@ -698,7 +771,13 @@ async def get_or_create_oauth_user(
     oauth = OAuthAccount(
         id=generate_ulid(), user_id=user.id,
         provider=provider, provider_user_id=provider_user_id,
-        access_token=access_token, refresh_token=refresh_token,
+    )
+    store_oauth_account_tokens(
+        oauth,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        preserve_existing_refresh=False,
+        requester_id=user.id,
     )
     db.add(oauth)
     await db.flush()

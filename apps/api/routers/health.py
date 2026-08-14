@@ -64,6 +64,7 @@ async def client_config():
         "email_enabled": os.getenv("EMAIL_ENABLED", "false").lower() == "true",
         "fs_enabled": os.getenv("MANOR_FS_ENABLED", "false").lower() in ("true", "1"),
         "flows_available": _feature_available("FLOWS_AVAILABLE", environment),
+        "flows_released": _feature_available("FLOWS_RELEASED", environment),
         "support_tickets_enabled": deployment_mode.lower() == "cloud",
     }
     return config

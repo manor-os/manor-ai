@@ -221,7 +221,7 @@ def test_marketplace_installs_are_resolved_by_id_not_slug():
     assert "WorkspaceBlueprint" in body, (
         "payloads must come from the blueprint table"
     )
-    assert "BLUEPRINT_ID_KEY" in body
+    assert "_workspace_blueprint_candidates(settings)" in body
     assert "_builtin_blueprint_payload" not in body, (
         "the platform's blueprints are rows now — no config-directory branch"
     )
@@ -318,6 +318,31 @@ def test_a_lower_installed_version_means_an_update(payload):
     ) is BlueprintFreshness.UPDATE_AVAILABLE
 
 
+def test_equal_versions_still_detect_content_drift(payload):
+    """A stale seed/import must not make different content look current."""
+    from packages.core.blueprints.freshness import BLUEPRINT_VERSION_KEY
+
+    older = copy.deepcopy(payload)
+    older["embedded"]["skills"][0]["system_prompt"] = "an older installed procedure"
+    settings = _installed(blueprint_content_fingerprint(older))
+    settings["_blueprint"][BLUEPRINT_VERSION_KEY] = "1.2.3"
+
+    assert blueprint_freshness(
+        settings, payload, current_version="1.2.3",
+    ) is BlueprintFreshness.UPDATE_AVAILABLE
+
+
+def test_equal_versions_and_content_are_current(payload):
+    from packages.core.blueprints.freshness import BLUEPRINT_VERSION_KEY
+
+    settings = _installed(blueprint_content_fingerprint(payload))
+    settings["_blueprint"][BLUEPRINT_VERSION_KEY] = "1.2.3"
+
+    assert blueprint_freshness(
+        settings, payload, current_version="1.2.3",
+    ) is BlueprintFreshness.CURRENT
+
+
 def test_the_version_decides_even_when_the_payload_cannot_be_read(payload):
     """A version survives a payload the reader cannot fetch."""
     from packages.core.blueprints.freshness import BLUEPRINT_VERSION_KEY
@@ -348,3 +373,56 @@ def test_a_marketplace_install_records_the_version_it_took():
 
     body = inspect.getsource(blueprints)
     assert "blueprint_version=row.content_version" in body
+
+
+def test_builtin_installs_record_the_published_identity_and_version():
+    """The compatibility route must not create another detached workspace."""
+    import inspect
+
+    from apps.api.routers import blueprints
+
+    body = inspect.getsource(blueprints.install)
+    assert "durable_id = platform_blueprint_id(slug)" in body
+    assert "blueprint_id=durable_id" in body
+    assert "published.content_version" in body
+
+
+def test_legacy_builtin_installs_resolve_to_the_platform_row():
+    """Existing workspaces with the old null id stay upgradeable by slug."""
+    from apps.api.routers.workspaces import (
+        _workspace_blueprint_candidates,
+        _workspace_blueprint_id,
+    )
+
+    assert _workspace_blueprint_id({
+        "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": None},
+    }) == f"builtin:{SLUG}"
+    assert _workspace_blueprint_id({
+        "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": "01CUSTOM"},
+    }) == "01CUSTOM"
+    assert _workspace_blueprint_id({}) == ""
+    assert _workspace_blueprint_candidates({
+        "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": "01DELETEDDUPLICATE"},
+    }) == [f"builtin:{SLUG}", "01DELETEDDUPLICATE"]
+
+
+def test_legacy_builtin_summary_exposes_the_repaired_identity(payload):
+    from types import SimpleNamespace
+
+    from apps.api.routers.workspaces import _blueprint_update_for
+
+    workspace = SimpleNamespace(settings={
+        "_blueprint": {
+            "blueprint_slug": SLUG,
+            "blueprint_id": None,
+            CONTENT_FINGERPRINT_KEY: blueprint_content_fingerprint(payload),
+        },
+    })
+    summary = _blueprint_update_for(
+        workspace,
+        (payload, "1.0.0", f"builtin:{SLUG}"),
+    )
+
+    assert summary is not None
+    assert summary["blueprint_id"] == f"builtin:{SLUG}"
+    assert summary["status"] == BlueprintFreshness.CURRENT.value

@@ -560,6 +560,7 @@ async def resolve_stale_hitl_cards(
     *,
     plan_id: Optional[str] = None,
     step_ids: Optional[list[str]] = None,
+    task_id: Optional[str] = None,
     reason: str = "origin_terminal",
 ) -> int:
     """Mark unresolved governance-approval chat cards resolved when their
@@ -571,7 +572,7 @@ async def resolve_stale_hitl_cards(
     unresolved forever ("no longer attached to a waiting step") and inflates
     the sidebar pending-action badge. Returns how many cards were closed.
     """
-    if not plan_id and not step_ids:
+    if not plan_id and not step_ids and not task_id:
         return 0
     from datetime import datetime, timezone
 
@@ -584,6 +585,8 @@ async def resolve_stale_hitl_cards(
         conds.append(Message.pending_action["plan_id"].as_string() == plan_id)
     if step_ids:
         conds.append(Message.pending_action["step_id"].as_string().in_(list(step_ids)))
+    if task_id:
+        conds.append(Message.pending_action["task_id"].as_string() == task_id)
     rows = (
         await db.execute(
             select(Message).where(

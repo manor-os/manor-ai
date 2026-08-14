@@ -19,6 +19,7 @@ from urllib.parse import quote
 from typing import Any, Optional
 
 from packages.core.constants.pending_actions import PendingActionKind
+from packages.core.contracts.envelope import step_result_output_text
 from packages.core.database import async_session
 from packages.core.workspace_chat import service as chat
 
@@ -93,7 +94,16 @@ async def notify_plan_completed(
         duration_seconds=duration_seconds,
         cost_usd=cost_usd,
         steps=steps or [],
+        entity_id=entity_id,
     )
+    completion_artifacts = _unique_artifacts(
+        artifact
+        for step in (steps or [])
+        if isinstance(step, dict)
+        for artifact in (step.get("artifacts") or [])
+        if isinstance(artifact, dict)
+    )
+    attachments = _artifacts_as_attachments(completion_artifacts, entity_id=entity_id)
     headline = body
     if steps:
         body += "\n\n" + _render_dag(steps, entity_id=entity_id)
@@ -104,6 +114,7 @@ async def notify_plan_completed(
         body=body, message_kind="agent_update", author_kind="agent",
         thread_ref_kind="plan", thread_ref_id=plan_id,
         refs=_plan_refs(plan_id, task_id),
+        attachments=attachments or None,
     )
 
     # Main workspace chat
@@ -111,6 +122,7 @@ async def notify_plan_completed(
         entity_id=entity_id, workspace_id=workspace_id,
         body=headline, message_kind="agent_update", author_kind="agent",
         refs=_plan_refs(plan_id, task_id),
+        attachments=attachments or None,
     )
 
 
@@ -133,7 +145,7 @@ async def notify_plan_needs_attention(
         headline += f"\n\n{issue}"
     body = headline
     if steps:
-        body += "\n\n" + _render_dag(steps)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
 
     await _safe_post(
         entity_id=entity_id, workspace_id=workspace_id,
@@ -219,7 +231,9 @@ async def notify_step_done(
         summary=summary,
         artifacts=artifacts,
         max_summary_chars=1600,
+        entity_id=entity_id,
     )
+    attachments = _artifacts_as_attachments(artifacts, entity_id=entity_id)
 
     # 1. Detailed message in the plan thread (for drill-down)
     await _safe_post(
@@ -231,6 +245,7 @@ async def notify_step_done(
             {"type": "plan", "id": plan_id},
             {"type": "step", "id": step_id},
         ],
+        attachments=attachments or None,
     )
 
     # 2. Human-readable receipt in the main workspace chat. Keep enough
@@ -243,6 +258,7 @@ async def notify_step_done(
         summary=summary,
         artifacts=artifacts,
         max_summary_chars=1000,
+        entity_id=entity_id,
     )
     await _safe_post(
         entity_id=entity_id, workspace_id=workspace_id,
@@ -252,6 +268,7 @@ async def notify_step_done(
             {"type": "plan", "id": plan_id},
             {"type": "step", "id": step_id},
         ],
+        attachments=attachments or None,
     )
 
 
@@ -283,6 +300,9 @@ async def notify_step_failed(
             {"type": "step", "id": step_id},
         ],
     )
+
+    if will_retry:
+        return
 
     # Main workspace chat (visible)
     await _safe_post(
@@ -496,12 +516,35 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
         if not isinstance(obj, dict):
             return
 
+        def label_for(mapping: dict) -> Optional[str]:
+            explicit = _as_text(mapping.get("name") or mapping.get("filename"))
+            if explicit:
+                return explicit
+            location = _as_text(
+                mapping.get("fs_path")
+                or mapping.get("path")
+                or mapping.get("file_path")
+                or mapping.get("output_path")
+            )
+            if not location:
+                return None
+            return location.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
         doc = obj.get("document")
         if isinstance(doc, dict):
-            doc_name = _as_text(doc.get("name"))
-            add("file", doc.get("fs_path") or doc.get("path") or doc_name, name=doc_name)
-            add("document", doc.get("id"), name=doc_name)
-            add("url", doc.get("file_url") or doc.get("url"), name=doc_name)
+            doc_name = label_for(doc)
+            if doc.get("id"):
+                add("document", doc.get("id"), name=doc_name)
+            else:
+                add("file", doc.get("fs_path") or doc.get("path") or doc_name, name=doc_name)
+                add("url", doc.get("file_url") or doc.get("url"), name=doc_name)
+
+        document_id = obj.get("document_id")
+        object_name = label_for(obj)
+        if document_id:
+            # A Document is the canonical user-facing handle. Do not also
+            # render its filesystem provenance as a second, raw-path artifact.
+            add("document", document_id, name=object_name)
 
         for key, kind in (
             ("fs_path", "file"),
@@ -520,12 +563,13 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
             ("video_url", "url"),
             ("result_url", "url"),
             ("url", "url"),
-            ("document_id", "document"),
             ("job_id", "job"),
         ):
-            add(kind, obj.get(key), name=_as_text(obj.get("name")))
+            if document_id and kind in {"file", "url"}:
+                continue
+            add(kind, obj.get(key), name=object_name)
 
-        for key in ("files", "artifacts", "outputs", "documents"):
+        for key in ("files", "artifacts", "knowledge_artifacts", "outputs", "documents"):
             values = obj.get(key)
             if isinstance(values, list):
                 for item in values:
@@ -540,7 +584,19 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
 
     parsed = _parse_json_if_string(result)
     walk(parsed)
-    return artifacts[:8]
+    document_names = {
+        str(artifact.get("name") or "").strip().casefold()
+        for artifact in artifacts
+        if artifact.get("kind") == "document" and artifact.get("name")
+    }
+    canonical = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("kind") == "document"
+        or not artifact.get("name")
+        or str(artifact.get("name") or "").strip().casefold() not in document_names
+    ]
+    return canonical[:8]
 
 
 def _render_plan_completion_summary(
@@ -550,6 +606,7 @@ def _render_plan_completion_summary(
     duration_seconds: Optional[float],
     cost_usd: Optional[float],
     steps: list[dict],
+    entity_id: str = "",
 ) -> str:
     done_steps = [s for s in steps if s.get("status") == "done"]
     failed_steps = [s for s in steps if s.get("status") in {"failed", "skipped", "cancelled"}]
@@ -589,7 +646,10 @@ def _render_plan_completion_summary(
     if artifacts:
         lines.append("")
         lines.append("**Files and outputs saved**")
-        lines.extend(f"- {_format_artifact(artifact)}" for artifact in artifacts[:8])
+        lines.extend(
+            f"- {_format_artifact(artifact, entity_id=entity_id)}"
+            for artifact in artifacts[:8]
+        )
 
     if failed_steps:
         lines.append("")
@@ -610,6 +670,7 @@ def _render_step_completion_summary(
     summary: Optional[str],
     artifacts: list[dict],
     max_summary_chars: int,
+    entity_id: str = "",
 ) -> str:
     lines = [f"✅ **Completed: {label}**{agent_part}{time_part}"]
 
@@ -623,7 +684,10 @@ def _render_step_completion_summary(
     if artifacts:
         lines.append("")
         lines.append("**Files and outputs saved**")
-        lines.extend(f"- {_format_artifact(artifact)}" for artifact in artifacts[:6])
+        lines.extend(
+            f"- {_format_artifact(artifact, entity_id=entity_id)}"
+            for artifact in artifacts[:6]
+        )
 
     if not clean_summary and not artifacts:
         lines.append("")
@@ -635,6 +699,11 @@ def _render_step_completion_summary(
 def _extract_result_text(result: Any) -> Optional[str]:
     parsed = _parse_json_if_string(result)
     if isinstance(parsed, dict):
+        outputs = parsed.get("outputs")
+        if isinstance(outputs, dict) and isinstance(outputs.get("text"), str):
+            text = step_result_output_text(parsed)
+            if text:
+                return text
         for key in ("summary", "message", "text", "content", "output", "value"):
             value = parsed.get(key)
             if isinstance(value, str) and value.strip():
@@ -719,6 +788,42 @@ def _format_artifact(artifact: dict, *, entity_id: str = "") -> str:
     # No address to link — say the name plainly rather than dress a
     # non-address up as one.
     return f"{kind.title()}: `{value}`"
+
+
+def _artifacts_as_attachments(
+    artifacts: Any,
+    *,
+    entity_id: str = "",
+) -> list[dict]:
+    """Persist produced files as the same structured chat contract used by direct turns."""
+    by_name: dict[str, dict] = {}
+    for artifact in artifacts or []:
+        if not isinstance(artifact, dict):
+            continue
+        kind = _as_text(artifact.get("kind")) or "output"
+        value = _as_text(artifact.get("value"))
+        if not value or kind not in {"file", "document", "url"}:
+            continue
+        name = (
+            _as_text(artifact.get("name"))
+            or value.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            or value
+        )
+        key = name.casefold()
+        attachment = by_name.setdefault(key, {"name": name, "type": "knowledge"})
+        if "." in name:
+            attachment.setdefault("fileType", name.rsplit(".", 1)[-1].lower()[:20])
+        if kind == "document":
+            attachment["id"] = value
+        elif kind == "url":
+            attachment.setdefault("previewUrl", value)
+        elif entity_id:
+            path = value.replace("\\", "/").lstrip("/")
+            attachment.setdefault(
+                "previewUrl",
+                f"/api/v1/fs/{entity_id}/{quote(path)}",
+            )
+    return list(by_name.values())[:8]
 
 
 def _unique_artifacts(artifacts: Any) -> list[dict]:

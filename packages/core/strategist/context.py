@@ -15,6 +15,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import TaskStatus
+from packages.core.goals.scheduling import measurement_source_requires_external_provider
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.goal import Goal
 from packages.core.models.task import Task
@@ -38,6 +39,9 @@ class StrategistContext:
     the subscriptions list, *not* from operating_model.services — what
     actually exists in DB wins over what setup intended."""
 
+    installed_flows: list[dict[str, Any]] = field(default_factory=list)
+    """Active user-facing Blueprint Flows callable by workflow_run items."""
+
     goals: list[Goal] = field(default_factory=list)
     recent_tasks: list[Task] = field(default_factory=list)
     recent_plans: list[ExecutionPlan] = field(default_factory=list)
@@ -57,6 +61,9 @@ class StrategistContext:
     """Tasks already in ``status='proposed'`` from prior reviews —
     used to dedupe so the Strategist doesn't propose the same thing
     twice in the same cycle."""
+
+    open_proposed_items: list[dict[str, Any]] = field(default_factory=list)
+    """Non-task ProposalItems awaiting a cohort decision."""
 
     recent_proposal_outcomes: dict[str, list[Task]] = field(default_factory=dict)
     """Past Strategist proposals (last 30d) bucketed by what happened
@@ -163,12 +170,14 @@ async def gather_context(
     subs = await _list_subscriptions(db, workspace.id)
     agents_by_id = await _agents_by_id(db, [s.agent_id for s in subs])
     allowed = sorted({s.service_key for s in subs if s.service_key})
+    installed_flows = await _installed_workspace_flows(db, workspace)
 
     goals = await _active_goals(db, workspace.entity_id, workspace.id)
     recent_tasks = await _recent_tasks(db, workspace.id, limit=recent_task_limit)
     recent_plans = await _recent_plans(db, workspace.id, limit=recent_plan_limit)
     recent_activity = await _recent_activity(db, workspace.id)
     open_proposed = await _open_proposed_tasks(db, workspace.id)
+    open_proposed_items = await _open_proposed_items(db, workspace.id)
     recent_outcomes = await _recent_proposal_outcomes(db, workspace.id)
 
     relevant_memory = await _gather_memory(
@@ -227,6 +236,7 @@ async def gather_context(
         subscriptions=subs,
         agents_by_id=agents_by_id,
         allowed_service_keys=allowed,
+        installed_flows=installed_flows,
         goals=goals,
         recent_tasks=recent_tasks,
         recent_plans=recent_plans,
@@ -234,6 +244,7 @@ async def gather_context(
         relevant_memory=relevant_memory,
         operating_memory=operating_memory,
         open_proposed_tasks=open_proposed,
+        open_proposed_items=open_proposed_items,
         recent_proposal_outcomes=recent_outcomes,
         configured_integrations=configured_integrations,
         configured_channels=configured_channels,
@@ -262,6 +273,51 @@ async def _list_subscriptions(
             AgentSubscription.status == "active",
         )
     )).scalars().all())
+
+
+async def _installed_workspace_flows(
+    db: AsyncSession,
+    workspace: Workspace,
+) -> list[dict[str, Any]]:
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+
+    blueprint_slug = str(
+        ((workspace.settings or {}).get("_blueprint") or {}).get("blueprint_slug")
+        or ""
+    ).strip()
+    if not blueprint_slug:
+        return []
+    rows = (await db.execute(
+        select(WorkflowBinding, WorkflowDefinition)
+        .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
+        .where(
+            WorkflowBinding.entity_id == workspace.entity_id,
+            WorkflowBinding.workspace_id == workspace.id,
+            WorkflowBinding.enabled.is_(True),
+            WorkflowBinding.status == "active",
+            WorkflowDefinition.is_active.is_(True),
+            WorkflowDefinition.status == "active",
+        )
+        .order_by(WorkflowBinding.name.asc(), WorkflowBinding.id.asc())
+    )).all()
+    descriptors: list[dict[str, Any]] = []
+    for binding, workflow in rows:
+        workflow_slug = str(
+            (binding.config or {}).get("workspace_blueprint_workflow_slug") or ""
+        ).strip()
+        entrypoint = normalize_chat_entrypoint(binding, workflow)
+        if not workflow_slug or entrypoint is None:
+            continue
+        descriptors.append({
+            "blueprint_slug": blueprint_slug,
+            "workflow_slug": workflow_slug,
+            "binding_id": binding.id,
+            "title": entrypoint.title,
+            "description": entrypoint.description,
+            "inputs": [dict(item) for item in entrypoint.run_inputs],
+        })
+    return descriptors
 
 
 async def _agents_by_id(
@@ -350,7 +406,7 @@ def _workspace_declared_provider_keys(workspace: Workspace, goals: list[Goal]) -
 
     for goal in goals:
         source = goal.measurement_source or {}
-        if isinstance(source, dict):
+        if isinstance(source, dict) and measurement_source_requires_external_provider(source):
             key = canonical_provider_key(source.get("provider"))
             if key:
                 out.add(key)
@@ -479,6 +535,44 @@ async def _open_proposed_tasks(
             Task.status == TaskStatus.PROPOSED,
         ).order_by(desc(Task.created_at))
     )).scalars().all())
+
+
+async def _open_proposed_items(
+    db: AsyncSession,
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
+
+    rows = (await db.execute(
+        select(ProposalItemRecord, ProposalRecord.review_id)
+        .join(ProposalRecord, ProposalRecord.id == ProposalItemRecord.proposal_id)
+        .where(
+            ProposalItemRecord.workspace_id == workspace_id,
+            ProposalItemRecord.status == "proposed",
+            ProposalItemRecord.kind != "task",
+            ProposalRecord.status == "open",
+        )
+        .order_by(desc(ProposalItemRecord.created_at))
+    )).all()
+    result: list[dict[str, Any]] = []
+    for item, review_id in rows:
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        title = next(
+            (
+                str(payload.get(key) or "").strip()
+                for key in ("source_brief", "title", "summary", "run_key", "rationale")
+                if str(payload.get(key) or "").strip()
+            ),
+            str(item.kind or "proposal").replace("_", " ").title(),
+        )
+        result.append({
+            "id": item.id,
+            "kind": item.kind,
+            "title": title[:240],
+            "review_id": str(review_id or "") or None,
+            "created_at": item.created_at,
+        })
+    return result
 
 
 async def _recent_proposal_outcomes(

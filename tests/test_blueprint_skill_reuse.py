@@ -81,9 +81,16 @@ def test_blueprint_skill_carries_a_production_prompt():
     procedure to follow and searched for tools instead of calling them."""
     blueprint = json.loads(BLUEPRINT.read_text(encoding="utf-8"))
     skills = blueprint["embedded"]["skills"]
-    assert len(skills) == 1
+    # The publisher was folded into the Producer agent's own prompt (direct
+    # Chrome publication), so the blueprint embeds one skill now.  Its absence
+    # is the thing under test in
+    # test_solo_company_blueprints.py::test_stickman_blueprint_does_not_install_unfinished_youtube_publisher
+    # — asserting it here too is what made these two tests contradict.
+    assert {skill["slug"] for skill in skills} == {"stickman-video-creator"}
 
-    skill = skills[0]
+    skill = next(
+        skill for skill in skills if skill["slug"] == "stickman-video-creator"
+    )
     prompt = skill.get("system_prompt") or ""
     assert len(prompt) > 3000, (
         f"embedded skill prompt is only {len(prompt)} chars — too thin to "
@@ -94,7 +101,12 @@ def test_blueprint_skill_carries_a_production_prompt():
 
 def test_blueprint_skill_declares_the_media_toolchain():
     blueprint = json.loads(BLUEPRINT.read_text(encoding="utf-8"))
-    tools = set(blueprint["embedded"]["skills"][0].get("tools") or [])
+    skill = next(
+        skill
+        for skill in blueprint["embedded"]["skills"]
+        if skill["slug"] == "stickman-video-creator"
+    )
+    tools = set(skill.get("tools") or [])
     for required in (
         "generate_image",
         "generate_video",
@@ -110,7 +122,11 @@ def test_blueprint_agent_prompt_and_skill_slug_agree():
     side silently leaves the agent instructed to run something that is not
     bound to it."""
     blueprint = json.loads(BLUEPRINT.read_text(encoding="utf-8"))
-    skill_slug = blueprint["embedded"]["skills"][0]["slug"]
+    skill_slug = next(
+        skill["slug"]
+        for skill in blueprint["embedded"]["skills"]
+        if skill["slug"] == "stickman-video-creator"
+    )
 
     prompts = [
         agent.get("system_prompt") or ""

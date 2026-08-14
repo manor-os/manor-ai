@@ -92,6 +92,23 @@ def test_step_result_from_submit_normalizes():
     assert out["text"] == "the deliverable"
 
 
+def test_step_result_from_submit_keeps_canonical_output_text_authoritative():
+    out = step_result_from_submit(
+        {
+            "summary": "Selected today's topic.",
+            "status": "succeeded",
+            "result": {
+                "status": "succeeded",
+                "summary": "Selected today's topic.",
+                "outputs": {"text": "Chosen title\nThe Two-Minute Reset"},
+            },
+        }
+    )
+
+    assert out["outputs"]["text"] == "Chosen title\nThe Two-Minute Reset"
+    assert "text" not in out
+
+
 def test_followup_message_lists_schema_fields():
     msg = submit_result_followup_message({
         "type": "object", "properties": {"b": {}, "a": {}},

@@ -5,7 +5,7 @@
  * request continues in the background.
  */
 import { create } from "zustand";
-import { processSSEStream } from "../lib/chatStream";
+import { processSSEStream, settlePendingAssistantProcess } from "../lib/chatStream";
 import type { ChatMessage, SetMessages, SetConvId } from "../lib/chatStream";
 
 export type { ChatMessage };
@@ -54,6 +54,28 @@ const _controllers = new Map<string, ControllerRecord>();
 let _streamRunSeq = 0;
 let _draftSeq = 0;
 
+/*
+ * Conversations this tab is streaming itself, right now.
+ *
+ * The server pushes chat_stream_snapshot to every socket of the owner, the
+ * streaming tab included. That tab must ignore them: its SSE reducer appends
+ * onto the tail assistant row, so an outside write of the same row duplicates
+ * text on the next token, and the live row carries state a snapshot cannot
+ * reproduce (wrapper sub-tool spinners, sub-agent cards).
+ *
+ * Entries live for the duration of one run, not for the life of the page. A
+ * permanent latch would leave this tab deaf to every FUTURE turn of the same
+ * conversation started from another tab — the case the channel exists for.
+ * The cost of the shorter window: after a clean finish, a late snapshot of the
+ * just-finished turn can briefly replace the local row before the terminal
+ * refetch converges on the stored truth. That is a flicker; deafness is not.
+ */
+const _locallyStreamedConversations = new Set<string>();
+
+export function hasLocallyStreamedConversation(convId: string | undefined): boolean {
+  return Boolean(convId && _locallyStreamedConversations.has(convId));
+}
+
 function makeDraftKey() {
   _draftSeq += 1;
   return `draft:${Date.now()}:${_draftSeq}`;
@@ -99,6 +121,11 @@ function abortSessionController(session?: ChatStreamSession) {
   const controller = _controllers.get(controllerKey);
   controller?.ac.abort();
   _controllers.delete(controllerKey);
+  // Deleting the controller record makes the aborted run fail isCurrentRun(),
+  // so its finally can no longer clear the follower latch — do it here, or a
+  // stopped conversation stays deaf to snapshots for the life of the page.
+  // startStream re-adds the entry for a replacement run after this call.
+  if (session.convId) _locallyStreamedConversations.delete(session.convId);
 }
 
 export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
@@ -165,6 +192,7 @@ export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
     _controllers.set(controllerKey, { ac, runId, sessionKey: initialKey });
 
     let liveKey = initialKey;
+    if (convId) _locallyStreamedConversations.add(convId);
     set((state) => {
       const sessions = {
         ...state.sessions,
@@ -200,6 +228,8 @@ export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
       if (!isCurrentRun()) return;
       const newId = typeof id === "function" ? id(get().sessions[liveKey]?.convId) : id;
       if (!newId) return;
+      // A brand-new conversation only gets its id here, on the first frame.
+      _locallyStreamedConversations.add(newId);
 
       set((state) => {
         const current = state.sessions[liveKey];
@@ -254,6 +284,16 @@ export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
     } finally {
       if (isCurrentRun()) {
         _controllers.delete(controllerKey);
+        /*
+         * The run is over, however it ended — this tab is no longer the writer.
+         * From here snapshots are welcome again: a broken connection means the
+         * server may still be running the turn (it detaches once a tool has
+         * started) and this tab just became a follower; a clean finish means
+         * the next turn may come from another tab. A newer run for the same
+         * conversation fails isCurrentRun() here and keeps its own entry.
+         */
+        const endedConvId = get().sessions[liveKey]?.convId;
+        if (endedConvId) _locallyStreamedConversations.delete(endedConvId);
         set((state) => {
           const existing = state.sessions[liveKey];
           if (!existing) return {};
@@ -283,7 +323,7 @@ export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
           ...existing,
           streaming: false,
           controllerKey: undefined,
-          messages: closePendingHitlRequests(existing.messages),
+          messages: closePendingHitlRequests(settlePendingAssistantProcess(existing.messages)),
         },
       };
       return { sessions, ...activeSnapshot({ ...state, sessions }, key) };
@@ -327,6 +367,7 @@ export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
       controller.ac.abort();
     }
     _controllers.clear();
+    _locallyStreamedConversations.clear();
     set({
       streaming: false,
       streamingConvId: undefined,

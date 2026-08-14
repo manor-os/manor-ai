@@ -68,4 +68,4 @@ async def _measure_profile_metric(integration: Integration, metric_key: str) -> 
     return Decimal(str(metrics[metric_key]))
 
 
-register("twitter_x", measure)
+register("twitter_x", measure, metric_keys=_PROFILE_METRICS)

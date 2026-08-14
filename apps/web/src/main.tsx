@@ -9,6 +9,7 @@ import ToastContainer from "./components/ToastContainer";
 import DetailDrawer from "./components/ui/DetailDrawer";
 import VersionRefreshManager from "./VersionRefreshManager";
 import { initializeClientErrorCapture } from "./lib/clientErrors";
+import { shouldRetryApiQuery } from "./lib/api";
 import { applyThemePreference, getStoredThemePreference } from "./lib/theme";
 import "./index.css";
 
@@ -21,7 +22,7 @@ const queryClient = new QueryClient({
       staleTime: 60_000,
       gcTime: 10 * 60_000,
       refetchOnWindowFocus: false,
-      retry: 1,
+      retry: shouldRetryApiQuery,
     },
   },
 });

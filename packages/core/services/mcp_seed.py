@@ -14,6 +14,8 @@ import logging
 from sqlalchemy.engine import Engine
 from sqlalchemy import text
 
+from packages.core.integrations.registry import register_integration
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,8 +24,6 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
     ("gmail", "Gmail",
      "Send, read and manage Gmail messages.",
      "builtin", "packages.core.ai.mcp.gmail", "oauth2",
-     "https://www.googleapis.com/auth/gmail.send,"
-     "https://www.googleapis.com/auth/gmail.readonly,"
      "https://www.googleapis.com/auth/gmail.modify"),
     ("email", "Email (IMAP + SMTP)",
      "Read, write, send, and organize email on any IMAP/SMTP account.",
@@ -31,8 +31,9 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
     ("google_calendar", "Google Calendar",
      "Read and manage calendar events.",
      "builtin", "packages.core.ai.mcp.google_calendar", "oauth2",
-     "https://www.googleapis.com/auth/calendar,"
-     "https://www.googleapis.com/auth/calendar.events"),
+     "https://www.googleapis.com/auth/calendar.events,"
+     "https://www.googleapis.com/auth/calendar.calendarlist.readonly,"
+     "https://www.googleapis.com/auth/calendar.events.freebusy"),
     ("manor_mcp_calendar", "Manor Calendar",
      "Manage Manor calendar settings, booking links, working hours, "
      "daily agenda, and booking records.",
@@ -96,7 +97,7 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "SMS and voice via Twilio.",
      "builtin", "packages.core.ai.mcp.twilio", "api_key", None),
     ("whatsapp", "WhatsApp",
-     "Send WhatsApp messages (Twilio-backed).",
+     "Send WhatsApp Cloud messages and manage Meta message templates.",
      "builtin", "packages.core.ai.mcp.whatsapp", "api_key", None),
     ("webhook", "Webhook",
      "Generic outbound HTTP webhook calls.",
@@ -168,13 +169,16 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "builtin", "packages.core.ai.mcp.producthunt", "oauth2",
      "public,private"),
 
-    # ── Social platforms (OAuth via Nango) ──
+    # ── Social platforms (provider OAuth) ──
     ("facebook", "Facebook (Pages + Messenger)",
      "Let agents post to your Facebook Pages (text, photos, video, "
      "scheduled), reply to comments, hide spam, pull reach + engagement "
      "stats, and handle Messenger DMs on your behalf.",
      "builtin", "packages.core.ai.mcp.facebook", "oauth2",
-     "email,public_profile,pages_show_list,pages_read_engagement,pages_manage_posts,pages_manage_engagement,pages_messaging"),
+     "public_profile,pages_show_list,pages_read_engagement,pages_manage_posts,"
+     "pages_manage_engagement,pages_messaging,pages_manage_metadata,"
+     "read_insights,instagram_basic,instagram_content_publish,"
+     "instagram_manage_comments,instagram_manage_insights"),
 
     # ── Video platforms (official API + OAuth) ──
     # Instagram Reels publishing is part of the `facebook` module above
@@ -183,9 +187,8 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "YouTube Data API v3 — search videos/channels, read video & channel "
      "stats, list comments and captions, plus publish: post/reply/delete "
      "comments, like/dislike, edit your video's title/description/tags, "
-     "and manage playlists.",
+     "manage playlists, and upload new videos from a public HTTPS URL.",
      "builtin", "packages.core.ai.mcp.youtube", "oauth2",
-     "https://www.googleapis.com/auth/youtube.readonly,"
      "https://www.googleapis.com/auth/youtube.force-ssl"),
     ("tiktok", "TikTok",
      "TikTok API v2 — read your profile and videos (Display API) and "
@@ -267,6 +270,12 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "builtin", "packages.core.ai.mcp.ms_excel", "oauth2",
      "Files.ReadWrite Files.ReadWrite.All User.Read offline_access"),
 ]
+
+# The MCP catalog is the built-in Integration identity catalog. Register every
+# server key even when it has no dedicated health checker or Stat measurer so
+# callers can distinguish "known but unsupported" from a truly unknown key.
+for _catalog_row in _MCP_CATALOG:
+    register_integration(_catalog_row[0])
 
 
 # 1-to-1 spec rows for the new auth_types. Keyed by server_key so the

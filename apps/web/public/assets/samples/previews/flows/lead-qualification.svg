@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" fill="none">
+  <rect width="720" height="360" rx="28" fill="#F5F4F1"/>
+  <g fill="#D9D6D0" opacity=".62">
+    <circle cx="44" cy="42" r="2"/><circle cx="76" cy="42" r="2"/><circle cx="108" cy="42" r="2"/><circle cx="140" cy="42" r="2"/><circle cx="172" cy="42" r="2"/><circle cx="204" cy="42" r="2"/>
+    <circle cx="44" cy="318" r="2"/><circle cx="76" cy="318" r="2"/><circle cx="108" cy="318" r="2"/><circle cx="140" cy="318" r="2"/><circle cx="172" cy="318" r="2"/><circle cx="204" cy="318" r="2"/>
+  </g>
+  <path d="M157 180H235" stroke="#B7B3AB" stroke-width="4" stroke-linecap="round"/>
+  <path d="M351 180H430" stroke="#B7B3AB" stroke-width="4" stroke-linecap="round"/>
+  <path d="M546 180H598" stroke="#B7B3AB" stroke-width="4" stroke-linecap="round"/>
+  <path d="M488 221V265" stroke="#B7B3AB" stroke-width="4" stroke-linecap="round"/>
+  <path d="M222 180l-13-9v18l13-9Z" fill="#8C8780"/>
+  <path d="M417 180l-13-9v18l13-9Z" fill="#8C8780"/>
+  <path d="M585 180l-13-9v18l13-9Z" fill="#8C8780"/>
+  <path d="M488 252l-9-13h18l-9 13Z" fill="#8C8780"/>
+  <g filter="url(#a)">
+    <rect x="56" y="132" width="101" height="96" rx="22" fill="white"/>
+    <rect x="235" y="132" width="116" height="96" rx="22" fill="white"/>
+    <rect x="430" y="132" width="116" height="96" rx="22" fill="white"/>
+    <rect x="598" y="132" width="76" height="96" rx="22" fill="white"/>
+    <rect x="430" y="265" width="116" height="58" rx="20" fill="#F0EDE8"/>
+  </g>
+  <circle cx="106" cy="163" r="16" fill="#DCEAE7"/>
+  <path d="M100 161a6 6 0 1 1 12 0c0 5-6 5-6 10" stroke="#557A73" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="106" cy="176" r="2" fill="#557A73"/>
+  <rect x="258" y="151" width="70" height="12" rx="6" fill="#E7E4DE"/>
+  <rect x="258" y="175" width="52" height="8" rx="4" fill="#CFCBC3"/>
+  <rect x="258" y="192" width="61" height="8" rx="4" fill="#DCD8D1"/>
+  <circle cx="488" cy="170" r="23" fill="#E8E3F1"/>
+  <path d="M474 181l12-27 16 27" stroke="#756C8E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M479 173h18" stroke="#756C8E" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="636" cy="171" r="22" fill="#E4ECE9"/>
+  <path d="M626 171l7 7 14-16" stroke="#52766F" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="106" y="211" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Intake</text>
+  <text x="293" y="211" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Enrich</text>
+  <text x="488" y="211" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Score</text>
+  <text x="636" y="211" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Route</text>
+  <text x="488" y="300" text-anchor="middle" fill="#6B655E" font-family="Inter,Arial,sans-serif" font-size="13" font-weight="700">Review exception</text>
+  <defs><filter id="a" x="44" y="124" width="642" height="215" filterUnits="userSpaceOnUse"><feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#332C26" flood-opacity=".09"/></filter></defs>
+</svg>

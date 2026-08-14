@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { build } from "esbuild";
 
 const entryPoint = `
-  export { formatUserFacingStructuredText } from "../src/lib/taskDisplay.ts";
+  export { formatTaskOutputSummary, formatUserFacingStructuredText } from "../src/lib/taskDisplay.ts";
   export { parseAppLayoutChatTarget } from "../src/layouts/appLayoutChatQuery.ts";
 `;
 
@@ -26,7 +26,7 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(
   bundled.outputFiles[0].text,
 ).toString("base64")}`;
 
-const { formatUserFacingStructuredText, parseAppLayoutChatTarget } = await import(moduleUrl);
+const { formatTaskOutputSummary, formatUserFacingStructuredText, parseAppLayoutChatTarget } = await import(moduleUrl);
 
 test("task display renders nested plain objects without [object Object]", () => {
   const text = formatUserFacingStructuredText({
@@ -50,6 +50,67 @@ test("task display falls back to readable JSON for deeply nested objects", () =>
 
   assert.doesNotMatch(text, /\[object Object\]/);
   assert.match(text, /full approval pack/);
+});
+
+test("task display preserves canonical file links byte-for-byte", () => {
+  const fsUrl = "/api/v1/fs/01KXVW5YZRHMDSB9MN4VV6KRV3/Videos/manor-video-contract-e2e-20260810/snapshots/manor-review/frame-05-at-16s.png";
+  const viewerUrl = "/viewer/01KZQBAVMH7DZE4Q3CD8GTPT34";
+  const content = [
+    `[frame-05-at-16s.png](${fsUrl})`,
+    `[final-review.mp4](${viewerUrl})`,
+  ].join("\n");
+
+  assert.equal(formatUserFacingStructuredText(content), content);
+});
+
+test("task display never humanizes addresses or code while still cleaning prose", () => {
+  const url = "https://cdn.example.test/manor-video-contract-e2e/final-review.mp4?run=video-edit-v1";
+  const code = "`Videos/manor-video-contract-e2e/snapshots/manor-review`";
+  const content = `workspace_agent: ${url}\nPath: ${code}`;
+  const formatted = formatUserFacingStructuredText(content);
+
+  assert.match(formatted, /^Workspace AI /);
+  assert.ok(formatted.includes(url));
+  assert.ok(formatted.includes(code));
+});
+
+test("task display hides standalone document IDs but keeps them inside viewer links", () => {
+  const documentId = "01KZQBAVMH7DZE4Q3CD8GTPT34";
+  const link = `[video-edit-recipe.json](/viewer/${documentId})`;
+  const content = [
+    "Editable recipe:",
+    link,
+    `Recipe document ID: \`${documentId}\``,
+  ].join("\n");
+  const formatted = formatUserFacingStructuredText(content);
+
+  assert.ok(formatted.includes(link));
+  assert.doesNotMatch(formatted, /Recipe document ID/i);
+  assert.equal(formatted.match(new RegExp(documentId, "g"))?.length, 1);
+});
+
+test("task display does not use a document ID as a file label", () => {
+  const text = formatUserFacingStructuredText({
+    documents: [{ document_id: "01KZQBAVMH7DZE4Q3CD8GTPT34" }],
+  });
+
+  assert.doesNotMatch(text, /01KZQBAVMH7DZE4Q3CD8GTPT34/);
+  assert.match(text, /File 1/);
+});
+
+test("task output summary renders a structured result when no prose summary was saved", () => {
+  const text = formatTaskOutputSummary({
+    plan_status: "completed",
+    result: {
+      topic_title: "The Two-Minute Reset for a Stuck Task",
+      core_promise: "Turn an avoided task into one visible next move.",
+      visual_beats: ["Face the wall", "Choose one corner", "Take the next action"],
+    },
+  });
+
+  assert.match(text, /Two-Minute Reset/);
+  assert.match(text, /Core Promise/);
+  assert.match(text, /Take the next action/);
 });
 
 test("app layout chat query parser gives conversation precedence over workspace", () => {

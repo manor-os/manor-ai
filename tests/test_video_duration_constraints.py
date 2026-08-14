@@ -195,6 +195,45 @@ async def test_video_handler_rejects_long_single_clip_duration(monkeypatch):
     assert "Do not start a shortened clip" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_video_handler_rejects_prompt_only_atlas_wan_before_creating_job(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def fake_resolve_video_model(_user_id, _entity_id):
+        return "atlascloud/wan-2.2-turbo-spicy"
+
+    async def fake_resolve_credentials(_user_id, _entity_id, *, role):
+        assert role == "video"
+        return "atlas-user-key", "", True
+
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_user_video_model",
+        fake_resolve_video_model,
+    )
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_user_media_credentials",
+        fake_resolve_credentials,
+    )
+
+    result = json.loads(
+        await extended_tools._generate_video_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="A fluffy orange cat dancing in a sunny room.",
+            duration=5,
+            generate_audio=False,
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert "job_id" not in result
+    assert "image-to-video only" in result["error"]
+    assert "first_frame_url" in result["error"]
+    assert "text-to-video model" in result["error"]
+
+
 def test_video_reference_url_alias_is_normalized():
     from packages.core.ai.tools.extended_tools import _coerce_video_reference_urls
 
@@ -967,3 +1006,119 @@ async def test_video_reference_validation_surfaces_preflight_failure(monkeypatch
             references=["/api/v1/fs/entity/uploads/media-references/job/00-first.png"],
             public_base_url="https://app.example.test",
         )
+
+
+# ── Native audio degrades, never detonates ────────────────────────────
+#
+# A chat user typed "生成一个stickman视频" and got back "Selected video model
+# capability mismatch: … does not support native video audio". They never
+# asked for audio — the video composer defaults generate_audio on for every
+# send, and the selected model (atlascloud/wan-2.2-turbo-spicy) cannot
+# speak. A default must not be able to fail the request: the model that
+# can't do audio makes a silent video and says so.
+
+
+def test_default_audio_on_a_silent_model_downgrades_with_a_note():
+    from packages.core.ai.tools.extended_tools import (
+        _video_capability_error,
+        _video_native_audio_downgrade_warning,
+    )
+
+    warning = _video_native_audio_downgrade_warning(
+        model="atlascloud/wan-2.2-turbo-spicy",
+        generate_audio=True,
+    )
+    assert warning is not None
+    assert "silent video" in warning
+    assert "compose_video_timeline" in warning
+
+    # Audio itself no longer causes the rejection. Wan is still correctly
+    # blocked because its Atlas route is image-to-video only.
+    error = _video_capability_error(
+        model="atlascloud/wan-2.2-turbo-spicy",
+        prompt="生成一个stickman视频",
+        generate_audio=False,
+    )
+    assert error is not None
+    assert "image-to-video only" in error
+    assert "first_frame_url" in error
+
+
+def test_atlas_wan_accepts_video_generation_when_first_frame_is_present():
+    from packages.core.ai.tools.extended_tools import _video_capability_error
+
+    assert _video_capability_error(
+        model="atlascloud/wan-2.2-turbo-spicy",
+        prompt="Animate this cat image.",
+        first_frame_url="https://cdn.example.test/cat.png",
+        generate_audio=False,
+    ) is None
+
+
+def test_native_audio_capable_models_keep_their_audio():
+    from packages.core.ai.tools.extended_tools import (
+        _video_native_audio_downgrade_warning,
+    )
+    from packages.core.constants.models import VIDEO_MODEL_CAPABILITIES
+
+    speaking_models = [
+        model for model, caps in VIDEO_MODEL_CAPABILITIES.items()
+        if caps.get("native_audio")
+    ]
+    assert speaking_models, "no native-audio models in the table — update this test"
+    for model in speaking_models:
+        assert _video_native_audio_downgrade_warning(
+            model=model, generate_audio=True,
+        ) is None
+
+
+def test_attached_audio_files_still_get_the_hard_error():
+    """audio_reference_urls are files the user actually supplied — silently
+    ignoring them would be worse than the error, which carries the lip-sync
+    guidance. The downgrade must step aside."""
+    from packages.core.ai.tools.extended_tools import (
+        _video_capability_error,
+        _video_native_audio_downgrade_warning,
+    )
+
+    assert _video_native_audio_downgrade_warning(
+        model="kwaivgi/kling-v3.0-std",
+        generate_audio=True,
+        audio_reference_urls=["/api/v1/fs/entity/dialogue.wav"],
+    ) is None
+    error = _video_capability_error(
+        model="kwaivgi/kling-v3.0-std",
+        prompt="Lip-sync this take.",
+        audio_reference_urls=["/api/v1/fs/entity/dialogue.wav"],
+    )
+    assert error is not None
+    assert "audio" in error
+
+
+def test_silent_requests_are_untouched():
+    from packages.core.ai.tools.extended_tools import (
+        _video_native_audio_downgrade_warning,
+    )
+
+    assert _video_native_audio_downgrade_warning(
+        model="atlascloud/wan-2.2-turbo-spicy", generate_audio=False,
+    ) is None
+    assert _video_native_audio_downgrade_warning(
+        model="atlascloud/wan-2.2-turbo-spicy", generate_audio=None,
+    ) is None
+
+
+def test_the_handler_downgrades_before_it_validates():
+    """The wiring, not just the helper: the handler must consult the
+    downgrade before the capability validator, or the validator fails the
+    request first and the helper never runs."""
+    import inspect
+
+    from packages.core.ai.tools import extended_tools
+
+    source = inspect.getsource(extended_tools._generate_video_handler)
+    downgrade_at = source.find("_video_native_audio_downgrade_warning(")
+    validate_at = source.find("_video_capability_error(")
+    assert downgrade_at != -1, "the handler no longer consults the downgrade"
+    assert validate_at != -1
+    assert downgrade_at < validate_at

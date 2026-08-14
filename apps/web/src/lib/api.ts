@@ -72,7 +72,7 @@ import { useToastStore } from "../stores/toast";
 import { t } from "./i18n";
 import {
   getAuthToken,
-  USER_TOKEN_KEY,
+  clearAuthBrowserState,
 } from "./authToken";
 import { captureClientError } from "./clientErrors";
 
@@ -124,6 +124,16 @@ type PaginatedMessagesResponse<T> = {
   open_actions_complete?: boolean;
 };
 
+export type GlobalChatMessage = Message & {
+  message_kind?: string | null;
+  refs?: Record<string, unknown>[] | null;
+  meta?: Record<string, unknown> | null;
+  pending_action?: Record<string, unknown> | null;
+  resolved_at?: string | null;
+  resolution?: Record<string, unknown> | null;
+  updated_at?: string | null;
+};
+
 export type WorkspaceChatEntrypoint = {
   binding_id: string;
   workflow_id: string;
@@ -140,6 +150,11 @@ export type WorkspaceChatEntrypoint = {
     placeholder: string;
     default?: unknown;
   }>;
+};
+
+export type GlobalChatFlowEntrypoint = WorkspaceChatEntrypoint & {
+  workspace_id: string;
+  workspace_name: string;
 };
 
 type DocumentListParams = {
@@ -165,6 +180,54 @@ type DocumentBrowseResponse = DocumentListResponse & {
   direct_total_files?: number;
   direct_total_size?: number;
 };
+type DocumentIndexingStatus = Pick<Document, "id" | "vector_status" | "indexing_progress">;
+
+export type VideoEditorFinalizeResult = {
+  document: Document;
+  render: {
+    duration_seconds: number;
+    width: number;
+    height: number;
+    fps: number;
+    file_size: number;
+    has_audio: boolean;
+    video_codec: string;
+    audio_codec?: string | null;
+  };
+};
+
+export type VideoEditorRecipeLinkResult = {
+  document: Document;
+  recipe: Document;
+};
+
+export type FreeMusicTrack = {
+  id: string;
+  title: string;
+  creator: string;
+  duration_seconds?: number | null;
+  preview_url: string;
+  source_url: string;
+  license: "pdm" | "cc0" | "by";
+  license_name: string;
+  license_url: string;
+  attribution: string;
+  source: string;
+  provider: string;
+  genres: string[];
+};
+
+export type FreeMusicSearchResult = {
+  items: FreeMusicTrack[];
+  page: number;
+  page_count: number;
+  total: number;
+};
+
+export type FreeMusicImportResult = {
+  document: Document;
+  track: FreeMusicTrack;
+};
 
 function listDocuments(params?: DocumentListParams) {
   const q = new URLSearchParams();
@@ -185,6 +248,12 @@ function browseDocuments(params?: Pick<DocumentListParams, "search" | "folder_id
   if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
   if (params?.include_generated_assets !== undefined) q.set("include_generated_assets", String(params.include_generated_assets));
   return request<DocumentBrowseResponse>(`/documents/browse?${q}`);
+}
+
+function listDocumentIndexingStatuses(ids: string[]) {
+  const q = new URLSearchParams();
+  ids.forEach((id) => q.append("ids", id));
+  return request<DocumentIndexingStatus[]>(`/documents/indexing-status?${q}`);
 }
 
 async function listAllDocuments(params?: DocumentListParams) {
@@ -242,6 +311,84 @@ export interface HealthStatus {
   latency_ms: number | null;
   checked_at: string | null;
   wiring: WiringStatus | null;
+}
+
+export interface IntegrationMCPAccount {
+  id: string;
+  display_name: string | null;
+  is_default: boolean;
+}
+
+export interface IntegrationMCPServer {
+  server_key: string;
+  name: string;
+  category: string | null;
+  description: string | null;
+  auth_type: string;
+  scopes: string | null;
+  tagline: string | null;
+  docs_url: string | null;
+  setup_hint: string | null;
+  color_hex: string | null;
+  supports_multi_account: boolean;
+  capabilities?: string[];
+  example_prompts?: string[];
+  connections: Array<IntegrationMCPAccount & {
+    provider_user_id: string;
+    expires_at: string | null;
+    connected_at: string | null;
+    health: HealthStatus | null;
+  }>;
+  entity_accounts: Array<IntegrationMCPAccount & {
+    name: string | null;
+    created_at: string | null;
+    status: string;
+    health: HealthStatus | null;
+  }>;
+  user_connected: boolean;
+  user_expires_at: string | null;
+  entity_connected: boolean;
+  required_permission: string | null;
+  user_has_required_permission: boolean;
+  agent_can_use: boolean;
+  hint: string;
+  nango_provider_config_key?: string | null;
+  oauth_configured?: boolean;
+  coming_soon?: boolean;
+  cli_spec?: {
+    command_template: string;
+    supported_subcommands: string[];
+    requires_local_paths: boolean;
+    timeout_seconds: number;
+    output_format: string;
+  } | null;
+  browser_spec?: {
+    login_url: string;
+    session_check_selector: string | null;
+    provider_module: string;
+    tool_actions: Record<string, any>;
+    cookie_ttl_days: number;
+  } | null;
+}
+
+export interface IntegrationOperation {
+  name: string;
+  label: string;
+  resource: string;
+  description: string;
+  effect: "read" | "write" | "destructive";
+  input_schema: {
+    type: "object";
+    properties: Record<string, Record<string, any>>;
+    required: string[];
+    [key: string]: any;
+  };
+}
+
+export interface IntegrationOperationCatalog {
+  server_key: string;
+  source: "builtin" | "cache";
+  operations: IntegrationOperation[];
 }
 
 // ── Workers ─────────────────────────────────────────────────────────
@@ -463,6 +610,8 @@ export interface BlueprintSetupPreview {
   optional_channels: BlueprintSetupItem[];
   required_sessions: BlueprintSetupItem[];
   optional_sessions: BlueprintSetupItem[];
+  required_integrations: BlueprintSetupItem[];
+  optional_integrations: BlueprintSetupItem[];
   first_week_outputs: string[];
   validation_evidence: string[];
   acceptance_criteria: string[];
@@ -482,6 +631,20 @@ export interface BlueprintShowcaseAsset {
   uploaded_at: string | null;
 }
 
+export interface BlueprintCoverTemplate {
+  motif:
+    | "analytics"
+    | "commerce"
+    | "content"
+    | "distribution"
+    | "service"
+    | "video"
+    | "workspace";
+  palette: "blue" | "peach" | "sage" | "stone";
+  variant: 0 | 1 | 2;
+  seed: number;
+}
+
 export interface BlueprintSummary {
   id: string;
   slug: string;
@@ -494,6 +657,7 @@ export interface BlueprintSummary {
   source_workspace_id: string | null;
   cover_image_url: string | null;
   showcase_assets: BlueprintShowcaseAsset[];
+  cover_template?: BlueprintCoverTemplate;
   author_handle: string | null;
   author_display_name: string | null;
   author_avatar_url: string | null;
@@ -544,12 +708,20 @@ export interface ExportBlueprintRequest {
   author_display_name?: string;
   include_subscriptions?: boolean;
   include_goals?: boolean;
+  include_stats?: boolean;
   include_scheduled_jobs?: boolean;
+  include_workflows?: boolean;
   include_custom_fields?: boolean;
   include_governance?: boolean;
   include_channel_requirements?: boolean;
   include_session_requirements?: boolean;
+  include_embedded_agents?: boolean;
+  include_embedded_skills?: boolean;
+  include_knowledge_packs?: boolean;
+  knowledge_pack_mode?: "skeleton" | "inline_text";
+  include_starter_memory?: boolean;
   include_memory_files?: boolean;
+  replace_existing?: boolean;
 }
 
 export type InstallMode = "simulate" | "live";
@@ -859,6 +1031,7 @@ export interface InstallBlueprintResponse {
   mode: string;
   blueprint_id: string | null;
   blueprint_slug: string | null;
+  stat_ids: string[];
   goal_ids: string[];
   subscription_ids: string[];
   scheduled_job_ids: string[];
@@ -867,6 +1040,26 @@ export interface InstallBlueprintResponse {
   todos: InstallTodo[];
   notes: string[];
 }
+
+export type WorkspaceSimulationRun = {
+  workspace_id: string;
+  enabled: boolean;
+  run_id: string | null;
+  status: "idle" | "running" | "waiting" | "completed";
+  title: string;
+  goal_title: string;
+  stage_index: number;
+  stage_count: number;
+  stage_id: string | null;
+  stage_title: string;
+  waiting_message_id: string | null;
+  last_message_id: string | null;
+  started_at: string | null;
+  updated_at: string | null;
+  completed_at: string | null;
+  decision_count: number;
+  runtime_version: string;
+};
 
 export interface GovernancePresetSummary {
   key: GovernancePresetKey;
@@ -954,7 +1147,7 @@ function handleSessionExpired(path: string) {
   if (window.location.pathname.startsWith("/login")) return;
   _sessionRedirecting = true;
   try {
-    window.localStorage.removeItem(USER_TOKEN_KEY);
+    clearAuthBrowserState();
     window.sessionStorage.setItem("manor_session_expired", "1");
   } catch {
     /* storage may be unavailable */
@@ -983,6 +1176,30 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+export function shouldShowRequestErrorToast(
+  status: number,
+  method: string | undefined,
+  suppressed: boolean,
+): boolean {
+  if (suppressed || status === 401 || status === 403) return false;
+  const normalizedMethod = (method || "GET").toUpperCase();
+  if (normalizedMethod === "GET" && (status === 404 || status === 410)) {
+    return false;
+  }
+  return true;
+}
+
+export function shouldRetryApiQuery(failureCount: number, error: unknown): boolean {
+  if (
+    error instanceof ApiError
+    && error.status >= 400
+    && error.status < 500
+  ) {
+    return false;
+  }
+  return failureCount < 1;
 }
 
 /** Pull i18n code + vars out of a FastAPI error response's structured
@@ -1039,6 +1256,8 @@ export interface PlanLimitDetail {
   plan: string;
   /** Limit type; absent on legacy payloads → treated as "credit". */
   kind?: PlanLimitKind;
+  /** Exact billing-period boundary for the next included-credit refill. */
+  resets_at?: string | null;
 }
 
 type DocumentDownloadCacheEntry = {
@@ -1321,6 +1540,9 @@ async function fetchProtectedBlob(
     const cached = documentDownloadCache.get(cacheKey);
     if (cached && cached.expiresAt > now) {
       cached.lastAccessed = now;
+      // Sliding TTL keeps genuinely hot files in L1 while inactive entries
+      // still age out and are pruned by the size/item bounds.
+      cached.expiresAt = now + DOCUMENT_DOWNLOAD_CACHE_TTL_MS;
       return cached.blob;
     }
     if (cached) documentDownloadCache.delete(cacheKey);
@@ -1482,6 +1704,16 @@ async function fetchDocumentVideoThumbnailUrl(id: string, options: DocumentThumb
     if (cached) return cached;
   }
 
+  // Ask the server for its 640px thumbnail first. The server keeps generated
+  // previews in Redis + its disk cache, so a Knowledge card never needs the
+  // full video unless the user actually opens it.
+  try {
+    return await fetchDocumentThumbnailUrl(id, options);
+  } catch {
+    // Remote/legacy videos without a server-renderable source retain the
+    // browser capture fallback below.
+  }
+
   const blob = await fetchDocumentBlob(id, options);
   const videoUrl = URL.createObjectURL(blob);
   try {
@@ -1533,6 +1765,15 @@ async function fetchDocumentImageThumbnailUrl(id: string, options: DocumentThumb
     if (cached) return cached;
   }
 
+  // Prefer the server's bounded JPEG preview instead of downloading an
+  // original multi-megabyte image just to paint a small Knowledge card.
+  try {
+    return await fetchDocumentThumbnailUrl(id, options);
+  } catch {
+    // SVG/remote formats that the server cannot rasterize use the existing
+    // client-side fallback.
+  }
+
   const blob = await fetchDocumentBlob(id, options);
   if (usePersistentCache) {
     const captured = await captureDocumentImageThumbnail(blob).catch(() => null);
@@ -1552,6 +1793,12 @@ async function fetchDocumentPresentationThumbnailUrl(id: string, options: Docume
     if (cached) return cached;
   }
 
+  try {
+    return await fetchDocumentThumbnailUrl(id, options);
+  } catch {
+    // Keep the slide endpoint fallback for legacy presentations.
+  }
+
   const slideData = await request<{ slides: { index: number; url: string }[]; total: number }>(`/documents/${id}/slides`);
   const firstSlide = slideData.slides?.[0];
   if (!firstSlide?.url) throw new ApiError(404, "Presentation thumbnail unavailable");
@@ -1569,7 +1816,7 @@ async function fetchDocumentPresentationThumbnailUrl(id: string, options: Docume
 
 const PLAN_LIMIT_KINDS: PlanLimitKind[] = ["credit", "storage", "workspaces", "users", "generic"];
 
-function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitDetail {
+export function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitDetail {
   if (typeof detail === "object" && detail !== null) {
     const d = detail as Record<string, unknown>;
     const kind = typeof d.kind === "string" && (PLAN_LIMIT_KINDS as string[]).includes(d.kind)
@@ -1581,6 +1828,7 @@ function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitD
       current: typeof d.current === "number" ? d.current : null,
       plan: String(d.plan || "current"),
       kind,
+      resets_at: typeof d.resets_at === "string" ? d.resets_at : null,
     };
   }
   return {
@@ -1588,6 +1836,7 @@ function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitD
     limit: null,
     current: null,
     plan: "current",
+    resets_at: null,
   };
 }
 
@@ -1676,8 +1925,9 @@ async function request<T>(
     // Expired session mid-use → clear + route to login (once), so an in-app
     // action never silently dead-ends on a stale token.
     if (res.status === 401) handleSessionExpired(path);
-    // Show error toast for non-auth failures
-    if (!suppressErrorToast && res.status !== 401 && res.status !== 403) {
+    // Background reads own their loading/empty/error state. A missing resource
+    // should not produce a global toast for every query that referenced it.
+    if (shouldShowRequestErrorToast(res.status, options.method, suppressErrorToast)) {
       useToastStore.getState().error(t("lib.api.request_failed"), displayMessage);
     }
     const err = new ApiError(res.status, message);
@@ -1764,6 +2014,7 @@ async function streamSseResult<T>(
 async function streamWorkflowRun(
   path: string,
   onNode: (id: string, status: string) => void,
+  onRun?: (runId: string) => void,
   data?: Record<string, unknown>,
 ): Promise<any> {
   const token = getAuthToken();
@@ -1798,7 +2049,8 @@ async function streamWorkflowRun(
       if (!data) continue;
       let parsed: any;
       try { parsed = JSON.parse(data); } catch { continue; }
-      if (event === "node") onNode(parsed.id, parsed.status);
+      if (event === "run") onRun?.(parsed.run_id);
+      else if (event === "node") onNode(parsed.id, parsed.status);
       else if (event === "done") result = parsed;
       else if (event === "error") errorMessage = parsed.message || "Run failed";
     }
@@ -2094,7 +2346,95 @@ async function _streamDraftSSE(
   return finalTurn;
 }
 
+export type WorkspaceStatIntegrationKey = "twitter_x";
+
+export interface WorkspaceStatLibraryEntry {
+  key: string;
+  name: string;
+  description: string;
+  category: string;
+  value_type: "number" | "percent" | "currency" | "duration";
+  unit: string | null;
+  default_window: string;
+  collector_type: "manual" | "workspace_internal" | "integration";
+  integration_key: WorkspaceStatIntegrationKey | null;
+  collector_config: Record<string, unknown>;
+  default_cadence: string | null;
+  freshness_limit_seconds: number | null;
+  goal_eligible: boolean;
+  recommended_goal_role: string | null;
+  available_connections: Array<{
+    id: string;
+    integration_key: WorkspaceStatIntegrationKey;
+    label: string;
+    is_default: boolean;
+  }>;
+}
+
+export interface WorkspaceStatDefinition {
+  id: string;
+  workspace_id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  value_type: "number" | "percent" | "currency" | "duration";
+  unit: string | null;
+  window: string;
+  collector_type: "manual" | "workspace_internal" | "integration";
+  collector_config: Record<string, unknown>;
+  collection_cadence: string | null;
+  freshness_limit_seconds: number | null;
+  origin: string;
+  library_key: string | null;
+  status: string;
+  goal_eligible: boolean;
+  current_value: number | null;
+  current_value_updated_at: string | null;
+  last_collection_status: string | null;
+  last_collection_error: string | null;
+  freshness_status: "fresh" | "stale" | "no_data" | "collection_error" | "paused" | string;
+  revision: number;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface WorkspaceStatObservation {
+  id: string;
+  stat_id: string;
+  value: number;
+  observed_at: string;
+  window_start: string | null;
+  window_end: string | null;
+  source: string;
+  evidence: Record<string, unknown> | null;
+  collector_revision: number;
+}
+
+export interface WorkspaceStatsQuickView {
+  ordered_stat_ids: string[];
+  hidden_stat_ids: string[];
+  configured: boolean;
+}
+
+export interface WorkspaceStatCreate {
+  library_key?: string;
+  key?: string;
+  name?: string;
+  description?: string;
+  value_type?: WorkspaceStatDefinition["value_type"];
+  unit?: string;
+  window?: string;
+  collector_type?: WorkspaceStatDefinition["collector_type"];
+  collector_config?: Record<string, unknown>;
+  collection_cadence?: string | null;
+  freshness_limit_seconds?: number | null;
+  goal_eligible?: boolean;
+}
+
 export const api = {
+  platform: {
+    flags: () => request<{ flags: Record<string, boolean> }>("/platform/flags"),
+  },
   auth: {
     register: (data: {
       email: string;
@@ -2117,6 +2457,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify(data),
       }),
+    logout: () => request<void>("/auth/logout", { method: "POST" }),
     verifyEmail: (email: string, code: string) =>
       request<{ access_token: string; user_id: string; entity_id: string; role: string }>("/auth/verify-email", {
         method: "POST",
@@ -2170,6 +2511,7 @@ export const api = {
         llm_base_url: string;
         role_api_keys?: Record<string, string>;
         role_base_urls?: Record<string, string>;
+        role_api_key_models?: Record<string, string>;
         byok_allowed?: boolean;
         byok_effective?: boolean;
       }>("/auth/me/llm-config"),
@@ -2189,7 +2531,7 @@ export const api = {
       request<{ detail: string; models: Record<string, string>; masked: string }>("/auth/me/models/custom", {
         method: "PUT", body: JSON.stringify(data),
       }),
-    saveCatalogModel: (data: { role: string; model: string; api_key?: string; use_saved_api_key?: boolean; clear_api_key?: boolean; base_url?: string }) =>
+    saveCatalogModel: (data: { role: string; model: string; api_key?: string; use_saved_api_key?: boolean; clear_api_key?: boolean; base_url?: string; test_token?: string | null }) =>
       request<{ detail: string; models: Record<string, string>; masked: string }>("/auth/me/models/catalog", {
         method: "PUT", body: JSON.stringify(data),
       }),
@@ -2198,10 +2540,13 @@ export const api = {
     getMyModels: () =>
       request<{ models: Record<string, string>; user_models: Record<string, string>; entity_models: Record<string, string> }>("/auth/me/models"),
     updateMyModels: (data: { models: Record<string, string> }) =>
-      request<{ models: Record<string, string> }>("/auth/me/models", {
+      request<{
+        models: Record<string, string>;
+        changed: Record<string, { old?: string; new: string }>;
+      }>("/auth/me/models", {
         method: "PUT", body: JSON.stringify(data),
       }),
-    oauthGoogle: (opts: { code?: string; redirectUri: string; invitationCode?: string; teamInviteToken?: string; oauthSession?: string; publicChatToken?: string }) =>
+    oauthGoogle: (opts: { code?: string; redirectUri: string; invitationCode?: string; teamInviteToken?: string; oauthSession?: string; publicChatToken?: string; rememberMe?: boolean }) =>
       request<{ access_token: string; user: User }>("/auth/oauth/google", {
         method: "POST",
         body: JSON.stringify({
@@ -2211,6 +2556,7 @@ export const api = {
           ...(opts.teamInviteToken ? { team_invite_token: opts.teamInviteToken } : {}),
           ...(opts.oauthSession ? { oauth_session: opts.oauthSession } : {}),
           ...(opts.publicChatToken ? { public_chat_token: opts.publicChatToken } : {}),
+          remember_me: Boolean(opts.rememberMe),
         }),
       }),
     googleOAuthConfig: () =>
@@ -2418,6 +2764,52 @@ export const api = {
   },
 
   chat: {
+    listFlowEntrypoints: () =>
+      request<GlobalChatFlowEntrypoint[]>("/chat/flow-entrypoints"),
+    streamFlowEntrypoint: async (
+      bindingId: string,
+      message: string,
+      conversationId?: string,
+      opts?: { files?: File[]; documentIds?: string[]; agentId?: string; localWorkerId?: string },
+    ): Promise<Response> => {
+      const token = getAuthToken();
+      const form = new FormData();
+      form.append("message", message);
+      if (conversationId) form.append("conversation_id", conversationId);
+      if (opts?.agentId) form.append("agent_id", opts.agentId);
+      if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
+      if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
+      if (opts?.files) opts.files.forEach((file) => form.append("files", file));
+      const response = await fetch(
+        `${API_BASE}/chat/flow-entrypoints/${encodeURIComponent(bindingId)}/stream`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: form,
+        },
+      );
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({ detail: response.statusText }));
+        const detail = body.detail;
+        if (response.status === 402) {
+          const limitDetail = normalizePlanLimitDetail(
+            detail,
+            body.error || t("component.upgrade_prompt.default_message"),
+          );
+          const err = new ApiError(response.status, limitDetail.message);
+          err.detail = limitDetail as unknown as Record<string, unknown>;
+          throw err;
+        }
+        const message =
+          (typeof detail === "string" ? detail : (detail as any)?.message)
+          || response.statusText;
+        if (response.status !== 401) {
+          useToastStore.getState().error(t("lib.api.chat_failed"), message);
+        }
+        throw new ApiError(response.status, message);
+      }
+      return response;
+    },
     stream: async (
       message: string,
       conversationId?: string,
@@ -2426,6 +2818,7 @@ export const api = {
         documentIds?: string[];
         manualSkillIds?: string[];
         agentId?: string;
+        localWorkerId?: string;
         workspaceId?: string;
         workspaceContext?: boolean;
         threadRef?: { kind: "task" | "plan" | "goal"; id: string };
@@ -2452,6 +2845,7 @@ export const api = {
       form.append("message", message);
       if (conversationId) form.append("conversation_id", conversationId);
       if (opts?.agentId) form.append("agent_id", opts.agentId);
+      if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
       if (opts?.workspaceContext) form.append("workspace_context", "true");
       if (opts?.workspaceContext && opts?.workspaceId) form.append("workspace_id", opts.workspaceId);
       if (opts?.threadRef?.kind) form.append("thread_ref_kind", opts.threadRef.kind);
@@ -2496,7 +2890,7 @@ export const api = {
     listConversations: (wsId?: string) =>
       request<Conversation[]>(`/chat/conversations${wsId ? `?workspace_id=${wsId}` : ""}`),
     getMessages: (convId: string, opts?: { silent?: boolean; limit?: number }) =>
-      request<Message[]>(`/chat/conversations/${convId}/messages?limit=${encodeURIComponent(String(opts?.limit ?? 500))}`, {
+      request<GlobalChatMessage[]>(`/chat/conversations/${convId}/messages?limit=${encodeURIComponent(String(opts?.limit ?? 500))}`, {
         headers: opts?.silent ? { "X-Silent-Error": "1" } : undefined,
       }),
     getMessagesPage: (
@@ -2506,13 +2900,22 @@ export const api = {
       const q = new URLSearchParams();
       q.set("limit", String(opts?.limit ?? 75));
       if (opts?.before) q.set("before", opts.before);
-      return request<PaginatedMessagesResponse<Message>>(
+      return request<PaginatedMessagesResponse<GlobalChatMessage>>(
         `/chat/conversations/${convId}/messages/page?${q}`,
         {
           headers: opts?.silent ? { "X-Silent-Error": "1" } : undefined,
         },
       );
     },
+    resolveAction: (
+      msgId: string,
+      choice: string,
+      note?: string,
+      payload?: Record<string, unknown>,
+    ) => request<GlobalChatMessage>(`/chat/messages/${msgId}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ choice, note, payload }),
+    }),
     feedback: (
       convId: string,
       messageId: string,
@@ -2579,10 +2982,58 @@ export const api = {
     },
   },
 
+  videoEditor: {
+    searchFreeMusic: (query: string, page = 1, pageSize = 18): Promise<FreeMusicSearchResult> => {
+      const params = new URLSearchParams({
+        q: query,
+        page: String(page),
+        page_size: String(pageSize),
+      });
+      return request<FreeMusicSearchResult>(`/media/free-music/search?${params}`);
+    },
+    importFreeMusic: (trackId: string, sourceDocumentId: string): Promise<FreeMusicImportResult> => (
+      request<FreeMusicImportResult>("/media/free-music/import", {
+        method: "POST",
+        body: JSON.stringify({ track_id: trackId, source_document_id: sourceDocumentId }),
+      })
+    ),
+    finalizePreview: (
+      file: File,
+      sourceDocumentId: string,
+      outputName: string,
+      options?: { fps?: number; crf?: number; preset?: string; targetDurationSeconds?: number },
+    ): Promise<VideoEditorFinalizeResult> => {
+      const form = new FormData();
+      form.append("preview", file);
+      form.append("source_document_id", sourceDocumentId);
+      form.append("output_name", outputName);
+      form.append("fps", String(options?.fps ?? 30));
+      form.append("crf", String(options?.crf ?? 18));
+      form.append("preset", options?.preset ?? "veryfast");
+      if (typeof options?.targetDurationSeconds === "number" && options.targetDurationSeconds > 0) {
+        form.append("target_duration_seconds", String(options.targetDurationSeconds));
+      }
+      return request<VideoEditorFinalizeResult>("/media/video-editor/finalize", {
+        method: "POST",
+        body: form,
+      });
+    },
+    linkRecipe: (finalDocumentId: string, recipeDocumentId: string): Promise<VideoEditorRecipeLinkResult> => {
+      const form = new FormData();
+      form.append("final_document_id", finalDocumentId);
+      form.append("recipe_document_id", recipeDocumentId);
+      return request<VideoEditorRecipeLinkResult>("/media/video-editor/link-recipe", {
+        method: "POST",
+        body: form,
+      });
+    },
+  },
+
   documents: {
     list: listDocuments,
     listAll: listAllDocuments,
     browse: browseDocuments,
+    indexingStatuses: listDocumentIndexingStatuses,
     move: (id: string, folderId: string | null) =>
       request<Document>(`/documents/${id}/move`, { method: "POST", body: JSON.stringify({ folder_id: folderId }) }),
     get: (id: string) => request<Document>(`/documents/${id}`),
@@ -2648,6 +3099,11 @@ export const api = {
       return res.json() as Promise<Document>;
     },
     getVersions: (id: string) => request<any[]>(`/documents/${id}/versions`),
+    restoreVersion: async (id: string, versionId: string): Promise<Document> => {
+      const result = await request<Document>(`/documents/${id}/versions/${versionId}/restore`, { method: "POST" });
+      invalidateDocumentDownloadCache(id);
+      return result;
+    },
     download: async (id: string, options?: DocumentBlobOptions): Promise<string> => {
       const blob = await fetchDocumentBlob(id, options);
       return URL.createObjectURL(blob);
@@ -3123,7 +3579,7 @@ export const api = {
         blueprint_slug: string | null;
         can_revert: boolean;
         items: Array<{
-          kind: "skill" | "agent";
+          kind: "skill" | "agent" | "workflow" | "knowledge_document";
           slug: string;
           name: string;
           id?: string;
@@ -3161,6 +3617,43 @@ export const api = {
     trash: () => request<Workspace[]>("/workspaces/trash/list"),
     graceDays: () => request<{ grace_days: number }>("/workspaces/trash/grace-days"),
     dashboard: (id: string) => request<WorkspaceStats>(`/workspaces/${id}/dashboard`),
+    stats: {
+      library: () => request<{ items: WorkspaceStatLibraryEntry[] }>("/workspaces/stats/library"),
+      list: (wsId: string) => request<{ items: WorkspaceStatDefinition[] }>(`/workspaces/${wsId}/stats`),
+      quickView: (wsId: string) =>
+        request<WorkspaceStatsQuickView>(`/workspaces/${wsId}/stats/quick-view`),
+      updateQuickView: (wsId: string, data: Omit<WorkspaceStatsQuickView, "configured">) =>
+        request<WorkspaceStatsQuickView>(`/workspaces/${wsId}/stats/quick-view`, {
+          method: "PUT",
+          body: JSON.stringify(data),
+        }),
+      create: (wsId: string, data: WorkspaceStatCreate) =>
+        request<WorkspaceStatDefinition>(`/workspaces/${wsId}/stats`, {
+          method: "POST",
+          body: JSON.stringify(data),
+        }),
+      update: (wsId: string, statId: string, data: Partial<WorkspaceStatCreate> & { status?: string }) =>
+        request<WorkspaceStatDefinition>(`/workspaces/${wsId}/stats/${statId}`, {
+          method: "PATCH",
+          body: JSON.stringify(data),
+        }),
+      delete: (wsId: string, statId: string) =>
+        request<void>(`/workspaces/${wsId}/stats/${statId}`, { method: "DELETE" }),
+      collect: (wsId: string, statId: string) =>
+        request<{ stat: WorkspaceStatDefinition; observation: WorkspaceStatObservation }>(
+          `/workspaces/${wsId}/stats/${statId}/collect`,
+          { method: "POST" },
+        ),
+      observations: (wsId: string, statId: string, limit = 50) =>
+        request<{ items: WorkspaceStatObservation[] }>(
+          `/workspaces/${wsId}/stats/${statId}/observations?limit=${limit}`,
+        ),
+      record: (wsId: string, statId: string, data: { value: number; note?: string; observed_at?: string }) =>
+        request<{ stat: WorkspaceStatDefinition; observation: WorkspaceStatObservation }>(
+          `/workspaces/${wsId}/stats/${statId}/observations`,
+          { method: "POST", body: JSON.stringify(data) },
+        ),
+    },
     operatingModel: (id: string) => request<any>(`/workspaces/${id}/operating-model`),
     updateOperatingModel: (id: string, model: Record<string, any>) => request<any>(`/workspaces/${id}/operating-model`, { method: "PUT", body: JSON.stringify(model) }),
     evaluation: (id: string, days = 30) => request<WorkspaceEvaluationSnapshot>(`/workspaces/${id}/evaluation?days=${days}`),
@@ -3361,12 +3854,13 @@ export const api = {
         bindingId: string,
         message: string,
         conversationId?: string,
-        opts?: { files?: File[]; documentIds?: string[] },
+        opts?: { files?: File[]; documentIds?: string[]; localWorkerId?: string },
       ): Promise<Response> => {
         const token = getAuthToken();
         const form = new FormData();
         form.append("message", message);
         if (conversationId) form.append("conversation_id", conversationId);
+        if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
         if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
         if (opts?.files) opts.files.forEach((file) => form.append("files", file));
         const response = await fetch(
@@ -3437,6 +3931,16 @@ export const api = {
         request<any>(`/workspaces/${wsId}/chat/messages/${msgId}/resolve`, {
           method: "POST",
           body: JSON.stringify({ choice, note, payload }),
+        }),
+      simulationRun: (wsId: string) =>
+        request<WorkspaceSimulationRun>(`/workspaces/${wsId}/chat/simulation-run`),
+      startSimulationRun: (wsId: string) =>
+        request<WorkspaceSimulationRun>(`/workspaces/${wsId}/chat/simulation-run/start`, {
+          method: "POST",
+        }),
+      restartSimulationRun: (wsId: string) =>
+        request<WorkspaceSimulationRun>(`/workspaces/${wsId}/chat/simulation-run/restart`, {
+          method: "POST",
         }),
       feedback: (wsId: string, msgId: string, rating: "up" | "down") =>
         request<any>(`/workspaces/${wsId}/chat/messages/${msgId}/feedback`, {
@@ -3986,7 +4490,15 @@ export const api = {
     status: () => request<{ enabled: boolean }>("/auth/2fa/status"),
     setup: () => request<{ secret: string; uri: string }>("/auth/2fa/setup", { method: "POST" }),
     verify: (code: string) =>
-      request<{ enabled: boolean; backup_codes: string[] }>("/auth/2fa/verify", {
+      request<{
+        enabled: boolean;
+        backup_codes: string[];
+        access_token: string;
+        token_type: string;
+        user_id: string;
+        entity_id: string;
+        role: string;
+      }>("/auth/2fa/verify", {
         method: "POST",
         body: JSON.stringify({ code }),
       }),
@@ -4140,9 +4652,12 @@ export const api = {
       request<{ run: any; task: any | null; agent_execution: any | null }>(
         `/jobs/${jobId}/runs/${runId}`,
       ),
-    runNow: (jobId: string) =>
-      request<{ job_id: string; queued_at: string }>(
-        `/jobs/${jobId}/run_now`, { method: "POST" },
+    runNow: (jobId: string, idempotencyKey = crypto.randomUUID()) =>
+      request<{ job_id: string; queued_at: string; idempotency_key: string }>(
+        `/jobs/${jobId}/run_now`, {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey },
+        },
       ),
   },
 
@@ -4156,6 +4671,12 @@ export const api = {
 
   workflows: {
     list: () => request<any[]>("/workflows"),
+    templates: () => request<any[]>("/workflows/templates"),
+    installTemplate: (templateId: string, workspaceId?: string) =>
+      request<any>(`/workflows/templates/${encodeURIComponent(templateId)}/install`, {
+        method: "POST",
+        body: JSON.stringify({ workspace_id: workspaceId || null }),
+      }),
     create: (data: any) =>
       request<any>("/workflows", { method: "POST", body: JSON.stringify(data) }),
     get: (id: string) => request<any>(`/workflows/${id}`),
@@ -4170,8 +4691,9 @@ export const api = {
     runStream: (
       id: string,
       onNode: (nodeId: string, status: string) => void,
+      onRun?: (runId: string) => void,
       data?: { variables?: Record<string, any>; trigger_data?: Record<string, any> },
-    ) => streamWorkflowRun(`/workflows/${id}/run-stream`, onNode, data),
+    ) => streamWorkflowRun(`/workflows/${id}/run-stream`, onNode, onRun, data),
     runs: (id: string) => request<any[]>(`/workflows/${id}/runs`),
     listRuns: (params?: { workspace_id?: string; binding_id?: string; status?: string; limit?: number }) => {
       const q = new URLSearchParams();
@@ -4187,7 +4709,8 @@ export const api = {
       `/workflows/runs/${runId}${detail ? "" : "?detail=false"}`,
     ),
     getRunFamily: (runId: string) => request<any[]>(`/workflows/runs/${runId}/family`),
-    cancelRun: (runId: string) => request<void>(`/workflows/runs/${runId}/cancel`, { method: "POST" }),
+    cancelRun: (runId: string) => request<any>(`/workflows/runs/${runId}/cancel`, { method: "POST" }),
+    pauseRun: (runId: string) => request<any>(`/workflows/runs/${runId}/pause`, { method: "POST" }),
     retryRun: (runId: string, data: {
       from_step_id?: string;
       variables?: Record<string, any>;
@@ -4383,6 +4906,11 @@ export const api = {
       request<WorkerResponse>(`/workers/${workerId}/pause`, { method: "POST" }),
     resume: (workerId: string) =>
       request<WorkerResponse>(`/workers/${workerId}/resume`, { method: "POST" }),
+    rename: (workerId: string, displayName: string) =>
+      request<WorkerResponse>(`/workers/${workerId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ display_name: displayName }),
+      }),
     revoke: (workerId: string) =>
       request<WorkerResponse>(`/workers/${workerId}/revoke`, { method: "POST" }),
     register: (data: WorkerRegisterRequest) =>
@@ -4419,60 +4947,12 @@ export const api = {
         ),
     },
     mcpServers: () =>
-      request<Array<{
-        server_key: string;
-        name: string;
-        category: string | null;
-        description: string | null;
-        auth_type: string;
-        scopes: string | null;
-        tagline: string | null;
-        docs_url: string | null;
-        setup_hint: string | null;
-        color_hex: string | null;
-        supports_multi_account: boolean;
-        connections: Array<{
-          id: string;
-          display_name: string | null;
-          provider_user_id: string;
-          expires_at: string | null;
-          is_default: boolean;
-          connected_at: string | null;
-          health: HealthStatus | null;
-        }>;
-        entity_accounts: Array<{
-          id: string;
-          name: string | null;
-          display_name: string | null;
-          is_default: boolean;
-          created_at: string | null;
-          status: string;
-          health: HealthStatus | null;
-        }>;
-        user_connected: boolean;       // legacy
-        user_expires_at: string | null; // legacy
-        entity_connected: boolean;
-        required_permission: string | null;
-        user_has_required_permission: boolean;
-        agent_can_use: boolean;
-        hint: string;
-        nango_provider_config_key?: string | null;
-        oauth_configured?: boolean;
-        cli_spec?: {
-          command_template: string;
-          supported_subcommands: string[];
-          requires_local_paths: boolean;
-          timeout_seconds: number;
-          output_format: string;
-        } | null;
-        browser_spec?: {
-          login_url: string;
-          session_check_selector: string | null;
-          provider_module: string;
-          tool_actions: Record<string, any>;
-          cookie_ttl_days: number;
-        } | null;
-      }>>("/integrations/mcp-servers"),
+      request<IntegrationMCPServer[]>("/integrations/mcp-servers"),
+    operations: (serverKey: string) =>
+      request<IntegrationOperationCatalog>(
+        `/integrations/mcp-servers/${encodeURIComponent(serverKey)}/tools`,
+        { headers: { "X-Silent-Error": "1" } },
+      ),
     setDefaultConnection: (serverKey: string, connectionId: string) =>
       request<void>(
         `/integrations/mcp-servers/${serverKey}/connections/${connectionId}/set-default`,
@@ -4995,4 +5475,105 @@ export const api = {
         body: JSON.stringify(schedule),
       }),
   },
+  sites: {
+    forPath: (path: string) =>
+      request<{
+        publishable: boolean;
+        target: string | null;
+        site: SiteInfo | null;
+        hosting_configured: boolean;
+        auto_connection_plan: SiteAutoConnectionPlan | null;
+      }>(`/sites/for-path?path=${encodeURIComponent(path)}`),
+    publish: (data: { path: string; name: string; auto_connect?: boolean }) =>
+      request<SitePublishResult>("/sites/publish", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    setStatus: (id: string, status: "active" | "offline") =>
+      request<SiteInfo>(`/sites/${id}/status`, {
+        method: "POST",
+        body: JSON.stringify({ status }),
+      }),
+    bindDomain: (id: string, domain: string) =>
+      request<SiteInfo>(`/sites/${id}/domain`, {
+        method: "POST",
+        body: JSON.stringify({ domain }),
+      }),
+    checkDomain: (id: string) =>
+      request<SiteInfo>(`/sites/${id}/domain/check`, { method: "POST" }),
+    unbindDomain: (id: string) =>
+      request<SiteInfo>(`/sites/${id}/domain`, { method: "DELETE" }),
+    getConnections: (id: string) =>
+      request<SiteConnections>(`/sites/${id}/connections`),
+    updateConnections: (id: string, data: Omit<SiteConnections, "site_id">) =>
+      request<SiteInfo>(`/sites/${id}/connections`, {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+    analytics: (id: string, days = 30) =>
+      request<SiteAnalytics>(`/sites/${id}/analytics?days=${days}`),
+  },
 };
+
+export interface SiteConnections {
+  site_id: string;
+  workspace_id: string | null;
+  customer_service_channel_config_id: string | null;
+  subscription_workflow_binding_id: string | null;
+  lead_workflow_binding_id: string | null;
+  analytics_enabled: boolean;
+}
+
+export interface SiteAutoConnectionPlan {
+  eligible: boolean;
+  workspace_id: string | null;
+  workspace_name: string | null;
+  features: {
+    customer_service: boolean;
+    lead_forms: number;
+    subscription_forms: number;
+    tracked_interactions: number;
+    analytics: boolean;
+  };
+  actions: {
+    customer_service: "create" | "reuse" | "not_available";
+    lead_flow: "create" | "reuse" | "not_detected";
+    subscription_flow: "create" | "reuse" | "not_detected";
+    analytics: "enable";
+  };
+  reason: "no_workspace_origin" | null;
+}
+
+export interface SiteAnalytics {
+  site_id: string;
+  days: number;
+  analytics_enabled: boolean;
+  page_views: number;
+  unique_sessions: number;
+  interactions: number;
+  form_submissions: number;
+  chat_opens: number;
+  top_pages: Array<{ path: string; views: number }>;
+}
+
+export interface SiteInfo {
+  id: string;
+  name: string;
+  slug: string;
+  status: "active" | "offline";
+  revision: number;
+  url: string;
+  platform_url: string;
+  sites_domain: string;
+  custom_domain: string | null;
+  domain_status: "pending" | "active" | null;
+  published_at: string | null;
+  source_path: string;
+  workspace_id: string | null;
+  connections: Omit<SiteConnections, "site_id" | "workspace_id">;
+}
+
+export interface SitePublishResult extends SiteInfo {
+  excluded: { path: string; sensitive: boolean }[];
+  auto_connected: boolean;
+}

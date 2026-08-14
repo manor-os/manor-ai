@@ -8,13 +8,20 @@ import remarkGfm from "remark-gfm";
 import { PrismAsync as CodeSyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { api } from "../lib/api";
+import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
 import StatusBadge from "../components/ui/StatusBadge";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
+import TabSwitcher from "../components/ui/TabSwitcher";
 import Select from "../components/ui/Select";
 import Dropdown from "../components/ui/Dropdown";
 import AiEditButton from "../components/ui/AiEditButton";
+import ResizablePaneGroup, { type ResizablePaneDefinition } from "../components/ui/ResizablePaneGroup";
 import { PageHeaderTitle } from "../components/ui/PageHeader";
 import EditorLiveInlineDiff from "../components/EditorLiveInlineDiff";
+import MediaInsertDialog from "../components/MediaInsertDialog";
+import MarkdownTable from "../components/MarkdownTable";
+import SpreadsheetChartPreview from "../components/SpreadsheetChartPreview";
+import CodeProjectExplorer from "../components/code/CodeProjectExplorer";
 import {
   IconArrowLeft,
   IconArrowDown,
@@ -30,9 +37,11 @@ import {
   IconEye,
   IconHighlighter,
   IconImage,
+  IconInfo,
   IconLayers,
   IconLink,
   IconList,
+  IconLock,
   IconPalette,
   IconPlay,
   IconPlus,
@@ -58,10 +67,54 @@ import {
 } from "../lib/editorLiveChat";
 import { getAuthToken } from "../lib/authToken";
 import { codeLanguageForFile, codeLanguageLabel, isCodeLikeFile } from "../lib/codeFiles";
+import {
+  codeProjectDirectory,
+  codeProjectName,
+  useCodeProjectWorkspace,
+} from "../lib/useCodeProjectWorkspace";
+import { useHtmlPreviewDocument } from "../lib/useHtmlPreviewDocument";
+import {
+  presentationMediaMime,
+  presentationRelationshipsPart,
+  presentationShapeFillScope,
+  presentationVideoSource,
+  resolvePresentationPartTarget,
+} from "../lib/presentationOoxml";
+import { presentationSlideEditability } from "../lib/presentationEditability";
+import {
+  applyPresentationLiveEditContent,
+  buildPresentationLiveEditContent,
+  localPresentationLiveEditContent,
+  mediaExtension,
+  presentationImageMime,
+  presentationLiveEditTargetShape,
+  type PresentationLiveEditTarget,
+} from "../lib/presentationLiveEdit";
+import {
+  detectDelimitedTextFormat,
+  parseDelimitedText,
+  serializeDelimitedText,
+  type DelimitedTextFormat,
+} from "../lib/delimitedText";
+import {
+  decodeTextFile,
+  encodeTextFile,
+  textEncodingLabel,
+  type PreservedTextFormat,
+} from "../lib/textFilePreservation";
+import {
+  spreadsheetMergeAt,
+  spreadsheetChartsFromFile,
+  spreadsheetSheetsFromWorkbook,
+  type SpreadsheetSheetModel,
+  type SpreadsheetSheetSnapshot,
+} from "../lib/spreadsheetOoxml";
 import { useAuthStore } from "../stores/auth";
 import { useToastStore } from "../stores/toast";
 import { canCommentDocument, canEditDocument } from "../lib/permissions";
 import type { Comment, CommentAnchor } from "../lib/types";
+import { isLegacyOfficeFile } from "../lib/legacyOfficeFiles";
+import type { InsertableMediaAsset } from "../lib/mediaInsertion";
 
 import { t } from "../lib/i18n";
 // ---------------------------------------------------------------------------
@@ -289,185 +342,6 @@ function renderableCodePreviewLabel(name: string): string {
   return isSvgFile(name) ? "SVG" : "HTML";
 }
 
-function isLocalPreviewAssetUrl(url: string): boolean {
-  const trimmed = url.trim();
-  if (!trimmed || trimmed.startsWith("#")) return false;
-  return !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(trimmed);
-}
-
-type PreviewAssetReplacement =
-  | { kind: "url"; value: string }
-  | { kind: "style"; value: string }
-  | { kind: "script"; value: string };
-
-function stripUrlSuffix(url: string): string {
-  return url.split(/[?#]/, 1)[0] || "";
-}
-
-function normalizePreviewPath(path: string): string {
-  const parts: string[] = [];
-  for (const rawPart of path.replace(/\\/g, "/").split("/")) {
-    const part = rawPart.trim();
-    if (!part || part === ".") continue;
-    if (part === "..") {
-      parts.pop();
-      continue;
-    }
-    parts.push(part);
-  }
-  return parts.join("/");
-}
-
-function dirname(path: string): string {
-  const normalized = normalizePreviewPath(path);
-  const idx = normalized.lastIndexOf("/");
-  return idx >= 0 ? normalized.slice(0, idx) : "";
-}
-
-function resolvePreviewAssetPath(currentFsPath: string | undefined | null, rawUrl: string): string | null {
-  if (!currentFsPath || !isLocalPreviewAssetUrl(rawUrl)) return null;
-  const cleanUrl = stripUrlSuffix(rawUrl).replace(/^\/+/, "");
-  if (!cleanUrl) return null;
-  const baseDir = dirname(currentFsPath);
-  return normalizePreviewPath(`${baseDir}/${cleanUrl}`);
-}
-
-function extractLocalHtmlAssetRefs(html: string): string[] {
-  const refs = new Set<string>();
-  const attrRe = /\b(?:src|href|poster)\s*=\s*(["'])(.*?)\1/gi;
-  let attrMatch: RegExpExecArray | null;
-  while ((attrMatch = attrRe.exec(html))) {
-    const url = attrMatch[2]?.trim();
-    if (url && isLocalPreviewAssetUrl(url)) refs.add(url);
-  }
-
-  const cssUrlRe = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
-  let cssMatch: RegExpExecArray | null;
-  while ((cssMatch = cssUrlRe.exec(html))) {
-    const url = cssMatch[2]?.trim();
-    if (url && isLocalPreviewAssetUrl(url)) refs.add(url);
-  }
-  return [...refs];
-}
-
-function escapePreviewAttr(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;");
-}
-
-function escapeRawElementText(value: string, tagName: "script" | "style"): string {
-  const closingTag = new RegExp(`</${tagName}`, "gi");
-  return value.replace(closingTag, `<\\/${tagName}`);
-}
-
-function previewAssetKind(ref: string, result: { encoding: string; mime_type?: string }): PreviewAssetReplacement["kind"] | null {
-  if (result.encoding !== "utf-8") return null;
-  const cleanRef = stripUrlSuffix(ref).toLowerCase();
-  const mime = (result.mime_type || "").toLowerCase();
-  if (cleanRef.endsWith(".css") || mime === "text/css") return "style";
-  if (
-    cleanRef.endsWith(".js") ||
-    cleanRef.endsWith(".mjs") ||
-    cleanRef.endsWith(".cjs") ||
-    mime.includes("javascript") ||
-    mime === "text/ecmascript"
-  ) {
-    return "script";
-  }
-  return null;
-}
-
-function rewriteHtmlLocalAssetUrls(html: string, assets: Record<string, PreviewAssetReplacement>): string {
-  if (!Object.keys(assets).length) return html;
-  return html
-    .replace(/<link\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2([^>]*)>/gi, (match, before, _quote, url, after) => {
-      const asset = assets[String(url).trim()];
-      const attrs = `${before || ""} ${after || ""}`;
-      if (asset?.kind === "style" && /\brel\s*=\s*(["'])?[^"'>\s]*stylesheet/i.test(attrs)) {
-        return `<style data-manor-preview-src="${escapePreviewAttr(String(url).trim())}">\n${escapeRawElementText(asset.value, "style")}\n</style>`;
-      }
-      if (asset?.kind === "url") {
-        return match.replace(String(url), asset.value);
-      }
-      return match;
-    })
-    .replace(/<script\b([^>]*?)\bsrc\s*=\s*(["'])(.*?)\2([^>]*)>([\s\S]*?)<\/script>/gi, (match, before, _quote, url, after) => {
-      const asset = assets[String(url).trim()];
-      if (asset?.kind === "script") {
-        const attrs = `${before || ""}${after || ""}`.replace(
-          /\s+\b(?:async|defer|crossorigin|integrity|referrerpolicy)\b(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/gi,
-          "",
-        );
-        return `<script${attrs} data-manor-preview-src="${escapePreviewAttr(String(url).trim())}">\n${escapeRawElementText(asset.value, "script")}\n</script>`;
-      }
-      if (asset?.kind === "url") {
-        return match.replace(String(url), asset.value);
-      }
-      return match;
-    })
-    .replace(/\b(src|href|poster)\s*=\s*(["'])(.*?)\2/gi, (match, attr, quote, url) => {
-      const replacement = assets[String(url).trim()];
-      return replacement?.kind === "url" ? `${attr}=${quote}${replacement.value}${quote}` : match;
-    })
-    .replace(/url\(\s*(["']?)(.*?)\1\s*\)/gi, (match, quote, url) => {
-      const replacement = assets[String(url).trim()];
-      return replacement?.kind === "url" ? `url(${quote || ""}${replacement.value}${quote || ""})` : match;
-    });
-}
-
-const HTML_PREVIEW_NAVIGATION_GUARD = [
-  '<base href="about:blank">',
-  "<script>",
-  "(() => {",
-  "  const isNavigationHref = (href) => {",
-  "    const value = String(href || '').trim();",
-  "    return Boolean(value) && !value.startsWith('#') && !/^(?:javascript:|mailto:|tel:|data:|blob:)/i.test(value);",
-  "  };",
-  "  const block = (event) => {",
-  "    event.preventDefault();",
-  "    event.stopImmediatePropagation();",
-  "  };",
-  "  document.addEventListener('click', (event) => {",
-  "    const target = event.target instanceof Element ? event.target : null;",
-  "    if (!target) return;",
-  "    const link = target.closest('a[href], area[href]');",
-  "    if (link && isNavigationHref(link.getAttribute('href'))) {",
-  "      block(event);",
-  "      return;",
-  "    }",
-  "    if (target.closest('button[formaction], input[formaction], button[type=\"submit\"], input[type=\"submit\"]')) {",
-  "      block(event);",
-  "    }",
-  "  }, true);",
-  "  document.addEventListener('submit', block, true);",
-  "  window.open = () => null;",
-  "})();",
-  "</script>",
-].join("");
-
-function injectHtmlPreviewNavigationGuard(html: string): string {
-  if (/<head(?:\s|>)/i.test(html)) {
-    return html.replace(/<head([^>]*)>/i, `<head$1>${HTML_PREVIEW_NAVIGATION_GUARD}`);
-  }
-  if (/<html(?:\s|>)/i.test(html)) {
-    return html.replace(/<html([^>]*)>/i, `<html$1><head>${HTML_PREVIEW_NAVIGATION_GUARD}</head>`);
-  }
-  return `<!doctype html><html><head>${HTML_PREVIEW_NAVIGATION_GUARD}</head><body>${html}</body></html>`;
-}
-
-function blobFromFsReadResult(result: { content: string; encoding: string; mime_type?: string }): Blob {
-  const mimeType = result.mime_type || "application/octet-stream";
-  if (result.encoding === "base64") {
-    const binary = window.atob(result.content);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    return new Blob([bytes], { type: mimeType });
-  }
-  return new Blob([result.content], { type: mimeType });
-}
-
 function isSpreadsheetFile(name: string): boolean {
   const ext = (name.split(".").pop() || "").toLowerCase();
   return ["xlsx", "xls"].includes(ext);
@@ -481,6 +355,64 @@ function isCsvFile(name: string): boolean {
 function isPptxFile(name: string): boolean {
   const ext = (name.split(".").pop() || "").toLowerCase();
   return ["pptx", "ppt"].includes(ext);
+}
+
+async function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Unable to read image data."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function safeMediaFileName(name: string, fallback: string) {
+  const clean = name
+    .split(/[\\/]/).pop()
+    ?.replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "") || fallback;
+  return clean.slice(0, 120) || fallback;
+}
+
+function relativeFsReference(fromFile: string, targetFile: string) {
+  const fromParts = fromFile.replace(/^\/+/, "").split("/").filter(Boolean);
+  const targetParts = targetFile.replace(/^\/+/, "").split("/").filter(Boolean);
+  fromParts.pop();
+  let shared = 0;
+  while (shared < fromParts.length && shared < targetParts.length && fromParts[shared] === targetParts[shared]) shared += 1;
+  const relative = `${"../".repeat(fromParts.length - shared)}${targetParts.slice(shared).join("/")}`;
+  return relative.startsWith(".") ? relative : `./${relative}`;
+}
+
+async function presentationReplacementImageDataUrl(imageUrl: string, expectedMime: string): Promise<string> {
+  const response = await fetch(imageUrl);
+  if (!response.ok) throw new Error(`Unable to read the replacement image (${response.status}).`);
+  const sourceBlob = await response.blob();
+  if (!sourceBlob.type || sourceBlob.type.toLowerCase() === expectedMime) {
+    return blobToDataUrl(new Blob([sourceBlob], { type: expectedMime }));
+  }
+  if (!["image/png", "image/jpeg", "image/webp"].includes(expectedMime)) {
+    throw new Error(`This PPTX image must stay ${expectedMime}; use a matching replacement file.`);
+  }
+  const bitmap = await createImageBitmap(sourceBlob);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, bitmap.width);
+    canvas.height = Math.max(1, bitmap.height);
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Unable to prepare the replacement image.");
+    context.drawImage(bitmap, 0, 0);
+    const converted = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (blob) => blob ? resolve(blob) : reject(new Error("Unable to convert the replacement image.")),
+        expectedMime,
+        expectedMime === "image/jpeg" ? 0.94 : undefined,
+      );
+    });
+    return blobToDataUrl(converted);
+  } finally {
+    bitmap.close();
+  }
 }
 
 function extLabel(name: string): string {
@@ -507,46 +439,7 @@ function normalizeSheetData(value: any[][] | null): any[][] {
 }
 
 function parseCsvText(text: string): any[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    const next = text[i + 1];
-
-    if (ch === '"') {
-      if (inQuotes && next === '"') {
-        cell += '"';
-        i += 1;
-      } else {
-        inQuotes = !inQuotes;
-      }
-      continue;
-    }
-
-    if (ch === "," && !inQuotes) {
-      row.push(cell);
-      cell = "";
-      continue;
-    }
-
-    if ((ch === "\n" || ch === "\r") && !inQuotes) {
-      if (ch === "\r" && next === "\n") i += 1;
-      row.push(cell);
-      rows.push(row);
-      row = [];
-      cell = "";
-      continue;
-    }
-
-    cell += ch;
-  }
-
-  row.push(cell);
-  if (row.some((value) => value !== "") || rows.length === 0) rows.push(row);
-  return normalizeSheetData(rows);
+  return normalizeSheetData(parseDelimitedText(text).rows);
 }
 
 function parseSpreadsheetPasteText(text: string): string[][] {
@@ -755,13 +648,8 @@ function sheetStyleKey(row: number, col: number): string {
   return `${row}:${col}`;
 }
 
-function csvEscape(value: unknown): string {
-  const s = value != null ? String(value) : "";
-  return s.includes(",") || s.includes('"') || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
 function sheetDataToCsv(data: any[][]): string {
-  return data.map((row) => row.map(csvEscape).join(",")).join("\n");
+  return serializeDelimitedText(data, { delimiter: ",", lineEnding: "\n", finalLineEnding: false });
 }
 
 function normalizeSheetCharts(charts: unknown, data: any[][]): SheetChartConfig[] {
@@ -1344,12 +1232,30 @@ function SpreadsheetEditor({
   initialData,
   initialCharts,
   initialStyles,
+  initialDisplayData = [],
+  columnWidths = [],
+  rowHeights = [],
+  merges = [],
+  nativeCharts = [],
+  fidelityMode = false,
+  sheetTabs = [],
+  activeSheetIndex = 0,
+  onSelectSheet,
   persistCharts,
   onChange,
 }: {
   initialData: any[][] | null;
   initialCharts: SheetChartConfig[];
   initialStyles: SheetStyleMap;
+  initialDisplayData?: string[][];
+  columnWidths?: number[];
+  rowHeights?: number[];
+  merges?: SpreadsheetSheetModel["merges"];
+  nativeCharts?: SpreadsheetSheetModel["charts"];
+  fidelityMode?: boolean;
+  sheetTabs?: Array<{ index: number; name: string }>;
+  activeSheetIndex?: number;
+  onSelectSheet?: (sheetIndex: number) => void;
   persistCharts: boolean;
   onChange: (data: any[][], charts: SheetChartConfig[], styles: SheetStyleMap) => void;
 }) {
@@ -1360,7 +1266,8 @@ function SpreadsheetEditor({
   const [selectionAnchor, setSelectionAnchor] = useState<SheetCellCoord>({ r: 0, c: 0 });
   const [isSelecting, setIsSelecting] = useState(false);
   const [showChartPanel, setShowChartPanel] = useState(true);
-  const activeInputRef = useRef<HTMLInputElement | null>(null);
+  const activeInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const sourceDataRef = useRef<any[][]>(structuredClone(normalizeSheetData(initialData)));
 
   useEffect(() => {
     setData(normalizeSheetData(initialData));
@@ -1373,6 +1280,10 @@ function SpreadsheetEditor({
   useEffect(() => {
     setStyles(normalizeSheetStyles(initialStyles));
   }, [initialStyles]);
+
+  useEffect(() => {
+    if (fidelityMode) setShowChartPanel(false);
+  }, [fidelityMode]);
 
   useEffect(() => {
     const stopSelecting = () => setIsSelecting(false);
@@ -1391,10 +1302,12 @@ function SpreadsheetEditor({
   }, [charts, onChange, styles]);
 
   const updateCell = useCallback((r: number, c: number, value: string) => {
+    const editableColumns = Math.max(1, ...data.map((row) => row.length));
+    if (fidelityMode && (r >= data.length || c >= editableColumns)) return;
     const next = ensureSheetDimensions(data, r + 1, c + 1);
     next[r][c] = value;
     commitData(next);
-  }, [commitData, data]);
+  }, [commitData, data, fidelityMode]);
 
   const actualMaxCols = Math.max(1, ...data.map((r) => r.length));
   const visibleRows = Math.max(MIN_VISIBLE_SHEET_ROWS, data.length, selected.r + 1);
@@ -1434,11 +1347,16 @@ function SpreadsheetEditor({
   }));
 
   const focusCell = useCallback((targetR: number, targetC: number, extend = false) => {
-    const safe = { r: Math.max(0, targetR), c: Math.max(0, targetC) };
+    const row = fidelityMode ? Math.min(data.length - 1, Math.max(0, targetR)) : Math.max(0, targetR);
+    const column = fidelityMode ? Math.min(actualMaxCols - 1, Math.max(0, targetC)) : Math.max(0, targetC);
+    const mergedRange = merges.find((range) => (
+      row >= range.s.r && row <= range.e.r && column >= range.s.c && column <= range.e.c
+    ));
+    const safe = mergedRange ? { r: mergedRange.s.r, c: mergedRange.s.c } : { r: row, c: column };
     setSelected(safe);
     setSelectionAnchor((current) => extend ? current : safe);
     focusActiveInput();
-  }, [focusActiveInput]);
+  }, [actualMaxCols, data.length, fidelityMode, focusActiveInput, merges]);
 
   const addRow = useCallback(() => {
     const range = selectionRange;
@@ -1492,15 +1410,17 @@ function SpreadsheetEditor({
   const clearSelection = useCallback(() => {
     const range = selectionRange;
     if (!range) return;
-    const next = ensureSheetDimensions(data, range.r2 + 1, range.c2 + 1);
-    for (let r = range.r1; r <= range.r2; r += 1) {
-      for (let c = range.c1; c <= range.c2; c += 1) {
+    const lastRow = fidelityMode ? Math.min(range.r2, data.length - 1) : range.r2;
+    const lastColumn = fidelityMode ? Math.min(range.c2, actualMaxCols - 1) : range.c2;
+    const next = ensureSheetDimensions(data, lastRow + 1, lastColumn + 1);
+    for (let r = range.r1; r <= lastRow; r += 1) {
+      for (let c = range.c1; c <= lastColumn; c += 1) {
         next[r][c] = "";
       }
     }
     commitData(next);
     focusCell(range.r1, range.c1);
-  }, [commitData, data, focusCell, selectionRange]);
+  }, [actualMaxCols, commitData, data, fidelityMode, focusCell, selectionRange]);
 
   const commitStyles = useCallback((nextStyles: SheetStyleMap) => {
     const normalized = normalizeSheetStyles(nextStyles);
@@ -1539,30 +1459,34 @@ function SpreadsheetEditor({
     if (matrix.length === 0 || matrix.every((row) => row.length === 0)) return;
     const range = selectionRange;
     if (range && matrix.length === 1 && matrix[0].length === 1 && sheetRangeSize(range) > 1) {
-      const next = ensureSheetDimensions(data, range.r2 + 1, range.c2 + 1);
-      for (let r = range.r1; r <= range.r2; r += 1) {
-        for (let c = range.c1; c <= range.c2; c += 1) {
+      const lastRow = fidelityMode ? Math.min(range.r2, data.length - 1) : range.r2;
+      const lastColumn = fidelityMode ? Math.min(range.c2, actualMaxCols - 1) : range.c2;
+      const next = ensureSheetDimensions(data, lastRow + 1, lastColumn + 1);
+      for (let r = range.r1; r <= lastRow; r += 1) {
+        for (let c = range.c1; c <= lastColumn; c += 1) {
           next[r][c] = matrix[0][0];
         }
       }
       commitData(next);
-      focusCell(range.r2, range.c2, true);
+      focusCell(lastRow, lastColumn, true);
       return;
     }
     const maxPasteCols = Math.max(1, ...matrix.map((row) => row.length));
-    const targetRows = startR + matrix.length;
-    const targetCols = startC + maxPasteCols;
+    const targetRows = fidelityMode ? Math.min(data.length, startR + matrix.length) : startR + matrix.length;
+    const targetCols = fidelityMode ? Math.min(actualMaxCols, startC + maxPasteCols) : startC + maxPasteCols;
+    if (targetRows <= startR || targetCols <= startC) return;
     const next = ensureSheetDimensions(data, targetRows, targetCols);
     matrix.forEach((row, ri) => {
       row.forEach((cell, ci) => {
+        if (fidelityMode && (startR + ri >= targetRows || startC + ci >= targetCols)) return;
         next[startR + ri][startC + ci] = cell;
       });
     });
     commitData(next);
-    const end = { r: startR + matrix.length - 1, c: startC + maxPasteCols - 1 };
+    const end = { r: targetRows - 1, c: targetCols - 1 };
     setSelectionAnchor({ r: startR, c: startC });
     setSelected(end);
-  }, [commitData, data, focusCell, selectionRange]);
+  }, [actualMaxCols, commitData, data, fidelityMode, focusCell, selectionRange]);
 
   const commitCharts = useCallback((nextCharts: SheetChartConfig[]) => {
     const normalized = normalizeSheetCharts(nextCharts, data);
@@ -1624,10 +1548,13 @@ function SpreadsheetEditor({
 
   const selectAllVisible = useCallback(() => {
     setSelectionAnchor({ r: 0, c: 0 });
-    setSelected({ r: visibleRows - 1, c: maxCols - 1 });
-  }, [maxCols, visibleRows]);
+    setSelected({
+      r: (fidelityMode ? data.length : visibleRows) - 1,
+      c: (fidelityMode ? actualMaxCols : maxCols) - 1,
+    });
+  }, [actualMaxCols, data.length, fidelityMode, maxCols, visibleRows]);
 
-  const handleCellKeyDown = useCallback((event: React.KeyboardEvent<HTMLInputElement>, ri: number, ci: number, rawCellValue: string) => {
+  const handleCellKeyDown = useCallback((event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>, ri: number, ci: number, rawCellValue: string) => {
     const meta = event.metaKey || event.ctrlKey;
     if (meta && event.key.toLowerCase() === "a") {
       event.preventDefault();
@@ -1659,6 +1586,7 @@ function SpreadsheetEditor({
       return;
     }
     if (event.key === "Enter") {
+      if (event.altKey) return;
       event.preventDefault();
       focusCell(event.shiftKey ? ri - 1 : ri + 1, ci);
       return;
@@ -1687,6 +1615,36 @@ function SpreadsheetEditor({
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      {sheetTabs.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "7px 12px", borderBottom: "1px solid var(--border-subtle, #dbe3ef)", background: "var(--surface-panel, #ffffff)", overflowX: "auto", flexShrink: 0 }}>
+          {sheetTabs.map((sheet) => (
+            <button
+              key={`${sheet.index}:${sheet.name}`}
+              type="button"
+              onClick={() => onSelectSheet?.(sheet.index)}
+              aria-pressed={sheet.index === activeSheetIndex}
+              style={{
+                padding: "5px 12px",
+                borderRadius: 7,
+                border: `1px solid ${sheet.index === activeSheetIndex ? "var(--editor-active-border, #ccded9)" : "transparent"}`,
+                background: sheet.index === activeSheetIndex ? "var(--editor-active-bg, #ecfdf8)" : "transparent",
+                color: sheet.index === activeSheetIndex ? "var(--editor-active-text, #436b65)" : "var(--text-muted, #57534e)",
+                fontSize: 12,
+                fontWeight: sheet.index === activeSheetIndex ? 800 : 650,
+                whiteSpace: "nowrap",
+                cursor: "pointer",
+              }}
+            >
+              {sheet.name}
+            </button>
+          ))}
+          {fidelityMode && (
+            <span title={t("page.doc_editor.xlsx_fidelity_hint")} style={{ marginLeft: "auto", fontSize: 11, fontWeight: 800, color: "var(--editor-active-text, #436b65)", whiteSpace: "nowrap" }}>
+              {t("page.doc_editor.xlsx_fidelity_mode")}
+            </span>
+          )}
+        </div>
+      )}
       <div
         style={{
           display: "flex",
@@ -1708,6 +1666,7 @@ function SpreadsheetEditor({
           </div>
           <input
             value={activeCellValue}
+            disabled={fidelityMode && (selected.r >= data.length || selected.c >= actualMaxCols)}
             onChange={(event) => updateCell(selected.r, selected.c, event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
@@ -1725,6 +1684,7 @@ function SpreadsheetEditor({
           />
         </SheetToolbarGroup>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginLeft: "auto" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", pointerEvents: fidelityMode ? "none" : undefined, opacity: fidelityMode ? 0.42 : 1 }}>
           <SheetToolbarGroup>
           <Select
             value={activeStyle.fontFamily || ""}
@@ -1799,6 +1759,7 @@ function SpreadsheetEditor({
             onSelect={(key) => addChart(key as SheetChartType)}
           />
           </SheetToolbarGroup>
+          </div>
           <SheetToolbarGroup>
           <SheetToolbarButton onClick={() => void copySelection()} icon={<IconCopy size={14} />} title={t("action.copy")}>
             {t("action.copy")}
@@ -1806,19 +1767,20 @@ function SpreadsheetEditor({
           <SheetToolbarButton onClick={clearSelection} icon={<IconEraser size={14} />} title="Clear">
             Clear
           </SheetToolbarButton>
-          <SheetToolbarButton onClick={addRow} icon={<IconPlus size={14} />} title={t("page.doc_editor.plus_row")}>
+          <SheetToolbarButton disabled={fidelityMode} onClick={addRow} icon={<IconPlus size={14} />} title={t("page.doc_editor.plus_row")}>
             Row
           </SheetToolbarButton>
-          <SheetToolbarButton onClick={addCol} icon={<IconPlus size={14} />} title={t("page.doc_editor.plus_column")}>
+          <SheetToolbarButton disabled={fidelityMode} onClick={addCol} icon={<IconPlus size={14} />} title={t("page.doc_editor.plus_column")}>
             Col
           </SheetToolbarButton>
-          <SheetToolbarButton onClick={deleteRows} danger icon={<IconTrash size={14} />} title="Delete row">
+          <SheetToolbarButton disabled={fidelityMode} onClick={deleteRows} danger icon={<IconTrash size={14} />} title="Delete row">
             Row
           </SheetToolbarButton>
-          <SheetToolbarButton onClick={deleteCols} danger icon={<IconTrash size={14} />} title="Delete col">
+          <SheetToolbarButton disabled={fidelityMode} onClick={deleteCols} danger icon={<IconTrash size={14} />} title="Delete col">
             Col
           </SheetToolbarButton>
           <SheetToolbarButton
+            disabled={fidelityMode}
             onClick={() => setShowChartPanel((value) => !value)}
             active={showChartPanel}
             icon={<IconEye size={14} />}
@@ -1846,10 +1808,10 @@ function SpreadsheetEditor({
                     onMouseDown={(event) => {
                       event.preventDefault();
                       setSelectionAnchor({ r: 0, c: i });
-                      setSelected({ r: visibleRows - 1, c: i });
+                      setSelected({ r: (fidelityMode ? data.length : visibleRows) - 1, c: i });
                       setIsSelecting(true);
                     }}
-                    style={{ ...shTh, minWidth: 112, cursor: "cell" }}
+                    style={{ ...shTh, width: columnWidths[i] || 112, minWidth: columnWidths[i] || 112, cursor: "cell" }}
                   >
                     {colLetter(i)}
                   </th>
@@ -1859,13 +1821,18 @@ function SpreadsheetEditor({
             <tbody>
               {Array.from({ length: visibleRows }, (_, ri) => {
                 const row = data[ri] || [];
+                const naturalRowHeight = Math.max(
+                  32,
+                  ...row.map((value) => String(value ?? "").split(/\r\n|\r|\n/).length * 18 + 12),
+                );
+                const renderedRowHeight = rowHeights[ri] || naturalRowHeight;
                 return (
-                <tr key={ri}>
+                <tr key={ri} style={{ height: renderedRowHeight }}>
                   <td
                     onMouseDown={(event) => {
                       event.preventDefault();
                       setSelectionAnchor({ r: ri, c: 0 });
-                      setSelected({ r: ri, c: maxCols - 1 });
+                      setSelected({ r: ri, c: (fidelityMode ? actualMaxCols : maxCols) - 1 });
                       setIsSelecting(true);
                     }}
                     style={{ ...shTd, background: "#fafaf9", color: "#78716c", fontWeight: 700, textAlign: "center", width: 48, minWidth: 48, position: "sticky", left: 0, zIndex: 2, cursor: "cell" }}
@@ -1873,11 +1840,19 @@ function SpreadsheetEditor({
                     {ri + 1}
                   </td>
                   {Array.from({ length: maxCols }, (_, ci) => {
+                    const merge = spreadsheetMergeAt(merges, ri, ci);
+                    if (merge.covered) return null;
                     const isActive = selected.r === ri && selected.c === ci;
                     const isInRange = sheetCellInRange(ri, ci, selectionRange);
                     const rawCellValue = row[ci] != null ? String(row[ci]) : "";
                     const isFormulaCell = rawCellValue.trim().startsWith("=");
-                    const displayValue = getSheetDisplayValue(data, ri, ci);
+                    const sourceValue = sourceDataRef.current[ri]?.[ci];
+                    const currentValue = data[ri]?.[ci];
+                    const sourceDisplay = initialDisplayData[ri]?.[ci];
+                    const displayValue = Object.is(sourceValue == null ? "" : sourceValue, currentValue == null ? "" : currentValue)
+                      && sourceDisplay != null
+                      ? sourceDisplay
+                      : getSheetDisplayValue(data, ri, ci);
                     const cellStyle = styles[sheetStyleKey(ri, ci)] || {};
                     const cellBackground = isInRange
                       ? `linear-gradient(rgba(79,125,117,0.10), rgba(79,125,117,0.10)), ${cellStyle.fill || "#ffffff"}`
@@ -1893,6 +1868,8 @@ function SpreadsheetEditor({
                     return (
                       <td
                         key={ci}
+                        rowSpan={merge.rowSpan}
+                        colSpan={merge.columnSpan}
                         onMouseDown={() => {
                           selectCell(ri, ci);
                           setIsSelecting(true);
@@ -1906,14 +1883,16 @@ function SpreadsheetEditor({
                           background: cellBackground,
                           outline: isActive ? "2px solid #4f7d75" : isInRange ? "1px solid rgba(79,125,117,0.35)" : undefined,
                           outlineOffset: -2,
-                          minWidth: 112,
-                          height: 32,
+                          width: columnWidths[ci] || 112,
+                          minWidth: columnWidths[ci] || 112,
+                          height: renderedRowHeight,
                         }}
                       >
                         {isActive ? (
-                          <input
+                          <textarea
                             ref={activeInputRef}
                             autoFocus
+                            disabled={fidelityMode && (ri >= data.length || ci >= actualMaxCols)}
                             value={rawCellValue}
                             onChange={(e) => updateCell(ri, ci, e.target.value)}
                             onKeyDown={(e) => handleCellKeyDown(e, ri, ci, rawCellValue)}
@@ -1926,17 +1905,21 @@ function SpreadsheetEditor({
                             style={{
                               ...sharedTextStyle,
                               width: "100%",
-                              height: 32,
+                              height: renderedRowHeight,
                               padding: "5px 9px",
                               border: "none",
                               outline: "none",
                               background: "transparent",
+                              resize: "none",
+                              overflow: "hidden",
+                              lineHeight: "18px",
+                              whiteSpace: "pre-wrap",
                             }}
                           />
                         ) : (
                           <div
                             title={isFormulaCell ? rawCellValue : undefined}
-                            style={{ ...sharedTextStyle, padding: "6px 10px", minHeight: 32, cursor: "cell", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                            style={{ ...sharedTextStyle, padding: "6px 10px", minHeight: renderedRowHeight, cursor: "cell", whiteSpace: "pre-wrap", overflowWrap: "anywhere", overflow: "hidden" }}
                           >
                             {displayValue}
                           </div>
@@ -1950,7 +1933,12 @@ function SpreadsheetEditor({
           </table>
         </div>
 
-        {showChartPanel && <aside style={{ width: "min(100%, 360px)", maxWidth: "100%", borderLeft: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", background: "var(--surface-muted, #fafaf9)", overflow: "auto", flexShrink: 0 }}>
+        {fidelityMode && nativeCharts.length > 0 && (
+          <aside style={{ width: "min(44vw, 520px)", minWidth: 360, maxWidth: "100%", borderLeft: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", background: "var(--surface-muted, #fafaf9)", overflow: "auto", padding: 12, flexShrink: 0 }}>
+            <SpreadsheetChartPreview charts={nativeCharts} />
+          </aside>
+        )}
+        {!fidelityMode && showChartPanel && <aside style={{ width: "min(100%, 360px)", maxWidth: "100%", borderLeft: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", background: "var(--surface-muted, #fafaf9)", overflow: "auto", flexShrink: 0 }}>
           <div style={{ padding: 14, borderBottom: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", display: "flex", alignItems: "center", gap: 8 }}>
             <strong style={{ fontSize: 13, color: "var(--text-strong, #1c1917)" }}>{t("page.doc_editor.charts")}</strong>
             <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-faint, #a8a29e)" }}>
@@ -2050,7 +2038,9 @@ function SpreadsheetEditor({
       <div style={{ display: "flex", gap: 12, alignItems: "center", padding: "6px 12px", borderTop: "1px solid var(--border-subtle, #dbe3ef)", background: "var(--surface-muted, #fafaf9)", flexShrink: 0, fontSize: 12, color: "var(--text-faint, #78716c)" }}>
         <span>{data.length} {t("page.doc_editor.rows")} · {actualMaxCols} {t("page.doc_editor.cols")}</span>
         <span>{selectedRangeLabel}</span>
-        <span style={{ marginLeft: "auto" }}>{persistCharts ? t("page.doc_editor.saved_to_xlsx") : t("page.doc_editor.preview_only")}</span>
+        <span style={{ marginLeft: "auto" }} title={fidelityMode ? t("page.doc_editor.xlsx_fidelity_hint") : undefined}>
+          {fidelityMode ? t("page.doc_editor.xlsx_fidelity_hint") : persistCharts ? t("page.doc_editor.saved_to_xlsx") : t("page.doc_editor.preview_only")}
+        </span>
       </div>
     </div>
   );
@@ -2104,6 +2094,14 @@ interface PptxTableCell {
   gridSpan?: number; vMerge?: boolean;
 }
 
+interface PptxShapeSource {
+  part: string;
+  kind: "sp" | "pic" | "cxnSp" | "graphicFrame";
+  objectId: string;
+  editable: boolean;
+  mediaPart?: string;
+}
+
 interface PptxShape {
   id: string;
   type?: "shape" | "table" | "image";
@@ -2124,11 +2122,14 @@ interface PptxShape {
   padding?: { l: number; t: number; r: number; b: number };
   texts: PptxTextRun[];
   imgUrl?: string;
+  videoUrl?: string;
+  hyperlink?: string;
   imageFit?: "cover" | "contain";
   // Table data
   tableRows?: PptxTableCell[][];
   tableCols?: number;
   tableColWidths?: number[];
+  source?: PptxShapeSource;
 }
 
 interface PptxSlide {
@@ -2139,6 +2140,8 @@ interface PptxSlide {
   aspectRatio?: string;
   notes?: string;
   shapes: PptxShape[];
+  sourcePart?: string;
+  notesPart?: string;
 }
 
 let EDITOR_SLIDE_W = 12192000;
@@ -2348,6 +2351,7 @@ function genId() { return `s${++_shapeCounter}_${Date.now()}`; }
 
 function clonePptxShape(shape: PptxShape, offset = 0): PptxShape {
   const clone = JSON.parse(JSON.stringify(shape)) as PptxShape;
+  delete clone.source;
   return {
     ...clone,
     id: genId(),
@@ -2463,8 +2467,8 @@ function pptxParseTextRuns(spXml: string): PptxTextRun[] {
         const spcM = pptxXmlAttr(rPr, "spc");
         if (spcM) rSpacing = parseInt(spcM, 10) / 100;
       }
-      const tMatch = token.match(/<a:t>([^<]*)<\/a:t>/);
-      const runText = tMatch ? tMatch[1] : "";
+      const tMatch = token.match(/<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/);
+      const runText = tMatch ? pptxDecodeText(tMatch[1]) : "";
       if (!runText) continue;
       paraText += runText;
       runs.push({
@@ -2499,6 +2503,8 @@ function pptxParseTextRuns(spXml: string): PptxTextRun[] {
 
 function pptxDecodeText(value: string): string {
   return value
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, decimal: string) => String.fromCodePoint(parseInt(decimal, 10)))
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
@@ -2628,7 +2634,12 @@ function editorParseBgFromXml(bgXml: string): { color?: string; grad?: PptxSlide
   return result;
 }
 
-function pptxParseShapeXml(sp: string, relsMap: Map<string, string>, phMap?: Map<string, { x: number; y: number; w: number; h: number }>): PptxShape | null {
+function pptxParseShapeXml(
+  sp: string,
+  relsMap: Map<string, string>,
+  phMap?: Map<string, { x: number; y: number; w: number; h: number }>,
+  source?: Omit<PptxShapeSource, "objectId" | "mediaPart"> & { mediaParts?: Map<string, string> },
+): PptxShape | null {
   let x: number, y: number, w: number, h: number;
 
   const xfrm = pptxXmlInner(sp, "a:xfrm");
@@ -2657,6 +2668,18 @@ function pptxParseShapeXml(sp: string, relsMap: Map<string, string>, phMap?: Map
     x, y, w, h,
     texts: [],
   };
+  if (source) {
+    const cNvPr = sp.match(/<p:cNvPr\b[^>]*\/?\s*>/);
+    const objectId = cNvPr ? pptxXmlAttr(cNvPr[0], "id") : null;
+    if (objectId) {
+      shape.source = {
+        part: source.part,
+        kind: source.kind,
+        objectId,
+        editable: source.editable,
+      };
+    }
+  }
 
   // Rotation + flip (in 60000ths of a degree)
   if (xfrm) {
@@ -2672,11 +2695,12 @@ function pptxParseShapeXml(sp: string, relsMap: Map<string, string>, phMap?: Map
 
   // Fill — parse within spPr to avoid picking up text fills
   const spPr = pptxXmlInner(sp, "p:spPr") || pptxXmlInner(sp, "xdr:spPr") || sp;
-  const hasNoFill = spPr.includes("<a:noFill");
+  const shapeFillScope = presentationShapeFillScope(spPr);
+  const hasNoFill = shapeFillScope.includes("<a:noFill");
   if (!hasNoFill) {
-    const solidFill = pptxXmlInner(spPr, "a:solidFill");
+    const solidFill = pptxXmlInner(shapeFillScope, "a:solidFill");
     if (solidFill) shape.fill = pptxParseColor(solidFill) || undefined;
-    shape.gradFill = pptxParseGradient(spPr);
+    shape.gradFill = pptxParseGradient(shapeFillScope);
 
     // Blip fill (texture/image fill on shapes)
     if (!shape.fill && !shape.gradFill) {
@@ -2686,6 +2710,7 @@ function pptxParseShapeXml(sp: string, relsMap: Map<string, string>, phMap?: Map
         if (blipM) {
           const imgUrl = relsMap.get(blipM[1]);
           if (imgUrl) shape.imgUrl = imgUrl;
+          if (shape.source) shape.source.mediaPart = source?.mediaParts?.get(blipM[1]);
         }
       }
     }
@@ -2749,17 +2774,19 @@ function pptxParseShapeXml(sp: string, relsMap: Map<string, string>, phMap?: Map
     if (blipM) {
       const imgUrl = relsMap.get(blipM[1]);
       if (imgUrl) { shape.imgUrl = imgUrl; shape.type = "image"; }
+      if (shape.source) shape.source.mediaPart = source?.mediaParts?.get(blipM[1]);
     }
   }
+  shape.videoUrl = presentationVideoSource(sp, relsMap);
   // Image cropping (srcRect)
   if (shape.imgUrl) {
     const srcRect = sp.match(/<a:srcRect\s+([^/]*)\/>/);
     if (srcRect) {
       const attrs = srcRect[1];
-      const l = parseInt((attrs.match(/l="(\d+)"/) || [])[1] || "0", 10) / 1000;
-      const t = parseInt((attrs.match(/t="(\d+)"/) || [])[1] || "0", 10) / 1000;
-      const r = parseInt((attrs.match(/r="(\d+)"/) || [])[1] || "0", 10) / 1000;
-      const b = parseInt((attrs.match(/b="(\d+)"/) || [])[1] || "0", 10) / 1000;
+      const l = parseInt((attrs.match(/l="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
+      const t = parseInt((attrs.match(/t="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
+      const r = parseInt((attrs.match(/r="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
+      const b = parseInt((attrs.match(/b="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
       if (l || t || r || b) shape.imgCrop = { l, t, r, b };
     }
   }
@@ -2794,7 +2821,7 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
         const id = pptxXmlAttr(rel, "Id");
         const target = pptxXmlAttr(rel, "Target");
         if (id && target) {
-          const resolved = target.startsWith("../") ? target.slice(3) : target.startsWith("/") ? target.slice(1) : `ppt/${target}`;
+          const resolved = resolvePresentationPartTarget("ppt/presentation.xml", target);
           presRelsMap.set(id, resolved);
         }
       }
@@ -2838,16 +2865,7 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
         const entry = zip.file(name);
         if (!entry) continue;
         const data = await entry.async("base64");
-        const ext = name.split(".").pop()?.toLowerCase() || "";
-        const mime = ext === "jpg" || ext === "jpeg"
-          ? "image/jpeg"
-          : ext === "svg"
-            ? "image/svg+xml"
-            : ext === "webp"
-              ? "image/webp"
-              : ext === "gif"
-                ? "image/gif"
-                : "image/png";
+        const mime = presentationMediaMime(name);
         mediaCache.set(name, `data:${mime};base64,${data}`);
       } catch { /* skip bad media */ }
     }
@@ -2857,6 +2875,7 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
   const layoutCache = new Map<string, string>();
   const masterCache = new Map<string, string>();
   const layoutToMasterPath = new Map<string, string>();
+  const layoutRelsCache = new Map<string, Map<string, string>>();
   const masterRelsCache = new Map<string, Map<string, string>>();
   try {
     for (const name of Object.keys(zip.files)) {
@@ -2872,31 +2891,34 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
     // Build layout → master mapping
     for (const layoutPath of layoutCache.keys()) {
       try {
-        const layoutNum = layoutPath.match(/slideLayout(\d+)/)?.[1] || "1";
-        const lre = zip.file(`ppt/slideLayouts/_rels/slideLayout${layoutNum}.xml.rels`);
+        const lre = zip.file(presentationRelationshipsPart(layoutPath));
         if (lre) {
+          const layoutRels = new Map<string, string>();
           for (const rel of ((await lre.async("text")).match(/<Relationship[^>]*\/>/g) || [])) {
+            const id = pptxXmlAttr(rel, "Id");
             const target = pptxXmlAttr(rel, "Target");
             const type = pptxXmlAttr(rel, "Type");
-            if (target && type?.includes("slideMaster")) {
-              layoutToMasterPath.set(layoutPath, target.startsWith("../") ? "ppt/" + target.slice(3) : target);
+            if (target) {
+              const resolved = resolvePresentationPartTarget(layoutPath, target);
+              if (type?.includes("slideMaster")) layoutToMasterPath.set(layoutPath, resolved);
+              if (id && mediaCache.has(resolved)) layoutRels.set(id, mediaCache.get(resolved)!);
             }
           }
+          layoutRelsCache.set(layoutPath, layoutRels);
         }
       } catch { /* non-fatal */ }
     }
     // Pre-cache master rels for media
     for (const masterPath of masterCache.keys()) {
       try {
-        const masterNum = masterPath.match(/slideMaster(\d+)/)?.[1] || "1";
-        const mre = zip.file(`ppt/slideMasters/_rels/slideMaster${masterNum}.xml.rels`);
+        const mre = zip.file(presentationRelationshipsPart(masterPath));
         if (mre) {
           const masterRels = new Map<string, string>();
           for (const rel of ((await mre.async("text")).match(/<Relationship[^>]*\/>/g) || [])) {
             const id = pptxXmlAttr(rel, "Id");
             const target = pptxXmlAttr(rel, "Target");
             if (id && target) {
-              const resolved = target.startsWith("../") ? "ppt/" + target.slice(3) : target;
+              const resolved = resolvePresentationPartTarget(masterPath, target);
               if (mediaCache.has(resolved)) masterRels.set(id, mediaCache.get(resolved)!);
             }
           }
@@ -2918,13 +2940,12 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
         const fallback = block.match(/<mc:Fallback[\s>]([\s\S]*?)<\/mc:Fallback>/);
         return fallback ? fallback[1] : "";
       });
-      const slideNum = slidePath.match(/slide(\d+)/)?.[1] || "1";
-
       const relsMap = new Map<string, string>();
+      const mediaParts = new Map<string, string>();
       let layoutPath: string | undefined;
       let notesPath: string | undefined;
       try {
-        const relsEntry = zip.file(`ppt/slides/_rels/slide${slideNum}.xml.rels`);
+        const relsEntry = zip.file(presentationRelationshipsPart(slidePath));
         if (relsEntry) {
           const relsXml = await relsEntry.async("text");
           for (const rel of (relsXml.match(/<Relationship[^>]*\/>/g) || [])) {
@@ -2932,21 +2953,24 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
             const target = pptxXmlAttr(rel, "Target");
             const type = pptxXmlAttr(rel, "Type");
             if (id && target) {
-              const resolved = target.startsWith("../") ? "ppt/" + target.slice(3) : target;
-              if (mediaCache.has(resolved)) relsMap.set(id, mediaCache.get(resolved)!);
+              const resolved = resolvePresentationPartTarget(slidePath, target);
+              if (mediaCache.has(resolved)) {
+                relsMap.set(id, mediaCache.get(resolved)!);
+                mediaParts.set(id, resolved);
+              }
               if (type && type.includes("slideLayout")) layoutPath = resolved;
               if (type && type.includes("notesSlide")) notesPath = resolved;
             }
           }
         }
         if (layoutPath) {
-          const lre = zip.file(layoutPath.replace(/slideLayouts\//, "slideLayouts/_rels/") + ".rels");
+          const lre = zip.file(presentationRelationshipsPart(layoutPath));
           if (lre) {
             for (const rel of ((await lre.async("text")).match(/<Relationship[^>]*\/>/g) || [])) {
               const id = pptxXmlAttr(rel, "Id");
               const target = pptxXmlAttr(rel, "Target");
               if (id && target) {
-                const resolved = target.startsWith("../") ? "ppt/" + target.slice(3) : target;
+                const resolved = resolvePresentationPartTarget(layoutPath, target);
                 if (mediaCache.has(resolved) && !relsMap.has(id)) relsMap.set(id, mediaCache.get(resolved)!);
               }
             }
@@ -2954,17 +2978,7 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
         }
       } catch { /* rels non-fatal */ }
 
-      // Merge master rels into relsMap
-      if (layoutPath) {
-        const masterPath = layoutToMasterPath.get(layoutPath);
-        if (masterPath && masterRelsCache.has(masterPath)) {
-          for (const [id, url] of masterRelsCache.get(masterPath)!) {
-            if (!relsMap.has(id)) relsMap.set(id, url);
-          }
-        }
-      }
-
-      const slide: PptxSlide = { id: genId(), aspectRatio: `${EDITOR_SLIDE_W}/${EDITOR_SLIDE_H}`, shapes: [] };
+      const slide: PptxSlide = { id: genId(), aspectRatio: `${EDITOR_SLIDE_W}/${EDITOR_SLIDE_H}`, shapes: [], sourcePart: slidePath, notesPart: notesPath };
       if (notesPath) {
         try {
           const notesEntry = zip.file(notesPath);
@@ -2989,20 +3003,23 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
       // Background — slide → layout → slide master fallback (with bgRef resolution)
       try {
         let bgXml = pptxXmlInner(xml, "p:bg");
+        let bgRels = relsMap;
         if (!bgXml && layoutPath && layoutCache.has(layoutPath)) {
           bgXml = pptxXmlInner(layoutCache.get(layoutPath)!, "p:bg");
+          bgRels = layoutRelsCache.get(layoutPath) || new Map<string, string>();
         }
         if (!bgXml && layoutPath) {
           const masterPath = layoutToMasterPath.get(layoutPath);
           if (masterPath && masterCache.has(masterPath)) {
             bgXml = pptxXmlInner(masterCache.get(masterPath)!, "p:bg");
+            bgRels = masterRelsCache.get(masterPath) || new Map<string, string>();
           }
         }
         if (bgXml) {
           const bgResult = editorParseBgFromXml(bgXml);
           if (bgResult.color) slide.bg = bgResult.color;
           if (bgResult.grad) slide.bgGrad = bgResult.grad;
-          if (bgResult.imgRId && relsMap.has(bgResult.imgRId)) slide.bgImgUrl = relsMap.get(bgResult.imgRId);
+          if (bgResult.imgRId && bgRels.has(bgResult.imgRId)) slide.bgImgUrl = bgRels.get(bgResult.imgRId);
         }
       } catch { /* bg non-fatal */ }
 
@@ -3037,7 +3054,8 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
             ...(grp.match(/<p:cxnSp[\s>][\s\S]*?<\/p:cxnSp>/g) || []),
           ];
           for (const ch of children) {
-            const s = pptxParseShapeXml(ch, relsMap, phMap);
+            const kind = ch.startsWith("<p:pic") ? "pic" : ch.startsWith("<p:cxnSp") ? "cxnSp" : "sp";
+            const s = pptxParseShapeXml(ch, relsMap, phMap, { part: slidePath, kind, editable: false, mediaParts });
             if (s && grpXfrm && chExtCx > 0 && chExtCy > 0) {
               const cxE = (s.x / 100) * EDITOR_SLIDE_W, cyE = (s.y / 100) * EDITOR_SLIDE_H;
               const cwE = (s.w / 100) * EDITOR_SLIDE_W, chE = (s.h / 100) * EDITOR_SLIDE_H;
@@ -3053,7 +3071,8 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
 
       for (const sp of [...spMatches, ...picMatches, ...cxnMatches]) {
         try {
-          const s = pptxParseShapeXml(sp, relsMap, phMap);
+          const kind = sp.startsWith("<p:pic") ? "pic" : sp.startsWith("<p:cxnSp") ? "cxnSp" : "sp";
+          const s = pptxParseShapeXml(sp, relsMap, phMap, { part: slidePath, kind, editable: true, mediaParts });
           if (s) slide.shapes.push(s);
         } catch { /* individual shape non-fatal */ }
       }
@@ -3073,6 +3092,11 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
               x: emu2pctX(parseInt(offM[1], 10)), y: emu2pctY(parseInt(offM[2], 10)),
               w: emu2pctX(parseInt(extM[1], 10)), h: emu2pctY(parseInt(extM[2], 10)),
               texts: [], tableRows: table.rows, tableCols: table.cols, tableColWidths: table.colWidths,
+              source: (() => {
+                const cNvPr = gf.match(/<p:cNvPr\b[^>]*\/?\s*>/);
+                const objectId = cNvPr ? pptxXmlAttr(cNvPr[0], "id") : null;
+                return objectId ? { part: slidePath, kind: "graphicFrame" as const, objectId, editable: true } : undefined;
+              })(),
             });
           }
         }
@@ -3087,7 +3111,13 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
             ...(layoutXml.match(/<p:pic[\s>][\s\S]*?<\/p:pic>/g) || []),
           ]) {
             if (sp.includes("<p:ph")) continue;
-            const lShape = pptxParseShapeXml(sp, relsMap);
+            const kind = sp.startsWith("<p:pic") ? "pic" : "sp";
+            const lShape = pptxParseShapeXml(
+              sp,
+              layoutRelsCache.get(layoutPath) || new Map<string, string>(),
+              undefined,
+              { part: layoutPath, kind, editable: false },
+            );
             if (lShape && (lShape.fill || lShape.gradFill || lShape.imgUrl || lShape.stroke)) {
               slide.shapes.unshift(lShape);
             }
@@ -3101,12 +3131,14 @@ async function parsePptxForEditor(buf: ArrayBuffer): Promise<PptxSlide[]> {
           const masterPath = layoutToMasterPath.get(layoutPath);
           if (masterPath && masterCache.has(masterPath)) {
             const masterXml = masterCache.get(masterPath)!;
+            const masterRels = masterRelsCache.get(masterPath) || new Map<string, string>();
             for (const sp of [
               ...(masterXml.match(/<p:sp[\s>][\s\S]*?<\/p:sp>/g) || []),
               ...(masterXml.match(/<p:pic[\s>][\s\S]*?<\/p:pic>/g) || []),
             ]) {
               if (sp.includes("<p:ph")) continue;
-              const mShape = pptxParseShapeXml(sp, relsMap);
+              const kind = sp.startsWith("<p:pic") ? "pic" : "sp";
+              const mShape = pptxParseShapeXml(sp, masterRels, undefined, { part: masterPath, kind, editable: false });
               if (mShape && (mShape.fill || mShape.gradFill || mShape.imgUrl || mShape.stroke)) {
                 slide.shapes.unshift(mShape);
               }
@@ -3275,6 +3307,30 @@ function createPptxSlide(layout: PptxSlideLayout, aspectRatio = "16/9"): PptxSli
   };
 }
 
+function pptxEditorImageStyle(shape: PptxShape, borderRadius: React.CSSProperties["borderRadius"]): React.CSSProperties {
+  if (!shape.imgCrop) {
+    return {
+      position: "absolute",
+      inset: 0,
+      width: "100%",
+      height: "100%",
+      objectFit: shape.imageFit || "cover",
+      borderRadius,
+    };
+  }
+  const remainingWidth = Math.max(0.01, 100 - shape.imgCrop.l - shape.imgCrop.r);
+  const remainingHeight = Math.max(0.01, 100 - shape.imgCrop.t - shape.imgCrop.b);
+  return {
+    position: "absolute",
+    left: `${-(shape.imgCrop.l / remainingWidth) * 100}%`,
+    top: `${-(shape.imgCrop.t / remainingHeight) * 100}%`,
+    width: `${10000 / remainingWidth}%`,
+    height: `${10000 / remainingHeight}%`,
+    objectFit: "fill",
+    borderRadius,
+  };
+}
+
 function PptxReadOnlySlide({ slide, serverUrl }: { slide: PptxSlide; serverUrl?: string }) {
   const background: React.CSSProperties = { backgroundColor: slide.bg || "#ffffff" };
   if (slide.bgGrad) background.backgroundImage = pptxGradToCss(slide.bgGrad);
@@ -3287,7 +3343,22 @@ function PptxReadOnlySlide({ slide, serverUrl }: { slide: PptxSlide; serverUrl?:
   return (
     <div className="presentation-editor-present-slide" style={{ ...background, aspectRatio: slide.aspectRatio || "16/9" }}>
       {serverUrl ? (
-        <img src={serverUrl} alt="" className="presentation-editor-present-server-image" />
+        <>
+          <img src={serverUrl} alt="" className="presentation-editor-present-server-image" />
+          {slide.shapes.filter((shape) => Boolean(shape.videoUrl)).map((shape) => (
+            <video
+              key={`video-${shape.id}`}
+              className="presentation-editor-native-video"
+              src={shape.videoUrl}
+              poster={shape.imgUrl}
+              controls
+              playsInline
+              preload="metadata"
+              aria-label="Presentation video"
+              style={{ left: `${shape.x}%`, top: `${shape.y}%`, width: `${shape.w}%`, height: `${shape.h}%` }}
+            />
+          ))}
+        </>
       ) : slide.shapes.map((shape) => {
         const radius = shape.presetGeom === "ellipse" || shape.presetGeom === "oval"
           ? "50%"
@@ -3339,15 +3410,21 @@ function PptxReadOnlySlide({ slide, serverUrl }: { slide: PptxSlide; serverUrl?:
 
         return (
           <div key={shape.id} style={shapeStyle}>
-            {shape.imgUrl && (
+            {shape.videoUrl ? (
+              <video
+                className="presentation-editor-native-video presentation-editor-native-video--shape"
+                src={shape.videoUrl}
+                poster={shape.imgUrl}
+                controls
+                playsInline
+                preload="metadata"
+                aria-label="Presentation video"
+              />
+            ) : shape.imgUrl && (
               <img
                 src={shape.imgUrl}
                 alt=""
-                style={{
-                  position: "absolute", inset: 0, width: "100%", height: "100%",
-                  objectFit: shape.imgCrop ? "fill" : shape.imageFit || "cover",
-                  borderRadius: radius,
-                }}
+                style={pptxEditorImageStyle(shape, radius)}
               />
             )}
             {shape.texts.map((paragraph, paragraphIndex) => (
@@ -3391,10 +3468,14 @@ function PptxReadOnlySlide({ slide, serverUrl }: { slide: PptxSlide; serverUrl?:
 function PresentationEditor({
   slides: initialSlides,
   serverSlideUrls,
+  fidelityMode = false,
+  onLiveEditTargetChange,
   onChange,
 }: {
   slides: PptxSlide[];
   serverSlideUrls?: string[];
+  fidelityMode?: boolean;
+  onLiveEditTargetChange?: (target: PresentationLiveEditTarget) => void;
   onChange: (slides: PptxSlide[]) => void;
 }) {
   const [slides, setSlides] = useState<PptxSlide[]>(initialSlides);
@@ -3414,12 +3495,14 @@ function PresentationEditor({
   const [presentingIdx, setPresentingIdx] = useState<number | null>(null);
   const [notesDraft, setNotesDraft] = useState("");
   const [shapeContextMenu, setShapeContextMenu] = useState<{ shapeId: string; x: number; y: number } | null>(null);
+  const [mediaInsertOpen, setMediaInsertOpen] = useState(false);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const replaceImageShapeIdRef = useRef<string | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const canvasViewportRef = useRef<HTMLDivElement>(null);
   const slidesRef = useRef(slides);
   const copiedShapeRef = useRef<PptxShape | null>(null);
+  const didAutoEnableServerPreviewRef = useRef(false);
   const [canvasViewportSize, setCanvasViewportSize] = useState({ width: 0, height: 0 });
 
   useEffect(() => {
@@ -3429,6 +3512,15 @@ function PresentationEditor({
   useEffect(() => {
     if (!selectedShapeId) setShowFormatOptions(false);
   }, [selectedShapeId]);
+
+  useEffect(() => {
+    if (!fidelityMode || !serverSlideUrls?.length || didAutoEnableServerPreviewRef.current) return;
+    didAutoEnableServerPreviewRef.current = true;
+    setUseServerBg(true);
+    setSelectedShapeId(null);
+    setEditingText(null);
+    setEditingTableCell(null);
+  }, [fidelityMode, serverSlideUrls]);
 
   useEffect(() => {
     const element = canvasViewportRef.current;
@@ -3455,7 +3547,12 @@ function PresentationEditor({
     setEditingTableCell(null);
     setUndoStack([]);
     setRedoStack([]);
+    setUseServerBg(false);
   }, [initialSlides]);
+
+  useEffect(() => {
+    onLiveEditTargetChange?.({ activeSlideIndex: activeIdx, selectedShapeId });
+  }, [activeIdx, onLiveEditTargetChange, selectedShapeId]);
 
   const pushUndo = useCallback((prev: PptxSlide[]) => {
     setUndoStack(s => [...s.slice(-29), prev]);
@@ -3487,6 +3584,10 @@ function PresentationEditor({
   }, [redoStack, slides, onChange]);
 
   const activeSlide = slides[activeIdx] || { id: "empty", bg: "#ffffff", aspectRatio: "16/9", shapes: [] };
+  const activeSlideEditability = useMemo(
+    () => presentationSlideEditability(activeSlide.shapes),
+    [activeSlide.shapes],
+  );
   useEffect(() => {
     setNotesDraft(activeSlide.notes || "");
   }, [activeSlide.id, activeSlide.notes]);
@@ -3554,6 +3655,7 @@ function PresentationEditor({
   }, [activeSlideAspect, canvasViewportSize.height, canvasViewportSize.width]);
 
   const addSlide = useCallback((layout: PptxSlideLayout = "title-body") => {
+    if (fidelityMode) return;
     const newSlide = createPptxSlide(layout, activeSlide.aspectRatio || "16/9");
     const next = [...slides, newSlide];
     updateSlides(next);
@@ -3561,9 +3663,10 @@ function PresentationEditor({
     setSelectedShapeId(null);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [activeSlide.aspectRatio, slides, updateSlides]);
+  }, [activeSlide.aspectRatio, fidelityMode, slides, updateSlides]);
 
   const deleteSlide = useCallback(() => {
+    if (fidelityMode) return;
     if (slides.length <= 1) return;
     const next = slides.filter((_, i) => i !== activeIdx);
     updateSlides(next);
@@ -3571,9 +3674,10 @@ function PresentationEditor({
     setSelectedShapeId(null);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const addTextBox = useCallback(() => {
+    if (fidelityMode) return;
     const shapeId = genId();
     const text = "New text box";
     const next = slides.map((s, i) => {
@@ -3590,9 +3694,10 @@ function PresentationEditor({
     updateSlides(next);
     setSelectedShapeId(shapeId);
     setEditingText({ shapeId, textIdx: 0, value: text, initialValue: text });
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const deleteShape = useCallback((shapeId: string) => {
+    if (fidelityMode) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return { ...s, shapes: s.shapes.filter(sh => sh.id !== shapeId) };
@@ -3601,7 +3706,7 @@ function PresentationEditor({
     setSelectedShapeId(null);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   // Keyboard shortcuts: undo/redo, delete shape, and nudge selected shapes.
   useEffect(() => {
@@ -3660,7 +3765,7 @@ function PresentationEditor({
         shapes: s.shapes.map(sh => {
           if (sh.id !== shapeId) return sh;
           const texts = [...sh.texts];
-          texts[textIdx] = { ...texts[textIdx], text: newText };
+          texts[textIdx] = { ...texts[textIdx], text: newText, runs: undefined };
           return { ...sh, texts };
         }),
       };
@@ -3669,10 +3774,12 @@ function PresentationEditor({
   }, [slides, activeIdx, updateSlides]);
 
   const beginTextEditing = useCallback((shapeId: string, textIdx: number, value: string) => {
+    const shape = activeSlide.shapes.find((candidate) => candidate.id === shapeId);
+    if (shape?.source && !shape.source.editable) return;
     setSelectedShapeId(shapeId);
     setEditingTableCell(null);
     setEditingText({ shapeId, textIdx, value, initialValue: value });
-  }, []);
+  }, [activeSlide.shapes]);
 
   const commitTextEditing = useCallback(() => {
     if (!editingText) return;
@@ -3712,14 +3819,16 @@ function PresentationEditor({
   }, [editingTableCell, updateTableCell]);
 
   const updateSlideBg = useCallback((color: string) => {
+    if (fidelityMode) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return { ...s, bg: color, bgGrad: undefined };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const addShape = useCallback((preset: string) => {
+    if (fidelityMode) return;
     const shapeMap: Record<string, Partial<PptxShape>> = {
       rect: { x: 20, y: 30, w: 25, h: 20, fill: "#4472c4", presetGeom: "rect" },
       roundRect: { x: 20, y: 30, w: 25, h: 20, fill: "#ed7d31", presetGeom: "roundRect", borderRadius: 8 },
@@ -3737,9 +3846,9 @@ function PresentationEditor({
     setSelectedShapeId(shapeId);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
-  const handleImageFile = useCallback((file: File, replaceShapeId: string | null = null) => {
+  const handleImageFile = useCallback((file: File, replaceShapeId: string | null = null, hyperlink?: string) => {
     const reader = new FileReader();
     reader.onload = () => {
       const url = String(reader.result || "");
@@ -3756,11 +3865,11 @@ function PresentationEditor({
             return {
               ...s,
               shapes: s.shapes.map((shape) => shape.id === replaceShapeId
-                ? { ...shape, type: "image" as const, imgUrl: url, imgCrop: undefined, imageFit: shape.imageFit || "contain" as const }
+                ? { ...shape, type: "image" as const, imgUrl: url, imgCrop: fidelityMode ? shape.imgCrop : undefined, imageFit: shape.imageFit || "contain" as const }
                 : shape),
             };
           }
-          return { ...s, shapes: [...s.shapes, { id: shapeId, type: "image" as const, x: 30, y: 20, w, h, imgUrl: url, imageFit: "contain" as const, texts: [] }] };
+          return { ...s, shapes: [...s.shapes, { id: shapeId, type: "image" as const, x: 30, y: 20, w, h, imgUrl: url, hyperlink, imageFit: "contain" as const, texts: [] }] };
         });
         updateSlides(next);
         setSelectedShapeId(shapeId);
@@ -3770,12 +3879,45 @@ function PresentationEditor({
       img.src = url;
     };
     reader.readAsDataURL(file);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const requestImageInsert = useCallback(() => {
-    replaceImageShapeIdRef.current = null;
-    imageInputRef.current?.click();
+    setMediaInsertOpen(true);
   }, []);
+
+  const handleMediaInsert = useCallback(async (asset: InsertableMediaAsset) => {
+    if (asset.kind === "image") {
+      const url = await api.documents.download(asset.document.id);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error("Unable to read the selected image.");
+        const blob = await response.blob();
+        handleImageFile(new File([blob], asset.name, { type: blob.type || asset.document.mime_type || "image/png" }));
+      } finally {
+        if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+      }
+      return;
+    }
+
+    let posterFile: File;
+    try {
+      const thumbnailUrl = await api.documents.videoThumbnail(asset.document.id);
+      const response = await fetch(thumbnailUrl);
+      if (!response.ok) throw new Error("Video poster unavailable");
+      const blob = await response.blob();
+      posterFile = new File([blob], `${asset.name}-poster.png`, { type: blob.type || "image/png" });
+      if (thumbnailUrl.startsWith("blob:")) URL.revokeObjectURL(thumbnailUrl);
+    } catch {
+      const safeTitle = asset.name.replace(/[<>&"']/g, "").slice(0, 72);
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720"><rect width="1280" height="720" fill="#171717"/><circle cx="640" cy="330" r="92" fill="#4f7d75"/><path d="M615 275l88 55-88 55z" fill="#fff"/><text x="640" y="505" fill="#fff" font-family="Arial,sans-serif" font-size="38" text-anchor="middle">${safeTitle}</text></svg>`;
+      posterFile = new File([svg], `${asset.name}-poster.svg`, { type: "image/svg+xml" });
+    }
+    handleImageFile(
+      posterFile,
+      null,
+      `${window.location.origin}/viewer/${encodeURIComponent(asset.document.id)}`,
+    );
+  }, [handleImageFile]);
 
   const requestImageReplacement = useCallback((shapeId: string) => {
     replaceImageShapeIdRef.current = shapeId;
@@ -3783,6 +3925,7 @@ function PresentationEditor({
   }, []);
 
   const moveShapeZ = useCallback((shapeId: string, dir: "up" | "down" | "top" | "bottom") => {
+    if (fidelityMode) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       const shapes = [...s.shapes];
@@ -3797,9 +3940,10 @@ function PresentationEditor({
       return { ...s, shapes };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const duplicateSlide = useCallback(() => {
+    if (fidelityMode) return;
     const src = slides[activeIdx];
     if (!src) return;
     const dup: PptxSlide = {
@@ -3813,9 +3957,10 @@ function PresentationEditor({
     setSelectedShapeId(null);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const duplicateShape = useCallback((shapeId: string) => {
+    if (fidelityMode) return;
     const source = activeSlide.shapes.find((shape) => shape.id === shapeId);
     if (!source) return;
     const duplicate = clonePptxShape(source, 2);
@@ -3826,7 +3971,7 @@ function PresentationEditor({
     setSelectedShapeId(duplicate.id);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [activeIdx, activeSlide.shapes, slides, updateSlides]);
+  }, [activeIdx, activeSlide.shapes, fidelityMode, slides, updateSlides]);
 
   const copyShape = useCallback((shapeId: string) => {
     const source = activeSlide.shapes.find((shape) => shape.id === shapeId);
@@ -3834,6 +3979,7 @@ function PresentationEditor({
   }, [activeSlide.shapes]);
 
   const pasteShape = useCallback(() => {
+    if (fidelityMode) return;
     if (!copiedShapeRef.current) return;
     const duplicate = clonePptxShape(copiedShapeRef.current, 2);
     const next = slides.map((slide, index) => index === activeIdx
@@ -3844,7 +3990,7 @@ function PresentationEditor({
     setSelectedShapeId(duplicate.id);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [activeIdx, slides, updateSlides]);
+  }, [activeIdx, fidelityMode, slides, updateSlides]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -3871,14 +4017,16 @@ function PresentationEditor({
   }, [copyShape, duplicateShape, pasteShape, presentingIdx, selectedShapeId]);
 
   const updateShapeFill = useCallback((shapeId: string, fill: string) => {
+    if (fidelityMode) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return { ...s, shapes: s.shapes.map(sh => sh.id === shapeId ? { ...sh, fill, gradFill: undefined } : sh) };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const updateShapeProps = useCallback((shapeId: string, update: Partial<PptxShape>) => {
+    if (fidelityMode && Object.keys(update).some((key) => !["x", "y", "w", "h", "rotation", "flipH", "flipV"].includes(key))) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return {
@@ -3897,9 +4045,10 @@ function PresentationEditor({
       };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const updateTextStyle = useCallback((shapeId: string, textIdx: number, update: Partial<PptxTextRun>) => {
+    if (fidelityMode) return;
     const inlineKeys = ["bold", "italic", "underline", "strikethrough", "fontSize", "color", "fontFamily"] as const;
     const runUpdate = inlineKeys.reduce((result, key) => {
       if (key in update) result[key] = update[key] as never;
@@ -3926,13 +4075,13 @@ function PresentationEditor({
       };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [slides, activeIdx, fidelityMode, updateSlides]);
 
   const handleDragStart = useCallback((e: React.MouseEvent, shapeId: string) => {
     if (editingText || editingTableCell) return;
     e.stopPropagation();
     const shape = activeSlide.shapes.find(s => s.id === shapeId);
-    if (!shape) return;
+    if (!shape || (shape.source && !shape.source.editable)) return;
     setDragging({ shapeId, slideIdx: activeIdx, startX: e.clientX, startY: e.clientY, origX: shape.x, origY: shape.y, baseSlides: slides });
     setSelectedShapeId(shapeId);
   }, [activeIdx, activeSlide, editingTableCell, editingText, slides]);
@@ -3973,7 +4122,7 @@ function PresentationEditor({
     e.stopPropagation();
     e.preventDefault();
     const shape = activeSlide.shapes.find(s => s.id === shapeId);
-    if (!shape) return;
+    if (!shape || (shape.source && !shape.source.editable)) return;
     setResizing({ shapeId, slideIdx: activeIdx, handle, startX: e.clientX, startY: e.clientY, origX: shape.x, origY: shape.y, origW: shape.w, origH: shape.h, baseSlides: slides });
   }, [activeIdx, activeSlide, slides]);
 
@@ -4030,9 +4179,12 @@ function PresentationEditor({
   }, [resizing, onChange, pushUndo]);
 
   // Slide reorder via drag
-  const handleThumbDragStart = useCallback((idx: number) => setDragThumbIdx(idx), []);
+  const handleThumbDragStart = useCallback((idx: number) => {
+    if (!fidelityMode) setDragThumbIdx(idx);
+  }, [fidelityMode]);
   const handleThumbDragOver = useCallback((e: React.DragEvent, idx: number) => { e.preventDefault(); setDragOverIdx(idx); }, []);
   const handleThumbDrop = useCallback((idx: number) => {
+    if (fidelityMode) return;
     if (dragThumbIdx === null || dragThumbIdx === idx) { setDragThumbIdx(null); setDragOverIdx(null); return; }
     const next = [...slides];
     const [moved] = next.splice(dragThumbIdx, 1);
@@ -4041,9 +4193,12 @@ function PresentationEditor({
     setActiveIdx(idx);
     setDragThumbIdx(null);
     setDragOverIdx(null);
-  }, [dragThumbIdx, slides, updateSlides]);
+  }, [dragThumbIdx, fidelityMode, slides, updateSlides]);
 
   const openShapeContextMenu = useCallback((event: React.MouseEvent, shapeId: string) => {
+    if (fidelityMode) return;
+    const shape = activeSlide.shapes.find((candidate) => candidate.id === shapeId);
+    if (shape?.source && !shape.source.editable) return;
     event.preventDefault();
     event.stopPropagation();
     setSelectedShapeId(shapeId);
@@ -4054,7 +4209,7 @@ function PresentationEditor({
       x: Math.max(8, Math.min(window.innerWidth - 220, event.clientX)),
       y: Math.max(8, Math.min(window.innerHeight - 300, event.clientY)),
     });
-  }, []);
+  }, [activeSlide.shapes, fidelityMode]);
 
   const selectedShape = activeSlide.shapes.find(s => s.id === selectedShapeId);
   const contextMenuShape = shapeContextMenu
@@ -4071,6 +4226,36 @@ function PresentationEditor({
 
   // Build slide background style — layer: solid color < gradient < image
   const hasServerBg = useServerBg && serverSlideUrls && serverSlideUrls.length > activeIdx;
+  const viewMode = hasServerBg ? "preview" : "edit";
+  const editabilityNotice = useMemo(() => {
+    if (hasServerBg) {
+      return {
+        icon: <IconEye size={15} />,
+        title: t("page.doc_editor.pptx_preview_notice_title"),
+        detail: t("page.doc_editor.pptx_preview_notice"),
+      };
+    }
+    if (!fidelityMode) return null;
+    if (activeSlideEditability.flattenedImageShapeId) {
+      return {
+        icon: <IconImage size={15} />,
+        title: t("page.doc_editor.pptx_flattened_notice_title"),
+        detail: t("page.doc_editor.pptx_flattened_notice"),
+      };
+    }
+    if (activeSlideEditability.lockedShapeCount > 0) {
+      return {
+        icon: <IconLock size={15} />,
+        title: t("page.doc_editor.pptx_partial_notice_title"),
+        detail: t("page.doc_editor.pptx_partial_notice"),
+      };
+    }
+    return {
+      icon: <IconInfo size={15} />,
+      title: t("page.doc_editor.pptx_edit_notice_title"),
+      detail: t("page.doc_editor.pptx_edit_notice"),
+    };
+  }, [activeSlideEditability.flattenedImageShapeId, activeSlideEditability.lockedShapeCount, fidelityMode, hasServerBg]);
   const slideBg: React.CSSProperties = { backgroundColor: activeSlide.bg || "#ffffff" };
   if (activeSlide.bgGrad) slideBg.backgroundImage = pptxGradToCss(activeSlide.bgGrad);
   if (activeSlide.bgImgUrl) {
@@ -4129,7 +4314,7 @@ function PresentationEditor({
               <div
                 key={slide.id}
                 className={`presentation-editor-thumb${idx === activeIdx ? " is-active" : ""}${dragOverIdx === idx ? " is-drag-over" : ""}`}
-                draggable
+                draggable={!fidelityMode}
                 onClick={() => { setActiveIdx(idx); setSelectedShapeId(null); setEditingText(null); setEditingTableCell(null); }}
                 onDragStart={() => handleThumbDragStart(idx)}
                 onDragOver={(e) => handleThumbDragOver(e, idx)}
@@ -4205,12 +4390,13 @@ function PresentationEditor({
           })}
         </div>
         <div className="presentation-editor-add-slide-controls">
-          <button type="button" onClick={() => addSlide("title-body")} className="presentation-editor-add-slide">
+          <button type="button" onClick={() => addSlide("title-body")} className="presentation-editor-add-slide" disabled={fidelityMode}>
             {t("page.doc_editor.plus_add_slide")}
           </button>
           <select
             value=""
             aria-label={t("page.doc_editor.new_slide_layout")}
+            disabled={fidelityMode}
             onChange={(event) => addSlide(event.target.value as PptxSlideLayout)}
           >
             <option value="" disabled>{t("page.doc_editor.layout")}</option>
@@ -4238,21 +4424,26 @@ function PresentationEditor({
             <IconRedo size={14} />
           </button>
           <div className="presentation-editor-separator" style={{ width: 1, height: 20, background: "#e7e5e4" }} />
+          {fidelityMode && (
+            <span title={t("page.doc_editor.pptx_fidelity_hint")}>
+              <StatusBadge type="gray">{t("page.doc_editor.pptx_fidelity_mode")}</StatusBadge>
+            </span>
+          )}
           {/* Insert tools */}
-          <button onClick={addTextBox} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px" }}>
+          <button onClick={addTextBox} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px" }}>
             {t("page.doc_editor.plus_text")}
           </button>
-          <button onClick={() => addShape("rect")} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 8px" }} title={t("page.doc_editor.rectangle")}>
+          <button onClick={() => addShape("rect")} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 8px" }} title={t("page.doc_editor.rectangle")}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
           </button>
-          <button onClick={() => addShape("ellipse")} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 8px" }} title={t("page.doc_editor.circle")}>
+          <button onClick={() => addShape("ellipse")} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 8px" }} title={t("page.doc_editor.circle")}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><circle cx="12" cy="12" r="9"/></svg>
           </button>
-          <button onClick={() => addShape("line")} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 8px" }} title={t("page.doc_editor.line")}>
+          <button onClick={() => addShape("line")} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 8px" }} title={t("page.doc_editor.line")}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><line x1="4" y1="20" x2="20" y2="4"/></svg>
           </button>
           <button onClick={requestImageInsert} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px" }}>
-            <IconImage size={14} /> {t("page.doc_editor.plus_image").replace(/^\+\s*/, "")}
+            <IconImage size={14} /> {t("component.media_insert.title")}
           </button>
           <input
             ref={imageInputRef}
@@ -4267,7 +4458,7 @@ function PresentationEditor({
               event.target.value = "";
             }}
           />
-          <button onClick={duplicateSlide} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px" }} title={t("page.doc_editor.duplicate_slide")}>
+          <button onClick={duplicateSlide} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px" }} title={t("page.doc_editor.duplicate_slide")}>
             {t("page.doc_editor.duplicate")}
           </button>
           {selectedShapeId && (
@@ -4276,6 +4467,7 @@ function PresentationEditor({
               <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.doc_editor.fill")}</span>
               <input
                 type="color"
+                disabled={fidelityMode}
                 value={selectedShape?.fill || "#ffffff"}
                 onChange={(e) => updateShapeFill(selectedShapeId, e.target.value)}
                 style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
@@ -4283,12 +4475,14 @@ function PresentationEditor({
               <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.doc_editor.stroke")}</span>
               <input
                 type="color"
+                disabled={fidelityMode}
                 value={selectedShape?.stroke || "#1c1917"}
                 onChange={(e) => updateShapeProps(selectedShapeId, { stroke: e.target.value })}
                 style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
               />
               <input
                 type="number"
+                disabled={fidelityMode}
                 min={0}
                 max={20}
                 step={0.5}
@@ -4299,6 +4493,7 @@ function PresentationEditor({
               />
               {selectedShape?.imgUrl && (
                 <select
+                  disabled={fidelityMode}
                   value={selectedShape.imageFit || "cover"}
                   onChange={(e) => updateShapeProps(selectedShapeId, { imageFit: e.target.value as "cover" | "contain" })}
                   style={{ fontSize: 12, padding: "3px 8px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 6, background: "#fff" }}
@@ -4308,16 +4503,17 @@ function PresentationEditor({
                 </select>
               )}
               {/* Z-order */}
-              <button onClick={() => moveShapeZ(selectedShapeId, "up")} className="btn-manor-ghost" style={{ fontSize: 12, padding: "2px 6px" }} title={t("page.doc_editor.bring_forward")}>
+              <button onClick={() => moveShapeZ(selectedShapeId, "up")} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "2px 6px" }} title={t("page.doc_editor.bring_forward")}>
                 <IconArrowUp size={13} />
               </button>
-              <button onClick={() => moveShapeZ(selectedShapeId, "down")} className="btn-manor-ghost" style={{ fontSize: 12, padding: "2px 6px" }} title={t("page.doc_editor.send_backward")}>
+              <button onClick={() => moveShapeZ(selectedShapeId, "down")} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "2px 6px" }} title={t("page.doc_editor.send_backward")}>
                 <IconArrowDown size={13} />
               </button>
               {selectedText && (
                 <>
                   <div className="presentation-editor-separator" style={{ width: 1, height: 20, background: "#e7e5e4" }} />
                   <select
+                    disabled={fidelityMode}
                     value={selectedText.fontFamily || "Aptos"}
                     aria-label={t("page.doc_editor.font")}
                     title={t("page.doc_editor.font")}
@@ -4331,6 +4527,7 @@ function PresentationEditor({
                   </select>
                   <input
                     type="number"
+                    disabled={fidelityMode}
                     min={8}
                     max={120}
                     value={selectedText.fontSize || 16}
@@ -4340,22 +4537,26 @@ function PresentationEditor({
                     style={{ width: 48, fontSize: 12, padding: "2px 4px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4 }}
                   />
                   <button
+                    disabled={fidelityMode}
                     onClick={() => updateSelectedTextStyle({ bold: !selectedText.bold })}
                     className="btn-manor-ghost"
                     style={{ fontSize: 12, padding: "2px 8px", fontWeight: 700, opacity: selectedText.bold ? 1 : 0.4 }}
                   >{t("page.doc_editor.b")}</button>
                   <button
+                    disabled={fidelityMode}
                     onClick={() => updateSelectedTextStyle({ italic: !selectedText.italic })}
                     className="btn-manor-ghost"
                     style={{ fontSize: 12, padding: "2px 8px", fontStyle: "italic", opacity: selectedText.italic ? 1 : 0.4 }}
                   >{t("page.doc_editor.i")}</button>
                   <button
+                    disabled={fidelityMode}
                     onClick={() => updateSelectedTextStyle({ underline: !selectedText.underline })}
                     className="btn-manor-ghost"
                     style={{ fontSize: 12, padding: "2px 8px", textDecoration: "underline", opacity: selectedText.underline ? 1 : 0.4 }}
                   >U</button>
                   <button
                     type="button"
+                    disabled={fidelityMode}
                     onClick={() => updateSelectedTextStyle({ bullet: selectedText.bullet ? undefined : "\u2022", indent: selectedText.bullet ? undefined : selectedText.indent || 24 })}
                     className="btn-manor-ghost"
                     title={t("page.doc_editor.bulleted_list")}
@@ -4366,6 +4567,7 @@ function PresentationEditor({
                   </button>
                   <input
                     type="color"
+                    disabled={fidelityMode}
                     value={selectedText.color || "#000000"}
                     aria-label={t("page.doc_editor.color")}
                     title={t("page.doc_editor.color")}
@@ -4373,6 +4575,7 @@ function PresentationEditor({
                     style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
                   />
                   <select
+                    disabled={fidelityMode}
                     value={selectedText.align || "left"}
                     onChange={(e) => updateSelectedTextStyle({ align: e.target.value })}
                     style={{ fontSize: 12, padding: "3px 8px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 6, background: "#fff" }}
@@ -4382,6 +4585,7 @@ function PresentationEditor({
                     <option value="right">Right</option>
                   </select>
                   <select
+                    disabled={fidelityMode}
                     value={selectedText.lineSpacing || 1.2}
                     aria-label={t("page.doc_editor.line_spacing")}
                     title={t("page.doc_editor.line_spacing")}
@@ -4409,7 +4613,7 @@ function PresentationEditor({
                 <IconSettings size={14} />
                 <span>{t("page.doc_editor.format_options")}</span>
               </button>
-              <button onClick={() => deleteShape(selectedShapeId)} className="btn-manor-ghost presentation-editor-danger-icon" title={t("action.delete")} aria-label={t("action.delete")}>
+              <button onClick={() => deleteShape(selectedShapeId)} disabled={fidelityMode} className="btn-manor-ghost presentation-editor-danger-icon" title={t("action.delete")} aria-label={t("action.delete")}>
                 <IconTrash size={14} />
               </button>
             </div>
@@ -4426,33 +4630,14 @@ function PresentationEditor({
             <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.doc_editor.bg")}</span>
             <input
               type="color"
+              disabled={fidelityMode}
               value={activeSlide.bg || "#ffffff"}
               onChange={(e) => updateSlideBg(e.target.value)}
               style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
             />
             {slides.length > 1 && (
-              <button onClick={deleteSlide} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px", color: "#c14a44" }}>
+              <button onClick={deleteSlide} disabled={fidelityMode} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px", color: "#c14a44" }}>
                 {t("page.doc_editor.delete_slide")}
-              </button>
-            )}
-            {serverSlideUrls && serverSlideUrls.length > 0 && (
-              <button
-                onClick={() => {
-                  setUseServerBg((value) => !value);
-                  setSelectedShapeId(null);
-                  setEditingText(null);
-                  setEditingTableCell(null);
-                }}
-                className="btn-manor-ghost"
-                style={{
-                  fontSize: 11, padding: "4px 10px",
-                  background: useServerBg ? "rgba(79,125,117,0.1)" : undefined,
-                  color: useServerBg ? "#4f7d75" : "#78716c",
-                  border: useServerBg ? "1px solid rgba(79,125,117,0.3)" : "1px solid #e7e5e4",
-                  borderRadius: 6,
-                }}
-              >
-                {useServerBg ? t("action.edit") : t("page.doc_editor.preview")}
               </button>
             )}
             <span className="presentation-editor-page-count" style={{ fontSize: 11, color: "#a8a29e" }}>
@@ -4461,6 +4646,34 @@ function PresentationEditor({
           </div>
         </div>
 
+        {editabilityNotice && (
+          <div className="presentation-editor-capability-notice" role="status">
+            <span className="presentation-editor-capability-icon" aria-hidden="true">{editabilityNotice.icon}</span>
+            <span className="presentation-editor-capability-copy">
+              <strong>{editabilityNotice.title}</strong>
+              <span>{editabilityNotice.detail}</span>
+            </span>
+            {serverSlideUrls && serverSlideUrls.length > 0 && (
+              <TabSwitcher
+                className="presentation-editor-view-switcher"
+                size="sm"
+                ariaLabel={t("page.doc_editor.pptx_view_mode")}
+                value={viewMode}
+                tabs={[
+                  { key: "preview", label: t("page.doc_editor.pptx_preview_mode"), compactLabel: t("page.doc_editor.preview"), icon: <IconEye size={13} /> },
+                  { key: "edit", label: t("page.doc_editor.pptx_edit_mode"), compactLabel: t("action.edit"), icon: <IconSettings size={13} /> },
+                ]}
+                onChange={(nextMode) => {
+                  const preview = nextMode === "preview";
+                  setUseServerBg(preview);
+                  setEditingText(null);
+                  setEditingTableCell(null);
+                  setSelectedShapeId(preview ? null : activeSlideEditability.flattenedImageShapeId);
+                }}
+              />
+            )}
+          </div>
+        )}
         <div className="presentation-editor-workspace">
           {/* Canvas */}
           <div
@@ -4484,17 +4697,33 @@ function PresentationEditor({
           }}>
             {/* Server-rendered slide image as pixel-perfect background */}
             {hasServerBg && (
-              <img
-                src={serverSlideUrls![activeIdx]}
-                alt=""
-                style={{
-                  position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
-                  objectFit: "contain", zIndex: 0, pointerEvents: "none",
-                }}
-              />
+              <>
+                <img
+                  src={serverSlideUrls![activeIdx]}
+                  alt=""
+                  style={{
+                    position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+                    objectFit: "contain", zIndex: 0, pointerEvents: "none",
+                  }}
+                />
+                {activeSlide.shapes.filter((shape) => Boolean(shape.videoUrl)).map((shape) => (
+                  <video
+                    key={`preview-video-${shape.id}`}
+                    className="presentation-editor-native-video"
+                    src={shape.videoUrl}
+                    poster={shape.imgUrl}
+                    controls
+                    playsInline
+                    preload="metadata"
+                    aria-label="Presentation video"
+                    style={{ left: `${shape.x}%`, top: `${shape.y}%`, width: `${shape.w}%`, height: `${shape.h}%` }}
+                  />
+                ))}
+              </>
             )}
             {!hasServerBg && activeSlide.shapes.map((shape) => {
               const isSelected = selectedShapeId === shape.id;
+              const isLockedSource = Boolean(shape.source && !shape.source.editable);
               const shapeBgStyle: React.CSSProperties = {};
               if (shape.gradFill) {
                 shapeBgStyle.background = pptxGradToCss(shape.gradFill);
@@ -4548,7 +4777,8 @@ function PresentationEditor({
                       left: `${shape.x}%`, top: `${shape.y}%`,
                       width: `${shape.w}%`, height: `${shape.h}%`,
                       overflow: isSelected ? "visible" : "auto",
-                      cursor: editingTableCell?.shapeId === shape.id ? "text" : "move",
+                      cursor: isLockedSource ? "default" : editingTableCell?.shapeId === shape.id ? "text" : "move",
+                      pointerEvents: isLockedSource ? "none" : undefined,
                       outline: isSelected ? "2px solid #4f7d75" : undefined,
                       outlineOffset: 2,
                       transform,
@@ -4632,7 +4862,8 @@ function PresentationEditor({
                     border: isSelected ? "2px solid #4f7d75" : borderStyle || "none",
                     borderRadius: borderRadius || 0,
                     opacity: shape.opacity,
-                    cursor: editingText?.shapeId === shape.id ? "text" : "move",
+                    cursor: isLockedSource ? "default" : editingText?.shapeId === shape.id ? "text" : "move",
+                    pointerEvents: isLockedSource ? "none" : undefined,
                     outline: isSelected ? "2px solid rgba(79,125,117,0.3)" : undefined,
                     outlineOffset: 2,
                     display: "flex", flexDirection: "column",
@@ -4644,7 +4875,18 @@ function PresentationEditor({
                     boxShadow: boxShadow,
                   }}
                 >
-                  {shape.imgUrl && (
+                  {shape.videoUrl ? (
+                    <video
+                      className="presentation-editor-native-video presentation-editor-native-video--shape"
+                      src={shape.videoUrl}
+                      poster={shape.imgUrl}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      aria-label="Presentation video"
+                      onMouseDown={(event) => event.stopPropagation()}
+                    />
+                  ) : shape.imgUrl && (
                     shape.imgCrop ? (
                       <div style={{
                         position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
@@ -4652,9 +4894,10 @@ function PresentationEditor({
                       }}>
                         <img src={shape.imgUrl} alt="" style={{
                           position: "absolute",
-                          left: `${-shape.imgCrop.l}%`, top: `${-shape.imgCrop.t}%`,
-                          width: `${100 + shape.imgCrop.l + shape.imgCrop.r}%`,
-                          height: `${100 + shape.imgCrop.t + shape.imgCrop.b}%`,
+                          left: `${-(shape.imgCrop.l / Math.max(0.01, 100 - shape.imgCrop.l - shape.imgCrop.r)) * 100}%`,
+                          top: `${-(shape.imgCrop.t / Math.max(0.01, 100 - shape.imgCrop.t - shape.imgCrop.b)) * 100}%`,
+                          width: `${10000 / Math.max(0.01, 100 - shape.imgCrop.l - shape.imgCrop.r)}%`,
+                          height: `${10000 / Math.max(0.01, 100 - shape.imgCrop.t - shape.imgCrop.b)}%`,
                           objectFit: "fill",
                         }} />
                       </div>
@@ -4681,14 +4924,15 @@ function PresentationEditor({
                           marginTop: t.spaceBefore ? `${t.spaceBefore}pt` : t.text === "" ? "0.3em" : "0.05em",
                           marginBottom: t.spaceAfter ? `${t.spaceAfter}pt` : "0.05em",
                           paddingLeft: t.indent ? `${t.indent}px` : t.bullet ? "18px" : undefined,
-                          fontSize: t.fontSize ? `${Math.max(8, t.fontSize * 0.85)}px` : "14px",
+                          fontSize: t.fontSize ? `${(t.fontSize / 5.4).toFixed(3)}cqh` : "2.6cqh",
                           fontWeight: t.bold ? 700 : 400,
                           fontStyle: t.italic ? "italic" : undefined,
                           textDecoration: [t.underline ? "underline" : "", t.strikethrough ? "line-through" : ""].filter(Boolean).join(" ") || undefined,
                           color: t.color || _activeTheme.tx1 || "#000000",
                           textAlign: (t.align as any) || undefined,
                           lineHeight: t.lineSpacing || 1.35,
-                          wordBreak: "break-word",
+                          wordBreak: "normal",
+                          overflowWrap: "break-word",
                           whiteSpace: "pre-wrap",
                           minHeight: "1.2em",
                           fontFamily: t.fontFamily ? `"${t.fontFamily}", sans-serif` : (_editorMinorFont ? `"${_editorMinorFont}", sans-serif` : undefined),
@@ -4729,11 +4973,11 @@ function PresentationEditor({
                                 fontWeight: run.bold ? 700 : undefined,
                                 fontStyle: run.italic ? "italic" : undefined,
                                 textDecoration: [run.underline ? "underline" : "", run.strikethrough ? "line-through" : ""].filter(Boolean).join(" ") || undefined,
-                                fontSize: run.fontSize ? `${Math.max(8, run.fontSize * 0.85)}px` : undefined,
+                                fontSize: run.fontSize ? `${(run.fontSize / 5.4).toFixed(3)}cqh` : undefined,
                                 color: run.color || undefined,
                                 fontFamily: run.fontFamily ? `"${run.fontFamily}", sans-serif` : undefined,
                                 verticalAlign: run.baseline ? (run.baseline > 0 ? "super" : "sub") : undefined,
-                                letterSpacing: run.spacing ? `${run.spacing}pt` : undefined,
+                                letterSpacing: run.spacing ? `${(run.spacing / 5.4).toFixed(3)}cqh` : undefined,
                               }}>{run.text}</span>
                             )) : t.text}
                           </>
@@ -4828,6 +5072,7 @@ function PresentationEditor({
                   </span>
                   <input
                     type="range"
+                    disabled={fidelityMode}
                     min={0}
                     max={100}
                     step={5}
@@ -4843,6 +5088,7 @@ function PresentationEditor({
                   <label className="presentation-editor-format-row">
                     <span>{t("page.doc_editor.image_fit")}</span>
                     <select
+                      disabled={fidelityMode}
                       value={selectedShape.imageFit || "cover"}
                       onChange={(event) => updateShapeProps(selectedShape.id, { imageFit: event.target.value as "cover" | "contain" })}
                     >
@@ -4859,23 +5105,23 @@ function PresentationEditor({
               <section className="presentation-editor-format-section">
                 <h3>{t("page.doc_editor.arrange")}</h3>
                 <div className="presentation-editor-format-actions">
-                  <button type="button" onClick={() => moveShapeZ(selectedShape.id, "up")}>
+                  <button type="button" disabled={fidelityMode} onClick={() => moveShapeZ(selectedShape.id, "up")}>
                     <IconArrowUp size={14} /> {t("page.doc_editor.bring_forward")}
                   </button>
-                  <button type="button" onClick={() => moveShapeZ(selectedShape.id, "down")}>
+                  <button type="button" disabled={fidelityMode} onClick={() => moveShapeZ(selectedShape.id, "down")}>
                     <IconArrowDown size={14} /> {t("page.doc_editor.send_backward")}
                   </button>
                 </div>
               </section>
 
               <section className="presentation-editor-format-section presentation-editor-format-actions-section">
-                <button type="button" onClick={() => copyShape(selectedShape.id)}>
+                <button type="button" disabled={fidelityMode} onClick={() => copyShape(selectedShape.id)}>
                   <IconCopy size={14} /> {t("action.copy")}
                 </button>
-                <button type="button" onClick={() => duplicateShape(selectedShape.id)}>
+                <button type="button" disabled={fidelityMode} onClick={() => duplicateShape(selectedShape.id)}>
                   <IconCopy size={14} /> {t("page.doc_editor.duplicate_object")}
                 </button>
-                <button type="button" className="is-danger" onClick={() => deleteShape(selectedShape.id)}>
+                <button type="button" disabled={fidelityMode} className="is-danger" onClick={() => deleteShape(selectedShape.id)}>
                   <IconTrash size={14} /> {t("action.delete")}
                 </button>
               </section>
@@ -4886,6 +5132,7 @@ function PresentationEditor({
           <label htmlFor="presentation-speaker-notes">{t("page.doc_editor.speaker_notes")}</label>
           <textarea
             id="presentation-speaker-notes"
+            disabled={fidelityMode && !activeSlide.notesPart}
             value={notesDraft}
             placeholder={t("page.doc_editor.speaker_notes_placeholder")}
             onChange={(event) => setNotesDraft(event.target.value)}
@@ -4974,6 +5221,11 @@ function PresentationEditor({
           </div>
         </div>
       ), document.body)}
+      <MediaInsertDialog
+        open={mediaInsertOpen}
+        onClose={() => setMediaInsertOpen(false)}
+        onInsert={handleMediaInsert}
+      />
     </div>
   );
 }
@@ -4991,9 +5243,9 @@ export default function DocEditor() {
   const showSaveSuccess = useToastStore((s) => s.success);
   const showSaveError = useToastStore((s) => s.error);
   const [content, setContent] = useState("");
+  const [textFileFormat, setTextFileFormat] = useState<PreservedTextFormat | null>(null);
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "unsaved">("saved");
   const [showPreview, setShowPreview] = useState(true);
-  const [codePreviewAssetReplacements, setCodePreviewAssetReplacements] = useState<Record<string, PreviewAssetReplacement>>({});
   const [markdownViewMode, setMarkdownViewMode] = useState<MarkdownViewMode>("split");
   const [showVersions, setShowVersions] = useState(false);
   const [showComments, setShowComments] = useState(false);
@@ -5001,26 +5253,37 @@ export default function DocEditor() {
   const [activeCommentId, setActiveCommentId] = useState<string | null>(null);
   const [documentComments, setDocumentComments] = useState<Comment[]>([]);
   const [lineCount, setLineCount] = useState(1);
+  const [codeCursor, setCodeCursor] = useState({ line: 1, column: 1 });
   const [richTextBlock, setRichTextBlock] = useState("p");
   const [richTextFont, setRichTextFont] = useState("Inter");
   const [richTextSize, setRichTextSize] = useState("16");
   const [liveDiff, setLiveDiff] = useState<string | null>(null);
   const [liveEditNotice, setLiveEditNotice] = useState<string | null>(null);
+  const [documentMediaInsertOpen, setDocumentMediaInsertOpen] = useState(false);
 
   // For DOCX: convert to HTML for editing, track original import
   const [docxHtml, setDocxHtml] = useState<string | null>(null);
   const [docxLoading, setDocxLoading] = useState(false);
+  const [docxFidelityMode, setDocxFidelityMode] = useState(false);
 
   // For XLSX: parsed sheet data
   const [sheetData, setSheetData] = useState<any[][] | null>(null);
   const [sheetCharts, setSheetCharts] = useState<SheetChartConfig[]>([]);
   const [sheetStyles, setSheetStyles] = useState<SheetStyleMap>({});
   const [xlsxLoading, setXlsxLoading] = useState(false);
+  const [xlsxSheets, setXlsxSheets] = useState<SpreadsheetSheetModel[]>([]);
+  const [xlsxActiveSheetIndex, setXlsxActiveSheetIndex] = useState(0);
+  const [xlsxFidelityMode, setXlsxFidelityMode] = useState(false);
 
   // For PPTX: parsed slides + server-rendered images
   const [pptxSlides, setPptxSlides] = useState<PptxSlide[]>([]);
   const [pptxLoading, setPptxLoading] = useState(false);
   const [pptxServerUrls, setPptxServerUrls] = useState<string[]>([]);
+  const [pptxFidelityMode, setPptxFidelityMode] = useState(false);
+  const [pptxLiveEditTarget, setPptxLiveEditTarget] = useState<PresentationLiveEditTarget>({
+    activeSlideIndex: 0,
+    selectedShapeId: null,
+  });
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -5034,18 +5297,49 @@ export default function DocEditor() {
   const codeGutterRef = useRef<HTMLDivElement>(null);
   const codeHighlightRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef("");
+  const textOriginalBufferRef = useRef<ArrayBuffer | null>(null);
+  const textBaselineRef = useRef<string | null>(null);
+  const textFileFormatRef = useRef<PreservedTextFormat | null>(null);
+  const csvFormatRef = useRef<DelimitedTextFormat>({ delimiter: ",", lineEnding: "\n", finalLineEnding: false });
+  const docxOriginalBufferRef = useRef<ArrayBuffer | null>(null);
+  const docxBaselineHtmlRef = useRef<string | null>(null);
   const sheetDataRef = useRef<any[][] | null>(null);
   const sheetChartsRef = useRef<SheetChartConfig[]>([]);
   const sheetStylesRef = useRef<SheetStyleMap>({});
+  const xlsxSheetsRef = useRef<SpreadsheetSheetModel[]>([]);
+  const xlsxOriginalBufferRef = useRef<ArrayBuffer | null>(null);
+  const xlsxBaselineSheetsRef = useRef<SpreadsheetSheetSnapshot[] | null>(null);
+  const xlsxSaveRevisionRef = useRef(0);
+  const xlsxSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const pptxSlidesRef = useRef<PptxSlide[]>([]);
+  const pptxOriginalBufferRef = useRef<ArrayBuffer | null>(null);
+  const pptxBaselineSlidesRef = useRef<PptxSlide[] | null>(null);
   const pptxSaveRevisionRef = useRef(0);
   const pptxSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
-  const codePreviewObjectUrlsRef = useRef<string[]>([]);
   const knowledgeReturnTo = getKnowledgeReturnTo(location.state);
 
   useEffect(() => {
     setLiveDiff(null);
     setLiveEditNotice(null);
+    textOriginalBufferRef.current = null;
+    textBaselineRef.current = null;
+    textFileFormatRef.current = null;
+    csvFormatRef.current = { delimiter: ",", lineEnding: "\n", finalLineEnding: false };
+    setTextFileFormat(null);
+    docxOriginalBufferRef.current = null;
+    docxBaselineHtmlRef.current = null;
+    setDocxFidelityMode(false);
+    xlsxSheetsRef.current = [];
+    xlsxOriginalBufferRef.current = null;
+    xlsxBaselineSheetsRef.current = null;
+    xlsxSaveRevisionRef.current += 1;
+    setXlsxSheets([]);
+    setXlsxActiveSheetIndex(0);
+    setXlsxFidelityMode(false);
+    pptxOriginalBufferRef.current = null;
+    pptxBaselineSlidesRef.current = null;
+    setPptxFidelityMode(false);
+    setPptxLiveEditTarget({ activeSlideIndex: 0, selectedShapeId: null });
     pptxSaveRevisionRef.current += 1;
   }, [docId]);
   useEffect(() => {
@@ -5083,6 +5377,11 @@ export default function DocEditor() {
     navigate(`/viewer/${doc.id}`, { replace: true, state: location.state });
   }, [canEditCurrentDoc, currentUser, doc, location.state, navigate]);
 
+  useEffect(() => {
+    if (!doc || !isLegacyOfficeFile(doc.name)) return;
+    navigate(`/viewer/${doc.id}`, { replace: true, state: location.state });
+  }, [doc, location.state, navigate]);
+
   const { data: contentData, isLoading: contentLoading } = useQuery({
     queryKey: ["document-content", docId],
     queryFn: () => api.documents.getContent(docId!),
@@ -5107,19 +5406,116 @@ export default function DocEditor() {
   }, [editorComments]);
 
   const saveMutation = useMutation({
-    mutationFn: (text: string) => {
+    mutationFn: async (text: string) => {
       if (!canEditCurrentDoc) throw new Error("You do not have edit access to this document");
-      return api.documents.saveContent(docId!, text);
+      const originalBuffer = docxOriginalBufferRef.current;
+      const baselineHtml = docxBaselineHtmlRef.current;
+      if (doc?.name && isOfficeDoc(doc.name) && originalBuffer && baselineHtml != null) {
+        const { collectDocumentParagraphEdits, preserveDocumentFile } = await import("../lib/documentOoxml");
+        const edits = collectDocumentParagraphEdits(baselineHtml, text);
+        const file = await preserveDocumentFile(originalBuffer, edits, doc.name);
+        const updatedDocument = await api.documents.replaceFile(docId!, file);
+        return {
+          updatedDocument,
+          savedBuffer: await file.arrayBuffer(),
+          savedHtml: text,
+          savedTextBuffer: null,
+          savedText: null,
+        };
+      }
+      const textBuffer = textOriginalBufferRef.current;
+      const baselineText = textBaselineRef.current;
+      const textFormat = textFileFormatRef.current;
+      if (doc?.name && textBuffer && baselineText != null && textFormat) {
+        const bytes = encodeTextFile(text, baselineText, textFormat);
+        const fileBytes = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+        const file = new File([fileBytes], doc.name, { type: doc.mime_type || "text/plain;charset=utf-8" });
+        const updatedDocument = await api.documents.replaceFile(docId!, file);
+        return {
+          updatedDocument,
+          savedBuffer: null,
+          savedHtml: null,
+          savedTextBuffer: fileBytes,
+          savedText: text,
+        };
+      }
+      await api.documents.saveContent(docId!, text);
+      return {
+        updatedDocument: null,
+        savedBuffer: null,
+        savedHtml: null,
+        savedTextBuffer: null,
+        savedText: null,
+      };
     },
     onMutate: () => setSaveStatus("saving"),
-    onSuccess: () => {
+    onSuccess: ({ updatedDocument, savedBuffer, savedHtml, savedTextBuffer, savedText }) => {
       setSaveStatus("saved");
-      queryClient.invalidateQueries({ queryKey: ["documents"] });
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
+      if (updatedDocument) queryClient.setQueryData(["document", docId], updatedDocument);
+      if (savedBuffer && savedHtml != null) {
+        docxOriginalBufferRef.current = savedBuffer;
+        docxBaselineHtmlRef.current = savedHtml;
+      }
+      if (savedTextBuffer && savedText != null) {
+        textOriginalBufferRef.current = savedTextBuffer;
+        textBaselineRef.current = savedText;
+      }
+      invalidateKnowledgeQueries(queryClient);
       queryClient.invalidateQueries({ queryKey: ["fs-wiki-links", doc?.fs_path] });
       if (showVersions) refetchVersions();
     },
-    onError: () => setSaveStatus("unsaved"),
+    onError: (error) => {
+      setSaveStatus("unsaved");
+      showSaveError(error instanceof Error ? error.message : t("page.blueprint_detail.save_failed"));
+    },
+  });
+
+  const spreadsheetSaveMutation = useMutation({
+    mutationFn: ({ sheets, revision }: { sheets: SpreadsheetSheetSnapshot[]; revision: number }) => {
+      const saveTask = xlsxSaveQueueRef.current.catch(() => undefined).then(async () => {
+        if (!canEditCurrentDoc) throw new Error("You do not have edit access to this document");
+        if (revision !== xlsxSaveRevisionRef.current) return { updatedDocument: null, revision };
+        const originalBuffer = xlsxOriginalBufferRef.current;
+        const baselineSheets = xlsxBaselineSheetsRef.current;
+        if (!originalBuffer || !baselineSheets) {
+          throw new Error("The original workbook is unavailable for a fidelity-preserving save.");
+        }
+        const { preserveSpreadsheetFile } = await import("../lib/spreadsheetOoxml");
+        const file = await preserveSpreadsheetFile(
+          originalBuffer,
+          baselineSheets,
+          sheets,
+          doc?.name || "Workbook.xlsx",
+        );
+        if (revision !== xlsxSaveRevisionRef.current) return { updatedDocument: null, revision };
+        const updatedDocument = await api.documents.replaceFile(docId!, file);
+        return {
+          updatedDocument,
+          revision,
+          savedBuffer: await file.arrayBuffer(),
+          savedSheets: sheets,
+        };
+      });
+      xlsxSaveQueueRef.current = saveTask;
+      return saveTask;
+    },
+    onMutate: ({ revision }) => {
+      if (revision === xlsxSaveRevisionRef.current) setSaveStatus("saving");
+    },
+    onSuccess: ({ updatedDocument, revision, savedBuffer, savedSheets }) => {
+      if (revision === xlsxSaveRevisionRef.current) setSaveStatus("saved");
+      if (!updatedDocument || !savedBuffer || !savedSheets) return;
+      xlsxOriginalBufferRef.current = savedBuffer;
+      xlsxBaselineSheetsRef.current = structuredClone(savedSheets);
+      queryClient.setQueryData(["document", docId], updatedDocument);
+      invalidateKnowledgeQueries(queryClient);
+      queryClient.invalidateQueries({ queryKey: ["fs-wiki-links", doc?.fs_path] });
+      if (showVersions) refetchVersions();
+    },
+    onError: (error, { revision }) => {
+      if (revision === xlsxSaveRevisionRef.current) setSaveStatus("unsaved");
+      showSaveError(error instanceof Error ? error.message : t("page.blueprint_detail.save_failed"));
+    },
   });
 
   const presentationSaveMutation = useMutation({
@@ -5127,11 +5523,20 @@ export default function DocEditor() {
       const saveTask = pptxSaveQueueRef.current.catch(() => undefined).then(async () => {
         if (!canEditCurrentDoc) throw new Error("You do not have edit access to this document");
         if (revision !== pptxSaveRevisionRef.current) return { updatedDocument: null, revision };
-        const { buildPresentationFile } = await import("../lib/presentationPptx");
-        const file = await buildPresentationFile(slides, doc?.name || "Presentation.pptx");
+        let file: File;
+        const originalBuffer = pptxOriginalBufferRef.current;
+        const baselineSlides = pptxBaselineSlidesRef.current;
+        if (originalBuffer && baselineSlides) {
+          const { preservePresentationFile } = await import("../lib/presentationOoxmlPatch");
+          file = await preservePresentationFile(originalBuffer, baselineSlides, slides, doc?.name || "Presentation.pptx");
+        } else {
+          const { buildPresentationFile } = await import("../lib/presentationPptx");
+          file = await buildPresentationFile(slides, doc?.name || "Presentation.pptx");
+        }
         if (revision !== pptxSaveRevisionRef.current) return { updatedDocument: null, revision };
         const updatedDocument = await api.documents.replaceFile(docId!, file);
-        return { updatedDocument, revision };
+        const savedBuffer = originalBuffer ? await file.arrayBuffer() : null;
+        return { updatedDocument, revision, savedBuffer, savedSlides: originalBuffer ? slides : null };
       });
       pptxSaveQueueRef.current = saveTask;
       return saveTask;
@@ -5139,18 +5544,23 @@ export default function DocEditor() {
     onMutate: ({ revision }) => {
       if (revision === pptxSaveRevisionRef.current) setSaveStatus("saving");
     },
-    onSuccess: ({ updatedDocument, revision }) => {
+    onSuccess: ({ updatedDocument, revision, savedBuffer, savedSlides }) => {
       if (revision === pptxSaveRevisionRef.current) setSaveStatus("saved");
       if (!updatedDocument) return;
+      if (savedBuffer && savedSlides) {
+        pptxOriginalBufferRef.current = savedBuffer;
+        pptxBaselineSlidesRef.current = JSON.parse(JSON.stringify(savedSlides)) as PptxSlide[];
+      }
       queryClient.setQueryData(["document", docId], updatedDocument);
-      queryClient.invalidateQueries({ queryKey: ["documents"] });
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
+      invalidateKnowledgeQueries(queryClient);
       queryClient.invalidateQueries({ queryKey: ["fs-wiki-links", doc?.fs_path] });
       setPptxServerUrls([]);
       if (showVersions) refetchVersions();
     },
-    onError: (_error, { revision }) => {
+    onError: (error, { revision }) => {
       if (revision === pptxSaveRevisionRef.current) setSaveStatus("unsaved");
+      const message = error instanceof Error ? error.message : t("page.blueprint_detail.save_failed");
+      showSaveError(message);
     },
   });
 
@@ -5159,6 +5569,20 @@ export default function DocEditor() {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
+    }
+    if (doc?.name && isSpreadsheetFile(doc.name) && xlsxOriginalBufferRef.current && xlsxBaselineSheetsRef.current) {
+      if (saveStatus === "saved" && !spreadsheetSaveMutation.isPending) return true;
+      const revision = xlsxSaveRevisionRef.current;
+      const sheets = xlsxSheetsRef.current.map((sheet) => ({
+        name: sheet.name,
+        data: structuredClone(sheet.data),
+      }));
+      try {
+        await spreadsheetSaveMutation.mutateAsync({ sheets, revision });
+        return true;
+      } catch {
+        return false;
+      }
     }
     if (doc?.name && isPptxFile(doc.name)) {
       if (saveStatus === "saved" && !presentationSaveMutation.isPending) return true;
@@ -5177,21 +5601,7 @@ export default function DocEditor() {
     } catch {
       return false;
     }
-  }, [content, doc?.name, docId, presentationSaveMutation, saveMutation, saveStatus]);
-
-  const handleManualSave = useCallback(async () => {
-    const saved = await flushSave(content);
-    if (saved) {
-      showSaveSuccess(t("page.blueprint_detail.saved"));
-      return;
-    }
-    showSaveError(t("page.blueprint_detail.save_failed"));
-  }, [content, flushSave, showSaveError, showSaveSuccess]);
-
-  const goBackToKnowledge = useCallback(async () => {
-    const saved = await flushSave(content);
-    if (saved) navigate(knowledgeReturnTo || "/knowledge");
-  }, [content, flushSave, knowledgeReturnTo, navigate]);
+  }, [content, doc?.name, docId, presentationSaveMutation, saveMutation, saveStatus, spreadsheetSaveMutation]);
 
   // Derived
   const mode: EditorMode = doc ? detectMode(doc.name) : "richtext";
@@ -5200,20 +5610,10 @@ export default function DocEditor() {
   const isXlsx = doc ? isSpreadsheetFile(doc.name) : false;
   const isCsv = doc ? isCsvFile(doc.name) : false;
   const isPptx = doc ? isPptxFile(doc.name) : false;
-  const codeLanguage = useMemo(() => codeLanguageForFile(docName), [docName]);
-  const codeLanguageName = useMemo(() => codeLanguageLabel(docName), [docName]);
-  const htmlPreviewAssetRefs = useMemo(
-    () => (isHtmlFile(docName) ? extractLocalHtmlAssetRefs(content) : []),
-    [content, docName],
-  );
-  const htmlPreviewAssetRefKey = useMemo(
-    () => htmlPreviewAssetRefs.slice().sort().join("\n"),
-    [htmlPreviewAssetRefs],
-  );
-  const codePreviewContent = useMemo(
-    () => (isHtmlFile(docName) ? injectHtmlPreviewNavigationGuard(rewriteHtmlLocalAssetUrls(content, codePreviewAssetReplacements)) : content),
-    [codePreviewAssetReplacements, content, docName],
-  );
+  const activeXlsxSheet = xlsxSheets[xlsxActiveSheetIndex];
+  const xlsxSheetTabs = xlsxSheets.flatMap((sheet, index) => (
+    !sheet.hidden && sheet.name !== SPREADSHEET_CHARTS_SHEET ? [{ index, name: sheet.name }] : []
+  ));
 
   const { data: wikiLinkData } = useQuery({
     queryKey: ["fs-wiki-links", doc?.fs_path],
@@ -5221,77 +5621,55 @@ export default function DocEditor() {
     enabled: Boolean(doc?.fs_path && mode === "markdown"),
   });
 
-  useEffect(() => {
-    const revokePreviewUrls = () => {
-      codePreviewObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-      codePreviewObjectUrlsRef.current = [];
-    };
-
-    if (!doc?.fs_path || !isHtmlFile(docName) || !htmlPreviewAssetRefs.length) {
-      revokePreviewUrls();
-      setCodePreviewAssetReplacements({});
-      return;
-    }
-
-    let cancelled = false;
-    const currentFsPath = doc.fs_path;
-
-    async function loadPreviewAssets() {
-      const nextAssetReplacements: Record<string, PreviewAssetReplacement> = {};
-      const nextObjectUrls: string[] = [];
-
-      await Promise.all(
-        htmlPreviewAssetRefs.map(async (ref) => {
-          const path = resolvePreviewAssetPath(currentFsPath, ref);
-          if (!path) return;
-          try {
-            const result = await api.fs.read(path);
-            const inlineKind = previewAssetKind(ref, result);
-            if (inlineKind === "style" || inlineKind === "script") {
-              nextAssetReplacements[ref] = { kind: inlineKind, value: result.content };
-              return;
-            }
-            const objectUrl = URL.createObjectURL(blobFromFsReadResult(result));
-            nextAssetReplacements[ref] = { kind: "url", value: objectUrl };
-            nextObjectUrls.push(objectUrl);
-          } catch {
-            // Keep the original URL in the preview. The browser console will
-            // surface the missing asset, but the editor itself should remain usable.
-          }
-        }),
-      );
-
-      if (cancelled) {
-        nextObjectUrls.forEach((url) => URL.revokeObjectURL(url));
-        return;
-      }
-
-      revokePreviewUrls();
-      codePreviewObjectUrlsRef.current = nextObjectUrls;
-      setCodePreviewAssetReplacements(nextAssetReplacements);
-    }
-
-    loadPreviewAssets();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [doc?.fs_path, docName, htmlPreviewAssetRefKey]);
-
-  useEffect(() => () => {
-    codePreviewObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-    codePreviewObjectUrlsRef.current = [];
-  }, []);
-
   useEffect(() => { contentRef.current = content; }, [content]);
   useEffect(() => { sheetDataRef.current = sheetData; }, [sheetData]);
   useEffect(() => { sheetChartsRef.current = sheetCharts; }, [sheetCharts]);
   useEffect(() => { sheetStylesRef.current = sheetStyles; }, [sheetStyles]);
+  useEffect(() => { xlsxSheetsRef.current = xlsxSheets; }, [xlsxSheets]);
   useEffect(() => { pptxSlidesRef.current = pptxSlides; }, [pptxSlides]);
+
+  // Load text-like files from their original bytes so the editor and viewer
+  // agree on BOM/UTF-16 decoding. Saving can then restore the same encoding
+  // and newline convention instead of silently normalizing every file.
+  useEffect(() => {
+    if (!docId || !doc?.name || isXlsx || !["text", "markdown", "code", "spreadsheet", "diagram"].includes(mode)) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const url = await api.documents.download(docId);
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Text file download failed (${response.status})`);
+        const buffer = await response.arrayBuffer();
+        const decoded = decodeTextFile(buffer);
+        if (cancelled) return;
+        textOriginalBufferRef.current = buffer.slice(0);
+        textBaselineRef.current = decoded.text;
+        textFileFormatRef.current = decoded.format;
+        setTextFileFormat(decoded.format);
+        setContent(decoded.text);
+        contentRef.current = decoded.text;
+        if (isCsv) {
+          const csvFormat = detectDelimitedTextFormat(decoded.text);
+          csvFormatRef.current = csvFormat;
+          setSheetData(parseDelimitedText(decoded.text, csvFormat).rows);
+          setSheetCharts([]);
+          setSheetStyles({});
+        }
+        if (!decoded.format.safeToSave) {
+          setLiveEditNotice("Unknown text encoding detected. Saving is disabled to protect the original file.");
+        }
+        setSaveStatus("saved");
+      } catch {
+        // The content API remains the fallback for metadata-only documents.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [doc?.name, docId, isCsv, isXlsx, mode]);
 
   // Load text content
   useEffect(() => {
     if (contentData?.content != null) {
+      if (textOriginalBufferRef.current) return;
       const spreadsheetPayload = parseSpreadsheetPayload(contentData.content);
       if (spreadsheetPayload) {
         setContent(serializeSpreadsheetContent(spreadsheetPayload.data, spreadsheetPayload.charts, isXlsx, spreadsheetPayload.styles));
@@ -5301,7 +5679,9 @@ export default function DocEditor() {
       } else {
         setContent(contentData.content);
         if (isCsv) {
-          setSheetData(parseCsvText(contentData.content));
+          const csvFormat = detectDelimitedTextFormat(contentData.content);
+          csvFormatRef.current = csvFormat;
+          setSheetData(parseDelimitedText(contentData.content, csvFormat).rows);
           setSheetCharts([]);
           setSheetStyles({});
         }
@@ -5323,11 +5703,19 @@ export default function DocEditor() {
         if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
           const mammoth = await import("mammoth");
           const result = await mammoth.convertToHtml({ arrayBuffer: buf });
-          setDocxHtml(result.value);
-          setContent(result.value);
+          const { annotateDocumentHtml, extractDocumentParagraphSources } = await import("../lib/documentOoxml");
+          const annotatedHtml = annotateDocumentHtml(result.value, await extractDocumentParagraphSources(buf));
+          docxOriginalBufferRef.current = buf.slice(0);
+          docxBaselineHtmlRef.current = annotatedHtml;
+          setDocxFidelityMode(true);
+          setDocxHtml(annotatedHtml);
+          setContent(annotatedHtml);
         } else {
           // Previously saved as HTML text — load directly
           const html = new TextDecoder().decode(buf);
+          docxOriginalBufferRef.current = null;
+          docxBaselineHtmlRef.current = null;
+          setDocxFidelityMode(false);
           setDocxHtml(html);
           setContent(html);
         }
@@ -5337,7 +5725,14 @@ export default function DocEditor() {
         try {
           const textRes = await api.documents.getContent(docId);
           const html = typeof textRes === "string" ? textRes : textRes.content;
-          if (html) { setDocxHtml(html); setContent(html); return; }
+          if (html) {
+            docxOriginalBufferRef.current = null;
+            docxBaselineHtmlRef.current = null;
+            setDocxFidelityMode(false);
+            setDocxHtml(html);
+            setContent(html);
+            return;
+          }
         } catch { /* ignore */ }
         setDocxHtml(`<p>${t("page.doc_editor.failed_to_load_document_for_editing")}</p>`);
       } finally {
@@ -5348,7 +5743,7 @@ export default function DocEditor() {
 
   // Load XLSX: download blob → xlsx → data[][] (or CSV fallback)
   useEffect(() => {
-    if (!doc || !docId || !isXlsx) return;
+    if (!docId || !isXlsx) return;
     setXlsxLoading(true);
     (async () => {
       try {
@@ -5358,16 +5753,46 @@ export default function DocEditor() {
         const bytes = new Uint8Array(buf);
         if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
           const XLSX = await import("xlsx");
-          const wb = XLSX.read(buf, { type: "array" });
-          const firstSheet = wb.SheetNames.find((name: string) => name !== SPREADSHEET_CHARTS_SHEET) || wb.SheetNames[0];
-          const data = normalizeSheetData(XLSX.utils.sheet_to_json<any[]>(wb.Sheets[firstSheet], { header: 1 }) as any[][]);
-          const metadata = readWorkbookEditorMetadata(wb, data);
-          setSheetData(data);
+          const wb = XLSX.read(buf, {
+            type: "array",
+            cellFormula: true,
+            cellNF: true,
+            cellStyles: true,
+            cellText: true,
+          });
+          const chartsBySheet = await spreadsheetChartsFromFile(buf, XLSX, wb);
+          const parsedSheets = spreadsheetSheetsFromWorkbook(XLSX, wb)
+            .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }));
+          const firstSheetIndex = Math.max(0, parsedSheets.findIndex((sheet) => (
+            !sheet.hidden && sheet.name !== SPREADSHEET_CHARTS_SHEET
+          )));
+          const activeSheet = parsedSheets[firstSheetIndex] || parsedSheets[0];
+          if (!activeSheet) throw new Error("The workbook has no worksheets.");
+          const metadata = readWorkbookEditorMetadata(wb, activeSheet.data);
+          const nextSheets = parsedSheets.map((sheet, index) => index === firstSheetIndex
+            ? { ...sheet, styles: { ...sheet.styles, ...metadata.styles } }
+            : sheet);
+          const nextActiveSheet = nextSheets[firstSheetIndex];
+          xlsxOriginalBufferRef.current = buf.slice(0);
+          xlsxBaselineSheetsRef.current = nextSheets.map((sheet) => ({
+            name: sheet.name,
+            data: structuredClone(sheet.data),
+          }));
+          xlsxSheetsRef.current = nextSheets;
+          setXlsxFidelityMode(true);
+          setXlsxSheets(nextSheets);
+          setXlsxActiveSheetIndex(firstSheetIndex);
+          setSheetData(nextActiveSheet.data);
           setSheetCharts(metadata.charts);
-          setSheetStyles(metadata.styles);
+          setSheetStyles(nextActiveSheet.styles as SheetStyleMap);
         } else {
           // Previously saved as CSV — parse directly
           const text = new TextDecoder().decode(buf);
+          xlsxOriginalBufferRef.current = null;
+          xlsxBaselineSheetsRef.current = null;
+          xlsxSheetsRef.current = [];
+          setXlsxFidelityMode(false);
+          setXlsxSheets([]);
           const spreadsheetPayload = parseSpreadsheetPayload(text);
           if (spreadsheetPayload) {
             setSheetData(spreadsheetPayload.data);
@@ -5381,11 +5806,16 @@ export default function DocEditor() {
         }
       } catch (e) {
         console.error("Failed to load XLSX for editing:", e);
+        xlsxOriginalBufferRef.current = null;
+        xlsxBaselineSheetsRef.current = null;
+        xlsxSheetsRef.current = [];
+        setXlsxFidelityMode(false);
+        setXlsxSheets([]);
       } finally {
         setXlsxLoading(false);
       }
     })();
-  }, [doc, docId, isXlsx]);
+  }, [docId, isXlsx]);
 
   // Load PPTX: fetch server-rendered slides + download blob → parse slides (or text fallback)
   useEffect(() => {
@@ -5440,6 +5870,9 @@ export default function DocEditor() {
           const parsed = await parsePptxForEditor(buf);
           if (!cancelled) {
             const nextSlides = parsed.length > 0 ? parsed : [{ id: genId(), bg: "#ffffff", shapes: [] }];
+            pptxOriginalBufferRef.current = buf.slice(0);
+            pptxBaselineSlidesRef.current = JSON.parse(JSON.stringify(nextSlides)) as PptxSlide[];
+            setPptxFidelityMode(true);
             setPptxSlides(nextSlides);
             setContent(slidesToText(nextSlides));
             setSaveStatus("saved");
@@ -5448,6 +5881,9 @@ export default function DocEditor() {
           // AI-drafted text — parse into slide structures
           const text = new TextDecoder().decode(bytes);
           if (!cancelled) {
+            pptxOriginalBufferRef.current = null;
+            pptxBaselineSlidesRef.current = null;
+            setPptxFidelityMode(false);
             setPptxSlides(textToSlides(text));
             setContent(text);
             setSaveStatus("saved");
@@ -5460,6 +5896,9 @@ export default function DocEditor() {
           const textRes = await api.documents.getContent(docId);
           const text = typeof textRes === "string" ? textRes : textRes.content;
           if (text && !cancelled) {
+            pptxOriginalBufferRef.current = null;
+            pptxBaselineSlidesRef.current = null;
+            setPptxFidelityMode(false);
             setPptxSlides(textToSlides(text));
             setContent(text);
             setSaveStatus("saved");
@@ -5519,6 +5958,19 @@ export default function DocEditor() {
     [canEditCurrentDoc, saveMutation],
   );
 
+  const scheduleSpreadsheetSave = useCallback((sheets: SpreadsheetSheetModel[]) => {
+    if (!canEditCurrentDoc) return;
+    const revision = xlsxSaveRevisionRef.current + 1;
+    xlsxSaveRevisionRef.current = revision;
+    setSaveStatus("unsaved");
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    const snapshots = sheets.map((sheet) => ({ name: sheet.name, data: structuredClone(sheet.data) }));
+    saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null;
+      spreadsheetSaveMutation.mutate({ sheets: snapshots, revision });
+    }, 1800);
+  }, [canEditCurrentDoc, spreadsheetSaveMutation]);
+
   const schedulePresentationSave = useCallback((newSlides: PptxSlide[]) => {
     if (!canEditCurrentDoc) return;
     const revision = pptxSaveRevisionRef.current + 1;
@@ -5539,6 +5991,154 @@ export default function DocEditor() {
     [scheduleSave],
   );
 
+  const projectRootPath = mode === "code" ? codeProjectDirectory(doc?.fs_path) : null;
+  const projectRootName = codeProjectName(projectRootPath);
+  const codeWorkspace = useCodeProjectWorkspace({
+    enabled: mode === "code",
+    mainPath: doc?.fs_path,
+    mainName: docName,
+    mainContent: content,
+    mainSaveStatus: saveStatus,
+    onMainContentChange: handleContentChange,
+    onSaveMain: flushSave,
+  });
+  const activeCodeTab = codeWorkspace.activeTab;
+  const activeCodePath = activeCodeTab?.path || doc?.fs_path || "";
+  const activeCodeName = activeCodeTab?.name || docName;
+  const activeCodeContent = activeCodeTab?.content ?? content;
+  const activeCodeStatus = activeCodeTab?.status || saveStatus;
+  const activeCodeIsMain = !activeCodeTab || activeCodeTab.isMain;
+  const activeCodeLineCount = useMemo(
+    () => activeCodeContent.split("\n").length,
+    [activeCodeContent],
+  );
+  const codeLanguage = useMemo(() => codeLanguageForFile(activeCodeName), [activeCodeName]);
+  const codeLanguageName = useMemo(() => codeLanguageLabel(activeCodeName), [activeCodeName]);
+  const codeOpenPaths = useMemo(
+    () => new Set(codeWorkspace.tabs.map((tab) => tab.path)),
+    [codeWorkspace.tabs],
+  );
+  const codeFileStatuses = useMemo(
+    () => Object.fromEntries(codeWorkspace.tabs.map((tab) => [tab.path, tab.status])),
+    [codeWorkspace.tabs],
+  );
+  const {
+    srcDoc: codePreviewContent,
+    isResolvingAssets: isResolvingCodePreviewAssets,
+    failedAssetCount: codePreviewFailedAssetCount,
+  } = useHtmlPreviewDocument(
+    content,
+    isHtmlFile(docName) ? doc?.fs_path : null,
+    isHtmlFile(docName),
+    codeWorkspace.previewTextOverrides,
+  );
+
+  useEffect(() => {
+    setCodeCursor({ line: 1, column: 1 });
+  }, [activeCodePath]);
+
+  useEffect(() => {
+    const textarea = codeRef.current;
+    if (!textarea) return;
+    syncCodeScrollLayers(textarea.scrollTop, textarea.scrollLeft);
+  }, [activeCodeContent, activeCodePath, syncCodeScrollLayers]);
+
+  const handleCodeKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Tab") return;
+    event.preventDefault();
+    const textarea = event.currentTarget;
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const selected = activeCodeContent.slice(start, end);
+    let nextContent = activeCodeContent;
+    let nextStart = start;
+    let nextEnd = end;
+
+    if (start !== end) {
+      const blockStart = activeCodeContent.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+      const nextBreak = activeCodeContent.indexOf("\n", end);
+      const blockEnd = nextBreak === -1 ? activeCodeContent.length : nextBreak;
+      const block = activeCodeContent.slice(blockStart, blockEnd);
+      const lines = block.split("\n");
+      if (event.shiftKey) {
+        let removedBeforeSelection = 0;
+        let removedTotal = 0;
+        let offset = 0;
+        const replacement = lines.map((line) => {
+          const removeCount = line.startsWith("  ") ? 2 : line.startsWith("\t") || line.startsWith(" ") ? 1 : 0;
+          if (blockStart + offset < start) removedBeforeSelection += removeCount;
+          removedTotal += removeCount;
+          offset += line.length + 1;
+          return line.slice(removeCount);
+        }).join("\n");
+        nextContent = activeCodeContent.slice(0, blockStart) + replacement + activeCodeContent.slice(blockEnd);
+        nextStart = Math.max(blockStart, start - removedBeforeSelection);
+        nextEnd = Math.max(nextStart, end - removedTotal);
+      } else {
+        const replacement = lines.map((line) => `  ${line}`).join("\n");
+        nextContent = activeCodeContent.slice(0, blockStart) + replacement + activeCodeContent.slice(blockEnd);
+        nextStart = start + 2;
+        nextEnd = end + lines.length * 2;
+      }
+    } else if (event.shiftKey) {
+      const lineStart = activeCodeContent.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+      const beforeCursor = activeCodeContent.slice(lineStart, start);
+      const removeCount = beforeCursor.endsWith("  ") ? 2 : beforeCursor.endsWith("\t") || beforeCursor.endsWith(" ") ? 1 : 0;
+      if (removeCount > 0) {
+        nextContent = activeCodeContent.slice(0, start - removeCount) + activeCodeContent.slice(end);
+        nextStart = start - removeCount;
+        nextEnd = nextStart;
+      }
+    } else {
+      nextContent = activeCodeContent.slice(0, start) + "  " + selected + activeCodeContent.slice(end);
+      nextStart = start + 2;
+      nextEnd = nextStart;
+    }
+
+    if (nextContent === activeCodeContent) return;
+    codeWorkspace.changeActiveContent(nextContent);
+    requestAnimationFrame(() => {
+      textarea.selectionStart = nextStart;
+      textarea.selectionEnd = nextEnd;
+    });
+  }, [activeCodeContent, codeWorkspace.changeActiveContent]);
+
+  const refreshCodeCursor = useCallback((textarea: HTMLTextAreaElement) => {
+    const position = textarea.selectionStart;
+    const beforeCursor = textarea.value.slice(0, position);
+    const lines = beforeCursor.split("\n");
+    setCodeCursor({ line: lines.length, column: (lines.at(-1)?.length || 0) + 1 });
+  }, []);
+
+  const handleCodeTabKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let targetIndex = index;
+    if (event.key === "ArrowLeft") targetIndex = Math.max(0, index - 1);
+    else if (event.key === "ArrowRight") targetIndex = Math.min(codeWorkspace.tabs.length - 1, index + 1);
+    else if (event.key === "Home") targetIndex = 0;
+    else if (event.key === "End") targetIndex = codeWorkspace.tabs.length - 1;
+    else return;
+    event.preventDefault();
+    const target = codeWorkspace.tabs[targetIndex];
+    if (!target) return;
+    codeWorkspace.setActivePath(target.path);
+    const tabButtons = event.currentTarget.closest('[role="tablist"]')?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    requestAnimationFrame(() => tabButtons?.[targetIndex]?.focus());
+  }, [codeWorkspace.setActivePath, codeWorkspace.tabs]);
+
+  const handleManualSave = useCallback(async () => {
+    const saved = mode === "code" ? await codeWorkspace.saveActive() : await flushSave(content);
+    if (saved) {
+      showSaveSuccess(t("page.blueprint_detail.saved"));
+      return;
+    }
+    showSaveError(t("page.blueprint_detail.save_failed"));
+  }, [codeWorkspace.saveActive, content, flushSave, mode, showSaveError, showSaveSuccess]);
+
+  const goBackFromEditor = useCallback(async () => {
+    const saved = mode === "code" ? await codeWorkspace.saveAll() : await flushSave(content);
+    if (saved) navigate(knowledgeReturnTo || "/knowledge");
+  }, [codeWorkspace.saveAll, content, flushSave, knowledgeReturnTo, mode, navigate]);
+
   const handleSlidesChange = useCallback(
     (newSlides: PptxSlide[]) => {
       setPptxSlides(newSlides);
@@ -5549,17 +6149,57 @@ export default function DocEditor() {
     [schedulePresentationSave],
   );
 
-  // Spreadsheet change → convert to CSV and save
+  const handlePresentationLiveEditTargetChange = useCallback((next: PresentationLiveEditTarget) => {
+    setPptxLiveEditTarget((current) => (
+      current.activeSlideIndex === next.activeSlideIndex && current.selectedShapeId === next.selectedShapeId
+        ? current
+        : next
+    ));
+  }, []);
+
+  const handleSelectXlsxSheet = useCallback((sheetIndex: number) => {
+    const sheet = xlsxSheetsRef.current[sheetIndex];
+    if (!sheet || sheet.hidden || sheet.name === SPREADSHEET_CHARTS_SHEET) return;
+    setXlsxActiveSheetIndex(sheetIndex);
+    setSheetData(sheet.data);
+    setSheetCharts([]);
+    setSheetStyles(sheet.styles as SheetStyleMap);
+    setContent(serializeSpreadsheetContent(sheet.data, [], true, sheet.styles as SheetStyleMap));
+  }, []);
+
+  // Spreadsheet change → preserve the original workbook or save the lightweight CSV model.
   const handleSheetChange = useCallback(
     (data: any[][], charts: SheetChartConfig[], styles: SheetStyleMap) => {
       setSheetData(data);
       setSheetCharts(charts);
       setSheetStyles(styles);
-      const content = serializeSpreadsheetContent(data, charts, isXlsx, styles);
+      const content = isXlsx
+        ? serializeSpreadsheetContent(data, charts, true, styles)
+        : serializeDelimitedText(data, csvFormatRef.current);
       setContent(content);
+      if (xlsxFidelityMode && xlsxSheetsRef.current.length > 0) {
+        const nextSheets = xlsxSheetsRef.current.map((sheet, index) => {
+          if (index !== xlsxActiveSheetIndex) return sheet;
+          const displayData = data.map((row, rowIndex) => row.map((value, columnIndex) => (
+            Object.is(sheet.data[rowIndex]?.[columnIndex] ?? "", value ?? "")
+              ? sheet.displayData[rowIndex]?.[columnIndex] ?? String(value ?? "")
+              : getSheetDisplayValue(data, rowIndex, columnIndex)
+          )));
+          return {
+            ...sheet,
+            data: structuredClone(data),
+            displayData,
+            styles: structuredClone(styles),
+          };
+        });
+        xlsxSheetsRef.current = nextSheets;
+        setXlsxSheets(nextSheets);
+        scheduleSpreadsheetSave(nextSheets);
+        return;
+      }
       scheduleSave(content);
     },
-    [isXlsx, scheduleSave],
+    [isXlsx, scheduleSave, scheduleSpreadsheetSave, xlsxActiveSheetIndex, xlsxFidelityMode],
   );
 
   // Manual save (Ctrl+S)
@@ -5567,22 +6207,29 @@ export default function DocEditor() {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "s") {
         e.preventDefault();
-        void flushSave(content);
+        if (mode === "code") void codeWorkspace.saveActive();
+        else void flushSave(content);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [content, flushSave]);
+  }, [codeWorkspace.saveActive, content, flushSave, mode]);
 
   useEffect(() => {
     const handler = (e: BeforeUnloadEvent) => {
-      if (saveStatus === "saved" && !saveMutation.isPending && !presentationSaveMutation.isPending) return;
+      if (
+        saveStatus === "saved"
+        && !saveMutation.isPending
+        && !spreadsheetSaveMutation.isPending
+        && !presentationSaveMutation.isPending
+        && !codeWorkspace.hasPendingWrites
+      ) return;
       e.preventDefault();
       e.returnValue = "";
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [presentationSaveMutation.isPending, saveMutation.isPending, saveStatus]);
+  }, [codeWorkspace.hasPendingWrites, presentationSaveMutation.isPending, saveMutation.isPending, saveStatus, spreadsheetSaveMutation.isPending]);
 
   useEffect(() => () => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -5733,10 +6380,8 @@ export default function DocEditor() {
   }, [execCmd]);
 
   const insertRichTextImage = useCallback(() => {
-    const url = window.prompt("Image URL", "https://");
-    if (!url) return;
-    execCmd("insertImage", url);
-  }, [execCmd]);
+    setDocumentMediaInsertOpen(true);
+  }, []);
 
   const insertRichTextCustomTable = useCallback(() => {
     const rows = Number(window.prompt("Rows", "3"));
@@ -6017,6 +6662,18 @@ export default function DocEditor() {
   }, [clearRichTextDocument, execCmd, findRichText, replaceFirstRichText, selectAllRichText, transformRichTextSelection]);
 
   const handleRichTextKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (docxFidelityMode) {
+      const command = event.metaKey || event.ctrlKey;
+      if (
+        event.key === "Enter"
+        || event.key === "Tab"
+        || (command && ["b", "i", "u", "k"].includes(event.key.toLowerCase()))
+        || (command && event.shiftKey && event.key.toLowerCase() === "x")
+      ) {
+        event.preventDefault();
+        return;
+      }
+    }
     if (event.key === "Tab") {
       event.preventDefault();
       execCmd(event.shiftKey ? "outdent" : "indent");
@@ -6036,7 +6693,22 @@ export default function DocEditor() {
       event.preventDefault();
       execCmd("strikeThrough");
     }
-  }, [applyRichTextLink, execCmd, findRichText]);
+  }, [applyRichTextLink, docxFidelityMode, execCmd, findRichText]);
+
+  const handleRichTextBeforeInput = useCallback((event: React.FormEvent<HTMLDivElement>) => {
+    if (!docxFidelityMode) return;
+    const inputType = (event.nativeEvent as InputEvent).inputType || "";
+    if (inputType === "insertParagraph" || inputType === "insertLineBreak" || inputType.startsWith("format")) {
+      event.preventDefault();
+    }
+  }, [docxFidelityMode]);
+
+  const handleRichTextPaste = useCallback((event: React.ClipboardEvent<HTMLDivElement>) => {
+    if (!docxFidelityMode) return;
+    event.preventDefault();
+    const text = event.clipboardData.getData("text/plain").replace(/\s*\r?\n\s*/g, " ");
+    document.execCommand("insertText", false, text);
+  }, [docxFidelityMode]);
 
   const applyTextareaEdit = useCallback((textarea: HTMLTextAreaElement, next: string, selectionStart: number, selectionEnd = selectionStart) => {
     handleContentChange(next);
@@ -6127,11 +6799,108 @@ export default function DocEditor() {
   }, [applyMarkdownEdit, content]);
 
   const insertMarkdownImage = useCallback(() => {
-    const url = window.prompt("Image URL", "https://");
-    if (!url) return;
-    const alt = window.prompt("Alt text", "image") || "image";
-    insertMarkdownBlock(`![${alt}](${url})`);
-  }, [insertMarkdownBlock]);
+    setDocumentMediaInsertOpen(true);
+  }, []);
+
+  const handleDocumentMediaInsert = useCallback(async (asset: InsertableMediaAsset) => {
+    if (mode === "richtext") {
+      if (docxFidelityMode) throw new Error("Adding media to an imported DOCX is not yet available in fidelity mode.");
+      const mediaUrl = await api.documents.download(asset.document.id);
+      try {
+        const response = await fetch(mediaUrl);
+        if (!response.ok) throw new Error("Unable to read the selected media.");
+        const dataUrl = await blobToDataUrl(await response.blob());
+        const escapedName = asset.name.replace(/[<>&"']/g, "");
+        if (asset.kind === "image") {
+          execCmd("insertHTML", `<figure class="doc-editor-media"><img src="${dataUrl}" alt="${escapedName}"/><figcaption>${escapedName}</figcaption></figure><p><br></p>`);
+        } else {
+          execCmd("insertHTML", `<figure class="doc-editor-media"><video src="${dataUrl}" controls playsinline preload="metadata"></video><figcaption>${escapedName}</figcaption></figure><p><br></p>`);
+        }
+      } finally {
+        if (mediaUrl.startsWith("blob:")) URL.revokeObjectURL(mediaUrl);
+      }
+      return;
+    }
+
+    if (mode === "markdown") {
+      const alt = asset.name.replace(/[\[\]]/g, "");
+      if (asset.kind === "image") {
+        const mediaUrl = await api.documents.download(asset.document.id);
+        try {
+          const response = await fetch(mediaUrl);
+          if (!response.ok) throw new Error("Unable to read the selected image.");
+          insertMarkdownBlock(`![${alt}](${await blobToDataUrl(await response.blob())})`);
+        } finally {
+          if (mediaUrl.startsWith("blob:")) URL.revokeObjectURL(mediaUrl);
+        }
+      } else {
+        let posterDataUrl = "";
+        try {
+          const thumbnailUrl = await api.documents.videoThumbnail(asset.document.id);
+          const response = await fetch(thumbnailUrl);
+          if (response.ok) posterDataUrl = await blobToDataUrl(await response.blob());
+          if (thumbnailUrl.startsWith("blob:")) URL.revokeObjectURL(thumbnailUrl);
+        } catch {
+          // The video link remains usable without a generated poster.
+        }
+        const viewerUrl = `/viewer/${encodeURIComponent(asset.document.id)}`;
+        insertMarkdownBlock(posterDataUrl
+          ? `[![Video: ${alt}](${posterDataUrl})](${viewerUrl})`
+          : `[▶ ${alt}](${viewerUrl})`);
+      }
+      return;
+    }
+
+    if (mode === "code") {
+      if (!activeCodePath) throw new Error("Open a project file before inserting media.");
+      const root = projectRootPath || codeProjectDirectory(activeCodePath) || ".";
+      const assetDirectory = root === "." ? "assets" : `${root}/assets`;
+      try {
+        await api.fs.mkdir(assetDirectory);
+      } catch {
+        // Existing asset directories are reusable.
+      }
+      const mediaUrl = await api.documents.download(asset.document.id);
+      try {
+        const response = await fetch(mediaUrl);
+        if (!response.ok) throw new Error("Unable to read the selected media.");
+        const blob = await response.blob();
+        const fileName = safeMediaFileName(asset.name, asset.kind === "image" ? "image.png" : "video.mp4");
+        const targetPath = `${assetDirectory}/${Date.now()}-${fileName}`;
+        await api.fs.upload(targetPath, new File([blob], fileName, { type: blob.type || asset.document.mime_type || undefined }));
+        const reference = relativeFsReference(activeCodePath, targetPath);
+        const escapedName = asset.name.replace(/[<>&"']/g, "");
+        const snippet = asset.kind === "image"
+          ? `<img src="${reference}" alt="${escapedName}" loading="lazy" />`
+          : `<video src="${reference}" controls playsinline preload="metadata"></video>`;
+        const textarea = codeRef.current;
+        const start = textarea?.selectionStart ?? activeCodeContent.length;
+        const end = textarea?.selectionEnd ?? activeCodeContent.length;
+        const prefix = start > 0 && activeCodeContent[start - 1] !== "\n" ? "\n" : "";
+        const suffix = end < activeCodeContent.length && activeCodeContent[end] !== "\n" ? "\n" : "";
+        const insertion = `${prefix}${snippet}${suffix}`;
+        codeWorkspace.changeActiveContent(activeCodeContent.slice(0, start) + insertion + activeCodeContent.slice(end));
+        requestAnimationFrame(() => {
+          if (!textarea) return;
+          const position = start + insertion.length;
+          textarea.selectionStart = position;
+          textarea.selectionEnd = position;
+          textarea.focus();
+        });
+      } finally {
+        if (mediaUrl.startsWith("blob:")) URL.revokeObjectURL(mediaUrl);
+      }
+    }
+  }, [
+    activeCodeContent,
+    activeCodePath,
+    codeWorkspace.changeActiveContent,
+    docxFidelityMode,
+    execCmd,
+    insertMarkdownBlock,
+    mode,
+    projectRootPath,
+  ]);
 
   const insertMarkdownWikiLink = useCallback(() => {
     const textarea = markdownRef.current;
@@ -6394,9 +7163,9 @@ export default function DocEditor() {
     const targetMode = anchorMode || mode;
     if (targetMode === "markdown") return markdownRef.current;
     if (targetMode === "text") return textRef.current;
-    if (targetMode === "code") return codeRef.current;
+    if (targetMode === "code") return activeCodeIsMain ? codeRef.current : null;
     return null;
-  }, [mode]);
+  }, [activeCodeIsMain, mode]);
 
   const buildCurrentCommentAnchor = useCallback((): CommentAnchor | null => {
     if (mode === "markdown" && commentSelectionSurfaceRef.current === "markdown-preview") {
@@ -6585,8 +7354,10 @@ export default function DocEditor() {
     saved: { label: t("page.blueprint_detail.saved"), type: "success" },
     saving: { label: t("page.task_collections.saving"), type: "warning" },
     unsaved: { label: t("page.doc_editor.unsaved_changes"), type: "orange" },
+    error: { label: t("page.blueprint_detail.save_failed"), type: "red" },
   };
-  const statusInfo = statusConfig[saveStatus];
+  const displayedSaveStatus = mode === "code" ? activeCodeStatus : saveStatus;
+  const statusInfo = statusConfig[displayedSaveStatus];
   const visibleLiveEditNotice = liveEditNotice && liveEditNotice !== statusInfo.label ? liveEditNotice : null;
   const modeBadgeType = mode === "richtext" ? "purple" : mode === "markdown" ? "blue" : mode === "text" ? "gray" : mode === "spreadsheet" ? "green" : mode === "presentation" ? "orange" : mode === "diagram" ? "teal" : "teal";
   const modeLabel = isDocx ? "Word" : isPptx ? "Presentation" : mode === "richtext" ? "Rich Text" : mode === "markdown" ? "Markdown" : mode === "text" ? "Text" : mode === "spreadsheet" ? "Spreadsheet" : mode === "presentation" ? "Presentation" : mode === "diagram" ? "Diagram" : "Code";
@@ -6606,21 +7377,69 @@ export default function DocEditor() {
     [scheduleSave],
   );
 
+  const getPresentationLiveEditContent = useCallback(() => buildPresentationLiveEditContent(
+    pptxSlidesRef.current,
+    {
+      documentName: docName,
+      activeSlideIndex: pptxLiveEditTarget.activeSlideIndex,
+      selectedShapeId: pptxLiveEditTarget.selectedShapeId,
+    },
+  ), [docName, pptxLiveEditTarget.activeSlideIndex, pptxLiveEditTarget.selectedShapeId]);
+
+  const getPresentationLiveEditAttachmentFiles = useCallback(async () => {
+    const slides = pptxSlidesRef.current;
+    const shape = presentationLiveEditTargetShape(slides, pptxLiveEditTarget);
+    const slideNumber = Math.max(1, Math.min(slides.length, pptxLiveEditTarget.activeSlideIndex + 1));
+    const sourceUrl = shape?.imgUrl || pptxServerUrls[pptxLiveEditTarget.activeSlideIndex];
+    if (!sourceUrl) return [];
+    const response = await fetch(sourceUrl);
+    if (!response.ok) throw new Error(`Unable to capture slide image (${response.status}).`);
+    const blob = await response.blob();
+    const expectedMime = shape ? presentationImageMime(shape.source?.mediaPart) : (blob.type || "image/png");
+    const extension = shape ? mediaExtension(shape.source?.mediaPart) : expectedMime === "image/jpeg" ? ".jpg" : ".png";
+    return [new File(
+      [blob],
+      shape ? `current-slide-${slideNumber}-image${extension}` : `current-slide-${slideNumber}.png`,
+      { type: blob.type || expectedMime },
+    )];
+  }, [pptxLiveEditTarget, pptxServerUrls]);
+
+  const applyGeneratedPresentationImage = useCallback(async (imageUrl: string, meta: EditorLiveApplyMeta) => {
+    if (!meta.complete || !imageUrl) return;
+    const slides = pptxSlidesRef.current;
+    const targetShape = presentationLiveEditTargetShape(slides, pptxLiveEditTarget);
+    if (!targetShape?.imgUrl) throw new Error("Select an editable slide image before asking AI to replace it.");
+    const expectedMime = presentationImageMime(targetShape.source?.mediaPart);
+    const replacement = await presentationReplacementImageDataUrl(imageUrl, expectedMime);
+    const nextSlides = slides.map((slide, slideIndex) => slideIndex !== pptxLiveEditTarget.activeSlideIndex
+      ? slide
+      : {
+        ...slide,
+        shapes: slide.shapes.map((shape) => shape.id === targetShape.id
+          ? { ...shape, imgUrl: replacement }
+          : shape),
+      });
+    handleSlidesChange(nextSlides);
+    setLiveEditNotice(t("page.doc_editor.pptx_ai_image_applied"));
+  }, [handleSlidesChange, pptxLiveEditTarget]);
+
   const getEditorLiveContent = useCallback(() => {
-    if (mode === "presentation") return slidesToText(pptxSlidesRef.current);
+    if (mode === "presentation") return getPresentationLiveEditContent();
     if (mode === "spreadsheet") {
-      return serializeSpreadsheetContent(
-        normalizeSheetData(sheetDataRef.current),
-        sheetChartsRef.current,
-        isXlsx,
-        sheetStylesRef.current,
-      );
+      return isXlsx
+        ? serializeSpreadsheetContent(
+          normalizeSheetData(sheetDataRef.current),
+          sheetChartsRef.current,
+          true,
+          sheetStylesRef.current,
+        )
+        : serializeDelimitedText(normalizeSheetData(sheetDataRef.current), csvFormatRef.current);
     }
     if (mode === "richtext" && editorRef.current) {
       return editorRef.current.innerHTML;
     }
     return contentRef.current;
-  }, [isXlsx, mode]);
+  }, [getPresentationLiveEditContent, isXlsx, mode]);
 
   const applyEditorLiveContent = useCallback((nextText: string, meta?: EditorLiveApplyMeta) => {
     const diff = meta?.diff || meta?.patch;
@@ -6633,7 +7452,11 @@ export default function DocEditor() {
     }
 
     if (mode === "presentation") {
-      const nextSlides = textToSlides(nextText);
+      const nextSlides = applyPresentationLiveEditContent(pptxSlidesRef.current, nextText);
+      if (!nextSlides) {
+        setLiveEditNotice(t("page.doc_editor.pptx_ai_invalid_edit"));
+        return;
+      }
       handleSlidesChange(nextSlides);
       return;
     }
@@ -6649,7 +7472,13 @@ export default function DocEditor() {
       const nextStyles = spreadsheetPayload
         ? spreadsheetPayload.styles
         : sheetStylesRef.current;
-      const serialized = serializeSpreadsheetContent(nextData, nextCharts, isXlsx, nextStyles);
+      const serialized = isXlsx
+        ? serializeSpreadsheetContent(nextData, nextCharts, true, nextStyles)
+        : serializeDelimitedText(nextData, csvFormatRef.current);
+      if (xlsxFidelityMode) {
+        handleSheetChange(nextData, nextCharts, nextStyles);
+        return;
+      }
       setSheetData(nextData);
       setSheetCharts(nextCharts);
       setSheetStyles(nextStyles);
@@ -6684,21 +7513,264 @@ export default function DocEditor() {
 
     setContent(nextText);
     scheduleSave(nextText);
-  }, [docName, handleSlidesChange, isDocx, isXlsx, mode, modeLabel, scheduleSave, usesInlineLiveDiff]);
+  }, [docName, handleSheetChange, handleSlidesChange, isDocx, isXlsx, mode, modeLabel, scheduleSave, usesInlineLiveDiff, xlsxFidelityMode]);
 
   const openLiveEdit = useCallback(() => {
-    openEditorLiveChat({
+    const baseDetail = {
       documentId: docId,
       documentName: docName,
       fileType: doc?.file_type,
       mimeType: doc?.mime_type,
       editorType: modeLabel,
       getContent: getEditorLiveContent,
-      applyContent: (next, meta) => applyEditorLiveContent(next, meta),
-    });
-  }, [applyEditorLiveContent, doc?.file_type, doc?.mime_type, docId, docName, getEditorLiveContent, modeLabel]);
+      applyContent: (next: string, meta: EditorLiveApplyMeta) => applyEditorLiveContent(next, meta),
+    };
+    if (mode === "presentation") {
+      openEditorLiveChat({
+        ...baseDetail,
+        fileType: "pptx",
+        editorType: "Presentation",
+        localEditContent: localPresentationLiveEditContent,
+        getAttachmentFiles: getPresentationLiveEditAttachmentFiles,
+        applyGeneratedImage: applyGeneratedPresentationImage,
+        supportsImageGeneration: true,
+        instruction: t("page.doc_editor.pptx_ai_instruction", { name: docName }),
+        emptyDescription: t("page.doc_editor.pptx_ai_description"),
+        placeholder: t("page.doc_editor.pptx_ai_placeholder"),
+        examples: [
+          t("page.doc_editor.pptx_ai_example_replace"),
+          t("page.doc_editor.pptx_ai_example_margin"),
+          t("page.doc_editor.pptx_ai_example_crop"),
+          t("page.doc_editor.pptx_ai_example_text"),
+        ],
+      });
+      return;
+    }
+    openEditorLiveChat(baseDetail);
+  }, [
+    applyEditorLiveContent,
+    applyGeneratedPresentationImage,
+    doc?.file_type,
+    doc?.mime_type,
+    docId,
+    docName,
+    getEditorLiveContent,
+    getPresentationLiveEditAttachmentFiles,
+    mode,
+    modeLabel,
+  ]);
 
   const isLoadingContent = contentLoading || docxLoading || xlsxLoading || pptxLoading;
+
+  const handleCodeSelection = useCallback((event: React.SyntheticEvent<HTMLTextAreaElement>) => {
+    refreshCodeCursor(event.currentTarget);
+    if (activeCodeIsMain) refreshEditorCommentAnchor();
+  }, [activeCodeIsMain, refreshCodeCursor, refreshEditorCommentAnchor]);
+
+  const visibleCodeTabs = codeWorkspace.tabs.length > 0 ? codeWorkspace.tabs : [{
+    path: activeCodePath || "__main__",
+    name: docName,
+    content,
+    status: saveStatus,
+    loading: false,
+    error: null,
+    readError: false,
+    isMain: true,
+  }];
+
+  const codeSourcePane = (
+    <section className="doc-editor-code-source" aria-label="Code editor">
+      <div className="doc-editor-code-titlebar doc-editor-code-tabs">
+        <div className="doc-editor-code-tablist" role="tablist" aria-label="Open code files">
+          {visibleCodeTabs.map((tab, index) => {
+            const selected = tab.path === activeCodePath || (tab.isMain && !activeCodeTab);
+            return (
+              <div key={tab.path} className={`doc-editor-code-tab-shell${selected ? " is-active" : ""}`}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  tabIndex={selected ? 0 : -1}
+                  className="doc-editor-code-tab"
+                  title={tab.path}
+                  onClick={() => codeWorkspace.setActivePath(tab.path)}
+                  onKeyDown={(event) => handleCodeTabKeyDown(event, index)}
+                >
+                  <IconCode size={13} />
+                  <span className="doc-editor-code-tab__name">{tab.name}</span>
+                  {tab.status !== "saved" && (
+                    <span className={`doc-editor-code-tab__status is-${tab.status}`} aria-label={tab.status} />
+                  )}
+                </button>
+                {!tab.isMain && (
+                  <button
+                    type="button"
+                    className="doc-editor-code-tab__close"
+                    aria-label={`Close ${tab.name}`}
+                    title={`Close ${tab.name}`}
+                    onClick={() => void codeWorkspace.closeFile(tab.path)}
+                  >
+                    <IconClose size={12} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="doc-editor-code-title-actions">
+          <span className="doc-editor-code-language">{codeLanguageName}</span>
+          {activeCodeIsMain && liveDiff && (
+            <button
+              type="button"
+              className="doc-editor-code-diff-close"
+              aria-label="Close inline diff"
+              title="Close inline diff"
+              onClick={() => setLiveDiff(null)}
+            >
+              <IconClose size={13} />
+            </button>
+          )}
+        </div>
+      </div>
+      <div className={`doc-editor-code-body${activeCodeIsMain && liveDiff ? " doc-editor-code-body--diff" : ""}`}>
+        {activeCodeTab?.loading ? (
+          <div className="doc-editor-code-load-state">Loading {activeCodeName}…</div>
+        ) : activeCodeTab?.readError ? (
+          <div className="doc-editor-code-load-state is-error">
+            <span>{activeCodeTab.error}</span>
+            <button
+              type="button"
+              onClick={() => void codeWorkspace.openFile({ path: activeCodeTab.path, name: activeCodeTab.name })}
+            >
+              Retry
+            </button>
+          </div>
+        ) : activeCodeIsMain && liveDiff ? (
+          <EditorLiveInlineDiff content={content} diff={liveDiff} variant="code" />
+        ) : (
+          <>
+            <div className="manor-editor-line-gutter doc-editor-code-gutter">
+              <div ref={codeGutterRef} className="doc-editor-code-gutter-lines">
+                {Array.from({ length: activeCodeLineCount }, (_, index) => {
+                  const line = index + 1;
+                  const count = activeCodeIsMain ? commentLineCounts.get(line) || 0 : 0;
+                  const firstComment = count ? firstCommentForLine(line) : undefined;
+                  return (
+                    <div key={line} className="doc-editor-code-gutter-line">
+                      <span>{line}</span>
+                      {firstComment && (
+                        <button
+                          type="button"
+                          className={activeCommentId === firstComment.id ? "doc-editor-code-comment-marker is-active" : "doc-editor-code-comment-marker"}
+                          title={`${count} ${t("page.tasks.comments")}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleSelectDocumentComment(firstComment);
+                          }}
+                        >
+                          <IconComment size={10} />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="doc-editor-code-stack">
+              <div ref={codeHighlightRef} className="doc-editor-code-highlight" aria-hidden="true">
+                <CodeSyntaxHighlighter
+                  language={codeLanguage}
+                  style={ideEditorTheme}
+                  wrapLongLines={false}
+                  customStyle={{ minHeight: "100%", overflow: "visible" }}
+                  codeTagProps={{
+                    style: {
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                      tabSize: 2,
+                    },
+                  }}
+                >
+                  {activeCodeContent || " "}
+                </CodeSyntaxHighlighter>
+              </div>
+              <textarea
+                key={activeCodePath}
+                ref={codeRef}
+                value={activeCodeContent}
+                onChange={(event) => codeWorkspace.changeActiveContent(event.target.value)}
+                onScroll={(event) => {
+                  const { scrollTop, scrollLeft } = event.currentTarget;
+                  syncCodeScrollLayers(scrollTop, scrollLeft);
+                }}
+                onKeyDown={handleCodeKeyDown}
+                onSelect={handleCodeSelection}
+                onClick={handleCodeSelection}
+                onKeyUp={handleCodeSelection}
+                className="manor-editor-codearea doc-editor-ide-textarea"
+                placeholder={t("page.doc_editor.start_coding")}
+                spellCheck={false}
+                wrap="off"
+              />
+            </div>
+          </>
+        )}
+      </div>
+    </section>
+  );
+
+  const codePreviewPane = showPreview && isRenderableCodeFile(docName) ? (
+    <section className="doc-editor-code-preview" aria-label={t("page.doc_editor.preview")}>
+      <div className="doc-editor-code-preview-bar">
+        <span>{t("page.doc_editor.preview")}</span>
+        <span>{renderableCodePreviewLabel(docName)}</span>
+      </div>
+      <iframe
+        srcDoc={codePreviewContent}
+        sandbox="allow-scripts"
+        className="doc-editor-code-preview-frame"
+        title={t("page.doc_editor.preview")}
+        aria-busy={isResolvingCodePreviewAssets}
+        data-missing-preview-assets={codePreviewFailedAssetCount || undefined}
+      />
+    </section>
+  ) : null;
+
+  const codePaneDefinitions: ResizablePaneDefinition[] = [
+    ...(projectRootPath ? [{
+      id: "files",
+      label: "Project files",
+      initialSize: 14,
+      minSize: 160,
+      maxSize: 340,
+      className: "doc-editor-project-pane",
+      children: (
+        <CodeProjectExplorer
+          rootPath={projectRootPath}
+          rootName={projectRootName}
+          activePath={activeCodePath}
+          openPaths={codeOpenPaths}
+          fileStatuses={codeFileStatuses}
+          onOpenFile={(file) => void codeWorkspace.openFile(file)}
+        />
+      ),
+    }] : []),
+    {
+      id: "source",
+      label: "Code editor",
+      initialSize: projectRootPath ? 44 : 54,
+      minSize: 360,
+      className: "doc-editor-code-pane-shell",
+      children: codeSourcePane,
+    },
+    ...(codePreviewPane ? [{
+      id: "preview",
+      label: "Preview",
+      initialSize: 42,
+      minSize: 320,
+      className: "doc-editor-preview-pane",
+      children: codePreviewPane,
+    }] : []),
+  ];
 
   // ---------------------------------------------------------------------------
   // Render
@@ -6709,7 +7781,7 @@ export default function DocEditor() {
       {/* Header bar */}
       <div className="manor-editor-header">
         <button
-          onClick={goBackToKnowledge}
+          onClick={() => void goBackFromEditor()}
           className="btn-manor-ghost"
           title={t("page.doc_editor.back_to_knowledge_base")}
           style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
@@ -6718,7 +7790,7 @@ export default function DocEditor() {
         </button>
 
         <div className="manor-editor-header-main">
-          <PageHeaderTitle>{docName}</PageHeaderTitle>
+          <PageHeaderTitle variant="editor" title={docName}>{docName}</PageHeaderTitle>
           <StatusBadge type="gray">{extLabel(docName)}</StatusBadge>
           <StatusBadge type={modeBadgeType}>{modeLabel}</StatusBadge>
         </div>
@@ -6728,6 +7800,19 @@ export default function DocEditor() {
         <StatusBadge type={statusInfo.type} dot>{statusInfo.label}</StatusBadge>
 
         <AiEditButton onClick={openLiveEdit} />
+
+        {(["richtext", "markdown", "code"] as EditorMode[]).includes(mode) && !docxFidelityMode && (
+          <button
+            type="button"
+            onClick={() => setDocumentMediaInsertOpen(true)}
+            className="btn-manor-ghost"
+            title={t("component.media_insert.title")}
+            aria-label={t("component.media_insert.title")}
+            style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <IconImage size={18} />
+          </button>
+        )}
 
         {doc && (
           <button
@@ -6762,7 +7847,15 @@ export default function DocEditor() {
 
         <button
           onClick={() => void handleManualSave()}
-          disabled={saveMutation.isPending || presentationSaveMutation.isPending || !canEditCurrentDoc}
+          disabled={
+            saveMutation.isPending
+            || spreadsheetSaveMutation.isPending
+            || presentationSaveMutation.isPending
+            || activeCodeTab?.loading
+            || activeCodeTab?.readError
+            || displayedSaveStatus === "saving"
+            || !canEditCurrentDoc
+          }
           className="btn-manor"
           style={{ fontSize: 12, padding: "6px 16px" }}
         >
@@ -6789,7 +7882,11 @@ export default function DocEditor() {
 
       {/* Toolbar (rich text + docx) */}
       {(mode === "richtext") && (
-        <div className="manor-editor-toolbar richtext-editor-toolbar">
+        <div
+          className="manor-editor-toolbar richtext-editor-toolbar"
+          aria-disabled={docxFidelityMode}
+          style={docxFidelityMode ? { pointerEvents: "none", opacity: 0.62 } : undefined}
+        >
           <ToolbarGroup>
             <ToolbarBtn title={t("page.doc_editor.undo_ctrl_plus_z")} onClick={() => execCmd("undo")} icon={<IconUndo size={15} />} />
             <ToolbarBtn title={t("page.doc_editor.redo_ctrl_plus_shift_plus_z")} onClick={() => execCmd("redo")} icon={<IconRedo size={15} />} />
@@ -6958,7 +8055,9 @@ export default function DocEditor() {
           {isDocx && (
             <>
               <ToolbarSep />
-              <span className="richtext-toolbar-note">{t("page.doc_editor.docx_imported_as_html_saves_as_text")}</span>
+              <span className="richtext-toolbar-note" title={t("page.doc_editor.docx_fidelity_hint")}>
+                {t("page.doc_editor.docx_imported_as_html_saves_as_text")}
+              </span>
             </>
           )}
         </div>
@@ -7108,13 +8207,36 @@ export default function DocEditor() {
           </div>
         ) : mode === "presentation" ? (
           /* Presentation editor (PPTX) */
-          <PresentationEditor key={docId} slides={pptxSlides} serverSlideUrls={pptxServerUrls} onChange={handleSlidesChange} />
+          <PresentationEditor
+            key={docId}
+            slides={pptxSlides}
+            serverSlideUrls={pptxServerUrls}
+            fidelityMode={pptxFidelityMode}
+            onLiveEditTargetChange={handlePresentationLiveEditTargetChange}
+            onChange={handleSlidesChange}
+          />
         ) : mode === "diagram" && diagramDoc ? (
           /* Editable diagram canvas */
           <DiagramCanvas document={diagramDoc} onChange={handleDiagramChange} />
         ) : mode === "spreadsheet" ? (
           /* Spreadsheet editor */
-          <SpreadsheetEditor key={docId} initialData={sheetData} initialCharts={sheetCharts} initialStyles={sheetStyles} persistCharts={isXlsx} onChange={handleSheetChange} />
+          <SpreadsheetEditor
+            key={`${docId}:${xlsxActiveSheetIndex}`}
+            initialData={sheetData}
+            initialCharts={sheetCharts}
+            initialStyles={sheetStyles}
+            initialDisplayData={activeXlsxSheet?.displayData}
+            columnWidths={activeXlsxSheet?.columnWidths}
+            rowHeights={activeXlsxSheet?.rowHeights}
+            merges={activeXlsxSheet?.merges}
+            nativeCharts={activeXlsxSheet?.charts}
+            fidelityMode={xlsxFidelityMode}
+            sheetTabs={xlsxSheetTabs}
+            activeSheetIndex={xlsxActiveSheetIndex}
+            onSelectSheet={handleSelectXlsxSheet}
+            persistCharts={isXlsx}
+            onChange={handleSheetChange}
+          />
         ) : mode === "text" ? (
           /* Plain text editor with the same page-centered document surface as Word */
           <div className="manor-editor-workspace richtext-editor-workspace text-editor-workspace">
@@ -7154,7 +8276,9 @@ export default function DocEditor() {
               contentEditable
               suppressContentEditableWarning
               onInput={handleRichTextInput}
+              onBeforeInput={handleRichTextBeforeInput}
               onKeyDown={handleRichTextKeyDown}
+              onPaste={handleRichTextPaste}
               onMouseUp={() => {
                 saveRichSelection();
                 refreshEditorCommentAnchor();
@@ -7294,7 +8418,7 @@ export default function DocEditor() {
                           return <code {...props} className={className || "md-inline-code"}>{children}</code>;
                         },
                         table({ children }: any) {
-                          return <table className="md-table">{children}</table>;
+                          return <MarkdownTable>{children}</MarkdownTable>;
                         },
                         input({ ...props }: any) {
                           return <input {...props} disabled className="md-task-checkbox" />;
@@ -7310,121 +8434,27 @@ export default function DocEditor() {
           </div>
         ) : (
           /* Code editor */
-          <div className={`doc-editor-code-layout${showPreview && isRenderableCodeFile(docName) ? " doc-editor-code-layout--split" : ""}`}>
-            <section className="doc-editor-code-source" aria-label="Code editor">
-              <div className="doc-editor-code-titlebar">
-                <span className="doc-editor-code-filename" title={docName}>{docName}</span>
-                <div className="doc-editor-code-title-actions">
-                  <span className="doc-editor-code-language">{codeLanguageName}</span>
-                  {liveDiff && (
-                    <button
-                      type="button"
-                      className="doc-editor-code-diff-close"
-                      aria-label="Close inline diff"
-                      title="Close inline diff"
-                      onClick={() => setLiveDiff(null)}
-                    >
-                      <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true">
-                        <path
-                          d="M6 6l12 12M18 6L6 18"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeLinecap="round"
-                          strokeWidth="2"
-                        />
-                      </svg>
-                    </button>
-                  )}
-                </div>
-              </div>
-              <div className={`doc-editor-code-body${liveDiff ? " doc-editor-code-body--diff" : ""}`}>
-                {liveDiff ? (
-                  <EditorLiveInlineDiff content={content} diff={liveDiff} variant="code" />
-                ) : (
-                  <>
-                    <div className="manor-editor-line-gutter doc-editor-code-gutter">
-                      <div ref={codeGutterRef} className="doc-editor-code-gutter-lines">
-                        {Array.from({ length: lineCount }, (_, i) => {
-                          const line = i + 1;
-                          const count = commentLineCounts.get(line) || 0;
-                          const firstComment = count ? firstCommentForLine(line) : undefined;
-                          return (
-                            <div key={i} className="doc-editor-code-gutter-line">
-                              <span>{line}</span>
-                              {firstComment && (
-                                <button
-                                  type="button"
-                                  className={activeCommentId === firstComment.id ? "doc-editor-code-comment-marker is-active" : "doc-editor-code-comment-marker"}
-                                  title={`${count} ${t("page.tasks.comments")}`}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    handleSelectDocumentComment(firstComment);
-                                  }}
-                                >
-                                  <IconComment size={10} />
-                                </button>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                    <div className="doc-editor-code-stack">
-                      <div ref={codeHighlightRef} className="doc-editor-code-highlight" aria-hidden="true">
-                        <CodeSyntaxHighlighter
-                          language={codeLanguage}
-                          style={ideEditorTheme}
-                          wrapLongLines={false}
-                          customStyle={{
-                            minHeight: "100%",
-                            overflow: "visible",
-                          }}
-                          codeTagProps={{
-                            style: {
-                              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                              tabSize: 2,
-                            },
-                          }}
-                        >
-                          {content || " "}
-                        </CodeSyntaxHighlighter>
-                      </div>
-                      <textarea
-                        ref={codeRef}
-                        value={content}
-                        onChange={(e) => handleContentChange(e.target.value)}
-                        onScroll={(event) => {
-                          const { scrollTop, scrollLeft } = event.currentTarget;
-                          syncCodeScrollLayers(scrollTop, scrollLeft);
-                        }}
-                        onKeyDown={handlePlainTextKeyDown}
-                        onSelect={refreshEditorCommentAnchor}
-                        onClick={refreshEditorCommentAnchor}
-                        onKeyUp={refreshEditorCommentAnchor}
-                        className="manor-editor-codearea doc-editor-ide-textarea"
-                        placeholder={t("page.doc_editor.start_coding")}
-                        spellCheck={false}
-                        wrap="off"
-                      />
-                    </div>
-                  </>
-                )}
-              </div>
-            </section>
-            {showPreview && isRenderableCodeFile(docName) && (
-              <section className="doc-editor-code-preview" aria-label={t("page.doc_editor.preview")}>
-                <div className="doc-editor-code-preview-bar">
-                  <span>{t("page.doc_editor.preview")}</span>
-                  <span>{renderableCodePreviewLabel(docName)}</span>
-                </div>
-                <iframe
-                  srcDoc={codePreviewContent}
-                  sandbox="allow-scripts"
-                  className="doc-editor-code-preview-frame"
-                  title={t("page.doc_editor.preview")}
-                />
-              </section>
-            )}
+          <div className="doc-editor-ide-shell">
+            <ResizablePaneGroup
+              panes={codePaneDefinitions}
+              storageKey={`doc-editor-code-panes:${projectRootPath || doc?.fs_path || docId || "default"}`}
+              className={`doc-editor-ide-workspace${projectRootPath ? " has-files" : " no-files"}${codePreviewPane ? " has-preview" : " no-preview"}`}
+            />
+            <div className="doc-editor-ide-statusbar" role="status">
+              <span className="doc-editor-ide-statusbar__file" title={activeCodePath}>{activeCodePath}</span>
+              <span>{codeLanguageName}</span>
+              <span>{textEncodingLabel(textFileFormat)}</span>
+              <span>Ln {codeCursor.line}, Col {codeCursor.column}</span>
+              {codePreviewPane && (
+                <span>
+                  {isResolvingCodePreviewAssets
+                    ? "Preview loading"
+                    : codePreviewFailedAssetCount > 0
+                      ? `${codePreviewFailedAssetCount} preview asset${codePreviewFailedAssetCount === 1 ? "" : "s"} missing`
+                      : "Preview ready"}
+                </span>
+              )}
+            </div>
           </div>
         )}
 
@@ -7489,14 +8519,14 @@ export default function DocEditor() {
       {/* Footer */}
       <div className="manor-editor-statusbar">
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <span>{mode === "presentation" ? formatBytes(doc?.file_size || 0) : formatBytes(new Blob([content]).size)}</span>
+          <span>{mode === "presentation" ? formatBytes(doc?.file_size || 0) : formatBytes(new Blob([mode === "code" ? activeCodeContent : content]).size)}</span>
           {mode !== "spreadsheet" && mode !== "presentation" && (
             <>
-              <span>{wordCount(mode === "richtext" ? content.replace(/<[^>]+>/g, " ") : content)} {t("page.doc_editor.words")}</span>
-              <span>{(mode === "richtext" ? content.replace(/<[^>]+>/g, "") : content).length} {t("page.doc_editor.chars")}</span>
+              <span>{wordCount(mode === "richtext" ? content.replace(/<[^>]+>/g, " ") : mode === "code" ? activeCodeContent : content)} {t("page.doc_editor.words")}</span>
+              <span>{(mode === "richtext" ? content.replace(/<[^>]+>/g, "") : mode === "code" ? activeCodeContent : content).length} {t("page.doc_editor.chars")}</span>
             </>
           )}
-          {(mode === "code" || mode === "text") && <span>{lineCount} {t("page.doc_editor.lines")}</span>}
+          {(mode === "code" || mode === "text") && <span>{mode === "code" ? activeCodeLineCount : lineCount} {t("page.doc_editor.lines")}</span>}
           {mode === "markdown" && (
             <>
               <span>{markdownStats.lines} lines</span>
@@ -7506,9 +8536,11 @@ export default function DocEditor() {
           {mode === "spreadsheet" && sheetData && <span>{sheetData.length} {t("page.doc_editor.rows_2")}</span>}
           {mode === "presentation" && <span>{pptxSlides.length} {t("page.doc_editor.slides")}</span>}
           {mode === "diagram" && diagramDoc && <span>{diagramDoc.elements.length} objects</span>}
+          {["text", "markdown", "code", "diagram"].includes(mode) && <span>{textEncodingLabel(textFileFormat)}</span>}
+          {isCsv && <span>{textEncodingLabel(textFileFormat)} · {csvFormatRef.current.delimiter === "\t" ? "TSV" : `delimiter ${csvFormatRef.current.delimiter}`}</span>}
         </div>
         <div className="doc-editor-footer-status" style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          {saveStatus === "saved" && (
+          {displayedSaveStatus === "saved" && (
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#5f928a", display: "inline-block" }} />
               {t("page.blueprint_detail.saved")}
@@ -7517,6 +8549,12 @@ export default function DocEditor() {
           {doc?.created_at && <span>{t("page.dashboard.created")} {new Date(doc.created_at).toLocaleDateString()}</span>}
         </div>
       </div>
+
+      <MediaInsertDialog
+        open={documentMediaInsertOpen}
+        onClose={() => setDocumentMediaInsertOpen(false)}
+        onInsert={handleDocumentMediaInsert}
+      />
 
       {/* Styles */}
       <style>{`
@@ -7758,26 +8796,19 @@ export default function DocEditor() {
             padding: 18px !important;
             border-radius: 18px !important;
           }
-          .doc-editor-code-layout {
-            grid-template-columns: minmax(0, 1fr) !important;
-            overflow: auto !important;
-          }
           .doc-editor-code-source {
-            min-height: 44vh !important;
-            flex: 0 0 auto !important;
+            min-height: 0 !important;
             border-right: 0 !important;
             border-bottom: 1px solid rgba(231,229,228,0.6) !important;
           }
           .doc-editor-code-source textarea {
-            min-height: 44vh !important;
-            padding: 18px !important;
+            min-height: 0 !important;
           }
           .doc-editor-code-preview {
-            min-height: 42vh !important;
-            flex: 0 0 auto !important;
+            min-height: 0 !important;
           }
           .doc-editor-code-preview-frame {
-            min-height: 42vh !important;
+            min-height: 0 !important;
           }
           .doc-editor-footer {
             align-items: flex-start !important;

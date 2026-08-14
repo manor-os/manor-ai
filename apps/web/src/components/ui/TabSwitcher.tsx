@@ -15,9 +15,12 @@ import { useEffect, useRef, type ReactNode } from "react";
 interface Tab {
   key: string;
   label: string;
+  compactLabel?: string;
   icon?: ReactNode;
   count?: number;
   badge?: string;
+  status?: "warning" | "danger";
+  statusLabel?: string;
 }
 
 interface TabSwitcherProps {
@@ -27,9 +30,10 @@ interface TabSwitcherProps {
   size?: "sm" | "md";
   className?: string;
   wrap?: boolean;
+  ariaLabel?: string;
 }
 
-export default function TabSwitcher({ tabs, value, onChange, size = "md", className = "", wrap = false }: TabSwitcherProps) {
+export default function TabSwitcher({ tabs, value, onChange, size = "md", className = "", wrap = false, ariaLabel }: TabSwitcherProps) {
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const pad = size === "sm" ? "4px 12px" : "5px 14px";
   const fs = size === "sm" ? 12 : 13;
@@ -38,16 +42,30 @@ export default function TabSwitcher({ tabs, value, onChange, size = "md", classN
   const buttonHeight = size === "sm" ? 28 : 32;
 
   useEffect(() => {
-    tabRefs.current[value]?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-      inline: "center",
+    const activeTab = tabRefs.current[value];
+    const scroller = activeTab?.parentElement;
+    if (!activeTab || !scroller) return;
+
+    const tabRect = activeTab.getBoundingClientRect();
+    const scrollerRect = scroller.getBoundingClientRect();
+    const centeredLeft = scroller.scrollLeft
+      + tabRect.left
+      - scrollerRect.left
+      - (scroller.clientWidth - tabRect.width) / 2;
+    const maxLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    scroller.scrollTo({
+      left: Math.min(Math.max(0, centeredLeft), maxLeft),
+      behavior: prefersReducedMotion ? "auto" : "smooth",
     });
   }, [value]);
 
   return (
     <div
       className={`manor-tab-switcher ${className}`}
+      role="tablist"
+      aria-label={ariaLabel}
       style={{
         display: wrap ? "flex" : "inline-flex",
         flexWrap: wrap ? "wrap" : "nowrap",
@@ -75,10 +93,23 @@ export default function TabSwitcher({ tabs, value, onChange, size = "md", classN
           <button
             key={tab.key}
             data-tab={tab.key}
+            role="tab"
+            aria-selected={active}
+            aria-label={tab.statusLabel ? `${tab.label}: ${tab.statusLabel}` : undefined}
+            tabIndex={active ? 0 : -1}
             ref={(node) => {
               tabRefs.current[tab.key] = node;
             }}
             onClick={() => onChange(tab.key)}
+            onKeyDown={(event) => {
+              if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+              event.preventDefault();
+              const currentIndex = tabs.findIndex((candidate) => candidate.key === tab.key);
+              const delta = event.key === "ArrowRight" ? 1 : -1;
+              const nextTab = tabs[(currentIndex + delta + tabs.length) % tabs.length];
+              onChange(nextTab.key);
+              tabRefs.current[nextTab.key]?.focus();
+            }}
             style={{
               display: "inline-flex", alignItems: "center", gap: 6,
               flex: "0 0 auto",
@@ -103,7 +134,18 @@ export default function TabSwitcher({ tabs, value, onChange, size = "md", classN
             } : undefined}
           >
             {tab.icon && <span style={{ display: "flex", alignItems: "center" }}>{tab.icon}</span>}
-            {tab.label}
+            {tab.compactLabel ? (
+              <>
+                <span className="manor-tab-label-default">{tab.label}</span>
+                <span className="manor-tab-label-compact">{tab.compactLabel}</span>
+              </>
+            ) : tab.label}
+            {tab.status && (
+              <span
+                className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${tab.status === "danger" ? "bg-red-500" : "bg-amber-500"}`}
+                aria-hidden="true"
+              />
+            )}
             {tab.badge && (
               <span style={{
                 fontSize: 9, fontWeight: 700, letterSpacing: "0.03em",

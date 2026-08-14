@@ -27,6 +27,7 @@ import {
   IconMusicNote,
   IconPalette,
   IconPaperclip,
+  IconPlay,
   IconReport,
   IconResolution,
   IconRefresh,
@@ -41,10 +42,12 @@ import ChatModeSelector, {
 import {
   getDefaultChatModePayload,
   normalizeChatModePayload,
+  coerceVideoGenerationMode,
   VIDEO_ASPECT_RATIO_OPTIONS,
   VIDEO_RESOLUTION_OPTIONS,
   type ChatModePayload,
 } from "./ChatModeBriefPanel";
+import { VideoGenerationMode } from "../lib/types";
 import { t } from "../lib/i18n";
 
 const VIDEO_DURATIONS = [4, 5, 8, 10, 15] as const;
@@ -366,6 +369,26 @@ export default function ChatModeToolbar({
     buttonLabel: option.label,
     icon: <IconResolution size={13} />,
   }));
+  const videoGenerationOptions = [
+    {
+      value: VideoGenerationMode.AUTO,
+      label: t("component.chat_mode.generation_auto"),
+      buttonLabel: t("component.chat_mode.generation_auto_short"),
+      icon: <IconSparkles size={13} />,
+    },
+    {
+      value: VideoGenerationMode.NATIVE_MOTION,
+      label: t("component.chat_mode.generation_native"),
+      buttonLabel: t("component.chat_mode.generation_native_short"),
+      icon: <IconGrid4 size={13} />,
+    },
+    {
+      value: VideoGenerationMode.AI_VIDEO,
+      label: t("component.chat_mode.generation_ai"),
+      buttonLabel: t("component.chat_mode.generation_ai_short"),
+      icon: <IconPlay size={13} />,
+    },
+  ];
   const videoAudioOptions = [
     {
       value: "true",
@@ -703,6 +726,15 @@ export default function ChatModeToolbar({
 
       {mode === "video" ? (
         <>
+          <ToolbarDropdownPill
+            controlLabel={t("component.chat_mode.brief_generation")}
+            value={current.generation_mode}
+            options={videoGenerationOptions}
+            disabled={disabled}
+            onChange={(generation_mode) =>
+              patch({ generation_mode: coerceVideoGenerationMode(generation_mode) })
+            }
+          />
           <ToolbarDropdownPill
             icon={<IconPaperclip size={12} />}
             controlLabel={t("component.chat_mode.brief_references")}

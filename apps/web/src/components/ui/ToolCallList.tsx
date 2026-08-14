@@ -12,6 +12,10 @@ import {
   type ToolCall,
 } from "../../lib/chatStream";
 import { resolveDisplayMediaUrl } from "../../lib/api";
+import {
+  AudioGenerationStatus,
+  parseAudioGenerationResult,
+} from "../../lib/audioGeneration";
 import { t } from "../../lib/i18n";
 import { matchSubAgentRuns } from "../../lib/subAgentDisplay";
 import { formatUserFacingLabel, formatUserFacingStructuredText } from "../../lib/taskDisplay";
@@ -220,6 +224,11 @@ function displayToolInput(tc: ToolCall) {
       params.filename;
     const label = name ? `${kind}: ${pathBasename(name)}` : kind;
     return label;
+  }
+
+  if (tc.name === "publish_site") {
+    const name = args.name || args.path;
+    return name ? compactText(String(name), 80) : "";
   }
 
   if (tc.name === "manor") {
@@ -783,9 +792,12 @@ function MediaPreview({ tc }: { tc: ToolCall }) {
   }
   if (tc.name === "generate_file" && resultText) {
     const parsed = parseToolResult(resultText);
+    const audioResult = parseAudioGenerationResult(parsed);
     const audioUrl =
-      parsed?.audio_url ||
-      (parsed?.kind === "audio" ? parsed?.result_url : undefined);
+      audioResult?.status === AudioGenerationStatus.Completed
+        ? audioResult.audio_url || audioResult.result_url
+        : parsed?.audio_url ||
+          (parsed?.kind === "audio" ? parsed?.result_url : undefined);
     if (audioUrl) {
       return (
         <div style={{ display: "block", padding: "4px 8px 6px" }}>
@@ -793,6 +805,23 @@ function MediaPreview({ tc }: { tc: ToolCall }) {
         </div>
       );
     }
+  }
+  if (tc.name === "publish_site" && resultText) {
+    const parsed = parseToolResult(resultText);
+    if (!parsed?.published || !parsed?.url) return null;
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px 6px" }}>
+        <a
+          href={String(parsed.url)}
+          target="_blank"
+          rel="noreferrer"
+          className="mono"
+          style={{ fontSize: 12, textDecoration: "underline", overflowWrap: "anywhere" }}
+        >
+          {String(parsed.url)}
+        </a>
+      </div>
+    );
   }
   if (
     (tc.name === "generate_video" ||

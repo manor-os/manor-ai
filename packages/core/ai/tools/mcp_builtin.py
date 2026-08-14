@@ -50,6 +50,22 @@ _INTEGRATION_ACCOUNT_PARAMETER = {
         "by search_tools. Omit it to use the default account."
     ),
 }
+_RUNTIME_WORKFLOW_CALL_CONTEXT_KEYS = (
+    "workflow_project_id",
+    "workflow_project_root",
+    "workflow_action_grant_id",
+    "workflow_scene_id",
+    "workflow_batch_capture",
+    "approved_plan_version",
+)
+
+
+def _runtime_workflow_call_context(runtime_context: Any) -> dict[str, Any]:
+    return {
+        key: value
+        for key in _RUNTIME_WORKFLOW_CALL_CONTEXT_KEYS
+        if (value := getattr(runtime_context, key, None))
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +518,7 @@ def _mcp_error_result_to_text(server_key: str, tool_name: str, result: dict) -> 
 
 from packages.core.ai.mcp import github as _gh_module  # noqa: E402
 from packages.core.ai.mcp import facebook as _fb_module  # noqa: E402
+from packages.core.ai.mcp import whatsapp as _whatsapp_module  # noqa: E402
 from packages.core.ai.mcp import gmail as _gmail_module  # noqa: E402
 from packages.core.ai.mcp import google_calendar as _gcal_module  # noqa: E402
 from packages.core.ai.mcp import manor_mcp_calendar as _manor_calendar_module  # noqa: E402
@@ -532,6 +549,7 @@ _SERVER_TOOL_SCHEMAS["github"] = _adapt_module_tools(_gh_module)
 _SERVER_TOOL_SCHEMAS["quickbooks"] = _adapt_module_tools(_qb_module)
 _SERVER_TOOL_SCHEMAS["telegram"] = _adapt_module_tools(_telegram_module)
 _SERVER_TOOL_SCHEMAS["facebook"] = _adapt_module_tools(_fb_module)
+_SERVER_TOOL_SCHEMAS["whatsapp"] = _adapt_module_tools(_whatsapp_module)
 _SERVER_TOOL_SCHEMAS["gmail"] = _adapt_module_tools(_gmail_module)
 _SERVER_TOOL_SCHEMAS["google_calendar"] = _adapt_module_tools(_gcal_module)
 _SERVER_TOOL_SCHEMAS["manor_mcp_calendar"] = _adapt_module_tools(_manor_calendar_module)
@@ -700,6 +718,11 @@ def _build_handler(server_key: str, tool_name: str) -> Callable:
             clear_ctx = getattr(module, "clear_call_context", None)
             if set_ctx:
                 call_ctx = {"user_id": user_id, "entity_id": entity_id}
+                if server_key == "manor_mcp_admin":
+                    from packages.core.services.auth_context import current_mfa_verified
+                    call_ctx["mfa_verified"] = (
+                        "true" if current_mfa_verified() else "false"
+                    )
                 runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
                 if decision.account_id:
                     call_ctx[INTEGRATION_ACCOUNT_ARGUMENT] = decision.account_id
@@ -709,16 +732,7 @@ def _build_handler(server_key: str, tool_name: str) -> Callable:
                 active_message = runtime_active_user_message_from_context(kwargs)
                 if active_message:
                     call_ctx["active_user_message"] = str(active_message)
-                for key in (
-                    "workflow_project_id",
-                    "workflow_action_grant_id",
-                    "workflow_scene_id",
-                    "workflow_batch_capture",
-                    "approved_plan_version",
-                ):
-                    value = getattr(runtime_context, key)
-                    if value:
-                        call_ctx[key] = value
+                call_ctx.update(_runtime_workflow_call_context(runtime_context))
                 set_ctx(call_ctx)
             try:
                 result = await module.call_tool(tool_name, tool_kwargs, bearer_token or "")
@@ -859,9 +873,9 @@ _ALT_TOOL_MAP: dict[tuple[str, str], tuple[str, str]] = {
     ("email", "list_messages"):   ("gmail", "list_messages"),
     ("email", "get_message"):     ("gmail", "get_message"),
     ("email", "send_email"):      ("gmail", "send_message"),
-    # WhatsApp → Twilio — both can SMS the same number, though the
-    # semantics differ slightly. Still useful as a fallback hint.
-    ("whatsapp", "send_message"): ("twilio", "send_sms"),
+    # WhatsApp → Twilio — both can deliver text to a phone number, though
+    # WhatsApp's customer-service window and template rules still apply.
+    ("whatsapp", "send_text"): ("twilio", "send_sms"),
 }
 
 
@@ -951,8 +965,15 @@ async def _resolve_bearer_token(
                     None,
                 )
                 chosen = default or rows[0]
-                if chosen.access_token:
-                    return chosen.access_token
+                from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+                token = lease_oauth_account_tokens(
+                    chosen,
+                    requester_id=user_id,
+                    reason=f"oauth.mcp.{server_key}",
+                    requester_kind="agent",
+                ).get("access_token")
+                if token:
+                    return token
 
         if scope == "entity":
             # Multi-account: prefer config.is_default first, fall back

@@ -86,6 +86,7 @@ def test_image_result_reports_the_saved_path():
     )
 
     assert payload["fs_path"] == "Workspaces/_by_id/f1/tasks/T1/images/hero.png"
+    assert payload["workspace_path"] == payload["fs_path"]
 
 
 def test_remote_url_result_has_no_entity_path_to_report():
@@ -99,6 +100,7 @@ def test_remote_url_result_has_no_entity_path_to_report():
         entity_id="ent_1",
     )
     assert not payload.get("fs_path")
+    assert not payload.get("workspace_path")
 
 
 # ── Write and read must agree on where files live ─────────────────────

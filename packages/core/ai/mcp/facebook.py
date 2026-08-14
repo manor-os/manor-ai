@@ -14,7 +14,7 @@ Lets agents:
 Auth model
 ──────────
 ``bearer_token`` here is the user's Facebook **User Access Token**
-(returned by Manor's Nango OAuth flow). Page-level operations need a
+(returned by Manor's provider OAuth flow). Page-level operations need a
 **Page Access Token**, fetched on demand via ``GET /me/accounts`` (or
 ``GET /{page_id}?fields=access_token``) and cached in-process by
 ``(user_token, page_id)``. Instagram Business calls reuse the Page
@@ -22,13 +22,15 @@ token of the linked Page (Meta's design).
 
 Scopes (Meta App Review required for non-Test users)
 ───────────────────────────────────────────────────
-Currently seeded scopes (see ``mcp_seed.py``):
+Seeded scopes (see ``mcp_seed.py``):
 
-  ``email, public_profile, pages_show_list, pages_read_engagement,
-   pages_manage_posts, pages_manage_engagement, pages_messaging``
+  ``public_profile, pages_show_list, pages_read_engagement,
+   pages_manage_posts, pages_manage_engagement, pages_messaging,
+   pages_manage_metadata, read_insights, instagram_basic,
+   instagram_content_publish, instagram_manage_comments,
+   instagram_manage_insights``
 
-To unlock the new surfaces, request these *additionally* during App
-Review (no code change needed — the same OAuth flow grants them):
+The higher-access scopes map to these surfaces during App Review:
 
   * ``pages_manage_metadata``      — ``update_page``
   * ``read_insights``              — page / post insights when

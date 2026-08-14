@@ -100,37 +100,52 @@ def _document_local_path(document: Document, fs_root: str) -> str | None:
     return full_path
 
 
-async def _filter_readable_local_documents(
-    db: AsyncSession,
-    documents: list[Document],
-) -> list[Document]:
-    """Keep stale local-file rows in Knowledge lists and mark them missing.
+# Stat results for entity-filesystem document files, keyed by
+# (fs_root, entity_id, fs_path). The mount is a network filesystem, so each
+# realpath/isfile is a metadata round-trip; listings re-stat the same files on
+# every request without this. Hits (file exists) stay valid for
+# _STAT_CACHE_TTL; misses use the shorter negative TTL so a file that just
+# landed (upload, repair, reconcile) stops being reported missing quickly.
+# Integrity marks written from stale entries are recoverable by design.
+_STAT_CACHE: dict[tuple[str, str, str], tuple[float, bool, str | None, bool]] = {}
+_STAT_CACHE_TTL = 60.0
+_STAT_CACHE_NEGATIVE_TTL = 5.0
+_STAT_CACHE_MAX = 50_000
+_STAT_CONCURRENCY = 8
 
-    The filesystem is the source of truth for rows with ``fs_path``. Background
-    reconcile eventually repairs or records these. A read path must not
-    permanently trash or hide documents because a mounted filesystem can be
-    temporarily unavailable.
+
+def _clear_local_stat_cache() -> None:
+    """Test hook."""
+    _STAT_CACHE.clear()
+
+
+async def _stat_local_documents(
+    stat_docs: list[Document],
+    fs_root: str,
+) -> dict[str, tuple[bool, str | None, bool]]:
+    """Resolve+stat document files off the event loop, through the TTL cache.
+
+    Returns ``{document.id: (root_ok, full_path, is_file)}``.
     """
-    from packages.core.config import get_settings
+    import time
 
-    settings = get_settings()
-    if not getattr(settings, "MANOR_FS_ENABLED", False):
-        return documents
-    fs_root = getattr(settings, "MANOR_FS_ROOT", "")
+    now = time.monotonic()
+    results: dict[str, tuple[bool, str | None, bool]] = {}
+    misses: list[Document] = []
+    for document in stat_docs:
+        key = (fs_root, str(document.entity_id), str(document.fs_path))
+        entry = _STAT_CACHE.get(key)
+        if entry is not None and entry[0] > now:
+            results[document.id] = entry[1:]
+        else:
+            misses.append(document)
+    if not misses:
+        return results
 
-    # Resolve every path and stat it in one worker-thread batch. The mount is
-    # a network filesystem: each realpath/isdir/isfile is a round-trip, and
-    # doing them inline on the event loop stalled every request in the
-    # process when a listing touched hundreds of rows.
-    stat_docs = [
-        document for document in documents
-        if not getattr(document, "file_url", None) and getattr(document, "fs_path", None)
-    ]
-
-    def _stat_batch() -> dict[str, tuple[bool, str | None, bool]]:
-        results: dict[str, tuple[bool, str | None, bool]] = {}
+    def _stat_chunk(chunk: list[Document]) -> dict[str, tuple[bool, str | None, bool]]:
+        chunk_results: dict[str, tuple[bool, str | None, bool]] = {}
         root_is_dir: dict[str, bool] = {}
-        for document in stat_docs:
+        for document in chunk:
             entity_root = os.path.realpath(
                 os.path.join(fs_root, str(getattr(document, "entity_id", "")))
             )
@@ -139,14 +154,69 @@ async def _filter_readable_local_documents(
                 root_ok = os.path.isdir(entity_root)
                 root_is_dir[entity_root] = root_ok
             if not root_ok:
-                results[document.id] = (False, None, False)
+                chunk_results[document.id] = (False, None, False)
                 continue
             full_path = _document_local_path(document, fs_root)
             is_file = bool(full_path and os.path.isfile(full_path))
-            results[document.id] = (True, full_path, is_file)
-        return results
+            chunk_results[document.id] = (True, full_path, is_file)
+        return chunk_results
 
-    stats = await asyncio.to_thread(_stat_batch) if stat_docs else {}
+    chunks = [misses[i::_STAT_CONCURRENCY] for i in range(_STAT_CONCURRENCY)]
+    chunks = [chunk for chunk in chunks if chunk]
+    parts = await asyncio.gather(*[asyncio.to_thread(_stat_chunk, chunk) for chunk in chunks])
+    fresh: dict[str, tuple[bool, str | None, bool]] = {}
+    for part in parts:
+        fresh.update(part)
+
+    now = time.monotonic()
+    for document in misses:
+        entry = fresh.get(document.id)
+        if entry is None:
+            continue
+        results[document.id] = entry
+        ttl = _STAT_CACHE_TTL if (entry[0] and entry[2]) else _STAT_CACHE_NEGATIVE_TTL
+        _STAT_CACHE[(fs_root, str(document.entity_id), str(document.fs_path))] = (now + ttl, *entry)
+
+    if len(_STAT_CACHE) > _STAT_CACHE_MAX:
+        expired = [key for key, entry in _STAT_CACHE.items() if entry[0] <= now]
+        for key in expired:
+            _STAT_CACHE.pop(key, None)
+        while len(_STAT_CACHE) > _STAT_CACHE_MAX:
+            _STAT_CACHE.pop(next(iter(_STAT_CACHE)), None)
+    return results
+
+
+async def _filter_readable_local_documents(
+    db: AsyncSession,
+    documents: list[Document],
+    *,
+    stat_files: bool = True,
+) -> list[Document]:
+    """Keep stale local-file rows in Knowledge lists and mark them missing.
+
+    The filesystem is the source of truth for rows with ``fs_path``. Background
+    reconcile eventually repairs or records these. A read path must not
+    permanently trash or hide documents because a mounted filesystem can be
+    temporarily unavailable.
+
+    ``stat_files=False`` skips the filesystem entirely: rows with ``fs_path``
+    are always kept visible regardless of stat outcome (the stats only feed
+    the ``file_integrity`` metadata mark), so aggregation passes — folder
+    counts, storage totals — get identical visibility without paying one
+    network-filesystem round-trip per document.
+    """
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    if not getattr(settings, "MANOR_FS_ENABLED", False):
+        return documents
+    fs_root = getattr(settings, "MANOR_FS_ROOT", "")
+
+    stat_docs = [
+        document for document in documents
+        if not getattr(document, "file_url", None) and getattr(document, "fs_path", None)
+    ] if stat_files else []
+    stats = await _stat_local_documents(stat_docs, fs_root) if stat_docs else {}
 
     visible: list[Document] = []
     mutated = False
@@ -172,6 +242,10 @@ async def _filter_readable_local_documents(
                 )
                 mutated = True
                 continue
+            visible.append(document)
+            continue
+
+        if not stat_files:
             visible.append(document)
             continue
 
@@ -1279,7 +1353,11 @@ async def list_visible_documents(
             limit=limit,
             offset=offset,
         )
-        readable = await _filter_readable_local_documents(db, docs)
+        # Knowledge listings are a database projection. Do not turn every
+        # browse/search request into a network-filesystem metadata scan: file
+        # existence is validated by content/download endpoints, while the
+        # periodic repair task records durable integrity state in the DB.
+        readable = await _filter_readable_local_documents(db, docs, stat_files=False)
         if len(readable) == len(docs):
             return readable, total
         return readable, max(0, total - (len(docs) - len(readable)))
@@ -1296,7 +1374,10 @@ async def list_visible_documents(
         limit=fetch_limit,
         offset=0,
     )
-    candidates = await _filter_readable_local_documents(db, candidates)
+    # Keep permission filtering independent from storage availability. Apart
+    # from making listings fast, this avoids transient JuiceFS outages hiding
+    # rows the caller is otherwise allowed to see.
+    candidates = await _filter_readable_local_documents(db, candidates, stat_files=False)
     ctx = await DocumentAccessContext.load(
         db,
         entity_id=entity_id,
@@ -1357,7 +1438,7 @@ async def visible_storage_usage(
         if not docs:
             break
         raw_batch_count = len(docs)
-        docs = await _filter_readable_local_documents(db, docs)
+        docs = await _filter_readable_local_documents(db, docs, stat_files=False)
         await ctx.preload_documents(db, docs)
         for document in docs:
             if await ctx.can_read_document(
@@ -1409,7 +1490,7 @@ async def visible_document_counts_by_folder(
         if not docs:
             break
         raw_batch_count = len(docs)
-        docs = await _filter_readable_local_documents(db, docs)
+        docs = await _filter_readable_local_documents(db, docs, stat_files=False)
         await ctx.preload_documents(db, docs)
         for document in docs:
             folder_id = getattr(document, "folder_id", None)

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { api } from "../lib/api";
 import {
+  clearAuthBrowserState,
   getAuthToken,
 } from "../lib/authToken";
 import { setPreferredTimeZone } from "../lib/format";
@@ -31,7 +32,7 @@ interface AuthState {
   verifyEmail: (email: string, code: string) => Promise<void>;
   resendVerification: (email: string) => Promise<void>;
   switchEntity: (entityId: string) => Promise<User>;
-  logout: () => void;
+  logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
 }
 
@@ -151,10 +152,16 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     return user;
   },
 
-  logout: () => {
+  logout: async () => {
     clearVolatileUserState();
-    localStorage.removeItem("manor_token");
-    rememberUser(null);
+    try {
+      await api.auth.logout();
+    } catch {
+      // Local cleanup must still complete if the token already expired or the
+      // network is unavailable. Server-side TTL remains capped at 60 minutes.
+    }
+    clearAuthBrowserState();
+    setPreferredTimeZone(undefined);
     set({ token: null, user: null, pendingVerificationEmail: null });
   },
 
@@ -176,8 +183,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       set({ user, token, isLoading: false });
     } catch {
       clearVolatileUserState();
-      localStorage.removeItem("manor_token");
-      rememberUser(null);
+      clearAuthBrowserState();
+      setPreferredTimeZone(undefined);
       set({ token: null, user: null, isLoading: false });
     }
   },

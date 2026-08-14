@@ -1,0 +1,32 @@
+{
+  "id": "video-edit",
+  "name": "video-edit",
+  "display_name": "Video Edit",
+  "type": "runtime_guidance",
+  "description": "Default workflow for finished and composed videos: edit and create product demos, UI walkthroughs, promos, explainers, motion graphics, title sequences, and screenshot- or clip-based productions with strict review and approval-gated rendering.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "video",
+    "video-editing",
+    "motion-graphics",
+    "product-video",
+    "product-demo",
+    "ui-walkthrough",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "video_edit",
+    "generate_file",
+    "write_file",
+    "edit_file",
+    "wait_media_jobs",
+    "probe_media",
+    "read_file",
+    "list_files"
+  ],
+  "max_rounds": 30,
+  "max_tokens": 14000,
+  "temperature": 0.2
+}

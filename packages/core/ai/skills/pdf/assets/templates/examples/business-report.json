@@ -1,0 +1,40 @@
+{
+  "brand": {
+    "name": "SOLIS RESEARCH",
+    "descriptor": "INDEPENDENT MARKET INTELLIGENCE"
+  },
+  "document_title": "Signals 2027",
+  "subtitle": "The Independent Retail Outlook",
+  "prepared_for": "Retail Strategy Council",
+  "prepared_by": "Mara Ellison",
+  "date": "October 14, 2026",
+  "summary": "Independent retail is entering a selective growth cycle. Smaller operators are investing less in footprint expansion and more in high-frequency customer rituals, service design, and local supply resilience.",
+  "metrics": [
+    {"label": "LOCAL SPEND SHARE", "value": "41%", "change": "+6 pts YoY"},
+    {"label": "AVG. VISIT FREQUENCY", "value": "2.8x", "change": "+14% YoY"},
+    {"label": "SAME-DAY FULFILLMENT", "value": "63%", "change": "+19 pts YoY"}
+  ],
+  "sections": [
+    {
+      "title": "Behavior Shift",
+      "paragraphs": [
+        "Customers are trading broad assortment for confident curation. Stores that explain why a product belongs outperform those that simply add more choice."
+      ],
+      "bullets": [
+        "Membership programs now influence 37% of repeat visits.",
+        "Repair, refill, and workshop services create the strongest retention lift.",
+        "Neighborhood relevance ranks above delivery speed for premium categories."
+      ]
+    },
+    {
+      "title": "Strategic Move",
+      "paragraphs": [
+        "Build one repeatable in-store ritual, publish a tighter point of view, and treat local partnerships as product rather than promotion."
+      ]
+    }
+  ],
+  "callout": {
+    "title": "THE 90-DAY BET",
+    "text": "Pilot a service-led membership in two locations and measure return visits, attachment rate, and community referrals."
+  }
+}

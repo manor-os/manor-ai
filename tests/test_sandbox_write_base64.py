@@ -9,6 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SANDBOX_SERVICE = ROOT / "sandbox-service"
 sys.path.insert(0, str(SANDBOX_SERVICE))
 
+# The service imports its own top-level ``config``. Another test module may
+# already have bound that name to a different file — packages/core/ai/skills/
+# pptx/scripts/config.py is also called ``config`` — and a sys.path insert
+# does nothing about an entry already in sys.modules. Whoever imported first
+# wins, so this passed alone and failed in a full collection.
+sys.modules.pop("config", None)
+
 fs_bridge = pytest.importorskip("sandbox.fs_bridge")
 
 

@@ -165,6 +165,25 @@ def test_planner_fallback_keeps_runtime_context_in_prompt():
     assert "doc:leasing-faq" in plan.steps[0].params["prompt"]
 
 
+def test_task_runner_propagates_proposal_external_authorization_as_runtime_metadata():
+    from packages.core.ai.task_runner import _task_runtime_metadata
+
+    authorization = {
+        "version": 1,
+        "task_id": "publish-task",
+        "provider": "youtube",
+        "destination": "studio.youtube.com",
+        "visibility": "public",
+    }
+    task = SimpleNamespace(
+        details={"proposal_external_authorization": authorization},
+    )
+
+    assert _task_runtime_metadata(task) == {
+        "proposal_external_authorization": authorization,
+    }
+
+
 @pytest.mark.asyncio
 async def test_task_runner_records_runtime_evidence_for_legacy_tasks(client, db_session, monkeypatch):
     import packages.core.ai.llm_client as llm_client
@@ -367,6 +386,7 @@ async def test_task_runner_uses_owner_user_when_creator_is_missing(
     assert "byok" not in seen["billing_context"]
     assert seen["agent_turn"]["user_id"] == owner_user_id
     assert seen["agent_turn"]["metadata"] == {"llm_api_key": "primary-owner-key"}
+    assert seen["supervisor"]["tool_evidence"] == []
 
 
 @pytest.mark.asyncio

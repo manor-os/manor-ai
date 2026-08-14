@@ -37,6 +37,13 @@ export default function Dropdown({
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  // Safari can composite a body-level fixed portal behind an overlay that
+  // uses backdrop-filter, even when the portal has the larger z-index. Keep
+  // dialog-owned menus inside the overlay's stacking context instead.
+  const overlayRoot = ref.current?.closest<HTMLElement>(
+    ".detail-scrim, .manor-dialog-overlay",
+  );
+  const portalTarget = overlayRoot ?? document.body;
 
   const triggerControl = isValidElement(trigger)
     ? cloneElement(trigger as ReactElement<any>, {
@@ -145,6 +152,7 @@ export default function Dropdown({
           <div
             ref={menuRef}
             className="manor-dropdown-menu animate-slide-down"
+            onClick={(event) => event.stopPropagation()}
             style={{
               position: "fixed",
               top: menuPos.top,
@@ -157,7 +165,9 @@ export default function Dropdown({
               borderRadius: 14,
               boxShadow: "var(--shadow-lg)",
               padding: "6px",
-              zIndex: 10030,
+              // DetailDrawer and Modal use the 20000/20001 layer. Dropdowns
+              // opened from inside them must sit above the dialog surface.
+              zIndex: 20010,
             }}
             role="menu"
           >
@@ -220,7 +230,7 @@ export default function Dropdown({
               </button>
             ))}
           </div>,
-          document.body,
+          portalTarget,
         )}
     </div>
   );

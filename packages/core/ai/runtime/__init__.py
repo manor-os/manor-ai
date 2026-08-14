@@ -505,6 +505,7 @@ from packages.core.ai.runtime.sandbox import (
     runtime_init_sandbox_context,
     runtime_load_sandbox_context,
     runtime_save_sandbox_context,
+    runtime_sandbox_context_owner_matches,
 )
 from packages.core.ai.runtime.prompt_sections import (
     DEFAULT_RUNTIME_PROMPT_SECTIONS,
@@ -877,6 +878,9 @@ from packages.core.ai.runtime.workspace_knowledge_actions import (
     runtime_workspace_remove_knowledge_document_action,
     runtime_workspace_update_knowledge_policy_action,
 )
+from packages.core.ai.runtime.workspace_blocker_actions import (
+    runtime_workspace_answer_task_blocker_action,
+)
 from packages.core.ai.runtime.workspace_delegation_actions import (
     runtime_workspace_delegate_service_action,
 )
@@ -1105,6 +1109,7 @@ __all__ = [
     "runtime_workspace_list_knowledge_action",
     "runtime_workspace_remove_knowledge_document_action",
     "runtime_workspace_update_knowledge_policy_action",
+    "runtime_workspace_answer_task_blocker_action",
     "runtime_workspace_delegate_service_action",
     "runtime_workspace_add_rule_action",
     "runtime_workspace_operation_action",
@@ -1499,6 +1504,7 @@ __all__ = [
     "runtime_init_sandbox_context",
     "runtime_load_sandbox_context",
     "runtime_save_sandbox_context",
+    "runtime_sandbox_context_owner_matches",
     "DEFAULT_RUNTIME_PROMPT_SECTIONS",
     "RuntimePromptMode",
     "RuntimePromptSectionFn",

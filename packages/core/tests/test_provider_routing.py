@@ -16,7 +16,10 @@ from packages.core.ai.llm_client import (
     resolve_llm_routing_for_model,
     resolve_provider_base_url,
 )
-from packages.core.services.model_provider_handlers import provider_from_base_url
+from packages.core.services.model_provider_handlers import (
+    provider_for_model_id,
+    provider_from_base_url,
+)
 from packages.core.services.platform_model_provider_keys import OfficialProviderCredential
 from packages.core.services.voice.whisper import WhisperError, transcribe_blob
 
@@ -475,6 +478,8 @@ async def test_platform_openrouter_fallback_returns_reference_aligned_timestamps
 
     assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
     assert captured["json"]["model"] == "google/gemini-3.1-flash-lite"
+    assert captured["json"]["temperature"] == 0
+    assert captured["json"]["top_p"] == 1
     assert "First sentence. Second sentence." in captured["json"]["messages"][0]["content"][1]["text"]
     assert result.model == "google/gemini-3.1-flash-lite"
     assert result.text == "First sentence. Second sentence."
@@ -599,6 +604,42 @@ class TestNormalizeModelForProvider:
         result = normalize_model_for_provider("anthropic/claude-sonnet-4.6", "https://openrouter.ai/api/v1")
         assert result == "anthropic/claude-sonnet-4.6"
 
+    def test_fixed_qwen_id_stays_qwen_on_openrouter(self):
+        result = normalize_model_for_provider(
+            "qwen/qwen3.8-max",
+            "https://openrouter.ai/api/v1",
+        )
+        assert result == "qwen/qwen3.8-max"
+
+    def test_fixed_qwen_id_maps_to_alibaba_on_vercel(self):
+        result = normalize_model_for_provider(
+            "qwen/qwen3.8-max",
+            "https://ai-gateway.vercel.sh/v1",
+        )
+        assert result == "alibaba/qwen3.8-max"
+
+    def test_fixed_qwen_id_strips_namespace_on_dashscope(self):
+        result = normalize_model_for_provider(
+            "qwen/qwen3.8-max",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        assert result == "qwen3.8-max"
+
+    def test_historical_alibaba_id_uses_qwen_native_provider(self):
+        assert provider_for_model_id("alibaba/qwen3.8-max") == "qwen"
+        _validate_llm_key_model_compatibility(
+            "sk-" + "q" * 32,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "alibaba/qwen3.8-max",
+        )
+        assert (
+            normalize_model_for_provider(
+                "alibaba/qwen3.8-max",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
+            == "qwen3.8-max"
+        )
+
     def test_vercel_gateway_keeps_full_id(self):
         result = normalize_model_for_provider(
             "anthropic/claude-sonnet-4.6",
@@ -691,6 +732,8 @@ class TestVisionFallbackRoutingMetadata:
         assert models.model_input_modalities("openai/gpt-5.5") == frozenset({"text", "image"})
         assert models.model_input_modalities("openai/gpt-5.5-pro") == frozenset({"text", "image"})
         assert models.model_input_modalities("moonshotai/kimi-k3") == frozenset({"text", "image"})
+        assert models.model_input_modalities("qwen/qwen3.8-max") == frozenset({"text", "image"})
+        assert models.model_input_modalities("qwen/qwen3.7-flash") == frozenset({"text", "image"})
         assert models.model_input_modalities("custom/unknown") is None
 
     def test_explicit_text_only_model_uses_configured_vision_fallback(self, monkeypatch):
@@ -759,7 +802,7 @@ class TestOfficialProviderRouting:
         import packages.core.services.platform_model_provider_keys as provider_keys
         from packages.core.ai import llm_client
 
-        async def fake_resolve(provider: str, *, reason: str = ""):
+        async def fake_resolve(provider: str, *, reason: str = "", sources=("db", "env")):
             assert provider == "vercel"
             return OfficialProviderCredential(
                 provider="vercel",
@@ -811,7 +854,7 @@ class TestOfficialProviderRouting:
         import packages.core.services.platform_model_provider_keys as provider_keys
         from packages.core.ai import llm_client
 
-        async def fake_resolve(provider: str, *, reason: str = ""):
+        async def fake_resolve(provider: str, *, reason: str = "", sources=("db", "env")):
             if provider == "vercel":
                 return None
             assert provider == "openrouter"

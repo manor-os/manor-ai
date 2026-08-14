@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 from apps.api.routers.chat import (
+    _VideoEditRouteState,
+    _VideoGenerationMode,
+    _chat_mode_blocked_tools,
     _chat_mode_direct_tool_calls,
     _chat_mode_runtime_prompt,
+    _conversation_video_edit_route_state,
     _message_with_chat_mode_marker,
+    _normalize_chat_mode,
     _parse_chat_mode_payload,
+    _runtime_metadata_for_chat_mode,
     _stream_llm_message_with_attachments,
 )
 from packages.core.ai.tools.generate_file.schema import GENERATE_FILE_SCHEMA
@@ -24,6 +33,7 @@ def test_video_chat_mode_all_refs_passes_image_video_and_audio_references():
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
         chat_mode_payload={
+            "generation_mode": "ai_video",
             "reference_policy": "hash_references",
             "aspect_ratio": "16:9",
             "clip_duration_seconds": 4,
@@ -87,7 +97,10 @@ def test_video_chat_mode_drops_kb_video_not_selected_in_raw_prompt():
 
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
-        chat_mode_payload={"reference_policy": "hash_references"},
+        chat_mode_payload={
+            "generation_mode": "ai_video",
+            "reference_policy": "hash_references",
+        },
         prompt="背景： #第三段 森林背景.png 大汉甲： #大汉三视图.png #白蛇三视图.png",
         attachments=attachments,
     )
@@ -114,7 +127,10 @@ def test_video_chat_mode_keeps_hash_selected_kb_video():
 
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
-        chat_mode_payload={"reference_policy": "hash_references"},
+        chat_mode_payload={
+            "generation_mode": "ai_video",
+            "reference_policy": "hash_references",
+        },
         prompt="参考 #motion.mp4 生成下一段",
         attachments=attachments,
     )
@@ -137,6 +153,7 @@ def test_video_chat_mode_first_last_uses_frame_fields_not_all_refs():
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
         chat_mode_payload={
+            "generation_mode": "ai_video",
             "reference_policy": "first_last_frames",
             "aspect_ratio": "9:16",
             "clip_duration_seconds": 5,
@@ -162,6 +179,7 @@ def test_video_chat_mode_audio_reference_can_be_kept_silent():
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
         chat_mode_payload={
+            "generation_mode": "ai_video",
             "reference_policy": "hash_references",
             "clip_duration_seconds": 4,
             "audio_policy": "silent_visual",
@@ -180,6 +198,7 @@ def test_video_chat_mode_defaults_to_native_generated_audio():
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
         chat_mode_payload={
+            "generation_mode": "ai_video",
             "reference_policy": "hash_references",
             "clip_duration_seconds": 4,
         },
@@ -205,6 +224,7 @@ def test_video_chat_mode_duration_is_clamped_to_single_clip_maximum():
 def test_video_chat_mode_resolution_is_normalized_and_passed_to_tool():
     payload = _parse_chat_mode_payload(
         {
+            "generation_mode": "ai_video",
             "clip_duration_seconds": 4,
             "reference_policy": "hash_references",
             "resolution": "1080P",
@@ -234,6 +254,223 @@ def test_video_chat_mode_resolution_rejects_unsupported_4k():
     )
 
     assert payload["resolution"] == "720p"
+
+
+def test_video_chat_mode_generation_modes_are_normalized():
+    assert {mode.value for mode in _VideoGenerationMode} == {
+        "auto",
+        "native_motion",
+        "ai_video",
+    }
+    assert _parse_chat_mode_payload({}, "video")["generation_mode"] is _VideoGenerationMode.AUTO
+    assert (
+        _parse_chat_mode_payload({"generation_mode": "auto"}, "video")["generation_mode"]
+        is _VideoGenerationMode.AUTO
+    )
+    assert (
+        _parse_chat_mode_payload({"generation_mode": "coded-motion"}, "video")["generation_mode"]
+        is _VideoGenerationMode.NATIVE_MOTION
+    )
+    assert (
+        _parse_chat_mode_payload({"generation_mode": "ai"}, "video")["generation_mode"]
+        is _VideoGenerationMode.AI_VIDEO
+    )
+
+
+def test_video_chat_mode_auto_and_native_motion_force_video_edit():
+    auto_calls = _chat_mode_direct_tool_calls(
+        chat_mode="video",
+        chat_mode_payload={"generation_mode": "auto", "output_type": "single_clip"},
+        prompt="Create a cinematic product launch animation.",
+        attachments=FileAttachments(),
+    )
+    assert auto_calls[0]["name"] == "invoke_skill"
+    assert auto_calls[0]["arguments"]["skill"] == "video-edit"
+
+    native_calls = _chat_mode_direct_tool_calls(
+        chat_mode="video",
+        chat_mode_payload={
+            "generation_mode": "native_motion",
+            "output_type": "single_clip",
+            "aspect_ratio": "9:16",
+            "clip_duration_seconds": 12,
+        },
+        prompt="Create a cinematic product launch animation.",
+        attachments=FileAttachments(
+            image_urls=["/api/v1/fs/entity/product.png"],
+        ),
+    )
+    assert native_calls[0]["name"] == "invoke_skill"
+    assert native_calls[0]["arguments"]["skill"] == "video-edit"
+    assert "/api/v1/fs/entity/product.png" in native_calls[0]["arguments"]["input"]
+    assert '"aspect_ratio": "9:16"' in native_calls[0]["arguments"]["input"]
+
+    native_prompt = _chat_mode_runtime_prompt("video", {"generation_mode": "native_motion"})
+    assert native_prompt is not None
+    assert "Do not call a video-generation model" in native_prompt
+    assert "video-edit" in native_prompt
+    assert "explicit user approval" in native_prompt
+    assert "Do not substitute manor.video_edit_recipe" in native_prompt
+
+    auto_prompt = _chat_mode_runtime_prompt("video", {"generation_mode": "auto"})
+    assert auto_prompt is not None
+    assert "Decide per scene" in auto_prompt
+    assert "instead of routing every video request" in auto_prompt
+    assert "video-edit" in auto_prompt
+    assert "video editing" in auto_prompt
+    assert "Do not silently fall back to manor.video_edit_recipe" in auto_prompt
+
+
+def test_auto_chat_does_not_guess_video_mode_from_keywords():
+    calls = _chat_mode_direct_tool_calls(
+        chat_mode="auto",
+        chat_mode_payload=None,
+        prompt="做一个需要产品截图和 UI 操作演示的产品 Demo 视频",
+        attachments=FileAttachments(
+            image_urls=["/api/v1/fs/entity/product-dashboard.png"],
+        ),
+    )
+
+    assert calls == []
+
+
+def test_auto_follow_up_routes_by_live_video_session_enum_without_keywords():
+    calls = _chat_mode_direct_tool_calls(
+        chat_mode="auto",
+        chat_mode_payload=None,
+        prompt="继续",
+        attachments=FileAttachments(),
+        video_edit_route_state=_VideoEditRouteState.SKILL_SANDBOX,
+    )
+    assert calls == [
+        {
+            "name": "invoke_skill",
+            "arguments": {"skill": "video-edit", "input": "继续"},
+        }
+    ]
+
+
+def test_live_owned_video_skill_sandbox_sets_structured_route_state(monkeypatch):
+    import packages.core.ai.runtime as runtime_module
+    import packages.core.ai.runtime.video_edit_sessions as session_module
+
+    async def no_edit_session(_conversation_id):
+        return None
+
+    async def load_skill_context(_conversation_id):
+        return {
+            "sandbox_id": "sandbox-video-1",
+            "skill_id": "video-edit",
+            "entity_id": "entity-1",
+            "user_id": "user-1",
+        }
+
+    async def live_skill(_sandbox_id, _expected_skill):
+        return True
+
+    monkeypatch.setattr(
+        session_module,
+        "load_conversation_video_edit_session",
+        no_edit_session,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "runtime_load_sandbox_context",
+        load_skill_context,
+    )
+    monkeypatch.setattr(
+        "apps.api.routers.chat._live_video_sandbox_matches_skill",
+        live_skill,
+    )
+
+    state = asyncio.run(
+        _conversation_video_edit_route_state(
+            "conversation-1",
+            entity_id="entity-1",
+            user_id="user-1",
+        )
+    )
+
+    assert state is _VideoEditRouteState.SKILL_SANDBOX
+
+
+def test_video_route_rejects_sandbox_owned_by_another_user(monkeypatch):
+    import packages.core.ai.runtime as runtime_module
+    import packages.core.ai.runtime.video_edit_sessions as session_module
+
+    async def no_edit_session(_conversation_id):
+        return None
+
+    async def load_skill_context(_conversation_id):
+        return {
+            "sandbox_id": "sandbox-video-1",
+            "skill_id": "video-edit",
+            "entity_id": "entity-1",
+            "user_id": "other-user",
+        }
+
+    async def must_not_probe(_sandbox_id, _expected_skill):
+        raise AssertionError("an unowned sandbox must not be probed")
+
+    monkeypatch.setattr(
+        session_module,
+        "load_conversation_video_edit_session",
+        no_edit_session,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "runtime_load_sandbox_context",
+        load_skill_context,
+    )
+    monkeypatch.setattr(
+        "apps.api.routers.chat._live_video_sandbox_matches_skill",
+        must_not_probe,
+    )
+
+    state = asyncio.run(
+        _conversation_video_edit_route_state(
+            "conversation-1",
+            entity_id="entity-1",
+            user_id="user-1",
+        )
+    )
+
+    assert state is _VideoEditRouteState.INACTIVE
+
+
+def test_chat_clients_reset_mode_while_auto_can_continue_server_session():
+    root = Path(__file__).resolve().parents[1]
+    embedded = (root / "apps/web/src/components/EmbeddedChat.tsx").read_text()
+    floating = (root / "apps/web/src/components/FloatingChat.tsx").read_text()
+    brief = (root / "apps/web/src/components/ChatModeBriefPanel.tsx").read_text()
+
+    assert "const resetChatModeAfterTurn" in embedded
+    assert "const resetChatModeAfterTurn" in floating
+    assert 'const requestChatMode = chatMode === "auto" ? undefined : chatMode;' in embedded
+    assert '!editorLiveSessionActive && chatMode !== "auto"' in floating
+    assert "if (requestChatMode) resetChatModeAfterTurn();" in embedded
+    assert "if (requestChatMode) resetChatModeAfterTurn();" in floating
+    assert "getPersistedChatModeState" not in embedded
+    assert "getPersistedChatModeState" not in floating
+    assert "getPersistedChatModeState" not in brief
+
+
+def test_video_chat_mode_ai_video_keeps_direct_generation_and_wait_contract():
+    calls = _chat_mode_direct_tool_calls(
+        chat_mode="video",
+        chat_mode_payload={
+            "generation_mode": "ai_video",
+            "output_type": "single_clip",
+        },
+        prompt="Generate a photoreal cinematic tracking shot.",
+        attachments=FileAttachments(),
+    )
+    assert calls[0]["arguments"]["kind"] == "video"
+
+    prompt = _chat_mode_runtime_prompt("video", {"generation_mode": "ai_video"})
+    assert prompt is not None
+    assert "generate_file(kind='video')" in prompt
+    assert "wait_media_jobs" in prompt
 
 
 def test_chat_mode_saved_marker_does_not_persist_raw_settings_json():
@@ -349,6 +586,67 @@ def test_auto_mode_does_not_force_presentation_generation_from_payload():
     assert calls == []
 
 
+def test_flows_mode_routes_through_workspace_flow_tools_without_forcing_media():
+    assert _normalize_chat_mode("flows") == "flows"
+    assert _chat_mode_direct_tool_calls(
+        chat_mode="flows",
+        chat_mode_payload=None,
+        prompt="Run Create product video in Product Video Studio.",
+        attachments=FileAttachments(),
+    ) == []
+
+    prompt = _chat_mode_runtime_prompt("flows")
+
+    assert prompt is not None
+    assert "search_tools" in prompt
+    assert prompt.index("search_tools") < prompt.index("list_workspace_flows")
+    assert "list_workspace_flows" in prompt
+    assert "start_workspace_flow" in prompt
+    assert "do not guess" in prompt.lower()
+    assert _message_with_chat_mode_marker("Run it", "flows") == (
+        "Run it\n[Mode: flows]"
+    )
+
+    assert _runtime_metadata_for_chat_mode(
+        FileAttachments(),
+        chat_mode="flows",
+        chat_mode_prompt=prompt,
+        direct_tool_calls=[],
+        origin_user_message_id="message-1",
+    )["chat_mode"] == "flows"
+
+
+def test_global_chat_mode_blocks_legacy_workflow_execution_and_authoring() -> None:
+    from packages.core.ai.runtime.surfaces import ChatSurface
+
+    auto_blocked = _chat_mode_blocked_tools(
+        "auto",
+        surface=ChatSurface.GLOBAL_OWNER_CHAT,
+    )
+    flows_blocked = _chat_mode_blocked_tools(
+        "flows",
+        surface=ChatSurface.GLOBAL_OWNER_CHAT,
+    )
+
+    assert {"run_workflow", "start_workspace_flow"} <= auto_blocked
+    assert "start_workspace_flow" not in flows_blocked
+    assert {"run_workflow", "create_workflow", "delete_workflow"} <= flows_blocked
+    assert {
+        "list_workspace_flows",
+        "start_workspace_flow",
+        "get_workflow_run",
+        "cancel_workflow_run",
+        "resume_workflow_run",
+    }.isdisjoint(flows_blocked)
+    assert "search_tools" not in flows_blocked
+    assert "invoke_skill" in flows_blocked
+    assert "generate_file" in flows_blocked
+    assert _chat_mode_blocked_tools(
+        "auto",
+        surface=ChatSurface.WORKSPACE_CHAT,
+    ) == set()
+
+
 def test_slides_editable_mode_stays_with_llm_planning():
     calls = _chat_mode_direct_tool_calls(
         chat_mode="slides",
@@ -373,7 +671,10 @@ def test_direct_media_chat_mode_does_not_inline_image_blocks_into_llm_message():
     )
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
-        chat_mode_payload={"reference_policy": "hash_references"},
+        chat_mode_payload={
+            "generation_mode": "ai_video",
+            "reference_policy": "hash_references",
+        },
         prompt="Generate a video from this reference.",
         attachments=attachments,
     )

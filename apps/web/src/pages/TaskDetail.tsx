@@ -18,6 +18,7 @@ import Modal from "../components/ui/Modal";
 import Button from "../components/ui/Button";
 import PageHeader from "../components/ui/PageHeader";
 import ChatMarkdown from "../components/ChatMarkdown";
+import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
 import WorkspaceChat from "../components/WorkspaceChat";
 import Chip from "../components/ui/Chip";
 import StatusPill from "../components/ui/StatusPill";
@@ -25,6 +26,7 @@ import PriorityPill from "../components/ui/PriorityPill";
 import { STATUS_CONFIG } from "../components/ui/StatusPill";
 import { PRIORITY_CONFIG } from "../components/ui/PriorityPill";
 import { CATEGORIES } from "../lib/taskCategories";
+import { isApprovalTaskType } from "../lib/taskTypes";
 import CategoryChip from "../components/ui/CategoryChip";
 import TaskPropertiesPanel from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
@@ -33,7 +35,15 @@ import TaskExecutionTimeline from "../components/task/TaskExecutionTimeline";
 import ChatInputFooter, { type AttachedItem, type MentionOption } from "../components/ChatInputFooter";
 import { t } from "../lib/i18n";
 import { inferRuntimeRuleFromText, shouldFallbackToWildcardRule } from "../lib/runtimeRules";
-import { formatTaskDescriptionForDisplay, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
+import { formatTaskDescriptionForDisplay, formatTaskOutputSummary, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
+import {
+  dedupeGeneratedFileRecords,
+  generatedFileDocumentId as canonicalOutputFileDocumentId,
+  generatedFileFsPath as canonicalOutputFileFsPath,
+  generatedFileIdentity as canonicalOutputFileIdentity,
+  generatedFileLabel as canonicalOutputFileLabel,
+  generatedFileOpenReference,
+} from "../lib/fileReferences";
 import {
   IconArrowLeft, IconClock, IconEdit, IconUser, IconAgent,
   IconCalendar, IconSend, IconFlag, IconCategory,
@@ -110,26 +120,11 @@ function canResumeStructuredHumanInput(task: Task | null | undefined, plan: any 
 }
 
 function outputFileIdentity(file: any): string {
-  if (!file || typeof file !== "object") return String(file || "");
-  const value = file.fs_path || file.saved_to || file.path || file.file_url || file.document_url || file.url || file.public_url || file.document_id || file.name || file.filename || file.original_name;
-  return String(value || JSON.stringify(file));
+  return canonicalOutputFileIdentity(file);
 }
 
 function outputFileLabel(file: any, fallback = "File"): string {
-  if (!file || typeof file !== "object") return String(file || fallback);
-  const explicit = file.name || file.filename || file.original_name || file.title;
-  if (explicit) return String(explicit);
-  const pathish = file.fs_path || file.saved_to || file.path || file.file_url || file.document_url || file.url || file.public_url || file.document_id;
-  if (pathish) {
-    const parts = String(pathish).split(/[\\/]/).filter(Boolean);
-    return parts[parts.length - 1] || String(pathish);
-  }
-  return String(file.type || fallback);
-}
-
-function isExternalOutputUrl(value: any): boolean {
-  const text = String(value || "").trim();
-  return /^https?:\/\//i.test(text) || text.startsWith("blob:") || text.startsWith("data:");
+  return canonicalOutputFileLabel(file, fallback);
 }
 
 function normalizeOutputPath(value: any): string {
@@ -137,17 +132,11 @@ function normalizeOutputPath(value: any): string {
 }
 
 function outputFileDocumentId(file: any): string {
-  if (!file || typeof file !== "object") return "";
-  return String(file.document_id || file.documentId || file.doc_id || "").trim();
+  return canonicalOutputFileDocumentId(file);
 }
 
 function outputFileLookupPath(file: any): string {
-  if (!file || typeof file !== "object") return "";
-  const value = file.fs_path || file.saved_to || file.path || file.file_url || file.document_url || file.result_url || file.output_url || file.url;
-  if (isExternalOutputUrl(value)) return "";
-  const path = normalizeOutputPath(value);
-  if (!path) return "";
-  return path;
+  return canonicalOutputFileFsPath(file);
 }
 
 function outputFileExternalUrl(file: any): string {
@@ -211,15 +200,7 @@ function buildTaskOutputPreview(source: any, fallbackLabel: string, fallbackPath
 }
 
 function dedupeOutputFiles(files: any[]): any[] {
-  const seen = new Set<string>();
-  const out: any[] = [];
-  for (const file of Array.isArray(files) ? files : []) {
-    const key = outputFileIdentity(file);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(file);
-  }
-  return out;
+  return dedupeGeneratedFileRecords(files);
 }
 
 function logTimestamp(log: any): number {
@@ -642,7 +623,7 @@ function TaskActionPanel({
   planPending: boolean;
 }) {
   const needsPlanApproval = plan?.status === "pending_approval";
-  const showTaskApproval = isApprovalTask || approvalDecision;
+  const showTaskApproval = isApprovalTask;
   const showPanel = hasPendingInput || showTaskApproval || needsPlanApproval;
   if (!showPanel) return null;
   const taskIsClosed = ["completed", "cancelled", "failed"].includes(task.status);
@@ -1012,6 +993,9 @@ export default function TaskDetail() {
   const currentUser = useAuthStore((s) => s.user);
   const taskReturnTo = getTaskReturnTo(location.state);
   const goBack = () => navigate(taskReturnTo || "/tasks");
+  const backLabel = taskReturnTo?.startsWith("/chat")
+    ? t("component.created_resource.back_to_chat")
+    : t("page.task_detail.back_to_tasks");
 
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
@@ -1447,15 +1431,11 @@ export default function TaskDetail() {
     staleTime: 60_000,
     queryFn: async () => {
       const entries = await Promise.all(taskOutputLookupPaths.map(async (path) => {
-        const label = outputFileLabel({ fs_path: path }, path);
-        const searches = Array.from(new Set([path, label].filter(Boolean)));
-        for (const search of searches) {
-          const res = await api.documents.list({ search, include_generated_assets: true, limit: 50 });
-          const docs = res.items || [];
-          const exact = docs.find((doc: any) => normalizeOutputPath(doc.fs_path) === path)
-            || docs.find((doc: any) => doc.name === label);
-          if (exact?.id) return [path, exact.id] as const;
-        }
+        const res = await api.documents.list({ search: path, include_generated_assets: true, limit: 50 });
+        const exact = (res.items || []).find(
+          (doc: any) => normalizeOutputPath(doc.fs_path) === path,
+        );
+        if (exact?.id) return [path, exact.id] as const;
         return [path, ""] as const;
       }));
       return Object.fromEntries(entries);
@@ -1475,7 +1455,7 @@ export default function TaskDetail() {
         <IconCancel size={24} />
       </div>
       <p style={{ color: "#78716c", fontSize: 14, margin: 0 }}>{t("page.task_detail.not_found")}</p>
-      <button onClick={goBack} className="btn-manor-ghost" style={{ fontSize: 13 }}>{t("page.task_detail.back_to_tasks")}</button>
+      <button onClick={goBack} className="btn-manor-ghost" style={{ fontSize: 13 }}>{backLabel}</button>
     </div>
   );
 
@@ -1531,27 +1511,13 @@ export default function TaskDetail() {
   const formattedDescription = formatTaskDescriptionForDisplay(task.description);
   const isLongDescription = formattedDescription.length > 720;
   const taskOutputSteps = Array.isArray(taskOutput?.steps) ? taskOutput.steps : [];
-  const taskOutputSummary = taskOutput
-    ? String(
-      taskOutput.summary
-      || taskOutput.result_summary
-      || taskOutput.message
-      || taskOutput.text
-      || taskOutputErrorMessage
-      || formatUserFacingStructuredText(taskOutput)
-      || "",
-    ).trim()
-    : "";
+  const taskOutputSummary = formatTaskOutputSummary(taskOutput) || taskOutputErrorMessage;
   const shouldShowAgentResponseInOutput = Boolean(
     taskOutputAgentResponse
     && taskOutputAgentResponse !== taskOutputSummary
     && taskOutputAgentResponse !== taskOutputErrorMessage
   );
-  const isApprovalTask = (
-    task.task_type === "approval" ||
-    String(task.title || "").toLowerCase().includes("approval") ||
-    String(runtimeContext.instructions || "").toLowerCase().includes("approval")
-  );
+  const isApprovalTask = isApprovalTaskType(task.task_type);
   const approvalDecision = taskDetails.approval_decision || task.actual_output?.approval;
   const taskWorkspace = task.workspace_id
     ? (workspaces as any[]).find((w) => w.id === task.workspace_id)
@@ -1622,8 +1588,9 @@ export default function TaskDetail() {
     if (comment) actionReplyCommentMutation.mutate(comment);
   };
   const pendingInputRequest = latestActionableInputRequest(logs as any[], taskOutput, task.status);
-  const pendingInputPrompt = inputRequestPrompt(pendingInputRequest);
-  const showTaskRecoveryPanel = !pendingInputRequest;
+  const actionableInputRequest = canResumePendingInput ? pendingInputRequest : null;
+  const pendingInputPrompt = inputRequestPrompt(actionableInputRequest);
+  const showTaskRecoveryPanel = !actionableInputRequest;
   const submitActionReply = () => {
     submitHumanInputReply(hitlReply);
   };
@@ -1633,13 +1600,13 @@ export default function TaskDetail() {
   const hasWorkspaceAgentActivity = workspaceAgentActivityCount > 0;
   return (
     <div className="task-detail-page" style={{ height: "100%", overflowY: "auto", padding: 0 }}>
-      {/* ── Breadcrumb ── */}
-      <button onClick={goBack} className="btn-manor-ghost"
-        style={{ padding: "4px 10px", fontSize: 13, marginBottom: 20, gap: 4 }}>
-        <IconArrowLeft size={14} /> {t("page.task_detail.back_to_tasks")}
-      </button>
-
       <PageHeader
+        breadcrumb={(
+          <button onClick={goBack} className="btn-manor-ghost"
+            style={{ padding: "4px 10px", fontSize: 13, gap: 4 }}>
+            <IconArrowLeft size={14} /> {backLabel}
+          </button>
+        )}
         title={editingTitle ? (
             <input autoFocus value={titleDraft} onChange={(e) => setTitleDraft(e.target.value)}
               onBlur={() => { if (titleDraft.trim() && titleDraft !== task.title) updateMutation.mutate({ title: titleDraft.trim() }); setEditingTitle(false); }}
@@ -1651,7 +1618,7 @@ export default function TaskDetail() {
               onClick={() => setEditingTitle(true)}
               className="flex min-w-0 cursor-pointer items-baseline gap-2 border-0 bg-transparent p-0 text-left font-[inherit] leading-[inherit] tracking-[inherit] text-[inherit]"
               title={t("page.task_detail.click_to_edit_title")}>
-              <span className="min-w-0 flex-1">{task.title}</span>
+              <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{task.title}</span>
               <span className="task-detail-title-id">
                 #{task.id.slice(-6)}
               </span>
@@ -1660,7 +1627,7 @@ export default function TaskDetail() {
         meta={(
           <div className="task-detail-chip-row">
             <StatusPill status={task.status} />
-            {pendingInputRequest && (
+            {actionableInputRequest && (
               <span style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 10px", borderRadius: 20, fontSize: 11, fontWeight: 800, color: "#936027", background: "#f3ecd6", border: "1px solid #ecdca4" }}>
                 <IconFlag size={10} /> {t("page.task_detail.needs_input")}
               </span>
@@ -1831,7 +1798,7 @@ export default function TaskDetail() {
           <TaskActionPanel
             task={task}
             pendingInputPrompt={pendingInputPrompt}
-            hasPendingInput={!!pendingInputRequest}
+            hasPendingInput={!!actionableInputRequest}
             canResumePendingInput={canResumePendingInput}
             hitlReply={hitlReply}
             onHitlReplyChange={setHitlReply}
@@ -2200,46 +2167,38 @@ export default function TaskDetail() {
                           || (f.step ? taskOutputPreviews.byKey[String(f.step)] : null)
                           || taskOutputPreviews.byKey[outputFileIdentity(f)]
                           || (!externalUrl && taskOutputPreviews.list.length === 1 ? taskOutputPreviews.list[0] : null);
-                        const viewerId = docId || lookupPath || (preview ? preview.id || outputFileIdentity(f) : "");
                         const viewerState = preview
                           ? { returnTo: `/tasks/${task.id}`, taskOutputPreview: preview }
                           : { returnTo: `/tasks/${task.id}` };
-                        const fileContent = (
-                          <>
-                            <IconDocument size={14} style={{ flexShrink: 0 }} />
-                            <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
-                            {f.step && <span style={{ fontSize: 10, color: "#a8a29e", fontWeight: 500 }}>{String(f.step).replace(/_/g, " ")}</span>}
-                          </>
-                        );
+                        const reference = generatedFileOpenReference(
+                          docId && !outputFileDocumentId(f)
+                            ? { ...f, document_id: docId }
+                            : f,
+                        ) || (preview ? `/viewer/${encodeURIComponent(`fs-preview:${label}`)}` : externalUrl);
                         const fileStyle = {
                           display: "flex", alignItems: "center", gap: 10,
                           padding: "8px 12px", borderRadius: 10,
                           background: "rgba(242,246,245,0.56)", border: "1px solid rgba(28,25,23,0.14)",
                           color: "#57534e", fontSize: 13, fontWeight: 650,
-                          cursor: viewerId || externalUrl ? "pointer" : "default",
+                          cursor: reference ? "pointer" : "default",
                         } as const;
-                        return viewerId ? (
-                          <Link
+                        return reference ? (
+                          <InlineFileReferenceCard
                             key={outputFileIdentity(f) || i}
-                            to={`/viewer/${encodeURIComponent(viewerId)}`}
-                            state={viewerState}
-                            style={{ ...fileStyle, textDecoration: "none" }}
-                          >
-                            {fileContent}
-                          </Link>
-                        ) : externalUrl ? (
-                          <a
-                            key={outputFileIdentity(f) || i}
-                            href={externalUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            style={{ ...fileStyle, textDecoration: "none" }}
-                          >
-                            {fileContent}
-                          </a>
+                            reference={reference}
+                            label={label}
+                            returnTo={`/tasks/${task.id}`}
+                            navigationState={viewerState}
+                            fileType={f.file_type || f.fileType}
+                            mimeType={f.mime_type || f.mimeType}
+                            compact
+                            trustedReference
+                          />
                         ) : (
                           <span key={outputFileIdentity(f) || i} style={fileStyle}>
-                            {fileContent}
+                            <IconDocument size={14} style={{ flexShrink: 0 }} />
+                            <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+                            {f.step && <span style={{ fontSize: 10, color: "#a8a29e", fontWeight: 500 }}>{String(f.step).replace(/_/g, " ")}</span>}
                           </span>
                         );
                       })}

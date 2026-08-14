@@ -23,14 +23,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.blueprints.installer import (
+    InstallError,
     InstallMode,
     _install_workflow_binding,
     install_blueprint,
 )
+from packages.core.blueprints.exporter import export_workspace
 from packages.core.models.base import generate_ulid
 from packages.core.models.integration_session import IntegrationSession
-from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
-from packages.core.models.workspace import Agent
+from packages.core.models.workflow import (
+    WorkflowBinding,
+    WorkflowDefinition,
+    WorkflowTemplateInstallation,
+)
+from packages.core.models.workspace import Agent, Workspace
 from packages.core.services.workflow_service import validate_workflow_steps
 
 
@@ -142,6 +148,44 @@ async def test_workflow_dependency_inversion(
     assert steps_by_id["review"]["config"]["timeout_minutes"] == 60
 
 
+async def test_entity_task_policy_sections_are_rejected_before_mutation(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    payload = _base_payload(
+        **{
+            "recipe.prompts": [{"key": "daily", "title": "Daily", "body": "Run the daily loop."}],
+            "recipe.task_categories": [{"key": "production", "label": "Production", "sort_order": 20}],
+            "recipe.sla_policies": [{"key": "review", "threshold_hours": 24, "description": "Review quickly."}],
+            "recipe.escalation_rules": [{"key": "review_late", "sla_policy_key": "review", "action": "notify", "delay_seconds": 60}],
+        }
+    )
+    with pytest.raises(InstallError, match="task_categories.*not portable"):
+        await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+
+    assert not (await db_session.execute(select(Workspace).where(Workspace.entity_id == entity_id))).scalars().all()
+
+
+async def test_prompts_are_workspace_guidance_and_roundtrip(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    payload = _base_payload(
+        **{
+            "recipe.prompts": [{"key": "daily", "title": "Daily", "body": "Run the daily loop."}],
+        }
+    )
+    installed = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    await db_session.commit()
+
+    workspace = (
+        await db_session.execute(select(Workspace).where(Workspace.id == installed.workspace_id))
+    ).scalar_one()
+    assert workspace.operating_model["blueprint_prompts"] == payload["recipe"]["prompts"]
+    exported = await export_workspace(db_session, workspace.id, title="T")
+    assert exported["recipe"]["prompts"] == payload["recipe"]["prompts"]
+
+
 async def test_workflow_idempotent_reinstall(
     db_session: AsyncSession,
     entity_id: str,
@@ -200,6 +244,53 @@ async def test_workflow_idempotent_reinstall(
     assert steps_by_id["s1"]["type"] == "agent"
 
 
+async def test_same_component_key_from_two_blueprint_ids_does_not_collide(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    workflow = {
+        "slug": "shared-readable-key",
+        "trigger_type": "manual",
+        "variables": [],
+        "steps": [{"id": "work", "kind": "agent_call"}],
+    }
+    payload = _base_payload(**{"recipe.workflows": [workflow]})
+
+    await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        payload=payload,
+        blueprint_id="blueprint:first",
+    )
+    await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        payload=payload,
+        blueprint_id="blueprint:second",
+    )
+    await db_session.commit()
+
+    workflows = list((await db_session.execute(
+        select(WorkflowDefinition).where(
+            WorkflowDefinition.entity_id == entity_id,
+            WorkflowDefinition.name == workflow["slug"],
+        )
+    )).scalars().all())
+    sources = list((await db_session.execute(
+        select(WorkflowTemplateInstallation).where(
+            WorkflowTemplateInstallation.entity_id == entity_id,
+            WorkflowTemplateInstallation.component_key == workflow["slug"],
+        )
+    )).scalars().all())
+
+    assert len(workflows) == 2
+    assert {source.template_id for source in sources} == {
+        "blueprint:first",
+        "blueprint:second",
+    }
+    assert len({source.workflow_id for source in sources}) == 2
+
+
 async def test_workflow_binding_config_installs_and_resynchronizes(
     db_session: AsyncSession,
     entity_id: str,
@@ -208,7 +299,10 @@ async def test_workflow_binding_config_installs_and_resynchronizes(
     workflow = {
         "slug": slug,
         "trigger_type": "manual",
-        "variables": [{"key": "request", "default": ""}],
+        "variables": [
+            {"key": "request", "default": ""},
+            {"key": "removed_default", "default": "legacy value"},
+        ],
         "run_inputs": [{
             "key": "request",
             "label": "Request",
@@ -254,7 +348,9 @@ async def test_workflow_binding_config_installs_and_resynchronizes(
     }
     await db_session.flush()
     workflow["binding_config"]["chat_entrypoint"]["title"] = "Updated workflow"
-    workflow["variables"][0]["default"] = "updated request"
+    workflow["variables"] = [{"key": "request", "default": "updated request"}]
+    workflow["deprecated_variable_keys"] = ["removed_default"]
+    workflow["trigger_type"] = "mcp"
     second_binding_id = await _install_workflow_binding(
         db_session,
         entity_id=entity_id,
@@ -266,12 +362,74 @@ async def test_workflow_binding_config_installs_and_resynchronizes(
     await db_session.refresh(binding)
 
     assert second_binding_id == binding.id
+    assert binding.trigger_type == "mcp"
     assert binding.config["chat_entrypoint"]["title"] == "Updated workflow"
     assert binding.config["operator_setting"] == "preserve-me"
     assert binding.variables == {
         "request": "updated request",
         "operator_variable": "preserve-me",
     }
+
+
+async def test_blueprint_workflow_can_persist_explicit_typed_data_contracts(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    slug = f"explicit-contracts-{entity_id}"
+    payload = _base_payload(**{
+        "recipe.workflows": [{
+            "slug": slug,
+            "trigger_type": "manual",
+            "explicit_data_contracts": True,
+            "run_inputs": [{"key": "source", "type": "string", "required": True}],
+            "steps": [
+                {
+                    "id": "draft",
+                    "kind": "agent_call",
+                    "input": "Draft from {{source}}",
+                    "output_var": "packet",
+                    "output_format": "json",
+                },
+                {
+                    "id": "gate",
+                    "type": "condition",
+                    "depends_on": ["draft"],
+                    "config": {"expression": "packet.approved == true"},
+                },
+                {
+                    "id": "done",
+                    "type": "end",
+                    "depends_on": ["gate"],
+                    "config": {"inputs": {"input": "{{packet}}"}},
+                },
+            ],
+        }],
+    })
+
+    await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    await db_session.commit()
+    definition = (await db_session.execute(
+        select(WorkflowDefinition).where(
+            WorkflowDefinition.entity_id == entity_id,
+            WorkflowDefinition.name == slug,
+        )
+    )).scalar_one()
+    steps = {step["id"]: step for step in definition.steps}
+
+    assert all(isinstance(step["config"]["inputs"], list) for step in steps.values())
+    assert all(isinstance(step["config"]["outputs"], list) for step in steps.values())
+    assert steps["draft"]["config"]["inputs"] == [
+        {"key": "source", "value": "{{source}}", "type": "text"},
+    ]
+    assert steps["draft"]["config"]["outputs"] == [
+        {"key": "packet", "value": "{{draft}}", "type": "json"},
+    ]
+    assert steps["gate"]["config"]["inputs"] == [
+        {"key": "packet", "value": "{{packet}}", "type": "json"},
+    ]
+    assert steps["done"]["config"]["inputs"] == [
+        {"key": "input", "value": "{{packet}}", "type": "json"},
+    ]
 
 
 async def test_workflow_diamond_dependencies(
@@ -547,3 +705,50 @@ async def test_check_unknown_kind_non_blocking_note(
     assert len(pic_todos) == 1
     assert pic_todos[0].blocking is False
     assert "ping_satellite" in pic_todos[0].detail
+
+
+async def test_check_blocking_workspace_setup_surfaces_install_todo(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    payload = _base_payload(
+        **{
+            "recipe.operating_model": {
+                "settings": {
+                    "blocking_setup": {
+                        "allowed_setup_task_keys": ["prepare_workspace_identity"],
+                        "checks": [
+                            {
+                                "key": "workspace_identity",
+                                "kind": "workspace_identity_assets",
+                                "asset_key": "stickman_character",
+                                "asset_path": "brand/stickman-character.png",
+                                "narrator_profile_key": "stickman_narrator_profile",
+                                "manifest_path": "brand/stickman-workspace-assets.md",
+                                "setup_task_key": "prepare_workspace_identity",
+                            }
+                        ],
+                    }
+                }
+            },
+            "policy.post_install_checks": [
+                {"kind": "blocking_setup_ready"},
+            ],
+        }
+    )
+    result = await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        payload=payload,
+        mode=InstallMode.SIMULATE,
+    )
+    await db_session.commit()
+
+    setup_todos = [todo for todo in result.todos if todo.kind == "blocking_setup"]
+    assert len(setup_todos) == 1
+    assert setup_todos[0].blocking is True
+    assert setup_todos[0].payload["result"] == "blocking_setup_incomplete"
+    assert setup_todos[0].payload["incomplete_checks"][0]["key"] == "workspace_identity"
+    assert setup_todos[0].payload["allowed_setup_task_keys"] == [
+        "prepare_workspace_identity"
+    ]

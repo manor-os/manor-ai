@@ -74,6 +74,11 @@ Hard constraints:
     or `files`.
     If the available agents can only provide text parameters, say so in
     `notes` instead of claiming drawings already exist.
+  * Make every structured `expected_output` a precise JSON Schema, not a prose
+    hint: list all mandatory fields in `required`; when the task asks for
+    exactly N records, set both `minItems` and `maxItems` to N on the relevant
+    array. The runtime hard-validates this contract before the terminal step
+    can complete, so do not omit constraints stated in the task description.
 
 Time horizon — pick the right owner for the timeline:
   * Agent-driven services (AI handles the work) typically complete
@@ -129,6 +134,18 @@ to the ids shown in [evidence: ...] suffixes of the observations you relied
 on. A task you cannot ground in any report or evidence is a task you should
 reconsider proposing. Optionally set `correlation_key` (stable snake_case)
 on recurring work so duplicate proposals can be detected across cycles."""
+
+
+RUNTIME_STRATEGIST_EXTERNAL_ACTION_GUIDANCE = """\
+`external_action` is optional and must be omitted for ordinary tasks. The only
+currently supported value is a one-use public YouTube publish scope with this
+exact shape: provider=youtube, action=publish_video,
+destination=studio.youtube.com, visibility=public, intended_channel set to the
+channel named by the task (or paired_chrome_signed_in_channel),
+predecessor_task_key naming a task in depends_on_task_keys, max_executions=1,
+and expires_in_hours between 1 and 168. Such a task must include
+external.social in required_capabilities. Never use this field for a different
+provider, host, visibility, action, or unbounded/repeating execution."""
 
 
 RUNTIME_STRATEGIST_HUMAN_REQUESTS_GUIDANCE = """\
@@ -217,6 +234,14 @@ duplicates, so do not re-propose a change that is still awaiting approval.
 Omit these arrays or return [] when the configuration is fine as it is."""
 
 
+RUNTIME_STRATEGIST_WORKFLOW_RUN_GUIDANCE = """\
+Use the optional `workflow_runs` array only for a Flow listed under Installed
+Workspace Flows. Reference its exact blueprint_slug and workflow_slug. Prefer
+workflow_run over decomposing an installed end-to-end Flow into ordinary tasks.
+Preserve the complete request in source_brief and use only declared input keys.
+Omit the field or return [] when no installed Flow matches."""
+
+
 RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
     "review_id": "<provided in user prompt — copy verbatim>",
     "summary": "One paragraph: this cycle's framing.",
@@ -235,6 +260,7 @@ RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
             "delegate_service_keys": ["<other allowed service>"],
             "depends_on_task_keys": ["task_key_that_must_finish_first"],
             "required_capabilities": ["workspace.search", "web.safe_search"],
+            "external_action": None,
             "priority": 3,
             "estimated_impact": {
                 "goal_id": "<Goal id this is meant to move, or null>",
@@ -306,6 +332,19 @@ RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT_V2 = {
                 "max_cost": 20,
                 "rollback_on_consecutive_failures": 2,
             },
+        }
+    ],
+    "workflow_runs": [
+        {
+            "run_key": "stable_snake_case_key",
+            "workflow_ref": {
+                "blueprint_slug": "exact installed blueprint slug",
+                "workflow_slug": "exact installed Flow slug",
+            },
+            "inputs": {"declared_input_key": "value"},
+            "source_brief": "Complete request and constraints for the Flow.",
+            "rationale": "Why this installed Flow is the right execution path.",
+            "basis": {"report_refs": [], "evidence_refs": []},
         }
     ],
     "automation_changes": [
@@ -432,12 +471,14 @@ def runtime_strategist_system_prompt(
         "ArtifactResult, TextResult, DocumentResult, ListResult, "
         "PublishResult, CountResult, DraftPack."
     )
+    parts.append(RUNTIME_STRATEGIST_EXTERNAL_ACTION_GUIDANCE)
     if briefing_mode:
         parts.append(RUNTIME_STRATEGIST_EMPTY_OK)
         parts.append(RUNTIME_STRATEGIST_BASIS_GUIDANCE)
         parts.append(RUNTIME_STRATEGIST_HUMAN_REQUESTS_GUIDANCE)
         parts.append(RUNTIME_STRATEGIST_EXPERIMENTS_GUIDANCE)
         parts.append(RUNTIME_STRATEGIST_CHANGE_GUIDANCE)
+        parts.append(RUNTIME_STRATEGIST_WORKFLOW_RUN_GUIDANCE)
     parts.append(
         "Output valid JSON matching this exact shape. No prose, no markdown:\n"
         f"{schema_hint}"
@@ -458,9 +499,10 @@ def runtime_strategist_template_block(ctx: Any) -> str:
         lines.append("# Business model for this workspace")
         if business_model.get("model_type"):
             lines.append(f"- Type: {business_model['model_type']}")
-        if business_model.get("primary_signal"):
-            lines.append(f"- Primary signal: {business_model['primary_signal']}")
-        secondary = business_model.get("secondary_signals") or []
+        primary_signal = business_model.get("primary_signal") or business_model.get("primary_metric")
+        if primary_signal:
+            lines.append(f"- Primary signal: {primary_signal}")
+        secondary = business_model.get("secondary_signals") or business_model.get("secondary_metrics") or []
         if secondary:
             lines.append("- Secondary signals: " + ", ".join(str(item) for item in secondary))
         anti = business_model.get("anti_signals") or []
@@ -488,6 +530,15 @@ def runtime_strategist_template_block(ctx: Any) -> str:
         must_weekly = proposal_shape.get("must_include_categories_per_week") or []
         if must_weekly:
             lines.append("- Must include at least one task per week in: " + ", ".join(str(item) for item in must_weekly))
+
+    priors = tpl.get("priors") or []
+    if isinstance(priors, (list, tuple)) and priors:
+        if lines:
+            lines.append("")
+        lines.append("# Workspace-specific proposal requirements - hard constraints")
+        for item in priors:
+            if str(item).strip():
+                lines.append(f"- {str(item).strip()}")
 
     do_not = tpl.get("do_not_propose") or []
     if do_not:
@@ -614,6 +665,13 @@ def runtime_strategist_user_prompt_v2(
     if getattr(ctx, "open_proposed_tasks", None):
         sections.append(
             "# Already-proposed tasks not yet approved\n" + _format_open_proposed(ctx)
+        )
+
+    installed_flows = getattr(ctx, "installed_flows", None) or []
+    if installed_flows:
+        sections.append(
+            "# Installed Workspace Flows\n"
+            + json.dumps(installed_flows, ensure_ascii=False, indent=2)
         )
 
     if getattr(ctx, "operating_memory", ""):

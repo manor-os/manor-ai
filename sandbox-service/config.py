@@ -18,9 +18,7 @@ class Config:
     SANDBOX_IMAGE: str = os.getenv("SANDBOX_IMAGE", "sandbox-skill:latest")
     SANDBOX_NETWORK: str = os.getenv("SANDBOX_NETWORK", "bridge")
     SANDBOX_DNS_SERVERS: list[str] = [
-        server.strip()
-        for server in os.getenv("SANDBOX_DNS_SERVERS", "").split(",")
-        if server.strip()
+        server.strip() for server in os.getenv("SANDBOX_DNS_SERVERS", "").split(",") if server.strip()
     ]
     SANDBOX_MEMORY: str = os.getenv("SANDBOX_MEMORY", "512m")
     SANDBOX_CPUS: float = float(os.getenv("SANDBOX_CPUS", "1.0"))
@@ -34,8 +32,8 @@ class Config:
     EXEC_TIMEOUT: int = int(os.getenv("SANDBOX_EXEC_TIMEOUT", "120"))
 
     # --- Lifecycle ---
-    IDLE_TIMEOUT_SECONDS: int = int(os.getenv("SANDBOX_IDLE_TIMEOUT", "3600"))
-    MAX_SANDBOXES: int = int(os.getenv("SANDBOX_MAX_SANDBOXES", "20"))
+    IDLE_TIMEOUT_SECONDS: int = int(os.getenv("SANDBOX_IDLE_TIMEOUT", "600"))
+    MAX_SANDBOXES: int = int(os.getenv("SANDBOX_MAX_SANDBOXES", "5"))
 
     # --- Skill files ---
     MAX_FILE_READ_SIZE: int = int(os.getenv("SANDBOX_MAX_FILE_READ_SIZE", "65536"))

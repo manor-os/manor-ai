@@ -103,6 +103,20 @@ class ExperimentPayload(BaseModel):
     overlay_patch: dict = Field(default_factory=dict)
 
 
+class WorkflowRunReference(BaseModel):
+    blueprint_slug: str
+    workflow_slug: str
+
+
+class WorkflowRunPayload(BaseModel):
+    run_key: str
+    workflow_ref: WorkflowRunReference
+    inputs: dict = Field(default_factory=dict)
+    source_brief: str
+    rationale: str
+    basis: Basis | None = None
+
+
 PAYLOAD_MODEL_BY_KIND: dict[str, type[BaseModel]] = {
     "task": TaskItemPayload,
     "human_request": HumanRequestPayload,
@@ -110,4 +124,5 @@ PAYLOAD_MODEL_BY_KIND: dict[str, type[BaseModel]] = {
     "workflow_change": WorkflowChangePayload,
     "goal_change": GoalChangePayload,
     "experiment": ExperimentPayload,
+    "workflow_run": WorkflowRunPayload,
 }

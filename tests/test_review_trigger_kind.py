@@ -26,6 +26,7 @@ from packages.core.ledger import record_event
 from packages.core.models.base import generate_ulid
 from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
+from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
 from packages.core.models.review_run import ReviewRun
 from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
@@ -165,6 +166,40 @@ async def _seed_open_proposal(db, workspace: Workspace, *, review_id: str) -> Ta
     return task
 
 
+async def _seed_open_workflow_proposal(
+    db,
+    workspace: Workspace,
+    *,
+    review_id: str,
+) -> ProposalItemRecord:
+    record = ProposalRecord(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        review_id=review_id,
+        summary="Run the product video Flow",
+        status="open",
+    )
+    db.add(record)
+    await db.flush()
+    item = ProposalItemRecord(
+        proposal_id=record.id,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        item_key="wr_product_video",
+        kind="workflow_run",
+        payload={
+            "run_key": "product_video",
+            "source_brief": "Create the approved product video.",
+        },
+        risk_level="medium",
+        action_key="workspace.proposal.workflow_run",
+        status="proposed",
+    )
+    db.add(item)
+    await db.commit()
+    return item
+
+
 async def _skip_notices(db, workspace: Workspace) -> list[Message]:
     conv_id = (await db.execute(
         select(Conversation.id).where(Conversation.workspace_id == workspace.id)
@@ -268,6 +303,40 @@ async def test_human_requested_review_with_open_proposals_is_not_silently_skippe
         select(Task).where(Task.workspace_id == workspace.id, Task.status == "proposed")
     )).scalars().all()
     assert [t.id for t in still_proposed] == [blocking.id]
+
+
+async def test_workflow_only_proposal_blocks_duplicate_review(
+    db_session,
+    monkeypatch,
+):
+    workspace = await _seed_workspace(db_session)
+    await _emit(db_session, workspace)
+    await _set_flag(db_session, True)
+    llm_calls: list[int] = []
+    _install_llm(monkeypatch, llm_calls)
+    _quiet_side_effects(monkeypatch)
+    blocking = await _seed_open_workflow_proposal(
+        db_session,
+        workspace,
+        review_id="rv_workflow_only",
+    )
+
+    result = await _execute_strategist_review_cycle(
+        db_session,
+        workspace.id,
+        ReviewTrigger(
+            kind=ReviewTriggerKind.HUMAN_REQUESTED,
+            detail="review the latest workspace state",
+        ),
+    )
+
+    assert result["needs_decision"] is True
+    assert result["reason"] == "open_proposals"
+    assert result["conflict"]["open_count"] == 1
+    assert result["conflict"]["item_ids"] == [blocking.id]
+    assert result["conflict"]["proposals"][0]["item_id"] == blocking.id
+    assert result["conflict"]["review_id"] == "rv_workflow_only"
+    assert llm_calls == []
 
 
 # ── 3. supersede=true → cohort rejected, review runs ──────────────────

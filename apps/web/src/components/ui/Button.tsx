@@ -13,6 +13,7 @@ interface ButtonProps {
   form?: string;
   title?: string;
   ariaLabel?: string;
+  ariaExpanded?: boolean;
 }
 
 const variantClass: Record<string, string> = {
@@ -42,6 +43,7 @@ export default function Button({
   form,
   title,
   ariaLabel,
+  ariaExpanded,
 }: ButtonProps) {
   const base = size === "lg" && variant === "primary" ? "btn-manor-lg" : variantClass[variant];
   const isDisabled = disabled || loading;
@@ -60,6 +62,7 @@ export default function Button({
       onClick={onClick}
       title={title}
       aria-label={ariaLabel}
+      aria-expanded={ariaExpanded}
     >
       {loading && <LoadingSpinner size={size === "sm" ? 14 : 16} />}
       {children}

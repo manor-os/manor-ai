@@ -1,24 +1,70 @@
 ---
 name: pptx
 description: "Use this skill to generate high-quality editable PowerPoint/PPTX decks from user requirements, topic prompts, or provided text/Markdown. Backed by PPT Master: plans the deck, writes SVG pages, quality-checks them, post-processes them, and exports to natively editable PPTX."
-version: 2.0.0
 ---
 
 # PPT Master Skill
 
 > AI-driven SVG presentation generation system. Turns user requirements, topic prompts, or provided text/Markdown into high-quality editable PPTX decks.
 
-**Core Pipeline**: `User Request / Source Text → Create Project → [Template] → Strategist → [AI Image Acquisition] → Executor → Quality Check → Post-processing → Export`
+**Core Pipeline**: `Request → Project → Strategist + layout_plan.json → [Images/Video] → SVG composition + [native chart/media data] → Quality Check → Export → Render/Repair`
+
+## Presentation Quality Contract (Mandatory)
+
+The deck is an audience-facing communication artifact, not a formatted outline.
+Every generation route MUST apply this contract before selecting layouts:
+
+1. **Communication job** — record one sentence in `design_spec.md`: “By the end,
+   [audience] should [outcome] because [central takeaway].” Infer sensible
+   defaults from the request; ask only when a missing choice would materially
+   change the result.
+2. **Narrative arc** — use a cumulative arc appropriate to the job, such as
+   context → stakes → evidence → implications → action; problem → options →
+   recommendation; or current state → change → future state. An agenda alone is
+   not a narrative.
+3. **One claim per slide** — each page has one narrative job and a concise,
+   takeaway-style title. Adjacent slides should answer or advance the question
+   raised by the prior slide. Open deliberately and close with a decision,
+   synthesis, implication, or next action rather than a generic “Thank you.”
+4. **Audience-facing copy** — never expose production notes, prompt scaffolds,
+   design deliberation, or model instructions on the canvas. Put presenter-only
+   material in speaker notes.
+5. **Density and typography** — shorten or split content before reducing type.
+   Use at least 67 px for deck titles (≈50 pt), 47 px for slide titles (≈35 pt),
+   32 px for subheads (≈24 pt), and 22 px for every audience-facing body or
+   label (exports safely above 16 pt). Only footer/legal text in the bottom 12%
+   of the canvas may be smaller. A reference template may preserve its style,
+   but its non-footer text must still meet these delivery minimums. A title
+   intended as one line must not wrap. Read `references/text-role-system.md` and
+   design a page-specific role grammar rather than repeating only title, body,
+   and boxed labels. Read `references/typography-profiles.md` and select one
+   profile from `templates/layouts/typography_profiles.json`; ordinary
+   unbranded business decks default to `office-modern`, not the more web-like
+   `product-modern`. Premium slides declare at least three text roles in
+   `layout_plan.json` and on the SVG root.
+6. **Visual composition** — use one coherent composition, not a dashboard of
+   repeated cards, pills, tabs, or UI panels. Vary adjacent silhouettes by
+   content role. Use diagrams only when they materially clarify a relationship
+   or sequence.
+7. **Provenance** — every externally sourced non-trivial claim and asset must be
+   traceable. Add a `[Sources]` block with exact URLs to that slide's speaker
+   notes; never invent citations.
+8. **Final-output QA** — SVG validation is necessary but not sufficient. After
+   exporting the native PPTX, render every final slide through LibreOffice,
+   inspect each slide at full size, and fix unintended overlap, clipping,
+   wrapping, font substitution, broken connectors, unresolved placeholders,
+   inconsistent page markers, and chart/data mismatches before delivery.
 
 > **Generation methods** — the default is the editable-SVG pipeline below. An
 > optional **Full-Page Image mode** (`workflows/image-mode.md`) keeps the same
-> page-by-page rhythm but renders each slide as a single AI-generated image
-> (fast, visually uniform, but **not editable** and text may be imperfect).
+> page-by-page SVG composition and validation discipline, then rasterizes every
+> validated page into one full-slide image. AI generation may supply text-free
+> visual assets, but exact text, charts, tables, and diagrams are authored in
+> SVG before rasterization. The final deck is **not editable**, but image-model
+> typography is forbidden.
 > Image mode is **explicit opt-in only** — enter it only when the user asks for
 > it (e.g. "整页图片模式 / image mode / 每页直接用图片生成") or when Manor invokes this
 > built-in skill with structured `params.render == "full_page_image"`.
-> It is a separate path and is exempt from the SVG-specific
-> rules below.
 
 ## Manor Built-In Skill Compatibility
 
@@ -27,27 +73,46 @@ This package is the built-in `pptx` skill, mounted in the sandbox at `/skill/`.
 - Treat `/skill` as `SKILL_DIR`. Before running commands, use `cd /skill` and set `SKILL_DIR=/skill` when needed.
 - Use `/skill/projects/...` for generated project folders unless the user asks for a different writable path.
 - Final PPTX files are expected under `/skill/projects/<project>/exports/`; save the final artifact from there.
-- Do not require external image-generation credentials inside the built-in skill. For `Acquire Via: ai` rows, create `images/image_prompts.json`, render `images/image_prompts.md` with `${SKILL_DIR}/scripts/image_prompts.py --render-md`, call Manor's system image tool with `generate_file(kind="image")`, then copy the returned workspace image into `<project_path>/images/<filename>` with `${SKILL_DIR}/scripts/import_system_image.py`.
+- Do not require external image-generation credentials inside the built-in skill. For `Acquire Via: ai` rows, create `images/image_prompts.json`, render `images/image_prompts.md` with `${SKILL_DIR}/scripts/image_prompts.py --render-md`, call Manor's system image tool with `generate_file(kind="image")`, then call the outer `sandbox_write_file` tool with the returned `workspace_path` and an absolute destination under `<project_path>/images/`. Use `${SKILL_DIR}/scripts/import_system_image.py` only when the generated asset is actually mounted under `/workspace`.
 - Do not use local image-provider backends from this skill. The built-in package has no local AI image generation entry point; use `${SKILL_DIR}/scripts/image_prompts.py` only for prompt manifest bookkeeping.
+- User-provided video attachments exposed under `/workspace` are supported as
+  embedded presentation assets. Copy each selected clip into
+  `<project_path>/media/`, probe it with ffprobe, and follow
+  `workflows/embedded-media.md`. Do not reference `/workspace` directly from
+  `embedded_media.json`, because delivery verification must be reproducible
+  from the project folder.
 
 ## Mandatory Pipeline Evidence
 
-> Scope: the rules in this section and in "Global Execution Discipline" govern
-> the **default editable-SVG pipeline**. The opt-in Full-Page Image mode
-> (`workflows/image-mode.md`) is the one sanctioned exception — when the user
-> explicitly requests it, follow that workflow instead and ignore the
-> SVG-specific evidence/discipline rules that do not apply (SVG authoring,
-> quality check, finalize, svg_to_pptx).
+> Scope: the serial authoring, layout-plan, SVG, and quality rules in this
+> section govern both output modes. The opt-in Full-Page Image mode
+> (`workflows/image-mode.md`) replaces only the editable `finalize_svg.py` /
+> `svg_to_pptx.py` export path with validated SVG → PNG → `images_to_pptx.py`.
+> Follow that workflow's evidence checklist when it is selected.
 
 - This skill has no direct-PPTX helper path. Do not write a custom Python, Node, or shell script that constructs a presentation directly.
 - Final PPTX output must be produced from hand-written SVG pages through the PPT Master pipeline.
 - Required pipeline evidence before saving the final PPTX:
   1. Project initialized with `${SKILL_DIR}/scripts/project_manager.py init <project_name>`.
   2. Strategist outputs exist: `<project_path>/design_spec.md` and `<project_path>/spec_lock.md`.
-  3. Executor SVG pages exist under `<project_path>/svg_output/`, written sequentially by the main agent.
-  4. Quality check has run with `${SKILL_DIR}/scripts/svg_quality_checker.py <project_path>` and has 0 errors.
-  5. Post-processing/export commands have run in order: `total_md_split.py`, `finalize_svg.py`, then `svg_to_pptx.py`.
-  6. The saved `.pptx` comes from `<project_path>/exports/` and was generated by `svg_to_pptx.py`.
+  3. `<project_path>/layout_plan.json` exists, follows
+     `references/layout-contract.md`, and passes `scripts/layout_plan.py`.
+  4. Executor SVG pages exist under `<project_path>/svg_output/`, written sequentially by the main agent. Quantitative chart pages also declare real PowerPoint charts in `native_charts.json`; read `workflows/native-charts.md`. Slides with playable video reserve `data-video-slot` regions and declare real PowerPoint media objects in `embedded_media.json`; read `workflows/embedded-media.md`.
+  5. Quality checks have run with `layout_plan.py` and `${SKILL_DIR}/scripts/svg_quality_checker.py <project_path>` and have 0 errors.
+  6. Post-processing/export commands have run in order: `total_md_split.py`, `finalize_svg.py`, then `svg_to_pptx.py`.
+  7. The saved `.pptx` comes from `<project_path>/exports/` and was generated by `svg_to_pptx.py`.
+  8. The final native PPTX was rendered with `render_pptx.py`; every rendered
+     slide was inspected at full size and the QA result recorded in
+     `<project_path>/qa/final-render.txt`.
+  9. `pptx_quality_gate.py` passed with score 90 or higher and wrote
+     `<project_path>/qa/pptx-quality.json`. A failed machine gate is a hard
+     stop: fix, re-export, re-render, and rerun the gate before delivery.
+
+`sandbox_save_result` reruns this gate server-side for every PPTX in
+`/skill/projects/<project>/exports/`. It verifies all-slide render evidence and
+binds the report to the exact PPTX bytes by SHA-256. Missing, failing, stale, or
+manually copied evidence cannot be delivered; renaming the output does not
+bypass the check.
 
 > [!CAUTION]
 > ## 🚨 Global Execution Discipline (MANDATORY)
@@ -55,8 +120,8 @@ This package is the built-in `pptx` skill, mounted in the sandbox at `/skill/`.
 > **This workflow is a strict serial pipeline. The following rules have the highest priority — violating any one of them constitutes execution failure:**
 >
 > 1. **SERIAL EXECUTION** — Steps MUST be executed in order; the output of each step is the input for the next. Non-BLOCKING adjacent steps may proceed continuously once prerequisites are met, without waiting for the user to say "continue"
-> 2. **BLOCKING = HARD STOP** — Steps marked ⛔ BLOCKING require a full stop; the AI MUST wait for an explicit user response before proceeding and MUST NOT make any decisions on behalf of the user
-> 3. **NO CROSS-PHASE BUNDLING** — Cross-phase bundling is FORBIDDEN. (Note: the Eight Confirmations in Step 4 are ⛔ BLOCKING — the AI MUST present recommendations and wait for explicit user confirmation before proceeding. Once the user confirms, all subsequent non-BLOCKING steps — design spec output, SVG generation, speaker notes, and post-processing — may proceed automatically without further user confirmation)
+> 2. **BLOCKING = MATERIAL CHOICE ONLY** — Pause only when missing information would materially change scope, brand identity, source fidelity, or the requested output mode. Ordinary topic-only requests use recommended defaults and continue.
+> 3. **NO CROSS-PHASE BUNDLING** — Cross-phase bundling is FORBIDDEN. Once the design contract is resolved—automatically for ordinary requests or explicitly for a material choice—all subsequent non-BLOCKING steps may proceed without further confirmation.
 > 4. **GATE BEFORE ENTRY** — Each Step has prerequisites (🚧 GATE) listed at the top; these MUST be verified before starting that Step
 > 5. **NO SPECULATIVE EXECUTION** — "Pre-preparing" content for subsequent Steps is FORBIDDEN (e.g., writing SVG code during the Strategist phase)
 > 6. **NO SUB-AGENT SVG GENERATION** — Executor Step 6 SVG generation is context-dependent and MUST be completed by the current main agent end-to-end. Delegating page SVG generation to sub-agents is FORBIDDEN
@@ -85,12 +150,17 @@ This package is the built-in `pptx` skill, mounted in the sandbox at `/skill/`.
 | `${SKILL_DIR}/scripts/project_manager.py` | Project init / validate / manage |
 | `${SKILL_DIR}/scripts/analyze_images.py` | Image analysis |
 | `${SKILL_DIR}/scripts/image_prompts.py` | AI image prompt manifest validation / Markdown sidecar / status updates |
-| `${SKILL_DIR}/scripts/import_system_image.py` | Copy Manor-generated images from `/workspace` into a pptx project |
+| `${SKILL_DIR}/scripts/import_system_image.py` | Compatibility fallback for generated images already mounted under `/workspace` |
+| `${SKILL_DIR}/scripts/icon_composer.py` | Build standalone vector icons with gradients, containers, duotone layers, and status badges |
 | `${SKILL_DIR}/scripts/svg_quality_checker.py` | SVG quality check |
+| `${SKILL_DIR}/scripts/layout_plan.py` | Validate semantic layout families, capacity budgets, SVG metadata, and deck rhythm |
 | `${SKILL_DIR}/scripts/total_md_split.py` | Speaker notes splitting |
 | `${SKILL_DIR}/scripts/finalize_svg.py` | SVG post-processing (unified entry) |
 | `${SKILL_DIR}/scripts/svg_to_pptx.py` | Export to PPTX |
-| `${SKILL_DIR}/scripts/images_to_pptx.py` | Full-Page Image mode export — assemble `images/page_*.png` into a one-image-per-slide PPTX |
+| `${SKILL_DIR}/scripts/render_pptx.py` | Render the final native PPTX through LibreOffice for per-slide visual QA |
+| `${SKILL_DIR}/scripts/pptx_quality_gate.py` | Validate final OOXML, editability, typography, provenance, media quality, and rendered-slide evidence |
+| `${SKILL_DIR}/scripts/render_page_images.py` | Full-Page Image mode composition — rasterize validated SVG pages to exact-size PNGs |
+| `${SKILL_DIR}/scripts/images_to_pptx.py` | Full-Page Image mode export — assemble `page_images/page_*.png` into a one-image-per-slide PPTX |
 | `${SKILL_DIR}/scripts/update_spec.py` | Propagate a `spec_lock.md` color / font_family change across all generated SVGs |
 
 For complete tool documentation, see `${SKILL_DIR}/scripts/README.md`.
@@ -102,6 +172,9 @@ For complete tool documentation, see `${SKILL_DIR}/scripts/README.md`.
 | Layout templates | `${SKILL_DIR}/templates/layouts/layouts_index.json` | Query available page layout templates |
 | Brand presets | `${SKILL_DIR}/templates/brands/brands_index.json` | Query available brand identity presets (color / typography / logo / voice) |
 | Visualization templates | `${SKILL_DIR}/templates/charts/charts_index.json` | Query available visualization SVG templates (charts, infographics, diagrams, frameworks) |
+| Composition registry | `${SKILL_DIR}/templates/layouts/composition_registry.json` | Semantic layout families with use/avoid rules, density, and bounded regions |
+| Text-role registry | `${SKILL_DIR}/templates/layouts/text_role_registry.json` | Semantic typography roles, scale bands, family roles, and line limits |
+| Typography profiles | `${SKILL_DIR}/templates/layouts/typography_profiles.json` | Office-modern, Microsoft 365, editorial, product, and CJK font systems with deterministic fallbacks |
 | Icon library | `${SKILL_DIR}/templates/icons/` | See `${SKILL_DIR}/templates/icons/README.md`; search icons on demand with `ls templates/icons/<library>/ \| grep <keyword>` |
 
 ## Diagram Guidance
@@ -111,7 +184,16 @@ matrix, funnel, timeline, or custom infographic, load
 `references/blocks/editable-diagram.md`. Diagram output must remain editable
 with native PPTX shapes/connectors/text after export, not a flattened raster
 image. Existing diagram block guidance lives at `references/blocks/diagram.md`
-and defers to the editable-diagram rules.
+and defers to the editable-diagram rules. Logical SVG edges must use
+`data-connector="true"`; diagram nodes and panels must use
+`data-connector-obstacle="true"`. The SVG gate rejects edges that cross text,
+enter protected shapes, cross other connectors, render above nodes, or fail to
+terminate on a visible shape boundary.
+
+Before choosing a diagram, write the relationship as one sentence and select a
+single topology. A hub-and-spoke is valid only for genuinely symmetric peer
+relationships around one hub. Intake → controls → execution with audit or
+evidence feedback is a governed pipeline, not a radial diagram.
 
 ## Standalone Workflows
 
@@ -119,9 +201,12 @@ and defers to the editable-diagram rules.
 |----------|------|---------|
 | `create-template` | `workflows/create-template.md` | Standalone layout template creation workflow |
 | `create-brand` | `workflows/create-brand.md` | Standalone brand-only template creation (identity preset; no SVG page roster) |
-| `image-mode` | `workflows/image-mode.md` | Full-Page Image mode — generate each slide as one AI image (non-editable); explicit opt-in only |
+| `image-mode` | `workflows/image-mode.md` | Full-Page Image mode — compose exact SVG pages with optional AI imagery, then flatten one image per slide; explicit opt-in only |
+| `follow-reference-pptx` | `workflows/follow-reference-pptx.md` | Generate from a user-provided PPTX while preserving its hierarchy and visual system |
+| `icon-composer` | `workflows/icon-composer.md` | Create or reuse refined native-PPT vector icons with layer palettes, official brand colors, optical alignment, quality checks, containers, gradients, and badges |
 | `resume-execute` | `workflows/resume-execute.md` | Phase B entry — resume execution in a fresh chat after Phase A (Step 1–5) completed in another session (split mode) |
 | `verify-charts` | `workflows/verify-charts.md` | Chart coordinate calibration — run after SVG generation if the deck contains data charts |
+| `embedded-media` | `workflows/embedded-media.md` | Editable image placement plus true embedded PowerPoint video objects with posters and playback settings |
 | `customize-animations` | `workflows/customize-animations.md` | Object-level PPTX animation customization — run only when the user explicitly asks to tune animation order/effects/timing |
 
 ---
@@ -132,7 +217,13 @@ and defers to the editable-diagram rules.
 
 🚧 **GATE**: User has provided a topic, requirements, outline, text, or Markdown content.
 
-Use the invocation prompt and any provided text/Markdown directly as the source material. This built-in skill does not install or run PDF, DOC, Excel, URL, or legacy PPT conversion pipelines. If the user supplies only a topic, create the deck from that topic and the model's general knowledge unless the user explicitly provides source text.
+Use the invocation prompt and any provided text/Markdown directly as the source
+material. A user-provided `.pptx` is a supported visual reference: carry its
+path into Step 3 and follow `workflows/follow-reference-pptx.md`. This built-in
+skill does not install or run PDF, DOC, Excel, URL, or legacy `.ppt` conversion
+pipelines. If the user supplies only a topic, create the deck from that topic
+and the model's general knowledge unless the user explicitly provides source
+text.
 >
 > Browser-based live preview cannot render EMF (will show blank) — this is expected;
 > the PPTX output is the source of truth.
@@ -149,6 +240,13 @@ Use the invocation prompt and any provided text/Markdown directly as the source 
 python3 ${SKILL_DIR}/scripts/project_manager.py init <project_name> --format <format>
 ```
 
+The canonical project directory includes the canvas format and date. Capture
+the exact path printed after `Project created:` and use that path for every
+later command, file write, quality check, and `sandbox_save_result` call. Never
+reconstruct or guess it from `<project_name>`. Initialization also creates a
+`projects/<project_name>` compatibility symlink, but the printed canonical path
+remains the source of truth for delivery evidence.
+
 Format options: `ppt169` (default), `ppt43`, `xhs`, `story`, etc. For the full format list, see `references/canvas-formats.md`.
 
 Use the user's prompt and any provided text/Markdown directly as the source context. Do not run source import or conversion commands in the built-in generation path.
@@ -161,18 +259,41 @@ Use the user's prompt and any provided text/Markdown directly as the source cont
 
 🚧 **GATE**: Step 2 complete; project directory structure is ready.
 
-**Default — free design.** Proceed directly to Step 4. Do NOT query `layouts_index.json` unless triggered. Do NOT ask the user. Do NOT proactively suggest, hint at, or fuzzy-match any template based on content, slug-like words, or vague style descriptions.
+Choose exactly one visual route. The first matching route wins:
 
-**Template flow triggers ONLY on an explicit template directory path** supplied by the user in their initial message. The trigger rule is mechanical, not interpretive:
+1. **User-provided PPTX or explicit template directory** — treat it as the
+   visual source of truth. Reuse its page hierarchy, layouts, typography, and
+   media frames; do not mix in an unrelated built-in template.
+2. **Explicit custom direction without a reference deck** — create a custom
+   system from the requested brand, theme, mood, or formatting brief.
+3. **No visual direction** — query `layouts_index.json` and automatically
+   shortlist unbranded layouts by semantic role: cover, statement, comparison,
+   process, timeline, evidence, chart, table, and closing action. Preserve the
+   selected layout's hierarchy and vary adjacent page silhouettes. Do not wait
+   for the user to choose a filesystem path.
 
-| User input contains | Step 3 action |
-|---|---|
-| An explicit path to a template directory (e.g. `/skill/templates/layouts/academic_defense/`, `projects/foo/template/`, or any other absolute / relative path that resolves to a directory containing `design_spec.md` and one or more page SVGs) | Copy that directory's SVGs + `design_spec.md` + assets into the project, advance |
-| Anything else — including bare template names ("用 academic_defense 模板"), style descriptions ("麦肯锡风格" / "Google style"), brand mentions ("招商银行风格"), vague intent ("想用个模板"), or silence | Skip Step 3, free design |
+A bare **unbranded** template name may be resolved through
+`layouts_index.json`. Never automatically apply a branded layout or logo from a
+brand mention alone. Branded templates and brand bundles require either an
+explicit directory path or supplied brand assets.
 
-There is no slug matching, no name lookup, no fuzzy resolution. A template name without a path does not trigger — the user must give a path the AI can `cd` into.
+When the reference is a `.pptx`, load
+`workflows/follow-reference-pptx.md`, then prepare the hierarchy-aware reference
+workspace before Strategist begins:
 
-The path may live anywhere — `/skill/templates/layouts/<name>/` (the built-in library), `projects/<other_project>/template/` (reusing a previous project's templates), or any other location. Location is irrelevant; what matters is that the user named the path.
+```bash
+python3 ${SKILL_DIR}/scripts/pptx_template_import.py \
+  <reference.pptx> --output <project_path>/reference \
+  --inheritance-mode both
+```
+
+Read `reference/manifest.json`, every master/layout/slide SVG, the inheritance
+graph, and every flattened slide at full size. Record the selected reference
+family for every new page in `spec_lock.page_layouts`. If the import exposes an
+unsupported source object, report and reconstruct it deliberately; never
+silently replace the reference with a generic built-in layout.
+
+For an explicit template directory, copy the exact bundle into the project:
 
 ```bash
 TEMPLATE_DIR=<user-supplied path>
@@ -182,20 +303,10 @@ cp ${TEMPLATE_DIR}/*.png <project_path>/images/ 2>/dev/null || true
 cp ${TEMPLATE_DIR}/*.jpg <project_path>/images/ 2>/dev/null || true
 ```
 
-> Style descriptions ("麦肯锡风格" / "Keynote 风" / "极简风" / etc.) never trigger Step 3. They flow naturally into Strategist's Eight Confirmations as part of the user's input — Strategist uses them as a style brief when proposing color / typography / tone in confirmations e and g.
-
-> Bare template names ("academic_defense", "招商银行") do NOT trigger Step 3 even if a folder by that name exists in the library. The user must give a path. AI must not "helpfully" resolve a name to a path.
-
-> "What templates exist?" is out-of-band Q&A — answer by listing entries from `layouts_index.json` together with their paths. Listing alone does not advance the pipeline; the user still has to send a path to trigger the Step 3 copy.
-
 > To create a new template, read `workflows/create-template.md`.
 
-**Brand triggering follows the same explicit-path rule as layout templates.** A brand is structurally a layout template minus its SVG page roster — its `design_spec.md` declares `kind: brand` in YAML frontmatter and lives under `templates/brands/<id>/`. `brands_index.json` is discovery-only, same as `layouts_index.json` — listing brands never triggers Step 3.
-
-| User input contains | Step 3 brand action |
-|---|---|
-| An explicit path to a brand directory (e.g. `/skill/templates/brands/acme/`, or any path that resolves to a directory whose `design_spec.md` declares `kind: brand`) | Copy `design_spec.md` + logo files + any present asset subdirectories into `<project_path>/templates/` |
-| Bare brand names ("use acme brand", "用 acme 品牌"), brand mentions without a path, or silence | Skip — same mechanical rule as layout templates: bare names never trigger |
+An explicit brand directory contributes color, typography, logo, voice, and
+icon treatment. Copy it without flattening its assets:
 
 ```bash
 BRAND_DIR=<user-supplied brand path>
@@ -206,10 +317,6 @@ cp ${BRAND_DIR}/*.png <project_path>/templates/ 2>/dev/null || true     # brand 
 [ -d ${BRAND_DIR}/illustrations ] && cp -r ${BRAND_DIR}/illustrations <project_path>/templates/
 [ -d ${BRAND_DIR}/icons ] && cp -r ${BRAND_DIR}/icons <project_path>/templates/
 ```
-
-> Brand and layout outputs share `<project_path>/templates/` because they are the same kind of artifact — a reference bundle that Strategist treats as truth. Downstream code never needs to distinguish them.
-
-> "What brands exist?" is out-of-band Q&A — answer by listing entries from `brands_index.json` together with their paths. Listing alone does not advance the pipeline; the user still has to send a path to trigger the Step 3 copy.
 
 > To create a new brand, read `workflows/create-brand.md`.
 
@@ -240,7 +347,9 @@ Action: AI reads `${LAYOUT_DIR}/design_spec.md` and `${BRAND_DIR}/design_spec.md
 
 If neither gate trips, fusion proceeds silently and Step 3 advances.
 
-**✅ Checkpoint — Default path proceeds to Step 4 without user interaction. If the user's input contains an explicit template directory path and/or an explicit brand directory path, those directories are copied (or fused) into `<project_path>/templates/` before advancing.**
+**✅ Checkpoint — Visual route selected and its constraints recorded. Ordinary
+topic-only requests now have a semantic layout shortlist; explicit reference or
+brand bundles are copied or fused before advancing.**
 
 ---
 
@@ -255,9 +364,13 @@ Read references/strategist.md
 
 > ⚠️ **Mandatory gate**: before writing `design_spec.md`, Strategist MUST `read_file templates/design_spec_reference.md` and follow its full I–XI section structure. See `strategist.md` Section 1.
 
-**Eight Confirmations** (full template: `templates/design_spec_reference.md`):
+**Eight Design Decisions** (full template: `templates/design_spec_reference.md`):
 
-⛔ **BLOCKING**: present the Eight Confirmations as a single bundled recommendation set and **wait for explicit user confirmation or modification** before outputting Design Specification & Content Outline. This is the single core confirmation point — once confirmed, all subsequent steps proceed automatically.
+Resolve these as a single recommended design contract. For an ordinary request,
+infer sensible defaults, record them in the spec, briefly tell the user what was
+chosen, and continue without stopping. Ask for confirmation only when a missing
+choice would materially alter scope, brand identity, reference fidelity, or the
+editable versus full-page-image output mode.
 
 1. Canvas format
 2. Page count range
@@ -266,35 +379,46 @@ Read references/strategist.md
 5. Color scheme
 6. Icon usage approach
 7. Typography plan
-8. Image usage approach
+8. Image and video usage approach
 
-**Mandatory — split-mode note** (not a ninth confirmation): after listing the eight confirmation details, you MUST append exactly one short line (rendered in the user's language, prefixed with 💡) about generation mode. Pick the variant by qualitative read of Phase A signals — recommended page count and source-material bulk:
+**Split-mode note** (not a ninth decision): include one short line, rendered in
+the user's language and prefixed with 💡, only for a heavy deck or when a context
+window switch would materially improve execution quality.
 
 | Signal read | Line content |
 |---|---|
 | Heavy (long page count / bulky source text) | State estimated page count and large source size; recommend switching to [split mode](workflows/resume-execute.md) after Step 5 — stop this chat, open a fresh window and input `继续生成 projects/<project_name>` to enter Phase B (SVG generation + export); no response or "continue" = default continuous mode. |
-| Normal (default) | State scale is moderate, default continuous mode generates in one go; if mid-way window switch is desired, input `继续生成 projects/<project_name>` after Step 5 to switch to [split mode](workflows/resume-execute.md). |
-
-This line is required output every run — the user must always see the mode choice exists. Whether to act on it is the user's call.
+| Normal (default) | Omit the split-mode note and continue in one pass. |
 
 If the user provided images, run analysis **before outputting the design spec**:
 ```bash
 python3 ${SKILL_DIR}/scripts/analyze_images.py <project_path>/images
 ```
 
-> ⚠️ **Image handling**: NEVER directly read / open / view image files (`.jpg`, `.png`, etc.). All image info comes from `analyze_images.py` output or the Design Spec's Image Resource List.
+> ⚠️ **Image handling**: run `analyze_images.py` for objective dimensions and
+> metadata, then inspect every selected image and its final crop at slide size
+> with the available image-viewing tool. Replace blurry, distorted, badly
+> framed, text-corrupted, or visually inconsistent assets before export.
+
+If the user provided video, inspect its filename, duration, dimensions, and
+codec with `ffprobe`, then list it in the design spec's media resource section.
+Do not fabricate or fetch video implicitly. A missing user-supplied clip is
+recorded as `Needs-Manual`, not silently replaced with a screenshot.
 
 **Output**:
 - `<project_path>/design_spec.md` — human-readable design narrative
 - `<project_path>/spec_lock.md` — machine-readable execution contract (skeleton: `templates/spec_lock_reference.md`); Executor re-reads before every page
+- `<project_path>/layout_plan.json` — one structured page composition per slide; read `references/layout-contract.md`, shortlist from `templates/layouts/composition_registry.json`, and validate before Executor begins
 
 **✅ Checkpoint — Phase deliverables complete, auto-proceed to next step**:
 ```markdown
 ## ✅ Strategist Phase Complete
-- [x] Eight Confirmations completed (user confirmed)
-- [x] Split-mode note appended below the eight items (heavy or normal variant)
+- [x] Eight design decisions resolved (recommended defaults or explicit confirmation)
+- [x] Communication job and narrative arc recorded
+- [x] Split-mode note included only when materially useful
 - [x] Design Specification & Content Outline generated
 - [x] Execution lock (spec_lock.md) generated
+- [x] Structured layout plan generated and validated
 - [ ] **Next**: Auto-proceed to [Image_Generator / Executor] phase
 ```
 
@@ -302,7 +426,7 @@ python3 ${SKILL_DIR}/scripts/analyze_images.py <project_path>/images
 
 ### Step 5: Image Acquisition Phase (Conditional)
 
-🚧 **GATE**: Step 4 complete; Design Specification & Content Outline generated and user confirmed.
+🚧 **GATE**: Step 4 complete; Design Specification & Content Outline generated and the design contract resolved through recommended defaults or explicit confirmation.
 
 > **Trigger**: At least one row in the resource list has `Acquire Via: ai`. If every row is `user` or `placeholder`, skip to Step 6.
 
@@ -316,12 +440,12 @@ Then load the AI image generation reference only when at least one row needs gen
 
 | Acquire Via | Load reference (only if any such row exists) | Run |
 |---|---|---|
-| `ai` | `references/image-generator.md` | System image generation tool; import outputs to `<project_path>/images/<filename>` with `import_system_image.py`; use `image_prompts.py` for manifest state |
+| `ai` | `references/image-generator.md` | System image generation tool; deliver the returned workspace file to `<project_path>/images/<filename>` with outer `sandbox_write_file`; use `import_system_image.py` only for `/workspace` compatibility and `image_prompts.py` for manifest state |
 | `user` / `placeholder` | (skip) | (skip) |
 
 Do not use web image search in this built-in skill. If an external visual is needed, generate it through the system image tool or mark the row `Needs-Manual`.
 
-> ⚠️ **In-pipeline ai path MUST use manifest mode for planning** — even when only 1 ai row exists. Write `images/image_prompts.json` first and render `image_prompts.md` as the audit sidecar via `image_prompts.py --render-md`. In built-in Manor mode, use `generate_file(kind="image")` to create each file from the manifest prompts, then import it from `/workspace` with `import_system_image.py`; do not ask for image API keys.
+> ⚠️ **In-pipeline ai path MUST use manifest mode for planning** — even when only 1 ai row exists. Write `images/image_prompts.json` first and render `image_prompts.md` as the audit sidecar via `image_prompts.py --render-md`. In built-in Manor mode, use `generate_file(kind="image")` to create each file from the manifest prompts, then deliver it with outer `sandbox_write_file(workspace_path=..., path=<project_path>/images/<filename>)`; use `import_system_image.py` only for an actual `/workspace` mount and do not ask for image API keys.
 
 Workflow:
 
@@ -359,12 +483,13 @@ Read the role definition based on the selected style:
 ```
 Read references/executor-base.md          # REQUIRED: common guidelines
 Read references/shared-standards.md       # REQUIRED: SVG/PPT technical constraints
+Read references/layout-contract.md        # REQUIRED: per-slide composition contract
 Read references/executor-general.md       # General flexible style
 Read references/executor-consultant.md    # Consulting style
 Read references/executor-consultant-top.md # Top consulting style (MBB level)
 ```
 
-> Only read executor-base + shared-standards + one style file.
+> Read executor-base + shared-standards + layout-contract + exactly one style file.
 
 **Design Parameter Confirmation (Mandatory)**: before the first SVG, output key design parameters from the spec (canvas dimensions, color scheme, font plan, body font size). See executor-base.md §2.
 
@@ -372,20 +497,47 @@ Read references/executor-consultant-top.md # Top consulting style (MBB level)
 
 **Per-page spec_lock re-read (Mandatory)**: before **each** SVG page, `read_file <project_path>/spec_lock.md` and use only its colors / fonts / icons / images, plus the per-page `page_rhythm` / `page_layouts` / `page_charts` lookups (resolves to template SVGs already loaded in the batch read above). Resists context-compression drift on long decks. See executor-base.md §2.1.
 
+When the design spec contains a video resource, also read
+`workflows/embedded-media.md`. Reserve its SVG region with `data-video-slot`
+and write `<project_path>/embedded_media.json`; do not rasterize the clip into
+the page or substitute a hyperlink.
+
+**Title-safe layout contract (Mandatory)**: reserve the complete header stack
+before placing body content. Keep titles inside the 5%–95% horizontal safe area.
+Use one line when it fits; otherwise use exactly one explicit semantic line
+break (`<tspan>`) and no more than two title lines. Never reduce a page title
+below 47px to force fit. A subtitle or eyebrow must start below the title's
+actual line box with at least 24px clear space, and body content must start at
+least 32px below the final header line. Shorten the claim or split the slide if
+those clearances cannot be met.
+
 > ⚠️ **Main-agent only**: SVG generation MUST stay in the current main agent — page design depends on full upstream context. Do NOT delegate to sub-agents.
 > ⚠️ **Generation rhythm**: generate pages sequentially, one at a time, in the same continuous context. Do NOT batch (e.g., 5 per group).
 
 **Visual Construction Phase**: generate SVG pages sequentially, one at a time, in one continuous pass → `<project_path>/svg_output/`
 
+For every quantitative data chart, read `workflows/native-charts.md`, reserve an
+SVG slot, and write the structured series/axis configuration to
+`<project_path>/native_charts.json`. Do not hand-draw ordinary bar, column,
+line, area, pie, doughnut, radar, scatter, or bubble charts as SVG geometry.
+
 **Quality Check Gate (Mandatory)** — after all SVGs, before post-processing/export:
 ```bash
+python3 ${SKILL_DIR}/scripts/layout_plan.py \
+  <project_path>/layout_plan.json \
+  --svg-dir <project_path>/svg_output \
+  --slide-count <count>
 python3 ${SKILL_DIR}/scripts/svg_quality_checker.py <project_path>
 ```
 - Any `error` (banned SVG features, viewBox mismatch, spec_lock drift, etc.) MUST be fixed before proceeding — return to Visual Construction, regenerate that page, re-run check.
 - `warning` entries (low-res image, non-PPT-safe font tail, etc.): fix when straightforward, otherwise acknowledge and release.
 - Run against `svg_output/` (not after `finalize_svg.py` — finalize rewrites SVG and masks violations).
 
-**Logic Construction Phase**: generate speaker notes → `<project_path>/notes/total.md`
+**Logic Construction Phase**: generate speaker notes → `<project_path>/notes/total.md`.
+For every externally sourced non-trivial claim or asset, append a literal
+`[Sources]` block with the exact supporting URLs to that page's notes. Do not
+invent sources and do not place production-only citations on the visible slide
+unless the audience needs them.
 
 **✅ Checkpoint — Confirm all SVGs and notes are fully generated and quality-checked. Proceed directly to Step 7 post-processing**:
 ```markdown
@@ -417,10 +569,10 @@ python3 ${SKILL_DIR}/scripts/svg_quality_checker.py <project_path>
 
 > If files are missing: PAUSE, list the missing filenames, point the user to `images/image_prompts.md` (each `### Image N:` block is paste-ready; auto-generated from `image_prompts.json`) and the required placement `project/images/<filename>`. Resume Step 7.1 only after all expected files are in place. `finalize_svg.py` and `svg_to_pptx.py` do not detect missing files at this layer — proceeding with gaps produces a deck with broken image references.
 
-> ⚠️ Run the three sub-steps **one at a time** — each must complete successfully before the next.
+> ⚠️ Run the six sub-steps **one at a time** — each must complete successfully before the next.
 > ❌ **NEVER** combine them into a single code block or shell invocation.
 
-Canonical three-command pipeline (mirrors `references/shared-standards.md` §5):
+Canonical export-and-QA pipeline (mirrors `references/shared-standards.md` §5):
 
 **Step 7.1** — Split speaker notes:
 ```bash
@@ -442,6 +594,100 @@ python3 ${SKILL_DIR}/scripts/svg_to_pptx.py <project_path>
 # Add --svg-snapshot to additionally emit the SVG-image preview pptx alongside the native pptx:
 #   exports/<project_name>_<timestamp>_svg.pptx      ← SVG preview pptx (reads svg_final/)
 ```
+
+When `<project_path>/native_charts.json` exists, the exporter automatically
+adds those charts as editable PowerPoint Chart objects at their reserved SVG
+slots. A manifest error is a hard export failure.
+
+When `<project_path>/embedded_media.json` exists, the exporter automatically
+embeds each local clip as a real PowerPoint media object at its reserved SVG
+slot, using a supplied poster or an ffmpeg-generated frame. A manifest, media,
+poster, or slot error is a hard export failure.
+
+**Step 7.4 — Render the final native PPTX (mandatory)**:
+
+```bash
+python3 ${SKILL_DIR}/scripts/render_pptx.py \
+  <project_path>/exports/<final_native_deck>.pptx \
+  --output-dir <project_path>/qa/final-render
+```
+
+**Step 7.5 — Run the final machine quality gate (mandatory)**:
+
+```bash
+python3 ${SKILL_DIR}/scripts/pptx_quality_gate.py \
+  <project_path>/exports/<final_native_deck>.pptx \
+  --mode auto \
+  --project <project_path> \
+  --render-dir <project_path>/qa/final-render \
+  --min-score 90 \
+  --report <project_path>/qa/pptx-quality.json
+```
+
+The gate auto-detects editable versus full-page-image delivery and checks OOXML
+relationship integrity, portable table typefaces/alignment, slide bounds,
+title fit/header collisions, editable
+content, the 16pt audience-text minimum, unresolved placeholders, internal
+process copy, repeated layout silhouettes, overlap risk, source-note
+formatting, `layout_plan.json` fidelity, declared native-chart and embedded-video counts, raster
+DPI, exact rendered-slide count, and a SHA-256 fingerprint of the final file.
+Its `repair_actions` are the mandatory next-pass instructions. Exit code 1 or
+a score below 90 is a hard failure.
+
+When the report contains `metrics.layout_defects`, use those records as the
+authoring targets for the next pass. Each record identifies the slide, defect
+kind, involved shape IDs, visible text, normalized bounds, and (for overlaps)
+the measured intersection ratio. Repair the named elements, regenerate the
+whole final PPTX, render every slide again, and rerun the gate; never discard
+this evidence and retry an unrelated layout.
+
+**Step 7.6 — Inspect every rendered slide at full size (mandatory)**:
+
+Inspect every `qa/final-render/slide-*.png` individually at full size. Use a
+contact sheet only to judge deck-level rhythm. Record the inspection in
+`qa/final-render.txt`, including title wrapping, overflow/overlap, font
+substitution, image crops, connector routing, chart/data fidelity, sources in
+speaker notes, and adjacent-layout repetition. Any unintended defect returns to
+the appropriate authoring step, followed by re-export and a fresh full render.
+For Full-Page Image mode, also follow `workflows/image-mode.md` and write the
+required `qa/visual-inspection.json` receipt bound to the exact PPTX and every
+rendered-slide SHA-256. Its checks explicitly include nested slide screenshots,
+duplicate/stale layers, and duplicate footer/callout text. Do not deliver a deck
+that has only passed SVG validation or an automated numeric score. The receipt
+must also record `connector_routing: pass` and `text_containment: pass`. Write
+`qa/text-containment.json` version 2 with exact final-PPTX SHA-256, every slide
+number, every final-render SHA-256, and slide-scoped review records. Any slide
+whose text was changed or is placed in a panel, node, bubble, badge, or chart
+mark must use `method: pixel-bbox` and include measured text/container padding
+records. Every measured record must prove the whole containment chain: `bbox`
+inside the actual `containing_region_bbox`, that region inside its actual
+`parent_region_bbox`, and the parent inside the final render canvas. Use the
+slide canvas as parent only for a true top-level region; a nested card or panel
+must name its visual owner. Record `minimum_required_padding`, recomputed
+`actual_minimum_padding`, `font_size`, and `minimum_font_size`; the gate rejects
+inflated padding, undersized text, and a card that extends outside its parent.
+For every `pixel-bbox` slide, also record `source_pixel_dimensions` from the
+actual full-page image embedded in that slide. Premium raster typography must
+use at least 192 effective DPI (2560×1440 for a 13.333×7.5 inch 16:9 slide);
+never upscale a 1280×720 page image. Use real Regular/Medium/Semibold font files,
+avoid faux bold and default DejaVu Bold unless the reference deck requires it,
+and reserve the heaviest weight for rare emphasis rather than whole labels.
+For generic business decks, use the `office-modern` profile: sentence-case
+Carlito with regular body and bold headings. Lato is an explicit product/digital
+choice, not the default PowerPoint look.
+The corresponding `svg_output` page must retain real SVG `<text>` primitives;
+a wrapper containing only a full-page raster is not authoring evidence and is
+rejected. Never satisfy the DPI gate by resampling a smaller flattened page.
+A single-slide evidence file never proves a multi-slide deck. Inspect every diagram at full size
+and fail the deck if an edge crosses text, a node/panel interior, or another
+connector, or if an endpoint floats away from its target boundary. For every
+panel or circular-node label, bind the SVG `<text>` to an explicit
+`data-text-container-id`; verify the measured text bbox remains inside the
+container's declared padding. Shorten copy before reducing audience text below
+the minimum size. A chart bubble or data mark is not automatically a label
+container: keep only a short number inside the mark and place the audience label
+in a measured external text region unless the full label passes the circle's
+declared padding.
 
 > The native pptx consumes `svg_output/` directly so the converter can preserve
 > high-fidelity primitives (icon `<use>` placeholders, image `preserveAspectRatio`
@@ -498,6 +744,8 @@ Before switching roles, **MUST first read** the corresponding reference file. Ou
 | Image-text layout patterns (Primary structures + Modifier layers — combine freely) | `references/image-layout-patterns.md` |
 | Image layout sizing (math for side-by-side container dimensions) | `references/image-layout-spec.md` |
 | SVG image embedding | `references/svg-image-embedding.md` |
+| Structured layout contract | `references/layout-contract.md` |
+| Native PowerPoint charts | `workflows/native-charts.md` |
 | Icon library | `templates/icons/README.md` |
 
 ---

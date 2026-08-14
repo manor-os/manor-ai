@@ -166,7 +166,7 @@ def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None
     assert triggers["workflow_dispatch"]["inputs"]["publish"]["type"] == "boolean"
     assert "if" not in job
     assert any(
-        step.get("uses") == "actions/setup-node@v4"
+        step.get("uses") == "actions/setup-node@v7"
         and step.get("with", {}).get("node-version") == "20"
         for step in steps
         if isinstance(step, dict)
@@ -176,7 +176,7 @@ def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None
     assert "npm ci" in install_step["run"]
     assert "npm run build" in install_step["run"]
 
-    upload_step = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+    upload_step = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v7")
     assert upload_step["with"]["name"] == "manor-ai-docs-${{ github.sha }}"
     assert upload_step["with"]["path"] == "docs-site/build"
 

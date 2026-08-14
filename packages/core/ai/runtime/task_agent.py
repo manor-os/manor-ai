@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from packages.core.constants.task import AI_LOG_TYPES, TaskLogType
@@ -40,6 +40,8 @@ RUNTIME_TASK_VALID_VERDICTS = {
     RUNTIME_TASK_VERDICT_NEEDS_HITL,
     RUNTIME_TASK_VERDICT_NEEDS_REPLAN,
 }
+_SUPERVISOR_TOOL_EVIDENCE_MAX_RESULT_CHARS = 1_600
+_SUPERVISOR_TOOL_EVIDENCE_MAX_ITEMS = 8
 
 
 def runtime_task_engine(engine: Any | None = None) -> Any:
@@ -246,6 +248,7 @@ class RuntimeTaskAgentTurnResult:
     tool_names: list[str]
     usage: dict[str, Any]
     had_tool_calls: bool
+    supervisor_evidence: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -346,6 +349,21 @@ def _supervisor_tool_names_for_call(tool_name: str, tool_args: Mapping[str, Any]
         if action:
             names.append(f"{tool_name}:{action}")
     return names
+
+
+def _supervisor_tool_evidence_for_call(
+    tool_name: str,
+    tool_result: Any,
+) -> dict[str, str]:
+    """Keep a bounded receipt for the supervisor's completion review."""
+
+    result_text = str(tool_result or "")
+    if len(result_text) > _SUPERVISOR_TOOL_EVIDENCE_MAX_RESULT_CHARS:
+        result_text = (
+            result_text[:_SUPERVISOR_TOOL_EVIDENCE_MAX_RESULT_CHARS]
+            + "... [truncated]"
+        )
+    return {"tool_name": tool_name, "result": result_text}
 
 
 def _schema_name(schema: dict[str, Any]) -> str | None:
@@ -461,6 +479,7 @@ async def runtime_execute_task_agent_turn(
     with runtime_artifact_tracking_scope(runtime_artifact_urls=prior_artifact_urls):
         messages.append(response)
         tool_names: list[str] = []
+        supervisor_evidence: list[dict[str, str]] = []
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
                 continue
@@ -484,6 +503,9 @@ async def runtime_execute_task_agent_turn(
                 runtime_envelope=runtime_envelope,
             )
             runtime_record_tool_result_artifacts(tool_result)
+            supervisor_evidence.append(
+                _supervisor_tool_evidence_for_call(tool_name, tool_result)
+            )
             messages.append(
                 ChatMessage(
                     role="tool",
@@ -512,6 +534,7 @@ async def runtime_execute_task_agent_turn(
             tool_names=tool_names,
             usage=usage,
             had_tool_calls=True,
+            supervisor_evidence=supervisor_evidence,
         )
 
 
@@ -575,11 +598,18 @@ def runtime_task_supervisor_prompt(
     turns_used: int,
     max_turns: int,
     tools_called: list[str] | None = None,
+    tool_evidence: list[dict[str, str]] | None = None,
 ) -> str:
     """Render the scheduled-task supervisor prompt."""
 
     response_preview = agent_response[:4000] + ("..." if len(agent_response) > 4000 else "")
     tools_summary = ", ".join(tools_called) if tools_called else "(none -- agent did not invoke any tool)"
+    evidence_items = (tool_evidence or [])[-_SUPERVISOR_TOOL_EVIDENCE_MAX_ITEMS:]
+    evidence_summary = "\n".join(
+        f"- {str(item.get('tool_name') or 'unknown_tool')}: {str(item.get('result') or '')}"
+        for item in evidence_items
+        if isinstance(item, dict)
+    ) or "(none recorded)"
     return (
         "## SYSTEM\n"
         "You are a task execution supervisor. Evaluate the agent's work.\n"
@@ -593,6 +623,12 @@ def runtime_task_supervisor_prompt(
         "If the task required a side effect (sending an email, creating "
         "a file, updating a record, etc.) and no relevant tool appears "
         "above, the agent FABRICATED its claim -- return verdict=failed.\n\n"
+        "## TOOL RESULT EVIDENCE\n"
+        f"{evidence_summary}\n"
+        "These are the actual bounded tool receipts for this run, not agent "
+        "claims. Preserve their JSON semantics: numeric 0 is a real reported "
+        "value, while null is unavailable. Do not reject an output merely "
+        "because it reports zero when the receipt shows zero.\n\n"
         "## AGENT OUTPUT\n"
         f"{response_preview}\n\n"
         "## VERDICTS\n"
@@ -619,6 +655,7 @@ async def runtime_review_task_agent_output(
     turns_used: int,
     max_turns: int,
     tools_called: list[str] | None = None,
+    tool_evidence: list[dict[str, str]] | None = None,
     worker_model: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -631,6 +668,7 @@ async def runtime_review_task_agent_output(
         turns_used=turns_used,
         max_turns=max_turns,
         tools_called=tools_called,
+        tool_evidence=tool_evidence,
     )
     try:
         response = await runtime_execute_task_supervisor_chat(

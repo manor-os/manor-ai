@@ -44,7 +44,10 @@ async function bundle(contents, { toFile } = {}) {
     platform: "browser",
     write: false,
     logLevel: "silent",
-    define: { "process.env.NODE_ENV": '"production"' },
+    define: {
+      "process.env.NODE_ENV": '"production"',
+      "import.meta.env.DEV": "false",
+    },
     loader: { ".css": "empty", ".png": "empty", ".svg": "text" },
   });
   const text = built.outputFiles[0].text;
@@ -222,6 +225,22 @@ test("the offline-worker card says what broke, what to do, and offers no Approve
       `an error card must not offer "${forbidden}"`,
     );
   }
+});
+
+test("an error card offers a guidance box so retry can carry new input", () => {
+  // Retry-with-no-change on a deterministic failure loops forever; the
+  // shared textarea is the escape hatch. It must render on every error card,
+  // and it must NOT add any button (labels stay exactly Retry/Cancel).
+  const html = renderCard({
+    kind: "governance_approval",
+    hitl_type: "error",
+    options: ["retry", "cancel"],
+    prompt: "The publish step failed.",
+  });
+  assert.match(html, /class="chat-hitl-retry-guidance"/);
+  assert.match(html, /<textarea[^>]*class="manor-textarea"/);
+  assert.match(html, /tell it what to change before retrying/);
+  assert.deepEqual(buttonLabels(html), ["Retry", "Cancel"]);
 });
 
 test("an error card with no payload still refuses to ask for approval", () => {

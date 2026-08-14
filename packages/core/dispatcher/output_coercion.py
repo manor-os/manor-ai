@@ -19,6 +19,7 @@ from packages.core.contracts.envelope import (
     build_step_result_envelope,
     is_step_result_envelope_schema,
 )
+from packages.core.contracts.task_output import is_plan_output_contract_schema
 
 
 _TEXT_KEYS = (
@@ -61,13 +62,19 @@ def coerce_step_output_for_schema(schema: dict | None, result: Any) -> Any:
     evidence. If a required field cannot be inferred, it stays missing and the
     normal JSON Schema validator will fail the step.
     """
-    # StepResult-envelope steps can never fail validation: the deterministic
-    # constructor always yields a schema-valid envelope, whatever the worker
-    # produced. Custom/action schemas keep the evidence-based path below.
+    # Normalize every StepResult-shaped output through the deterministic
+    # envelope constructor.  The generic envelope always validates; a
+    # task-output envelope may still fail its nested outputs.data contract,
+    # which is intentional and handled by the dispatcher retry path.
     if is_step_result_envelope_schema(schema):
         return build_step_result_envelope(result)
     if not isinstance(schema, dict) or result is None:
         return result
+    if is_plan_output_contract_schema(schema):
+        # A new plan declared this exact payload before execution. Permit only
+        # syntax unwrapping (for example a fenced JSON object); do not invent
+        # missing contract fields from summaries, URLs, aliases, or prose.
+        return _parse_wrapped_json(result, schema=schema)
 
     schema_type = _schema_type(schema)
     coerced = _parse_wrapped_json(result, schema=schema)

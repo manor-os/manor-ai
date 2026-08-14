@@ -18,6 +18,79 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from packages.core.models.base import Base
 import packages.core.models  # noqa: F401
 
+
+@pytest.mark.asyncio
+async def test_embedding_managed_db_route_precedes_embedding_env(monkeypatch):
+    from packages.core.services import embedding_service
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "env-embedding-key")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env-embedding.example/v1")
+
+    async def no_byok():
+        return None
+
+    async def managed_route(*_args, **kwargs):
+        assert kwargs.get("provider_chain") == ("vercel", "openai", "openrouter")
+        return type(
+            "Route",
+            (),
+            {
+                "api_key": "sk-admin-openai-key",
+                "base_url": "https://admin-openai.example/v1",
+                "provider": "openai",
+                "source": "official",
+                "source_detail": "db",
+            },
+        )()
+
+    monkeypatch.setattr(embedding_service, "_resolve_embedding_config_from_billing_context", no_byok)
+    monkeypatch.setattr(
+        "packages.core.services.model_gateway.resolve_official_model_route",
+        managed_route,
+    )
+
+    cfg = await embedding_service._resolve_embedding_config()
+
+    assert cfg["api_key"] == "sk-admin-openai-key"
+    assert cfg["base_url"] == "https://admin-openai.example/v1"
+    assert cfg["provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_embedding_defaults_to_local_ollama_before_cloud_gateway(monkeypatch):
+    """The bundled local Ollama route remains the default for embeddings."""
+    from packages.core.services import embedding_service
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://ollama:11434/v1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "mxbai-embed-large")
+
+    async def no_byok():
+        return None
+
+    async def ollama_is_available(_base_url):
+        return True
+
+    async def cloud_route_must_not_run(*_args, **_kwargs):
+        raise AssertionError("default Ollama embeddings must not query the cloud gateway")
+
+    monkeypatch.setattr(embedding_service, "_resolve_embedding_config_from_billing_context", no_byok)
+    monkeypatch.setattr(embedding_service, "_try_ollama", ollama_is_available)
+    monkeypatch.setattr(
+        "packages.core.services.model_gateway.resolve_official_model_route",
+        cloud_route_must_not_run,
+    )
+
+    cfg = await embedding_service._resolve_embedding_config()
+
+    assert cfg["api_key"] == "ollama"
+    assert cfg["base_url"] == "http://ollama:11434/v1"
+    assert cfg["model"] == "mxbai-embed-large"
+    assert cfg["dimensions"] > 0
+
 pytestmark = [pytest.mark.pgvector, pytest.mark.integration]
 
 TEST_DATABASE_URL = os.getenv(
@@ -121,6 +194,62 @@ async def test_generate_embedding_mock():
     assert isinstance(result, list)
     assert len(result) == EMBEDDING_DIMENSIONS
     assert result == FAKE_EMBEDDING
+
+
+@pytest.mark.asyncio
+async def test_remote_embedding_request_uses_deployment_dimension(monkeypatch):
+    """Every remote provider must receive the pgvector schema's dimension."""
+    from packages.core.services.embedding_service import generate_embedding
+
+    monkeypatch.setenv("EMBEDDING_API_KEY", "test-key")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", str(EMBEDDING_DIMENSIONS))
+    requested_payloads: list[dict] = []
+
+    async def _post(_url, *, json, headers):
+        requested_payloads.append(json)
+        return _mock_embedding_response()
+
+    with patch("packages.core.services.embedding_service.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = _post
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        result = await generate_embedding("Hello world")
+
+    assert result == FAKE_EMBEDDING
+    assert requested_payloads == [
+        {
+            "input": ["Hello world"],
+            "model": "mxbai-embed-large",
+            "dimensions": EMBEDDING_DIMENSIONS,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_embedding_rejects_provider_vector_with_wrong_deployment_dimension(monkeypatch):
+    """Providers that ignore requested downsampling cannot corrupt the shared index."""
+    from packages.core.services.embedding_service import generate_embedding
+
+    monkeypatch.setenv("EMBEDDING_API_KEY", "test-key")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", str(EMBEDDING_DIMENSIONS))
+    wrong_dimension = EMBEDDING_DIMENSIONS + 512
+    mock_resp = _mock_embedding_response([[0.0] * wrong_dimension])
+
+    with patch("packages.core.services.embedding_service.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        with pytest.raises(
+            RuntimeError,
+            match=rf"returned {wrong_dimension} dimensions; expected {EMBEDDING_DIMENSIONS} dimensions",
+        ):
+            await generate_embedding("Hello world")
 
 
 @pytest.mark.asyncio
@@ -502,6 +631,48 @@ async def test_hybrid_search_mock(db_session):
     # Both docs should appear — one from vector, one from text
     assert doc1_id in doc_ids
     assert doc2_id in doc_ids
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_rolls_back_after_vector_query_error(db_session, monkeypatch):
+    """A failed pgvector query must not poison the lexical fallback transaction."""
+    session, _ = db_session
+
+    from packages.core.services import embedding_service
+    lexical_called = False
+
+    async def broken_vector_search(*_args, **_kwargs):
+        # This is the actual pgvector failure shape: PostgreSQL aborts the
+        # transaction, so a later lexical query cannot run until rollback.
+        await session.execute(text(
+            "SELECT CAST('[1,2]' AS vector) <=> CAST('[1,2,3]' AS vector)"
+        ))
+
+    async def lexical_search(*_args, **_kwargs):
+        nonlocal lexical_called
+        lexical_called = True
+        result = await session.execute(text("SELECT 1 AS ok"))
+        return [{"document_id": "doc", "name": "doc", "score": 1.0,
+                 "content_preview": "content"}]
+
+    async def no_documents(*_args, **_kwargs):
+        return [], 0
+
+    async def embedding_config():
+        return {"model": "test"}
+
+    monkeypatch.setattr(embedding_service, "_resolve_embedding_config", embedding_config)
+    monkeypatch.setattr(embedding_service, "search_similar_chunks", broken_vector_search)
+    monkeypatch.setattr(embedding_service, "search_similar_trigram", lexical_search)
+    monkeypatch.setattr(embedding_service, "_workspace_document_ids", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(embedding_service, "_group_document_ids", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("packages.core.services.document_service.list_documents", no_documents)
+
+    results = await embedding_service.hybrid_search(session, "entity", "query")
+    assert results and results[0]["document_id"] == "doc"
+    assert lexical_called is True
+    # The caller must still be able to use the session after the fallback.
+    assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
 
 
 @pytest.mark.asyncio

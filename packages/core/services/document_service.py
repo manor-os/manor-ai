@@ -789,6 +789,16 @@ async def get_document_content(db: AsyncSession, document_id: str, entity_id: st
     doc = await get_document(db, document_id, entity_id)
     if not doc:
         return None
+    from packages.core.services.stickman_topic_ledger import (
+        render_topic_ledger_markdown,
+        topic_ledger_workspace_id_for_document,
+    )
+    ledger_workspace_id = topic_ledger_workspace_id_for_document(doc)
+    if ledger_workspace_id:
+        return await render_topic_ledger_markdown(
+            entity_id=entity_id,
+            workspace_id=ledger_workspace_id,
+        )
     if not doc.fs_path:
         return _metadata_text_content(doc)
     from packages.core.config import get_settings

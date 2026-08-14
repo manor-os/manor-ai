@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from packages.core.contracts.audio_generation import (
+    AudioGenerationFormat,
+    AudioGenerationPurpose,
+    GenerateFileKind,
+)
+
 _CAPABILITIES = {
     "diagram": "Create an editable .diagram.json canvas from a prompt and save it to Knowledge.",
     "code": "Create a multi-file website/code bundle from params.files; use real extensions like .html/.css/.js, not .txt.",
@@ -12,7 +18,12 @@ _CAPABILITIES = {
     "spreadsheet": "Compatibility fallback for spreadsheet specialist skills when no matching Available Skills entry is selected.",
     "image": "Generate an image with the Account-selected image model and BYOK/platform billing rules.",
     "video": "Generate one short video clip with the Account-selected video model and BYOK/platform billing rules. For >15s total runtime, segment, wait, then merge.",
-    "audio": "Generate an audio file with the Account-selected OpenRouter voice/music/SFX model and platform billing rules.",
+    "audio": (
+        "Generate an audio file with the Account-selected OpenRouter voice/music/SFX "
+        "model and platform billing rules. MP3/WAV/etc. is the final artifact format; "
+        "the tool handles provider-format conversion internally, so changing the "
+        "extension does not recover an upstream provider failure."
+    ),
 }
 
 VIDEO_DURATION_CHOICES = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
@@ -31,19 +42,7 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": [
-                        "search",
-                        "diagram",
-                        "code",
-                        "document",
-                        "word_document",
-                        "pdf",
-                        "presentation",
-                        "spreadsheet",
-                        "image",
-                        "video",
-                        "audio",
-                    ],
+                    "enum": GenerateFileKind.values(),
                     "description": "Type",
                 },
                 "prompt": {
@@ -129,11 +128,9 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                         },
                         "reference_audio_url": {
                             "type": "string",
-                            "description": "Alias.",
                         },
                         "audio_url": {
                             "type": "string",
-                            "description": "Alias.",
                         },
                         "generate_audio": {
                             "type": "boolean",
@@ -178,16 +175,7 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                         },
                         "purpose": {
                             "type": "string",
-                            "enum": [
-                                "speech",
-                                "dialogue",
-                                "narration",
-                                "music",
-                                "ambience",
-                                "soundscape",
-                                "sfx",
-                                "transition",
-                            ],
+                            "enum": AudioGenerationPurpose.values(),
                             "description": "Purpose.",
                         },
                         "duration_seconds": {
@@ -195,18 +183,29 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                             "minimum": 0.1,
                             "description": "Audio seconds.",
                         },
-                        "voice": {
-                            "type": "string",
-                            "description": "Voice name.",
-                        },
-                        "voice_instructions": {
-                            "type": "string",
-                            "description": "Tone, pace, emphasis.",
-                        },
+                "voice": {
+                    "type": "string",
+                    "description": "Voice name.",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "BCP-47.",
+                },
+                "narration_voice_mode": {
+                    "type": "string",
+                    "enum": ["random_per_task", "fixed_per_workspace"],
+                    "description": "Voice scope.",
+                },
+                "voice_instructions": {
+                    "type": "string",
+                    "description": "Tone, pace, emphasis.",
+                },
                         "response_format": {
                             "type": "string",
-                            "enum": ["mp3", "wav", "flac", "opus", "pcm", "pcm16"],
-                            "description": "Audio format.",
+                            "enum": AudioGenerationFormat.values(),
+                            # Conversion is internal, so the only thing the model
+                            # needs told is not to treat this as a retry knob.
+                            "description": "Stored format. Not a retry knob.",
                         },
                     },
                     "additionalProperties": True,
@@ -241,6 +240,15 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                 "last_frame_url": {
                     "type": "string",
                     "description": "End frame URL.",
+                },
+                "narration_voice_mode": {
+                    "type": "string",
+                    "enum": ["random_per_task", "fixed_per_workspace"],
+                    "description": "Voice scope.",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "BCP-47; defaults to Workspace settings.audio_defaults.language.",
                 },
                 "save_to_knowledge": {
                     "type": "boolean",

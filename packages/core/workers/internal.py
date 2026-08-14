@@ -1080,6 +1080,7 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
         conversation_id = None
         user_id = None
         task_binding_constraints: list[str] = []
+        runtime_metadata: dict[str, Any] = {}
         if plan.task_id:
             try:
                 from packages.core.models.task import Task
@@ -1091,13 +1092,22 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
                 if task_row:
                     conversation_id = task_row[0]
                     user_id = task_row[1]
+                    task_details = task_row[2]
+                    if isinstance(task_details, dict):
+                        proposal_authorization = task_details.get(
+                            "proposal_external_authorization"
+                        )
+                        if isinstance(proposal_authorization, dict):
+                            runtime_metadata["proposal_external_authorization"] = dict(
+                                proposal_authorization
+                            )
                     # The user's verbatim task constraints, carried to the
                     # executing subagent so a prohibition like "no essay" is
                     # not lost between planning and execution.
                     from packages.core.plans.task_constraints import (
                         extract_binding_constraints,
                     )
-                    task_binding_constraints = extract_binding_constraints(task_row[2])
+                    task_binding_constraints = extract_binding_constraints(task_details)
             except Exception:
                 conversation_id = None
                 user_id = None
@@ -1127,6 +1137,7 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
             "task_id": plan.task_id,
             "conversation_id": conversation_id,
             "task_binding_constraints": task_binding_constraints,
+            "runtime_metadata": runtime_metadata,
             "expected_output_schema": step.expected_output_schema,
             "attempt_count": step.attempt_count,
             "prior_error": step.error if isinstance(step.error, dict) else None,
@@ -1181,6 +1192,8 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
             # like any other error, instead of a SIGKILL'd process.
             await dispatcher.fail_lease(db, lease_id, error=error)
             await db.commit()
+        from packages.core.plans.wakeup import wake_plan_cycle
+        wake_plan_cycle(snapshot.get("plan_id"))
         return {"lease_id": lease_id, "outcome": "failed", "error": error}
     except _NeedsHumanInput as exc:
         async with async_session() as db:
@@ -1190,6 +1203,8 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
                 pending_action=exc.pending_action,
             )
             await db.commit()
+        from packages.core.plans.wakeup import wake_plan_cycle
+        wake_plan_cycle(snapshot.get("plan_id"))
         return {"lease_id": lease_id, "outcome": "needs_human"}
     except Exception as exc:  # noqa: BLE001
         logger.exception("execute_lease %s failed: %s", lease_id, exc)
@@ -1199,6 +1214,8 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
                 error={"type": type(exc).__name__, "message": str(exc)},
             )
             await db.commit()
+        from packages.core.plans.wakeup import wake_plan_cycle
+        wake_plan_cycle(snapshot.get("plan_id"))
         return {"lease_id": lease_id, "outcome": "failed"}
     finally:
         await _stop_lease_heartbeat(heartbeat)
@@ -1213,6 +1230,8 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
             metadata=result.get("metadata"),
         )
         await db.commit()
+    from packages.core.plans.wakeup import wake_plan_cycle
+    wake_plan_cycle(snapshot.get("plan_id"))
     return {"lease_id": lease_id, "outcome": completed_lease.status}
 
 
@@ -1427,6 +1446,29 @@ def _with_binding_constraints(prompt: str, s: dict) -> str:
     return f"{block}\n\n{prompt}" if block else prompt
 
 
+def _human_guidance_note(params: Any) -> str | None:
+    """Render the human's answer from a resumed HITL pause into the prompt.
+
+    Resume paths write the answer onto the step (``human_input_response``)
+    and the lease snapshot copies it into params — but for llm/subagent
+    steps nothing rendered it, so guidance typed at retry time was invisible
+    to the model and the retried attempt repeated the original one verbatim."""
+    if not isinstance(params, dict):
+        return None
+    response = params.get("human_input_response")
+    if not isinstance(response, dict) or not response:
+        return None
+    note = str(response.get("note") or response.get("response") or "").strip()
+    if not note:
+        return None
+    author = str(response.get("user") or "The operator").strip()
+    return (
+        f"[Operator guidance] {author} answered this step's pause with:\n"
+        f"{note[:1200]}\n"
+        "Apply this guidance directly in the current attempt."
+    )
+
+
 async def _exec_llm(s: dict) -> dict:
     """Single LLM call — uses shared context builder for model resolution."""
     from packages.core.ai.context import build_agent_context
@@ -1439,6 +1481,9 @@ async def _exec_llm(s: dict) -> dict:
     feedback = _prior_attempt_feedback(s.get("prior_error"))
     if feedback:
         prompt = f"{feedback}\n\n{prompt}"
+    guidance = _human_guidance_note(s["params"])
+    if guidance:
+        prompt = f"{guidance}\n\n{prompt}"
 
     entity_id = s.get("entity_id")
     agent_id = s.get("resolved_agent_id")
@@ -1563,6 +1608,9 @@ async def _exec_subagent(s: dict) -> dict:
     feedback = _prior_attempt_feedback(s.get("prior_error"))
     if feedback:
         original_prompt = f"{feedback}\n\n{original_prompt}"
+    guidance = _human_guidance_note(s["params"])
+    if guidance:
+        original_prompt = f"{guidance}\n\n{original_prompt}"
     prompt = runtime_prompt_with_output_schema(original_prompt, s.get("expected_output_schema"))
     prompt = f"{prompt}{SUBMIT_RESULT_PROMPT_SUFFIX}"
 
@@ -1581,6 +1629,7 @@ async def _exec_subagent(s: dict) -> dict:
             task_id=s.get("task_id"),
             active_user_message=prompt,
             model_role="primary",
+            runtime_metadata=s.get("runtime_metadata"),
         )
 
     system_prompt = s["params"].get("system_prompt") or ctx.system_prompt
@@ -1613,6 +1662,7 @@ async def _exec_subagent(s: dict) -> dict:
             workspace_id=s.get("workspace_id"),
             conversation_id=s.get("conversation_id"),
             task_id=s.get("task_id"),
+            step_id=s.get("step_id"),
             active_user_message=prompt,
             tool_profile=ctx.tool_profile,
             allowed_tool_names=allowed_tool_names,
@@ -1668,7 +1718,10 @@ async def _exec_subagent(s: dict) -> dict:
             raise EmptyModelOutput("model returned no content")
 
         if submit_payload is not None:
-            step_result = step_result_from_submit(submit_payload)
+            step_result = step_result_from_submit(
+                submit_payload,
+                s.get("expected_output_schema"),
+            )
         else:
             step_result = _coerce_llm_text_result(result.content, s.get("expected_output_schema"))
         step_result = _merge_artifact_refs(step_result, artifact_refs)
@@ -1774,6 +1827,7 @@ async def _force_submit_result_round(
             workspace_id=s.get("workspace_id"),
             conversation_id=s.get("conversation_id"),
             task_id=s.get("task_id"),
+            step_id=s.get("step_id"),
             active_user_message=prompt,
             allowed_tool_names=[SUBMIT_RESULT_TOOL_NAME],
             model=ctx.model,

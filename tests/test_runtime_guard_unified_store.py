@@ -312,6 +312,47 @@ async def test_cancel_expires_open_runtime_requests(db_session, monkeypatch):
     assert row.resolved_reason == "request_stopped"
 
 
+
+@pytest.mark.asyncio
+async def test_explicit_chat_cancel_advances_cross_process_turn_generation(db_session):
+    from packages.core.services.chat_approvals import (
+        CHAT_TURN_CANCEL_GENERATION_KEY,
+        cancel_chat_approvals,
+        chat_turn_cancellation_requested,
+        get_chat_turn_cancel_generation,
+    )
+
+    ids = await _fixture(db_session)
+    before = await get_chat_turn_cancel_generation(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+    )
+    cancelled = await cancel_chat_approvals(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        cancel_turn=True,
+    )
+
+    after = await get_chat_turn_cancel_generation(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+    )
+    conversation = await db_session.get(Conversation, ids["conversation_id"])
+    assert cancelled["cancel_requested"] == 1
+    assert after == before + 1
+    assert conversation.meta[CHAT_TURN_CANCEL_GENERATION_KEY] == after
+    assert await chat_turn_cancellation_requested(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        generation=before,
+    )
+
+
 # ── adversarial-review fixes ───────────────────────────────────────
 
 
@@ -475,3 +516,80 @@ async def test_reply_approve_on_legacy_blob_pending_gets_tombstone(db_session, m
     )
     assert resolution is not None
     assert "predates the approval-system upgrade" in resolution.message
+
+
+@pytest.mark.asyncio
+async def test_retry_while_still_pending_re_surfaces_the_same_card(
+    db_session, monkeypatch,
+):
+    """The second half of the workspace-email incident.
+
+    The model retried the gated tool with the token before the user had
+    answered. The guard returned a bare
+    ``{"error": "approval_not_granted", "status": "pending"}`` — not a
+    ``__hitl__`` envelope, so ``chat_service`` recorded no card — and the model
+    then told the user "已重试，新的审批卡已经生成。请在新的 approval card 上点
+    Approve". No such card existed, and the one real card was (at the time)
+    invisible in workspace chat anyway.
+
+    A retry-while-pending must re-surface THE SAME request as a real envelope:
+    the user gets something to click, and the model's sentence stops being a
+    lie. Critically it must not mint a second request — two open rows for one
+    blocked call would double the badge and let a user "approve" the one that
+    is not holding the call.
+    """
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    ids = await _fixture(db_session, hitl_capability="external.social")
+    args = {"text": "ship it"}
+
+    blocked = json.loads(await _guard(ids, dict(args)) or "{}")
+    token = blocked["approval_token"]
+    assert (await db_session.get(HitlRequest, token)).status == "pending"
+
+    # The model jumps the gun and retries with the token, still unanswered.
+    retried = json.loads(await _guard(ids, {**args, "approval_token": token}) or "{}")
+
+    # A real card, not a dead error.
+    assert retried.get("__hitl__") is True, "a pending retry produced no card"
+    assert retried.get("error") == "approval_required"
+    # The SAME request — resolving it unblocks the call that is actually stuck.
+    assert retried["approval_token"] == token
+    assert retried["hitl"]["id"] == token
+    assert retried["hitl"]["options"] == ["approve", "always_approve", "reject"]
+    # And the card is rendered from the context stored at mint time.
+    assert retried["hitl"]["action"] == "social_post.publish"
+    assert retried["hitl"]["tool"] == "mcp__twitter_x__create_tweet"
+
+    # No second request was minted.
+    open_rows = (await db_session.execute(
+        select(HitlRequest).where(
+            HitlRequest.entity_id == ids["entity_id"],
+            HitlRequest.status == "pending",
+        )
+    )).scalars().all()
+    assert [row.id for row in open_rows] == [token]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_rejection_still_reports_the_denial(db_session, monkeypatch):
+    """The pending re-surface must not swallow a real verdict: a rejected
+    token still returns the terminal error, or a refused action would loop
+    back into asking the user again."""
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    from packages.core.ai.runtime.approval_service import resolve_runtime_approval_message
+
+    ids = await _fixture(db_session, hitl_capability="external.social")
+    args = {"text": "do not ship"}
+
+    token = json.loads(await _guard(ids, dict(args)) or "{}")["approval_token"]
+    await resolve_runtime_approval_message(
+        db_session,
+        conversation_id=ids["conversation_id"], entity_id=ids["entity_id"],
+        user_id=ids["user_id"], hitl_id=token, action="reject",
+    )
+    assert (await db_session.get(HitlRequest, token)).status == "denied"
+
+    after = json.loads(await _guard(ids, {**args, "approval_token": token}) or "{}")
+    assert after["error"] == "approval_not_granted"
+    assert after["status"] == "rejected"
+    assert "__hitl__" not in after

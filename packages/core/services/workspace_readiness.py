@@ -7,6 +7,7 @@ into a blanket claim that all outbound work is blocked.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
@@ -22,6 +23,30 @@ from packages.core.models.workspace import AgentSubscription, Workspace
 
 
 BUILT_IN_CHANNEL_TYPES = {"webchat", "internal_chat", "in_app"}
+
+
+def iter_declared_service_keys(operating_model: dict[str, Any] | None) -> set[str]:
+    """Return canonical service keys from Workspace operating-model config.
+
+    Blueprint v1.1 payloads historically used ``key`` for entries under
+    ``operating_model.services`` while runtime configuration uses
+    ``service_key``. Accept both at this boundary, but fail closed when one
+    entry declares two different values.
+    """
+    keys: set[str] = set()
+    for index, service in enumerate((operating_model or {}).get("services") or []):
+        if not isinstance(service, dict):
+            continue
+        canonical = str(service.get("service_key") or "").strip()
+        legacy = str(service.get("key") or "").strip()
+        if canonical and legacy and canonical != legacy:
+            raise ValueError(
+                f"Operating-model service {index} has conflicting key and service_key"
+            )
+        value = canonical or legacy
+        if value:
+            keys.add(value)
+    return keys
 
 
 @dataclass(frozen=True)
@@ -81,6 +106,18 @@ class WorkspaceReadinessReport:
 
 
 WORKSPACE_READINESS_PARTS: tuple[WorkspaceReadinessPartSpec, ...] = (
+    WorkspaceReadinessPartSpec(
+        key="blocking_setup",
+        name="Blocking Workspace setup",
+        role=(
+            "Blueprint-defined prerequisites that must be ready before Strategist "
+            "may propose or launch normal operating work."
+        ),
+        check=(
+            "Every blocking_setup check in Workspace settings is evaluated from "
+            "current persisted assets or live integration readiness."
+        ),
+    ),
     WorkspaceReadinessPartSpec(
         key="agents",
         name="Agents and services",
@@ -318,6 +355,7 @@ async def check_workspace_readiness(
         if configured_channels is not None
         else await list_configured_workspace_channels(db, workspace)
     )
+    blocking_setup_status = await evaluate_workspace_blocking_setup(db, workspace)
     return build_workspace_readiness_report(
         operating_model=workspace.operating_model or {},
         subscriptions=subscription_rows,
@@ -330,6 +368,7 @@ async def check_workspace_readiness(
         governance_policy=governance_policy,
         operating_memory=operating_memory,
         runtime_bound_subscription_ids=runtime_bound_subscription_ids,
+        blocking_setup_status=blocking_setup_status,
     )
 
 
@@ -346,14 +385,11 @@ def build_workspace_readiness_report(
     governance_policy: dict[str, Any] | None,
     operating_memory: str,
     runtime_bound_subscription_ids: set[str] | None = None,
+    blocking_setup_status: WorkspaceReadinessPartStatus | None = None,
 ) -> WorkspaceReadinessReport:
     spec_by_key = {spec.key: spec for spec in WORKSPACE_READINESS_PARTS}
     missing_channels = missing_required_channels(configured_channels, operating_model)
-    declared_service_keys = {
-        str(service.get("service_key") or "").strip()
-        for service in (operating_model.get("services") or [])
-        if isinstance(service, dict) and str(service.get("service_key") or "").strip()
-    }
+    declared_service_keys = iter_declared_service_keys(operating_model)
     subscribed_service_keys = {
         str(getattr(subscription, "service_key", "") or "").strip()
         for subscription in subscriptions
@@ -451,12 +487,218 @@ def build_workspace_readiness_report(
             details={"loaded": bool(operating_memory)},
         ),
     ]
+    if blocking_setup_status is not None:
+        parts.insert(0, blocking_setup_status)
     return WorkspaceReadinessReport(
         parts=parts,
         configured_channels=configured_channels,
         missing_channel_requirements=missing_channels,
         configured_integrations=configured_integrations,
     )
+
+
+async def evaluate_workspace_blocking_setup(
+    db: AsyncSession,
+    workspace: Workspace,
+    *,
+    check_keys: set[str] | None = None,
+) -> WorkspaceReadinessPartStatus | None:
+    """Evaluate the Blueprint-owned setup gate for one Workspace.
+
+    The configuration is persisted under ``Workspace.settings.blocking_setup``
+    during Blueprint installation.  Results are derived on every read rather
+    than cached, so replacing a deleted asset or reconnecting Chrome takes
+    effect immediately and stale ``ready`` flags cannot bypass the gate.
+    """
+
+    setup = (workspace.settings or {}).get("blocking_setup")
+    if not isinstance(setup, dict):
+        return None
+    checks = setup.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return None
+
+    selected_checks = [
+        check
+        for check in checks
+        if isinstance(check, dict)
+        and (
+            check_keys is None
+            or str(check.get("key") or "").strip() in check_keys
+        )
+    ]
+    if not selected_checks:
+        return None
+
+    integration_checks = [
+        check
+        for check in selected_checks
+        if str(check.get("kind") or "").strip() == "integration_provider"
+        and str(check.get("provider") or "").strip()
+    ]
+    integration_states: dict[str, Any] = {}
+    if integration_checks:
+        from packages.core.services.integration_resolution import (
+            integration_provider_readiness,
+        )
+
+        integration_states = await integration_provider_readiness(
+            db,
+            entity_id=workspace.entity_id,
+            user_id=str((workspace.settings or {}).get("created_by_user_id") or "") or None,
+            provider_keys=[str(check["provider"]) for check in integration_checks],
+        )
+
+    results: list[dict[str, Any]] = []
+    for check in selected_checks:
+        kind = str(check.get("kind") or "").strip()
+        if kind == "workspace_identity_assets":
+            result = _workspace_identity_setup_result(workspace, check)
+        elif kind == "integration_provider":
+            from packages.core.services.provider_keys import canonical_provider_key
+
+            provider = canonical_provider_key(check.get("provider"))
+            state = integration_states.get(provider)
+            result = {
+                "ready": bool(state and state.ready),
+                "reason": (
+                    str(state.reason)
+                    if state is not None
+                    else f"Integration provider {provider!r} has no readiness result."
+                ),
+                "provider": provider,
+                "scope": str(state.scope) if state is not None else "none",
+                "setup_kind": (
+                    state.setup_kind
+                    if state is not None
+                    else check.get("setup_kind")
+                ),
+            }
+        else:
+            result = {
+                "ready": False,
+                "reason": f"Unknown blocking setup check kind {kind!r}; failing closed.",
+            }
+        result.update({
+            "key": str(check.get("key") or kind or "setup").strip(),
+            "kind": kind,
+            "blocking": bool(check.get("blocking", True)),
+            "setup_task_key": str(check.get("setup_task_key") or "").strip(),
+            "setup_job_id": str(check.get("setup_job_id") or "").strip(),
+        })
+        results.append(result)
+
+    incomplete = [
+        result
+        for result in results
+        if result["blocking"] and not result["ready"]
+    ]
+    configured_allowed_keys = {
+        str(value or "").strip()
+        for value in setup.get("allowed_setup_task_keys") or []
+        if str(value or "").strip()
+    }
+    incomplete_setup_keys = [
+        str(result.get("setup_task_key") or "").strip()
+        for result in incomplete
+        if str(result.get("setup_task_key") or "").strip()
+    ]
+    allowed_setup_task_keys = list(dict.fromkeys(
+        key
+        for key in incomplete_setup_keys
+        if not configured_allowed_keys or key in configured_allowed_keys
+    ))
+    ready = not incomplete
+    spec = next(spec for spec in WORKSPACE_READINESS_PARTS if spec.key == "blocking_setup")
+    return _part_status(
+        spec,
+        status="ready" if ready else "missing",
+        summary=(
+            f"All {len(results)} blocking setup check(s) are ready."
+            if ready
+            else (
+                f"{len(incomplete)} of {len(results)} blocking setup check(s) "
+                "must be completed before normal work."
+            )
+        ),
+        missing_setup_key="" if ready else "blocking_setup_incomplete",
+        details={
+            "ready": ready,
+            "check_results": results,
+            "incomplete_checks": incomplete,
+            "allowed_setup_task_keys": allowed_setup_task_keys,
+        },
+    )
+
+
+def _workspace_identity_setup_result(
+    workspace: Workspace,
+    check: dict[str, Any],
+) -> dict[str, Any]:
+    """Check the canonical person, narrator profile, and setup manifest."""
+
+    from packages.core.services.entity_fs import get_entity_root, resolve_path
+    from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+
+    settings = workspace.settings or {}
+    asset_key = str(check.get("asset_key") or "").strip()
+    narrator_key = str(check.get("narrator_profile_key") or "").strip()
+    asset_path = str(check.get("asset_path") or "").strip().replace("\\", "/").lstrip("/")
+    manifest_path = str(check.get("manifest_path") or "").strip().replace("\\", "/").lstrip("/")
+
+    assets = settings.get("reusable_media_assets")
+    record = assets.get(asset_key) if isinstance(assets, dict) else None
+    record_path = (
+        str(record.get("fs_path") or "").strip().replace("\\", "/").lstrip("/")
+        if isinstance(record, dict)
+        else ""
+    )
+    record_url = str(record.get("result_url") or "").strip() if isinstance(record, dict) else ""
+    asset_abs = resolve_path(workspace.entity_id, record_path) if record_path else None
+    asset_ready = bool(
+        isinstance(record, dict)
+        and record.get("kind") == "image"
+        and record_path
+        and record_url
+        and (not asset_path or record_path.endswith(asset_path))
+        and asset_abs
+        and os.path.isfile(asset_abs)
+    )
+
+    narrator = settings.get(narrator_key) if narrator_key else None
+    narrator_ready = bool(
+        isinstance(narrator, dict)
+        and all(str(narrator.get(field) or "").strip() for field in ("provider", "model", "voice"))
+    )
+
+    storage_base = workspace_artifact_storage_base(workspace.artifact_folder_id)
+    manifest_rel = "/".join(part for part in (storage_base, manifest_path) if part)
+    manifest_abs = resolve_path(workspace.entity_id, manifest_rel) if manifest_rel else None
+    manifest_ready = bool(manifest_abs and os.path.isfile(manifest_abs))
+
+    missing: list[str] = []
+    if not asset_ready:
+        missing.append(asset_key or "workspace_character_asset")
+    if not narrator_ready:
+        missing.append(narrator_key or "workspace_narrator_profile")
+    if not manifest_ready:
+        missing.append(manifest_path or "workspace_asset_manifest")
+    return {
+        "ready": not missing,
+        "reason": (
+            "Workspace identity assets are ready."
+            if not missing
+            else "Missing or unreadable Workspace identity requirement(s): " + ", ".join(missing) + "."
+        ),
+        "asset_key": asset_key,
+        "asset_fs_path": record_path,
+        "asset_ready": asset_ready,
+        "narrator_profile_key": narrator_key,
+        "narrator_ready": narrator_ready,
+        "manifest_fs_path": manifest_rel,
+        "manifest_ready": manifest_ready,
+        "entity_root": get_entity_root(workspace.entity_id),
+    }
 
 
 def _part_status(

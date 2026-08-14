@@ -40,9 +40,19 @@ from sqlalchemy import select
 from sqlalchemy.sql import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.models import DEFAULTS, resolve_model_for_role
+from packages.core.constants.models import (
+    DEFAULTS,
+    model_preference_is_available,
+    resolve_model_for_role,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _role_default(role: str) -> str:
+    """Return a role's explicit default, including an intentional empty one."""
+
+    return DEFAULTS[role] if role in DEFAULTS else DEFAULTS["primary"]
 
 
 PRIMARY_BYOK_FALLBACK_LLM_ROLES: frozenset[str] = frozenset({
@@ -215,12 +225,12 @@ async def resolve_model_for_user(
                 owner_prefs=owner_prefs,
                 platform_settings=platform_settings,
             )
-            or DEFAULTS.get(role, DEFAULTS["primary"])
+            or _role_default(role)
         )
 
     return (
         resolve_model_for_role(role, user_prefs, entity_settings, platform_settings)
-        or DEFAULTS.get(role, DEFAULTS["primary"])
+        or _role_default(role)
     )
 
 
@@ -285,18 +295,16 @@ async def load_entity_owner_preferences(db: AsyncSession, entity_id: str) -> dic
     return dict(owner.preferences or {}) if owner else None
 
 
-def _model_disabled(role: str, model_id: str, platform_settings: dict | None) -> bool:
-    disabled = set(((platform_settings or {}).get("disabled_models") or {}).get(role) or [])
-    return model_id in disabled
-
-
 def _configured_model(
     role: str,
     settings: dict | None,
     platform_settings: dict | None,
 ) -> str | None:
     model_id = str(((settings or {}).get("models") or {}).get(role) or "").strip()
-    if model_id and not _model_disabled(role, model_id, platform_settings):
+    disabled = set(
+        ((platform_settings or {}).get("disabled_models") or {}).get(role) or []
+    )
+    if model_preference_is_available(role, model_id, disabled_models=disabled):
         return model_id
     return None
 
@@ -341,7 +349,7 @@ def _resolve_entity_scoped_model(
             else None
         )
         or resolve_model_for_role(role, None, None, platform_settings)
-        or DEFAULTS.get(role, DEFAULTS["primary"])
+        or _role_default(role)
     )
 
 
@@ -378,6 +386,28 @@ async def resolve_llm_metadata_for_user(
             role, user_id, entity_id, exc,
         )
         return None
+    try:
+        from packages.core.services.model_settings import get_model_settings_cached
+
+        platform_settings = await get_model_settings_cached(db)
+        selected_model = (
+            _resolve_entity_scoped_model(
+                role,
+                entity_settings=entity_settings,
+                owner_prefs=owner_prefs,
+                platform_settings=platform_settings,
+            )
+            if entity_id
+            else resolve_model_for_role(
+                role,
+                user_prefs,
+                entity_settings,
+                platform_settings,
+            )
+        )
+    except Exception:
+        logger.debug("model_resolver: selected model lookup failed for BYOK", exc_info=True)
+        selected_model = ""
     if entity_id and not byok_allowed_for_plan(entity_plan_id):
         if _settings_have_byok(entity_settings) or _settings_have_byok(owner_prefs):
             logger.info(
@@ -388,10 +418,24 @@ async def resolve_llm_metadata_for_user(
         return None
     if entity_id:
         return (
-            resolve_llm_metadata_from_settings(entity_settings, role=role, source="entity")
-            or resolve_llm_metadata_from_settings(owner_prefs, role=role, source="owner_legacy")
+            resolve_llm_metadata_from_settings(
+                entity_settings,
+                role=role,
+                source="entity",
+                selected_model=selected_model,
+            )
+            or resolve_llm_metadata_from_settings(
+                owner_prefs,
+                role=role,
+                source="owner_legacy",
+                selected_model=selected_model,
+            )
         )
-    return resolve_llm_metadata_from_preferences(user_prefs, role=role)
+    return resolve_llm_metadata_from_preferences(
+        user_prefs,
+        role=role,
+        selected_model=selected_model,
+    )
 
 
 # ── Object-loaded variant — for callers that already have rows ──────────────
@@ -420,7 +464,7 @@ def resolve_model_from_objects(
         )
     return (
         resolve_model_for_role(role, user_prefs, entity_settings, platform_settings)
-        or DEFAULTS.get(role, DEFAULTS["primary"])
+        or _role_default(role)
     )
 
 
@@ -441,6 +485,8 @@ def resolve_model_from_context(ctx, role: str = "primary") -> str:
 def resolve_llm_metadata_from_preferences(
     prefs: dict | None,
     role: str = "primary",
+    *,
+    selected_model: str | None = None,
 ) -> dict | None:
     """Resolve BYOK metadata for an LLM role from user preferences.
 
@@ -449,7 +495,16 @@ def resolve_llm_metadata_from_preferences(
     credit accounting.
     """
 
-    return resolve_llm_metadata_from_settings(prefs, role=role, source="user")
+    return resolve_llm_metadata_from_settings(
+        prefs,
+        role=role,
+        source="user",
+        selected_model=(
+            selected_model
+            if selected_model is not None
+            else resolve_model_for_role(role, prefs)
+        ),
+    )
 
 
 def _settings_have_byok(settings: dict | None) -> bool:
@@ -462,18 +517,27 @@ def resolve_llm_metadata_from_settings(
     role: str = "primary",
     *,
     source: str = "settings",
+    selected_model: str | None = None,
 ) -> dict | None:
     """Resolve native-provider BYOK metadata from a settings document."""
 
     settings = settings or {}
     role_keys = settings.get("llm_api_keys") or {}
     fallback_to_primary = role in PRIMARY_BYOK_FALLBACK_LLM_ROLES
+    key_role = role if role_keys.get(role) else "primary"
     api_key = (
         role_keys.get(role)
         or (role_keys.get("primary") if fallback_to_primary else "")
         or (settings.get("llm_api_key", "") if fallback_to_primary else "")
     )
     if not api_key or not str(api_key).strip():
+        return None
+    bound_model = str(
+        (settings.get("llm_api_key_models") or {}).get(key_role)
+        or (settings.get("models") or {}).get(key_role)
+        or ""
+    ).strip()
+    if bound_model and bound_model != str(selected_model or "").strip():
         return None
     key = sanitize_llm_api_key(str(api_key), f"{source}.{role}_api_key")
     if not key or key.startswith("sk-or-"):
@@ -507,13 +571,23 @@ def resolve_llm_metadata_from_objects(
     if not byok_allowed_for_plan(plan_id):
         return None
     entity_settings = getattr(entity, "settings", None) if entity is not None else None
-    entity_metadata = resolve_llm_metadata_from_settings(entity_settings, role=role, source="entity")
+    selected_model = resolve_model_from_objects(role, user=user, entity=entity)
+    entity_metadata = resolve_llm_metadata_from_settings(
+        entity_settings,
+        role=role,
+        source="entity",
+        selected_model=selected_model,
+    )
     if entity_metadata:
         return entity_metadata
     prefs = getattr(user, "preferences", None) if user is not None else None
     if entity is not None and getattr(user, "role", None) != "owner":
         return None
-    return resolve_llm_metadata_from_preferences(prefs, role=role)
+    return resolve_llm_metadata_from_preferences(
+        prefs,
+        role=role,
+        selected_model=selected_model,
+    )
 
 
 # ── BYOK plan gate ──────────────────────────────────────────────────

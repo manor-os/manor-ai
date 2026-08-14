@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, lazy, Suspense } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
@@ -22,7 +22,7 @@ import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import Chip from "../components/ui/Chip";
-import { CardGridSkeleton, ListRowsSkeleton, PageLoading } from "../components/ui/Skeleton";
+import { CardGridSkeleton, ListRowsSkeleton } from "../components/ui/Skeleton";
 import FilterPills from "../components/ui/FilterPills";
 import ItemCard from "../components/ui/ItemCard";
 import WorkspaceIconTile, { getWorkspacePresentation } from "../components/ui/WorkspaceIcon";
@@ -41,8 +41,6 @@ import {
 } from "../components/icons";
 import { t } from "../lib/i18n";
 import { formatDate } from "../lib/format";
-const ManorOffice = lazy(() => import("./ManorOffice"));
-const WorkspaceGoalGraph = lazy(() => import("../components/ui/WorkspaceGoalGraph"));
 
 interface WorkspaceForm {
   name: string;
@@ -52,14 +50,11 @@ interface WorkspaceForm {
 
 type WorkspaceView =
   | "workspaces"
-  | "office"
-  | "goals";
+  ;
 
 const emptyForm: WorkspaceForm = { name: "", description: "", category: "" };
 const WORKSPACE_VIEW_KEYS: WorkspaceView[] = [
   "workspaces",
-  "office",
-  "goals",
 ];
 const WORKSPACE_INTRO_MOTION_URL = "/assets/workspace/workspace-intro-original.mp4";
 const WORKSPACE_INTRO_DARK_MOTION_URL = "/assets/workspace/workspace-intro-dark.mp4";
@@ -522,6 +517,13 @@ export default function Workspaces() {
   const [statusFilter, setStatusFilter] = useState("all");
   let view = parseWorkspaceView(searchParams.get("view"), false);
 
+  useEffect(() => {
+    const requestedView = searchParams.get("view");
+    if (!requestedView || requestedView === view) return;
+    const params = new URLSearchParams(searchParams);
+    params.delete("view");
+    setSearchParams(params, { replace: true });
+  }, [searchParams, setSearchParams, view]);
 
   const { data: workspaces, isLoading } = useQuery({
     queryKey: ["workspaces"],
@@ -651,12 +653,8 @@ export default function Workspaces() {
 
   const viewTabs = [
     { key: "workspaces", label: t("page.workspaces.tab_workspaces") },
-    { key: "goals", label: t("nav.goals"), badge: t("page.workspaces.beta") },
-    { key: "office", label: t("page.workspaces.tab_office"), badge: t("page.workspaces.beta") },
   ];
 
-  const isOffice = view === "office";
-  const isGoals = view === "goals";
   const isMarketplace =
     false;
 
@@ -672,7 +670,7 @@ export default function Workspaces() {
         title={
           t("page.workspaces.title")
         }
-        subtitle={isOffice ? t("page.workspaces.office_view") : isGoals ? t("page.workspaces.goals_across") :
+        subtitle={
           t("page.workspaces.focused_operating_rooms_for_agents_knowledge_tasks_cha")}
         tabs={(
           <TabSwitcher
@@ -681,7 +679,7 @@ export default function Workspaces() {
             onChange={handleViewChange}
           />
         )}
-        toolbar={!isOffice && !isGoals && !isMarketplace ? (
+        toolbar={!isMarketplace ? (
           <SmartToolbar
             searchValue={search}
             onSearchChange={setSearch}
@@ -689,7 +687,7 @@ export default function Workspaces() {
             className="w-full sm:w-64"
           />
         ) : undefined}
-        actions={!isOffice && !isGoals && !isMarketplace ? (
+        actions={!isMarketplace ? (
           <Dropdown
             align="right"
             trigger={<PageHeaderAddButton label={t("page.workspaces.add_workspace")} caret />}
@@ -705,42 +703,8 @@ export default function Workspaces() {
         ) : undefined}
       />
 
-      {isOffice ? (
-        <div style={{ flex: 1, overflow: "hidden" }}>
-          <Suspense fallback={<PageLoading label={t("page.workspaces.loading")} minHeight={180} />}>
-            <ManorOffice />
-          </Suspense>
-        </div>
-      ) : isGoals ? (
-        <div className="workspaces-goals-view" style={{ flex: 1, overflowY: "auto", padding: "0 0 24px" }}>
-          <Suspense fallback={<PageLoading label={t("page.workspaces.loading")} minHeight={180} />}>
-            {isLoading ? (
-              <PageLoading label={t("page.workspaces.loading")} minHeight={220} />
-            ) : allWs.length === 0 ? (
-              <EmptyState title={t("page.workspaces.no_workspaces")} description={t("page.workspaces.no_workspaces_goals_desc")} />
-            ) : (
-              <div className="workspaces-goals-list" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-                {allWs.filter((ws: Workspace) => ws.status === "active").map((ws: Workspace) => (
-                  <div className="workspaces-goals-workspace" key={ws.id}>
-                    <div className="workspaces-goals-workspace-header" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-                      <div className="workspaces-goals-workspace-icon" style={{
-                        width: 28, height: 28, borderRadius: 8, background: "#fbfbfa",
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        fontSize: 11, fontWeight: 800, color: "#57534e",
-                      }}>
-                        {ws.name.charAt(0).toUpperCase()}
-                      </div>
-                      <span className="workspaces-goals-workspace-title" style={{ fontSize: 16, fontWeight: 700, color: "#1c1917" }}>{ws.name}</span>
-                      <Chip variant="teal" size="sm">{ws.status}</Chip>
-                    </div>
-                    <WorkspaceGoalGraph workspaceId={ws.id} />
-                  </div>
-                ))}
-              </div>
-            )}
-          </Suspense>
-        </div>
-      ) : (
+      {
+      (
       <>
 
       {/* Edit Modal */}
@@ -1050,12 +1014,17 @@ export default function Workspaces() {
                     color: "#1c1917",
                     margin: "0 0 6px",
                     lineHeight: 1.25,
-                    display: "-webkit-box",
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: "vertical" as const,
-                    overflow: "hidden",
                   }}>
-                    {ws.name}
+                    <button
+                      type="button"
+                      className="workspace-card-title-button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        navigate(`/workspaces/${ws.id}`);
+                      }}
+                    >
+                      {ws.name}
+                    </button>
                   </h3>
 
                   <p style={{

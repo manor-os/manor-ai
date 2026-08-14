@@ -302,6 +302,7 @@ async def usage_by_source(
 
     start = datetime.now(timezone.utc) - timedelta(days=days)
     from packages.core.models.usage import TokenUsageLog as UsageLog
+    from packages.core.models.billing import CreditUsageLog
     filters = _usage_scope_filters(UsageLog, user, scope)
 
     rows = (await db.execute(
@@ -311,13 +312,29 @@ async def usage_by_source(
             func.sum(UsageLog.prompt_tokens).label("input_tokens"),
             func.sum(UsageLog.completion_tokens).label("output_tokens"),
             func.sum(UsageLog.total_tokens).label("total_tokens"),
-            func.sum(UsageLog.cost_usd).label("credit_used"),
             func.max(UsageLog.created_at).label("last_used"),
         )
         .where(*filters, UsageLog.created_at >= start)
         .group_by(UsageLog.source)
         .order_by(func.sum(UsageLog.total_tokens).desc())
     )).all()
+
+    # Credits actually charged live in the billing ledger (CreditUsageLog,
+    # source == business_type) — TokenUsageLog.cost_usd is an estimated
+    # provider cost in USD, which is neither credits nor always present.
+    credit_filters = _usage_scope_filters(CreditUsageLog, user, scope)
+    credit_rows = (await db.execute(
+        select(
+            CreditUsageLog.business_type,
+            func.sum(CreditUsageLog.total_credit).label("credit_used"),
+        )
+        .where(*credit_filters, CreditUsageLog.created_at >= start)
+        .group_by(CreditUsageLog.business_type)
+    )).all()
+    credits_by_source = {
+        (r.business_type or "Unknown"): int(r.credit_used or 0)
+        for r in credit_rows
+    }
 
     return [
         {
@@ -326,7 +343,7 @@ async def usage_by_source(
             "input_tokens": r.input_tokens or 0,
             "output_tokens": r.output_tokens or 0,
             "total_tokens": r.total_tokens or 0,
-            "credit_used": float(r.credit_used or 0),
+            "credit_used": credits_by_source.get(r.source or "Unknown", 0),
             "last_used": r.last_used.isoformat() if r.last_used else None,
         }
         for r in rows

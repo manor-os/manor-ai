@@ -6,6 +6,7 @@ import importlib
 import pytest
 
 from packages.core.ai.agentic_loop import (
+    DEFAULT_MAX_ROUNDS,
     _add_usage,
     _compact_messages,
     _compact_search_tools_result_for_context,
@@ -24,6 +25,10 @@ from packages.core.ai.runtime.tool_visibility import MASTER_ALWAYS_LOADED
 from packages.core.ai.runtime import RUNTIME_AGENTIC_MAX_TOKENS
 from packages.core.ai.tool_pool import ToolPool
 from packages.core.services.usage_service import log_token_usage
+
+
+def test_default_agentic_loop_budget_is_200_rounds() -> None:
+    assert DEFAULT_MAX_ROUNDS == 200
 
 
 def test_add_usage_preserves_cache_split_and_model():

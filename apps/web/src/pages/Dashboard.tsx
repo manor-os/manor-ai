@@ -141,8 +141,21 @@ interface DashboardLayoutPreference {
   modules: DashboardGeneratedModule[];
 }
 
+const DASHBOARD_WIDGET_DEFAULT_VISIBILITY: Record<DashboardWidgetId, boolean> = {
+  daily_brief: false,
+  time_saved: true,
+  total_tasks: true,
+  tasks_running: true,
+  activity: true,
+  workspaces: true,
+  task_trend: true,
+};
+
 const DEFAULT_DASHBOARD_WIDGETS: DashboardWidgetPreference[] =
-  DASHBOARD_WIDGET_IDS.map((id) => ({ id, visible: true }));
+  DASHBOARD_WIDGET_IDS.map((id) => ({
+    id,
+    visible: DASHBOARD_WIDGET_DEFAULT_VISIBILITY[id],
+  }));
 
 const DASHBOARD_WIDGET_META: Record<
   DashboardWidgetId,
@@ -200,7 +213,13 @@ function normalizeDashboardLayout(value: unknown): DashboardLayoutPreference {
     const id = String(raw?.id || "") as DashboardWidgetId;
     if (!DASHBOARD_WIDGET_IDS.includes(id) || seen.has(id)) continue;
     seen.add(id);
-    widgets.push({ id, visible: raw?.visible !== false });
+    widgets.push({
+      id,
+      visible:
+        typeof raw?.visible === "boolean"
+          ? raw.visible
+          : DASHBOARD_WIDGET_DEFAULT_VISIBILITY[id],
+    });
   }
 
   for (const widget of DEFAULT_DASHBOARD_WIDGETS) {

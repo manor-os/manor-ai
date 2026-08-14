@@ -1,10 +1,13 @@
 **CRITICAL: You MUST complete these steps in order. Do not skip ahead to writing code.**
 
 If you need to fill out a PDF form, first check to see if the PDF has fillable form fields. Run this script from this file's directory:
- `python scripts/check_fillable_fields <file.pdf>`, and depending on the result go to either the "Fillable fields" or "Non-fillable fields" and follow those instructions.
+ `python scripts/check_fillable_fields.py <file.pdf> --json`, and depending on the result go to either the "Fillable fields" or "Non-fillable fields" and follow those instructions. Treat `orphan_widget_names`, `ambiguous_widget_names`, and `signatures_present` as safety signals; a simple `get_fields()` result is not sufficient.
 
 # Fillable fields
 If the PDF has fillable form fields:
+- Preserve the input PDF and write to a different output path under `output/pdf/`. Interactive output is the default. Use `--flatten` only when the user explicitly asks for a completed static copy.
+- Inspect both representations before filling: the canonical `/AcroForm/Fields` tree and every page `/Widget`, following `/Parent` and `/Kids`. A visible widget is not proof that the canonical field tree is complete.
+- If a widget and a canonical field have the same name but are unrelated PDF objects, stop and report the ambiguity. Do not blindly reattach it as a second top-level field.
 - Run this script from this file's directory: `python scripts/extract_form_field_info.py <input.pdf> <field_info.json>`. It will create a JSON file with a list of fields in this format:
 ```
 [
@@ -74,6 +77,22 @@ Then analyze the images to determine the purpose of each form field (make sure t
 - Run the `fill_fillable_fields.py` script from this file's directory to create a filled-in PDF:
 `python scripts/fill_fillable_fields.py <input pdf> <field_values.json> <output pdf>`
 This script will verify that the field IDs and values you provide are valid; if it prints error messages, correct the appropriate fields and try again.
+
+The fill script repairs genuinely orphaned widgets, writes appearances with `auto_regenerate=False`, reopens the output, and verifies canonical values, effective widget values, and non-empty `/AP` appearances. It does not rely on `/NeedAppearances`.
+
+Run the delivery gate and inspect every generated PNG:
+
+`python scripts/verify_pdf.py <output.pdf> <verify_images/> --expect-interactive --require-form-appearances`
+
+To create a deliberately static copy:
+
+`python scripts/fill_fillable_fields.py <input pdf> <field_values.json> <output pdf> --flatten`
+
+A flattened result must reopen with zero `/Widget` annotations and no `/AcroForm` field tree. Keep the interactive output too when future revision may be needed.
+
+Validate the static copy with:
+
+`python scripts/verify_pdf.py <output.pdf> <verify_images/> --expect-flattened`
 
 # Non-fillable fields
 If the PDF doesn't have fillable form fields, you'll add text annotations. First try to extract coordinates from the PDF structure (more accurate), then fall back to visual estimation if needed.
@@ -280,7 +299,7 @@ Fix any reported errors in fields.json before proceeding.
 
 ## Step 3: Fill the Form
 
-The fill script auto-detects the coordinate system and handles conversion:
+The fill script auto-detects the coordinate system, preserves the source, rejects signed inputs unless explicitly approved, writes atomically, reopens the output, and verifies the new annotation count:
 `python scripts/fill_pdf_form_with_annotations.py <input.pdf> fields.json <output.pdf>`
 
 ## Step 4: Verify Output
@@ -292,3 +311,5 @@ If text is mispositioned:
 - **Approach A**: Check that you're using PDF coordinates from form_structure.json with `pdf_width`/`pdf_height`
 - **Approach B**: Check that image dimensions match and coordinates are accurate pixels
 - **Hybrid**: Ensure coordinate conversions are correct for visually-estimated fields
+
+Run `python scripts/verify_pdf.py <output.pdf> <verify_images/>`, then inspect every rendered page. A successful script exit, machine-check report, or extracted text is not proof that the final layout is correct.

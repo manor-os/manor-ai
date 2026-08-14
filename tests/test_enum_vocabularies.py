@@ -41,7 +41,7 @@ from packages.core.constants.execution import (
 )
 from packages.core.constants.supervisor import SupervisorVerdict
 from packages.core.models.media_job import MediaJobStatus
-from packages.core.constants.task import TaskLogType, TaskStatus
+from packages.core.constants.task import TASK_TYPES, TaskLogType, TaskStatus, TaskType
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCANNED_ROOTS = ("packages/core", "apps/api")
@@ -66,9 +66,15 @@ VOCABULARIES: tuple[tuple[str, tuple[str, ...], type, tuple[str, ...]], ...] = (
     ("execution step status", ("step_status",), ExecutionStepStatus, ()),
     (
         "execution plan status",
-        ("ExecutionPlan.status", "plan.status", "plan_row.status"),
+        # ``status`` bare is the executor's local for the plan's terminal
+        # status. It is scoped to that file because the name is too common to
+        # scan repo-wide — and it is here because the sweep's first pass missed
+        # it: `if status == "completed"` was still deciding whether to post
+        # "## Task Completed" long after every attribute-qualified site was
+        # converted.
+        ("ExecutionPlan.status", "plan.status", "plan_row.status", "status"),
         ExecutionPlanStatus,
-        (),
+        ("packages/core/plans/executor.py",),
     ),
     ("work lease status", ("WorkLease.status", "lease.status"), WorkLeaseStatus, ()),
     ("worker status", ("Worker.status", "worker.status", "w.status"), WorkerStatus, ()),
@@ -211,6 +217,11 @@ def test_vocabulary_has_no_literal_call_sites(label, receivers, enum_cls, only) 
         f"Use {enum_cls.__name__} members (comparisons) or .value "
         f"(assignments) instead:\n" + "\n".join(hits)
     )
+
+
+def test_task_types_are_derived_from_the_enum() -> None:
+    assert TASK_TYPES == TaskType.values()
+    assert TaskType.APPROVAL.value == "approval"
 
 
 def test_task_logs_are_written_with_the_log_type_enum() -> None:

@@ -126,6 +126,43 @@ function forgetStoredSessionId(token?: string | null) {
   }
 }
 
+const EMBED_THEME_COLOR = /^(?:#[0-9a-f]{3,8}|rgba?\([\d.,%\s+-]+\))$/i;
+
+function embedThemeColor(params: URLSearchParams, key: string, fallback: string): string {
+  const value = (params.get(key) || "").trim();
+  return value && EMBED_THEME_COLOR.test(value) ? value : fallback;
+}
+
+function embeddedThemeVariables(enabled: boolean): React.CSSProperties {
+  if (!enabled || typeof window === "undefined") return {};
+  const params = new URLSearchParams(window.location.search);
+  const mode = params.get("theme") === "dark" ? "dark" : "light";
+  const accent = embedThemeColor(params, "accent", "#436b65");
+  const accentText = embedThemeColor(params, "accentText", "#ffffff");
+  const surface = embedThemeColor(
+    params,
+    "surface",
+    mode === "dark" ? "#151823" : "#ffffff",
+  );
+  const text = embedThemeColor(params, "text", mode === "dark" ? "#f7f7fb" : "#1c1917");
+  const muted = embedThemeColor(params, "muted", mode === "dark" ? "#b8c0d9" : "#78716c");
+  const rawFont = (params.get("font") || "").replace(/[;{}<>]/g, "").slice(0, 180);
+  const variables: Record<string, string> = {
+    "--public-chat-accent": accent,
+    "--public-chat-on-accent": accentText,
+    "--public-chat-surface": surface,
+    "--public-chat-text": text,
+    "--public-chat-muted": muted,
+    "--public-chat-faint": mode === "dark" ? "rgba(247,247,251,0.58)" : "#a8a29e",
+    "--public-chat-soft": mode === "dark" ? "rgba(255,255,255,0.08)" : "#f5f5f4",
+    "--public-chat-soft-strong": mode === "dark" ? "rgba(255,255,255,0.13)" : "#efede8",
+    "--public-chat-line": mode === "dark" ? "rgba(255,255,255,0.14)" : "rgba(28,25,23,0.06)",
+    "--public-chat-input": mode === "dark" ? "rgba(255,255,255,0.08)" : "#ffffff",
+    "--public-chat-font": rawFont || "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+  };
+  return { ...variables, colorScheme: mode } as React.CSSProperties;
+}
+
 export default function PublicChat() {
   const { token } = useParams<{ token: string }>();
   const [info, setInfo] = useState<ChatInfo | null>(null);
@@ -157,7 +194,9 @@ export default function PublicChat() {
   const sendingRef = useRef(false);
   const resumeAttemptedForTokenRef = useRef<string | null>(null);
   const isEmbedded = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("embed") === "1";
-  const shellStyle = isEmbedded ? styles.embedContainer : styles.container;
+  const shellStyle = isEmbedded
+    ? { ...styles.embedContainer, ...embeddedThemeVariables(true) }
+    : styles.container;
   const cardStyle = isEmbedded ? { ...styles.card, ...styles.embedCard } : styles.card;
   const chatCardStyle = isEmbedded
     ? { ...styles.card, ...styles.embedCard, display: "flex", flexDirection: "column" as const }
@@ -675,7 +714,7 @@ export default function PublicChat() {
     return (
       <div style={shellStyle}>
         <div style={cardStyle}>
-          <div style={{ textAlign: "center", padding: 40, color: "#a8a29e" }}>
+          <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #a8a29e)" }}>
             {customerText("status.loading")}
           </div>
         </div>
@@ -687,7 +726,7 @@ export default function PublicChat() {
     return (
       <div style={shellStyle}>
         <div style={cardStyle}>
-          <div style={{ textAlign: "center", padding: 40, color: "#a8a29e" }}>
+          <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #a8a29e)" }}>
             {customerText("status.loading")}
           </div>
         </div>
@@ -714,14 +753,14 @@ export default function PublicChat() {
             <div style={{ textAlign: "center" }}>
               <div style={styles.authPill}>{customerText("page.public_chat.secure_chat")}</div>
             </div>
-            <h1 style={{ fontSize: 22, fontWeight: 850, color: "#1c1917", margin: "10px 0 6px", textAlign: "center" }}>
+            <h1 style={{ fontSize: 22, fontWeight: 850, color: "var(--public-chat-text, #1c1917)", margin: "10px 0 6px", textAlign: "center" }}>
               {isVerify
                 ? customerText("page.public_chat.verify_customer_email")
                 : isRegister
                 ? customerText("page.public_chat.create_customer_account")
                 : customerText("page.public_chat.customer_sign_in")}
             </h1>
-            <p style={{ fontSize: 13, color: "#78716c", margin: "0 auto 18px", lineHeight: 1.6, maxWidth: 320, textAlign: "center" }}>
+            <p style={{ fontSize: 13, color: "var(--public-chat-muted, #78716c)", margin: "0 auto 18px", lineHeight: 1.6, maxWidth: 320, textAlign: "center" }}>
               {isVerify
                 ? customerText("page.public_chat.verify_customer_email_desc", { email: customerPendingEmail })
                 : info.auth_hint || customerText("page.public_chat.sign_in_required_desc")}
@@ -849,7 +888,7 @@ export default function PublicChat() {
             )}
 
             {info.workspace_name && (
-              <p style={{ fontSize: 12, color: "#a8a29e", margin: "18px 0 0", textAlign: "center" }}>
+              <p style={{ fontSize: 12, color: "var(--public-chat-faint, #a8a29e)", margin: "18px 0 0", textAlign: "center" }}>
                 {info.workspace_name}
               </p>
             )}
@@ -876,20 +915,20 @@ export default function PublicChat() {
               shape="rounded"
               style={{ margin: "0 auto 12px" }}
             />
-            <h1 style={{ fontSize: 20, fontWeight: 800, color: "#1c1917", margin: "0 0 4px" }}>
+            <h1 style={{ fontSize: 20, fontWeight: 800, color: "var(--public-chat-text, #1c1917)", margin: "0 0 4px" }}>
               {info.channel_name}
             </h1>
             {info.workspace_name && (
-              <p style={{ fontSize: 13, color: "#78716c", margin: "0 0 8px" }}>{info.workspace_name}</p>
+              <p style={{ fontSize: 13, color: "var(--public-chat-muted, #78716c)", margin: "0 0 8px" }}>{info.workspace_name}</p>
             )}
             {info.purpose && (
-              <p style={{ fontSize: 12, color: "#a8a29e", margin: "0 0 20px", lineHeight: 1.5 }}>{info.purpose}</p>
+              <p style={{ fontSize: 12, color: "var(--public-chat-faint, #a8a29e)", margin: "0 0 20px", lineHeight: 1.5 }}>{info.purpose}</p>
             )}
             <div style={{ maxWidth: 280, margin: "0 auto" }}>
               {info.login_required ? (
                 <div style={styles.signedInBox}>
-                  <span style={{ color: "#78716c" }}>{customerText("page.public_chat.continue_as")}</span>
-                  <strong style={{ color: "#1c1917" }}>{currentUserName || currentUser?.email}</strong>
+                  <span style={{ color: "var(--public-chat-muted, #78716c)" }}>{customerText("page.public_chat.continue_as")}</span>
+                  <strong style={{ color: "var(--public-chat-text, #1c1917)" }}>{currentUserName || currentUser?.email}</strong>
                 </div>
               ) : (
                 <input
@@ -927,7 +966,7 @@ export default function PublicChat() {
             shape="rounded"
           />
           <div>
-            <div style={{ fontSize: 14, fontWeight: 700, color: "#1c1917" }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "var(--public-chat-text, #1c1917)" }}>
               {info.agent_name || info.channel_name}
             </div>
             {sending ? (
@@ -940,7 +979,7 @@ export default function PublicChat() {
                 <span>{customerText("component.embedded_chat.replying")}</span>
               </div>
             ) : info.workspace_name && (
-              <div style={{ fontSize: 11, color: "#a8a29e" }}>{info.workspace_name}</div>
+              <div style={{ fontSize: 11, color: "var(--public-chat-faint, #a8a29e)" }}>{info.workspace_name}</div>
             )}
           </div>
         </div>
@@ -1121,7 +1160,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 0,
     background: "transparent",
     overflow: "hidden",
-    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    color: "var(--public-chat-text, #1c1917)",
+    fontFamily: "var(--public-chat-font, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif)",
   },
   card: {
     width: "100%",
@@ -1139,7 +1179,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 0,
     border: "none",
     boxShadow: "none",
-    background: "#fff",
+    background: "var(--public-chat-surface, #fff)",
     backdropFilter: "none",
   },
   header: {
@@ -1147,14 +1187,14 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "center",
     gap: 10,
     padding: "14px 18px",
-    borderBottom: "1px solid rgba(28,25,23,0.06)",
-    background: "rgba(250,250,249,0.6)",
+    borderBottom: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    background: "var(--public-chat-soft, rgba(250,250,249,0.6))",
   },
   replyingStatus: {
     display: "inline-flex",
     alignItems: "center",
     gap: 5,
-    color: "#78716c",
+    color: "var(--public-chat-muted, #78716c)",
     fontSize: 11,
     lineHeight: 1.2,
   },
@@ -1166,7 +1206,7 @@ const styles: Record<string, React.CSSProperties> = {
   systemMsg: {
     textAlign: "center" as const,
     fontSize: 12,
-    color: "#a8a29e",
+    color: "var(--public-chat-faint, #a8a29e)",
     margin: "0 0 16px",
     lineHeight: 1.5,
   },
@@ -1181,20 +1221,20 @@ const styles: Record<string, React.CSSProperties> = {
     wordBreak: "break-word" as const,
   },
   userBubble: {
-    background: "#5d7f77",
-    color: "#fff",
+    background: "var(--public-chat-accent, #5d7f77)",
+    color: "var(--public-chat-on-accent, #fff)",
     borderBottomRightRadius: 4,
   },
   agentBubble: {
-    background: "#f5f5f4",
-    color: "#1c1917",
+    background: "var(--public-chat-soft, #f5f5f4)",
+    color: "var(--public-chat-text, #1c1917)",
     borderBottomLeftRadius: 4,
   },
   noticeBubble: {
     maxWidth: "86%",
-    background: "#fafaf9",
-    color: "#78716c",
-    border: "1px solid rgba(28,25,23,0.06)",
+    background: "var(--public-chat-soft, #fafaf9)",
+    color: "var(--public-chat-muted, #78716c)",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
     borderRadius: 12,
     fontSize: 12,
     textAlign: "center" as const,
@@ -1241,8 +1281,8 @@ const styles: Record<string, React.CSSProperties> = {
     whiteSpace: "nowrap" as const,
   },
   composer: {
-    borderTop: "1px solid rgba(28,25,23,0.06)",
-    background: "rgba(250,250,249,0.4)",
+    borderTop: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    background: "var(--public-chat-soft, rgba(250,250,249,0.4))",
   },
   attachmentTray: {
     display: "flex",
@@ -1257,9 +1297,9 @@ const styles: Record<string, React.CSSProperties> = {
     maxWidth: "100%",
     padding: "5px 7px 5px 9px",
     borderRadius: 9,
-    background: "#f1f6f5",
-    border: "1px solid #bae6fd",
-    color: "#1c1917",
+    background: "var(--public-chat-soft, #f1f6f5)",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    color: "var(--public-chat-text, #1c1917)",
     fontSize: 11,
     fontWeight: 650,
   },
@@ -1274,8 +1314,8 @@ const styles: Record<string, React.CSSProperties> = {
     height: 16,
     borderRadius: 999,
     border: "none",
-    background: "#cffafe",
-    color: "#5d7f77",
+    background: "var(--public-chat-soft-strong, #e5eeeb)",
+    color: "var(--public-chat-accent, #5d7f77)",
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
@@ -1294,9 +1334,9 @@ const styles: Record<string, React.CSSProperties> = {
     width: 38,
     height: 38,
     borderRadius: 12,
-    border: "1px solid rgba(28,25,23,0.06)",
-    background: "#fff",
-    color: "#78716c",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    background: "var(--public-chat-input, #fff)",
+    color: "var(--public-chat-muted, #78716c)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -1308,12 +1348,13 @@ const styles: Record<string, React.CSSProperties> = {
     minHeight: 38,
     maxHeight: 160,
     padding: "10px 14px",
-    border: "1px solid rgba(28,25,23,0.06)",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
     borderRadius: 12,
     fontSize: 13,
     lineHeight: 1.4,
     outline: "none",
-    background: "#fff",
+    background: "var(--public-chat-input, #fff)",
+    color: "var(--public-chat-text, #1c1917)",
     resize: "none" as const,
     overflowY: "auto" as const,
     overscrollBehavior: "contain" as const,
@@ -1326,8 +1367,8 @@ const styles: Record<string, React.CSSProperties> = {
     height: 38,
     borderRadius: 12,
     border: "none",
-    background: "#5d7f77",
-    color: "#fff",
+    background: "var(--public-chat-accent, #5d7f77)",
+    color: "var(--public-chat-on-accent, #fff)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -1336,21 +1377,23 @@ const styles: Record<string, React.CSSProperties> = {
   nameInput: {
     width: "100%",
     padding: "12px 16px",
-    border: "1px solid rgba(28,25,23,0.06)",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
     borderRadius: 12,
     fontSize: 14,
     outline: "none",
     marginBottom: 12,
     textAlign: "center" as const,
     boxSizing: "border-box" as const,
+    background: "var(--public-chat-input, #fff)",
+    color: "var(--public-chat-text, #1c1917)",
   },
   startBtn: {
     width: "100%",
     padding: "12px 0",
     borderRadius: 12,
     border: "none",
-    background: "#5d7f77",
-    color: "#fff",
+    background: "var(--public-chat-accent, #5d7f77)",
+    color: "var(--public-chat-on-accent, #fff)",
     fontSize: 14,
     fontWeight: 700,
     cursor: "pointer",
@@ -1367,38 +1410,38 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    color: "#5d7f77",
-    background: "linear-gradient(135deg, rgba(79,125,117,0.12), rgba(90,142,166,0.1))",
-    border: "1px solid rgba(79,125,117,0.18)",
+    color: "var(--public-chat-accent, #5d7f77)",
+    background: "var(--public-chat-soft, #f2f6f5)",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
   },
   errorTitle: {
     margin: "0 0 8px",
-    color: "#1c1917",
+    color: "var(--public-chat-text, #1c1917)",
     fontSize: 20,
     lineHeight: 1.25,
     fontWeight: 800,
   },
   errorCopy: {
     margin: 0,
-    color: "#57534e",
+    color: "var(--public-chat-muted, #57534e)",
     fontSize: 14,
     lineHeight: 1.55,
   },
   errorHint: {
     margin: "10px 0 0",
-    color: "#a8a29e",
+    color: "var(--public-chat-faint, #a8a29e)",
     fontSize: 12,
     lineHeight: 1.5,
   },
   signedInBox: {
     width: "100%",
     padding: "11px 14px",
-    border: "1px solid #e5eeeb",
+    border: "1px solid var(--public-chat-line, #e5eeeb)",
     borderRadius: 12,
     fontSize: 13,
     outline: "none",
     marginBottom: 12,
-    background: "#f2f6f5",
+    background: "var(--public-chat-soft, #f2f6f5)",
     boxSizing: "border-box" as const,
     display: "flex",
     flexDirection: "column" as const,
@@ -1409,8 +1452,8 @@ const styles: Record<string, React.CSSProperties> = {
     height: 56,
     borderRadius: 16,
     margin: "0 auto 14px",
-    background: "linear-gradient(135deg, #5d7f77, #5f928a)",
-    color: "#fff",
+    background: "var(--public-chat-accent, #5d7f77)",
+    color: "var(--public-chat-on-accent, #fff)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -1423,8 +1466,8 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "center",
     padding: "5px 10px",
     borderRadius: 999,
-    background: "#f1f6f3",
-    color: "#3f7361",
+    background: "var(--public-chat-soft, #f1f6f3)",
+    color: "var(--public-chat-accent, #3f7361)",
     fontSize: 11,
     fontWeight: 800,
     letterSpacing: "0.02em",
@@ -1439,14 +1482,14 @@ const styles: Record<string, React.CSSProperties> = {
     boxSizing: "border-box" as const,
   },
   primaryAuthBtn: {
-    background: "#5d7f77",
-    color: "#fff",
-    border: "1px solid #5d7f77",
+    background: "var(--public-chat-accent, #5d7f77)",
+    color: "var(--public-chat-on-accent, #fff)",
+    border: "1px solid var(--public-chat-accent, #5d7f77)",
   },
   secondaryAuthBtn: {
-    background: "#fff",
-    color: "#5d7f77",
-    border: "1px solid #ccded9",
+    background: "var(--public-chat-input, #fff)",
+    color: "var(--public-chat-accent, #5d7f77)",
+    border: "1px solid var(--public-chat-line, #ccded9)",
   },
   customerAuthTabs: {
     display: "grid",
@@ -1454,22 +1497,22 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 6,
     padding: 4,
     borderRadius: 12,
-    background: "#f5f5f4",
+    background: "var(--public-chat-soft, #f5f5f4)",
     marginBottom: 14,
   },
   customerAuthTab: {
     border: "none",
     borderRadius: 9,
     background: "transparent",
-    color: "#78716c",
+    color: "var(--public-chat-muted, #78716c)",
     padding: "9px 8px",
     fontSize: 12,
     fontWeight: 800,
     cursor: "pointer",
   },
   customerAuthTabActive: {
-    background: "#fff",
-    color: "#5d7f77",
+    background: "var(--public-chat-input, #fff)",
+    color: "var(--public-chat-text, #1c1917)",
     boxShadow: "0 1px 3px rgba(28,25,23,0.08)",
   },
   customerAuthForm: {
@@ -1480,11 +1523,12 @@ const styles: Record<string, React.CSSProperties> = {
   customerInput: {
     width: "100%",
     padding: "11px 13px",
-    border: "1px solid rgba(28,25,23,0.06)",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
     borderRadius: 12,
     fontSize: 13,
     outline: "none",
-    background: "#fff",
+    background: "var(--public-chat-input, #fff)",
+    color: "var(--public-chat-text, #1c1917)",
     boxSizing: "border-box" as const,
   },
   customerCodeInput: {
@@ -1507,7 +1551,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    color: "#a8a29e",
+    color: "var(--public-chat-faint, #a8a29e)",
     fontSize: 11,
     fontWeight: 700,
     margin: "14px 0 10px",
@@ -1521,9 +1565,9 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 8,
     padding: "11px 14px",
     borderRadius: 12,
-    border: "1px solid rgba(28,25,23,0.06)",
-    background: "#fff",
-    color: "#1c1917",
+    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    background: "var(--public-chat-input, #fff)",
+    color: "var(--public-chat-text, #1c1917)",
     fontSize: 13,
     fontWeight: 800,
     cursor: "pointer",
@@ -1543,7 +1587,7 @@ const styles: Record<string, React.CSSProperties> = {
   customerTextButton: {
     border: "none",
     background: "transparent",
-    color: "#78716c",
+    color: "var(--public-chat-muted, #78716c)",
     fontSize: 12,
     fontWeight: 700,
     cursor: "pointer",
@@ -1552,7 +1596,7 @@ const styles: Record<string, React.CSSProperties> = {
   branding: {
     marginTop: 12,
     fontSize: 11,
-    color: "#a8a29e",
+    color: "var(--public-chat-faint, #a8a29e)",
     textAlign: "center" as const,
   },
   embedBranding: {

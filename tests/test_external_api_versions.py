@@ -93,6 +93,13 @@ def test_whatsapp_adapter_uses_central_pin() -> None:
     assert whatsapp_adapter.DEFAULT_API_VERSION == META_GRAPH.value
 
 
+def test_whatsapp_mcp_uses_shared_meta_graph_client() -> None:
+    from packages.core.ai.mcp import whatsapp
+    from packages.core.services.meta_graph import graph
+
+    assert whatsapp._graph is graph
+
+
 def test_integration_health_uses_central_pin() -> None:
     from packages.core.services import integration_health
 

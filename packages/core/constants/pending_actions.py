@@ -39,6 +39,10 @@ class PendingActionKind(str, Enum):
     # ── Governance / policy ──
     #: A gated step tripped the approval gate. Backed by a HitlRequest.
     GOVERNANCE_APPROVAL = "governance_approval"
+    #: An explicit approval-type Task needs a review decision.
+    TASK_APPROVAL = "task_approval"
+    #: A Task stopped and needs retry/cancel guidance from an operator.
+    TASK_RECOVERY = "task_recovery"
 
     # ── Strategist review loop ──
     #: A proposal cohort is waiting on approve / reject.

@@ -108,6 +108,124 @@ async def test_chat_creates_conversation(client: AsyncClient):
     assert "still working" not in (assistant_msgs[-1]["content"] or "")
 
 
+def test_global_chat_message_response_preserves_workflow_action_fields() -> None:
+    from datetime import UTC, datetime
+
+    from apps.api.routers.chat import _to_chat_message_response
+
+    now = datetime.now(UTC)
+    message = SimpleNamespace(
+        id="message-workflow",
+        conversation_id="conversation-global",
+        role="system",
+        content="Review Flow inputs",
+        tool_calls=None,
+        token_usage=None,
+        attachments=None,
+        message_kind="hitl_request",
+        refs=[{"type": "workflow_run", "id": "run-1"}],
+        meta={
+            "workflow_run_id": "run-1",
+            "provider_reasoning_content": "private chain of thought",
+            "internal_trace": {"secret": "not public"},
+        },
+        pending_action={
+            "kind": "workflow_starter_input",
+            "workflow_run_id": "run-1",
+        },
+        resolved_at=now,
+        resolution={"choice": "run"},
+        created_at=now,
+    )
+
+    response = _to_chat_message_response(message)
+
+    assert response.meta == {"workflow_run_id": "run-1"}
+    assert response.pending_action == message.pending_action
+    assert response.resolved_at == now.isoformat()
+    assert response.resolution == {"choice": "run"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "items_key"),
+    [("messages", None), ("messages/page", "items")],
+)
+async def test_global_chat_marks_deleted_workspace_workflow_inaccessible(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    path: str,
+    items_key: str | None,
+) -> None:
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "global_deleted_workflow")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = (
+        await client.post(
+            "/api/v1/workspaces",
+            headers=headers,
+            json={"name": "Deleted workflow source"},
+        )
+    ).json()
+    conversation = Conversation(
+        id=generate_ulid(),
+        entity_id=me["entity_id"],
+        user_id=me["id"],
+        workspace_id=None,
+        title="Global workflow history",
+        channel="web",
+        scope="private",
+    )
+    run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=generate_ulid(),
+        entity_id=me["entity_id"],
+        workspace_id=workspace["id"],
+        status="failed",
+        variables={},
+        step_results={},
+        trigger_data={},
+        definition_snapshot={},
+        execution_trace=[],
+    )
+    message = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="system",
+        content="Workflow needs attention.",
+        author_kind="system",
+        message_kind="workflow_activity",
+        refs=[{"type": "workflow_run", "id": run.id}],
+        meta={"workflow_run_id": run.id, "workflow_status": "failed"},
+    )
+    db_session.add_all([conversation, run, message])
+    await db_session.commit()
+
+    deleted = await client.delete(
+        f"/api/v1/workspaces/{workspace['id']}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204
+
+    response = await client.get(
+        f"/api/v1/chat/conversations/{conversation.id}/{path}",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    body = payload if items_key is None else payload[items_key]
+    assert len(body) == 1
+    assert body[0]["id"] == message.id
+    assert body[0]["meta"] == {
+        "workflow_run_id": run.id,
+        "workflow_status": "failed",
+        "workflow_run_accessible": False,
+    }
+
+
 @pytest.mark.asyncio
 async def test_workspace_chat_user_message_records_author(client: AsyncClient):
     """Regression: a user message sent via /chat/stream into a workspace must

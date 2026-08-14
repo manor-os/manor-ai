@@ -7,34 +7,23 @@ setup resolution, capability displays, and runtime credential lookup agree.
 """
 from __future__ import annotations
 
-
-_CANONICAL_PROVIDER_ALIASES: dict[str, str] = {
-    "twitter": "twitter_x",
-    "twitterx": "twitter_x",
-    "x": "twitter_x",
-    "x_twitter": "twitter_x",
-}
+from packages.core.integrations.registry import (
+    canonical_integration_key,
+    integration_key_aliases,
+    normalize_integration_key,
+)
 
 
 def normalize_provider_key(provider: object) -> str:
-    return str(provider or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalize_integration_key(provider)
 
 
 def canonical_provider_key(provider: object) -> str:
-    key = normalize_provider_key(provider)
-    return _CANONICAL_PROVIDER_ALIASES.get(key, key)
+    return canonical_integration_key(provider)
 
 
 def provider_key_aliases(provider: object) -> set[str]:
-    key = normalize_provider_key(provider)
-    canonical = canonical_provider_key(key)
-    aliases = {key, canonical}
-    aliases.update(
-        alias
-        for alias, target in _CANONICAL_PROVIDER_ALIASES.items()
-        if target == canonical
-    )
-    return {alias for alias in aliases if alias}
+    return integration_key_aliases(provider)
 
 
 def provider_keys_match(left: object, right: object) -> bool:

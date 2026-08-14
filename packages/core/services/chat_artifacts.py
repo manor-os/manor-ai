@@ -6,6 +6,11 @@ import os
 import re
 from typing import Any
 
+from packages.core.services.generated_file_refs import (
+    canonical_generated_file_ref,
+    dedupe_generated_file_refs,
+)
+
 
 _COLLECTION_KEYS = (
     "files",
@@ -203,41 +208,6 @@ def _looks_like_input_upload(obj: dict[str, Any], reference: str) -> bool:
     return "/uploads/chat/" in haystack or haystack.startswith("uploads/chat/")
 
 
-def _looks_like_local_machine_path(value: str) -> bool:
-    text = _text(value)
-    if not text:
-        return False
-    # Grouped alternation (not literal segments) so this detection code
-    # itself passes the OSS-export forbidden-content scan for local paths.
-    return bool(
-        re.match(r"^(~/|/(?:Users|Volumes|private)/|[A-Za-z]:[\\/])", text, re.I)
-    )
-
-
-def _is_platform_fs_url(value: str) -> bool:
-    text = _text(value)
-    return bool(text and re.search(r"(^|/)api/v1/fs/", text))
-
-
-def _is_filesystem_path(value: str) -> bool:
-    text = _text(value)
-    if not text:
-        return False
-    if text.startswith(("http://", "https://", "data:")):
-        return _is_platform_fs_url(text)
-    if _looks_like_local_machine_path(text):
-        return False
-    return True
-
-
-def _has_filesystem_reference(url: str, fs_path: str, preview_url: str) -> bool:
-    return (
-        _is_platform_fs_url(url)
-        or _is_platform_fs_url(preview_url)
-        or _is_filesystem_path(fs_path)
-    )
-
-
 def _is_terminal_success(obj: dict[str, Any]) -> bool:
     for key in _STATUS_KEYS:
         status = _text(obj.get(key)).lower()
@@ -279,7 +249,7 @@ def _canonical_url(url: str, fs_path: str, entity_prefix: str) -> str:
 
 
 def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[dict]:
-    """Extract generated, previewable files from chat tool results."""
+    """Extract generated files with an exact address from chat tool results."""
 
     if not tool_results:
         return []
@@ -309,8 +279,8 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
             if isinstance(document, dict):
                 stack.append(document)
 
-    attachments: list[dict] = []
-    seen: set[tuple[str, str]] = set()
+    canonical_refs: list[dict[str, Any]] = []
+    entity_id = entity_prefix.removeprefix("/api/v1/fs/").strip("/")
 
     def add_from_obj(
         obj: dict[str, Any],
@@ -328,6 +298,7 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
             child = {
                 **doc,
                 "result_url": obj.get("result_url") or obj.get("url") or doc.get("result_url") or doc.get("url"),
+                "fs_path": _first_text(doc, _PATH_KEYS) or _first_text(obj, _PATH_KEYS),
             }
             add_from_obj(
                 child,
@@ -379,27 +350,18 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
         mime_type = _mime_type(name, obj.get("mime_type") or obj.get("mimeType"))
         file_type = _file_type(name, mime_type, obj.get("file_type") or obj.get("fileType"))
         preview_url = _canonical_url(url, fs_path, entity_prefix)
-        if not _has_filesystem_reference(url, fs_path, preview_url):
-            return
-
-        key = (document_id or "", preview_url or fs_path or name)
-        if key in seen:
-            return
-        seen.add(key)
-
-        attachment = {
+        canonical = canonical_generated_file_ref({
             "name": name,
-            "type": "knowledge" if document_id or fs_path or preview_url.startswith("/api/v1/fs/") else "file",
-        }
-        if document_id:
-            attachment["id"] = document_id
-        if file_type:
-            attachment["fileType"] = file_type
-        if mime_type:
-            attachment["mimeType"] = mime_type
-        if preview_url:
-            attachment["previewUrl"] = preview_url
-        attachments.append(attachment)
+            "document_id": document_id,
+            "fs_path": fs_path,
+            "url": url,
+            "file_type": file_type,
+            "mime_type": mime_type,
+            "preview_url": preview_url,
+        }, entity_id=entity_id)
+        if not canonical.get("open_url"):
+            return
+        canonical_refs.append(canonical)
 
     for item in tool_results:
         if not isinstance(item, dict):
@@ -408,4 +370,27 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
         if isinstance(payload, dict):
             add_from_obj(payload, tool_name=_text(item.get("name")), inherited_created=False)
 
-    return attachments[:12]
+    attachments: list[dict[str, Any]] = []
+    for ref in dedupe_generated_file_refs(canonical_refs, entity_id=entity_id)[:12]:
+        document_id = _text(ref.get("document_id"))
+        fs_path = _text(ref.get("fs_path"))
+        preview_url = _text(ref.get("preview_url"))
+        attachment: dict[str, Any] = {
+            "name": _text(ref.get("name")),
+            "type": "knowledge" if document_id or fs_path else "file",
+            "open_url": _text(ref.get("open_url")),
+        }
+        if ref.get("markdown_link"):
+            attachment["markdown_link"] = _text(ref.get("markdown_link"))
+        if document_id:
+            attachment["id"] = document_id
+        if fs_path:
+            attachment["fs_path"] = fs_path
+        if ref.get("file_type"):
+            attachment["fileType"] = _text(ref.get("file_type"))
+        if ref.get("mime_type"):
+            attachment["mimeType"] = _text(ref.get("mime_type"))
+        if preview_url:
+            attachment["previewUrl"] = preview_url
+        attachments.append(attachment)
+    return attachments

@@ -70,6 +70,9 @@ const SUMMARY_KEYS = [
 const COLLECTION_KEYS = ["tasks", "items", "results", "outputs", "files", "artifacts", "attachments", "documents", "steps"];
 const INTERNAL_SUMMARY_KEYS = new Set([
   "id",
+  "document_id",
+  "documentId",
+  "doc_id",
   "task_id",
   "plan_id",
   "step_id",
@@ -121,6 +124,46 @@ function humanizeKey(value: string, titleCase = false): string {
     return base.replace(/\b(ai|api|cli|csv|doc|faq|html|id|json|mcp|pdf|ppt|pptx|qa|sla|sms|url|xls|xlsx)\b/gi, (part) => part.toUpperCase());
   }
   return base.split(/\s+/).map((word, index) => titleWord(word, index)).join(" ");
+}
+
+/**
+ * Mask Markdown structure and openable addresses before applying prose cleanup.
+ *
+ * File references are an API contract, not display copy. In particular, changing
+ * punctuation in a Markdown destination can turn a valid entity-FS URL into a
+ * different path while leaving the card looking legitimate. Private-use tokens
+ * keep these segments opaque to every humanizing replacement below and are
+ * restored byte-for-byte before rendering.
+ */
+function protectUserFacingReferences(value: string): {
+  text: string;
+  restore: (formatted: string) => string;
+} {
+  const segments: string[] = [];
+  const protect = (segment: string) => {
+    const index = segments.push(segment) - 1;
+    return `\uE000${index}\uE001`;
+  };
+  const patterns = [
+    /```[\s\S]*?```|~~~[\s\S]*?~~~/g,
+    /!?\[(?:\\.|[^\]\\])*\]\((?:\\.|[^)\\])*\)/g,
+    /^\s{0,3}\[(?:\\.|[^\]\\])+\]:\s*(?:<[^>\n]+>|\S+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?/gm,
+    /`[^`\n]+`/g,
+    /<(?:https?:\/\/|mailto:|manor-file:|\/(?:viewer|api\/v1\/fs)\/)[^>\n]+>/gi,
+    /(?:https?:\/\/|mailto:|manor-file:)[^\s<>"'`]+/gi,
+    /\/(?:viewer\/|api\/v1\/fs\/)[^\s<>"'`\])}]+/gi,
+  ];
+
+  let text = value;
+  for (const pattern of patterns) {
+    text = text.replace(pattern, protect);
+  }
+  return {
+    text,
+    restore: (formatted) => formatted.replace(/\uE000(\d+)\uE001/g, (_match, index) => (
+      segments[Number(index)] ?? _match
+    )),
+  };
 }
 
 function looksJsonish(value: string): boolean {
@@ -197,9 +240,20 @@ function fileLabel(value: any, index = 0): string {
     value.file_url ||
     value.document_url ||
     value.public_url ||
-    value.url ||
-    value.document_id;
+    value.url;
   return formatUserFacingText(basename(label) || value.type || `File ${index + 1}`);
+}
+
+function stripStandaloneDocumentIdLines(value: string): string {
+  // A document ID is routing metadata. It may remain inside a protected
+  // `/viewer/<id>` destination, but it should never be repeated as display
+  // copy (for example, "Recipe document ID: `01...`").
+  const documentIdLine = /^\s*(?:[-*+]\s+)?(?:[^:\n：]{1,64}\s+)?(?:document(?:[_\s-]+)id|文档\s*(?:id|编号))\s*[:：]\s*(?:`[^`\n]+`|[A-Za-z0-9_-]{16,})[。.]?\s*$/i;
+  return value
+    .split("\n")
+    .filter((line) => !documentIdLine.test(line))
+    .join("\n")
+    .trim();
 }
 
 function itemLabel(value: any, index: number, fallback: string): string {
@@ -321,8 +375,10 @@ export function friendlyPersonName(value?: string | null, fallback = "Team membe
 }
 
 export function formatUserFacingText(value?: string | null): string {
-  let text = String(value || "").trim();
+  let text = stripStandaloneDocumentIdLines(String(value || "").trim());
   if (!text) return "";
+  const protectedReferences = protectUserFacingReferences(text);
+  text = protectedReferences.text;
 
   // Never surface an unresolved plan-ref / template expression
   // (e.g. "${{ steps.generate_video.result.file_url }}").
@@ -430,7 +486,7 @@ export function formatUserFacingText(value?: string | null): string {
     return humanizeKey(match);
   });
 
-  return text;
+  return protectedReferences.restore(text);
 }
 
 export function formatUserFacingStructuredText(value?: unknown): string {
@@ -446,6 +502,15 @@ export function formatUserFacingStructuredText(value?: unknown): string {
   if (rendered) return rendered;
   if (typeof value === "object") return jsonFallback(value) || "";
   return formatUserFacingText(String(value || ""));
+}
+
+export function formatTaskOutputSummary(output?: Record<string, unknown> | null): string {
+  if (!output) return "";
+  for (const key of ["summary", "result_summary", "message", "text", "result", "results"]) {
+    const rendered = formatUserFacingStructuredText(output[key]).trim();
+    if (rendered) return rendered;
+  }
+  return "";
 }
 
 export function formatTaskDescriptionForDisplay(description?: string | null): string {

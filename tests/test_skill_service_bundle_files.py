@@ -1,10 +1,15 @@
 import json
 
 from packages.core.services.skill_service import (
+    DEFAULT_SKILL_MAX_ROUNDS,
     _append_skill_bundle_manifest,
     _try_list_skill_bundle_files,
     _try_read_skill_bundle_file,
 )
+
+
+def test_prompt_skill_default_budget_is_200_rounds():
+    assert DEFAULT_SKILL_MAX_ROUNDS == 200
 
 
 def test_skill_bundle_manifest_and_file_tools():

@@ -1,0 +1,28 @@
+{
+  "id": "project-proposal",
+  "renderer": "project_proposal",
+  "page_size": "A4",
+  "orientation": "P",
+  "required": ["brand", "project_name", "client", "executive_summary", "goals", "scope", "milestones", "deliverables"],
+  "palette": {
+    "primary": "5B3DF5",
+    "accent": "FFE45E",
+    "secondary": "FF4F9A",
+    "ink": "171326",
+    "muted": "6D6782",
+    "surface": "F2EFFF",
+    "line": "D8D0FF"
+  },
+  "labels": {
+    "document": "CREATIVE PARTNERSHIP PROPOSAL",
+    "client": "CLIENT",
+    "timeline": "TIMELINE",
+    "budget": "INVESTMENT",
+    "overview": "THE BIG IDEA",
+    "goals": "WHAT SUCCESS LOOKS LIKE",
+    "scope": "WHAT WE WILL BUILD",
+    "milestones": "HOW WE GET THERE",
+    "deliverables": "WHAT YOU RECEIVE",
+    "assumptions": "WORKING AGREEMENTS"
+  }
+}

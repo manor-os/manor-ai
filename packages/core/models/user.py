@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Index, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -62,6 +62,12 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_login_ip: Mapped[Optional[str]] = mapped_column(String(128))
+    # Server-side revocation epoch for bearer tokens. Every JWT carries the
+    # version current at issuance; logout, password changes, and account
+    # disablement increment this value so already-issued tokens stop working.
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
 
     # 2FA / TOTP fields
     totp_secret: Mapped[Optional[str]] = mapped_column(String(255))
@@ -108,5 +114,12 @@ class OAuthAccount(Base, TimestampMixin):
     provider_user_id: Mapped[str] = mapped_column(String(255), nullable=False)
     access_token: Mapped[Optional[str]] = mapped_column(String)
     refresh_token: Mapped[Optional[str]] = mapped_column(String)
+    # New writes use CredentialService and leave the two legacy plaintext
+    # columns above empty. They remain temporarily for a rolling backfill.
+    credential_ref: Mapped[Optional[str]] = mapped_column(Text)
+    credential_scheme: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy_columns",
+        server_default="legacy_columns",
+    )
     token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     profile: Mapped[dict] = mapped_column(JSONB, server_default="{}")

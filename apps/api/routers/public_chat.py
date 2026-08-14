@@ -769,7 +769,12 @@ async def register_customer_for_chat(
         }
 
     mark_user_login(user, source="public_chat.register")
-    token_value = create_access_token(user.id, entity.id, user.role)
+    token_value = create_access_token(
+        user.id,
+        entity.id,
+        user.role,
+        token_version=user.token_version,
+    )
     return {
         "access_token": token_value,
         "token_type": "bearer",
@@ -1158,16 +1163,106 @@ async def get_embed_script(
     return window.location.origin;
   }}
 
+  function resolvedColor(value) {{
+    if (!value || !document.body) return "";
+    var probe = document.createElement("span");
+    probe.style.color = String(value).trim();
+    if (!probe.style.color) return "";
+    probe.style.display = "none";
+    document.body.appendChild(probe);
+    var result = window.getComputedStyle(probe).color || "";
+    probe.remove();
+    return result;
+  }}
+
+  function firstThemeValue(styles, names) {{
+    for (var i = 0; i < names.length; i += 1) {{
+      var value = styles.getPropertyValue(names[i]).trim();
+      if (value) return value;
+    }}
+    return "";
+  }}
+
+  function rgbChannels(value) {{
+    var match = String(value || "").match(/rgba?\\(\\s*([\\d.]+)[,\\s]+([\\d.]+)[,\\s]+([\\d.]+)/i);
+    if (!match) return null;
+    return [Number(match[1]), Number(match[2]), Number(match[3])];
+  }}
+
+  function luminance(value) {{
+    var channels = rgbChannels(value);
+    if (!channels) return 1;
+    var linear = channels.map(function (channel) {{
+      var part = Math.max(0, Math.min(255, channel)) / 255;
+      return part <= 0.03928 ? part / 12.92 : Math.pow((part + 0.055) / 1.055, 2.4);
+    }});
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+  }}
+
+  function siteTheme() {{
+    var rootStyles = window.getComputedStyle(document.documentElement);
+    var bodyStyles = window.getComputedStyle(document.body);
+    var themeMeta = document.querySelector('meta[name="theme-color"]');
+    var accent = resolvedColor(
+      options.color ||
+      firstThemeValue(rootStyles, [
+        "--manor-chat-accent", "--brand", "--primary", "--color-primary",
+        "--accent-color", "--accent"
+      ]) ||
+      (themeMeta ? themeMeta.getAttribute("content") : "")
+    ) || "rgb(67, 107, 101)";
+    var surface = resolvedColor(
+      options.surface ||
+      firstThemeValue(rootStyles, [
+        "--manor-chat-surface", "--bg", "--background", "--surface-app", "--surface"
+      ]) ||
+      bodyStyles.backgroundColor
+    ) || "rgb(255, 255, 255)";
+    var text = resolvedColor(
+      options.text ||
+      firstThemeValue(rootStyles, ["--manor-chat-text", "--text", "--foreground", "--text-strong"]) ||
+      bodyStyles.color
+    ) || "rgb(28, 25, 23)";
+    var muted = resolvedColor(
+      options.muted ||
+      firstThemeValue(rootStyles, ["--manor-chat-muted", "--muted", "--text-muted"])
+    ) || (luminance(surface) < 0.32 ? "rgb(184, 192, 217)" : "rgb(120, 113, 108)");
+    var mode = options.theme === "dark" || options.theme === "light"
+      ? options.theme
+      : (luminance(surface) < 0.32 ? "dark" : "light");
+    var font = String(options.font || bodyStyles.fontFamily || "").replace(/[;{{}}<>]/g, "").slice(0, 180);
+    return {{
+      accent: accent,
+      accentText: luminance(accent) > 0.52 ? "rgb(17, 24, 39)" : "rgb(255, 255, 255)",
+      surface: surface,
+      text: text,
+      muted: muted,
+      mode: mode,
+      font: font
+    }};
+  }}
+
   function mount() {{
     var origin = appOrigin();
-    var chatUrl = origin + "/chat/public/" + encodeURIComponent(token) + "?embed=1";
+    var theme = siteTheme();
+    var chatParams = new URLSearchParams({{
+      embed: "1",
+      theme: theme.mode,
+      accent: theme.accent,
+      accentText: theme.accentText,
+      surface: theme.surface,
+      text: theme.text,
+      muted: theme.muted,
+      font: theme.font
+    }});
+    var chatUrl = origin + "/chat/public/" + encodeURIComponent(token) + "?" + chatParams.toString();
     var root = document.createElement("div");
     root.id = rootId;
     root.style.position = "fixed";
     root.style.right = options.right || "24px";
     root.style.bottom = options.bottom || "24px";
     root.style.zIndex = options.zIndex || "2147483000";
-    root.style.fontFamily = "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif";
+    root.style.fontFamily = theme.font || "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif";
 
     var iframe = document.createElement("iframe");
     iframe.src = chatUrl;
@@ -1182,7 +1277,7 @@ async def get_embed_script(
     iframe.style.border = "0";
     iframe.style.borderRadius = "20px";
     iframe.style.boxShadow = "0 24px 80px rgba(15, 23, 42, 0.28)";
-    iframe.style.background = "#fff";
+    iframe.style.background = theme.surface;
     iframe.style.overflow = "hidden";
 
     var button = document.createElement("button");
@@ -1193,9 +1288,9 @@ async def get_embed_script(
     button.style.height = "58px";
     button.style.borderRadius = "999px";
     button.style.border = "0";
-    button.style.background = options.color || "#0f766e";
-    button.style.color = "#fff";
-    button.style.boxShadow = "0 14px 34px rgba(15, 118, 110, 0.35)";
+    button.style.background = theme.accent;
+    button.style.color = theme.accentText;
+    button.style.boxShadow = "0 16px 40px rgba(0, 0, 0, 0.30)";
     button.style.display = "flex";
     button.style.alignItems = "center";
     button.style.justifyContent = "center";
@@ -1205,26 +1300,35 @@ async def get_embed_script(
 
     var open = false;
     function setOpen(next) {{
+      var wasOpen = open;
       open = next;
       iframe.style.display = open ? "block" : "none";
       button.setAttribute("aria-label", open ? "Close chat" : (options.label || "Open chat"));
       button.innerHTML = open
         ? '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
         : '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4.5 6.75A3.25 3.25 0 0 1 7.75 3.5h8.5a3.25 3.25 0 0 1 3.25 3.25v6.5a3.25 3.25 0 0 1-3.25 3.25H12l-4.2 3.15a.8.8 0 0 1-1.28-.64V16.4A3.25 3.25 0 0 1 4.5 13.25v-6.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 9.25h8M8 12.25h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+      if (open && !wasOpen) {{
+        window.dispatchEvent(new CustomEvent("manor:webchat-open", {{ detail: {{ token: token }} }}));
+      }}
     }}
 
     button.addEventListener("mouseenter", function() {{
       button.style.transform = "translateY(-1px)";
-      button.style.boxShadow = "0 18px 42px rgba(15, 118, 110, 0.4)";
+      button.style.boxShadow = "0 20px 48px rgba(0, 0, 0, 0.36)";
     }});
     button.addEventListener("mouseleave", function() {{
       button.style.transform = "translateY(0)";
-      button.style.boxShadow = "0 14px 34px rgba(15, 118, 110, 0.35)";
+      button.style.boxShadow = "0 16px 40px rgba(0, 0, 0, 0.30)";
     }});
     button.addEventListener("click", function() {{
       setOpen(!open);
     }});
 
+    var focusStyles = document.createElement("style");
+    focusStyles.textContent =
+      "#" + rootId + " button:focus-visible{{outline:3px solid " + theme.accent + ";outline-offset:3px}}" +
+      "@media (prefers-reduced-motion: reduce){{#" + rootId + " button{{transition:none!important}}}}";
+    root.appendChild(focusStyles);
     root.appendChild(iframe);
     root.appendChild(button);
     document.body.appendChild(root);

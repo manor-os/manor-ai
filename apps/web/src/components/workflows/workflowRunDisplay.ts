@@ -110,6 +110,23 @@ export interface WorkflowArtifactRef {
   status?: string;
 }
 
+export interface WorkflowPublicationReceipt {
+  schema_version: "publication-receipt/v1";
+  platform: string;
+  verification_status: "verified" | "unverified" | "failed";
+  external_id?: string | null;
+  published_url?: string | null;
+  published_at: string;
+  verified_at: string;
+  payload_hash: string;
+  fallback_used?: string;
+  evidence?: Record<string, unknown>[];
+  attempts?: Record<string, unknown>[];
+  account?: string;
+  content_type?: string;
+  title?: string;
+}
+
 export interface WorkflowTraceEntry {
   sequence?: number;
   attempt_number?: number;
@@ -159,6 +176,7 @@ export interface WorkflowHistoryRun {
   total_count?: number;
   artifact_count?: number | null;
   history_blocker?: unknown;
+  publication_receipts?: WorkflowPublicationReceipt[];
 }
 
 export interface WorkflowHistoryFamily {
@@ -198,6 +216,7 @@ export interface WorkflowSnapshotNode {
 const ACTIVE_STATUSES = new Set<WorkflowRunStatus>(["pending", "running"]);
 const ACTIONABLE_COMPLETED_OUTCOMES = new Set<WorkflowRunStatusLabelKey>([
   "needs_input",
+  "revision_required",
 ]);
 const PROCESSED_STATUSES = new Set<WorkflowRunStatus>([
   "completed",
@@ -685,6 +704,16 @@ export function normalizeWorkflowArtifactRefs(value: unknown): WorkflowArtifactR
   });
 }
 
+export function workflowArtifactLabel(
+  ref: WorkflowArtifactRef,
+  fallback: string,
+): string {
+  const name = safeArtifactLabel(ref.name);
+  if (name) return name;
+  const path = safeArtifactPath(ref.fs_path);
+  return path.split(/[\\/]/).filter(Boolean).pop() || fallback;
+}
+
 function utf8Prefix(text: string, byteLimit: number, encoder: TextEncoder): string {
   const characters = Array.from(text);
   let low = 0;
@@ -753,6 +782,22 @@ export function formatWorkflowValue(value: unknown, truncationText: string): str
 
 export function isWorkflowRunActive(run: Pick<WorkflowRunView, "status">): boolean {
   return ACTIVE_STATUSES.has(run.status);
+}
+
+export function canCancelWorkflowRun(run: {
+  status?: string;
+  business_outcome?: string | null;
+  businessOutcome?: string | null;
+  capabilities?: { can_control?: boolean };
+}): boolean {
+  if (run.capabilities?.can_control !== true) return false;
+  const status = String(run.status || "").trim().toLowerCase();
+  if (["pending", "running", "paused", "failed"].includes(status)) return true;
+  const businessOutcome = String(
+    run.business_outcome ?? run.businessOutcome ?? "",
+  ).trim().toLowerCase();
+  return status === "completed"
+    && ACTIONABLE_COMPLETED_OUTCOMES.has(businessOutcome as WorkflowRunStatusLabelKey);
 }
 
 export function workflowRunStatusPresentation(
@@ -836,6 +881,7 @@ export function workflowRunActionLabelKey(
   }
   const keyByOption: Record<string, string> = {
     run: "component.workflow_run.action.run",
+    pause: "component.workflow_run.action.pause",
     resume: "component.workflow_run.action.resume",
     accept: "component.workflow_run.action.accept",
     revise: "component.workflow_run.action.revise",

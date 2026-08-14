@@ -8,8 +8,13 @@ new file + one ``register()`` call.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Awaitable, Callable, Protocol
+from typing import Protocol
 
+from packages.core.integrations.registry import (
+    integration_specs,
+    register_stat_measurer,
+    stat_measurer_for,
+)
 from packages.core.models.document import Integration
 
 
@@ -22,20 +27,22 @@ class Measurer(Protocol):
     ) -> Decimal: ...
 
 
-_REGISTRY: dict[str, Measurer] = {}
-
-
-def register(provider_key: str, fn: Measurer) -> None:
-    _REGISTRY[provider_key] = fn
+def register(
+    provider_key: str,
+    fn: Measurer,
+    *,
+    metric_keys: set[str] | frozenset[str] = frozenset(),
+) -> None:
+    register_stat_measurer(provider_key, fn, metric_keys=metric_keys)
 
 
 def get(provider_key: str) -> Measurer | None:
-    return _REGISTRY.get(provider_key)
+    return stat_measurer_for(provider_key)  # type: ignore[return-value]
 
 
 def supported_providers() -> list[str]:
-    return sorted(_REGISTRY.keys())
+    return [spec.key for spec in integration_specs() if spec.stat_measurer is not None]
 
 
 # Auto-register built-in measurers on import.
-from packages.core.goals.measurers import twitter_x as _twitter_x  # noqa: F401
+from packages.core.goals.measurers import twitter_x as _twitter_x  # noqa: E402,F401

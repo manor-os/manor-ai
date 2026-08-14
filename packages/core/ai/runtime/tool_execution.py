@@ -11,6 +11,7 @@ from packages.core.ai.runtime.harness import RuntimeHarness
 from packages.core.ai.runtime.chrome_routing import (
     runtime_blocked_chrome_action_shortcut,
     runtime_blocked_chrome_open_shortcut,
+    runtime_blocked_chrome_upload_knowledge_source,
     runtime_blocked_chrome_workflow_contract,
     runtime_blocked_generic_web_for_chrome_local_browser,
     runtime_record_chrome_tool_result,
@@ -29,6 +30,8 @@ RUNTIME_ENVELOPE_AWARE_TOOLS = frozenset(
         "rag",
         "workspace_search",
         "workspace_create_task",
+        "start_workspace_flow",
+        "run_workflow",
     }
 )
 
@@ -204,6 +207,7 @@ async def runtime_prepare_tool_execution(
     workspace_id: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
+    step_id: str | None = None,
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     manual_skill_slugs: list[str] | None = None,
@@ -238,6 +242,19 @@ async def runtime_prepare_tool_execution(
             arguments=arguments,
             harness=harness,
             blocked_result=blocked_chrome_web,
+        )
+
+    blocked_chrome_upload = runtime_blocked_chrome_upload_knowledge_source(
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+    if blocked_chrome_upload:
+        if harness is not None:
+            harness.record_tool_block_result(tool_name, blocked_chrome_upload)
+        return RuntimePreparedToolExecution(
+            arguments=arguments,
+            harness=harness,
+            blocked_result=blocked_chrome_upload,
         )
 
     blocked_chrome_open = runtime_blocked_chrome_open_shortcut(
@@ -312,6 +329,7 @@ async def runtime_prepare_tool_execution(
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
+            step_id=step_id,
         )
     else:
         policy_blocked = await RuntimeApprovalMiddleware().guard_tool_action(
@@ -322,6 +340,7 @@ async def runtime_prepare_tool_execution(
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
+            step_id=step_id,
         )
     if policy_blocked:
         return RuntimePreparedToolExecution(
@@ -376,6 +395,7 @@ async def runtime_execute_registered_tool(
     workspace_id: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
+    step_id: str | None = None,
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     manual_skill_slugs: list[str] | None = None,
@@ -403,6 +423,7 @@ async def runtime_execute_registered_tool(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         task_id=task_id,
+        step_id=step_id,
         active_user_message=active_user_message,
         manual_skill_selected=manual_skill_selected,
         manual_skill_slugs=manual_skill_slugs,

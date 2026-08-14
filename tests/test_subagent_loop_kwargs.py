@@ -62,6 +62,7 @@ def test_exec_subagent_only_forwards_supported_loop_kwargs(monkeypatch):
         "workspace_id": "ws",
         "conversation_id": "conv",
         "task_id": "task",
+        "step_id": "step",
         "expected_output_schema": None,
     }
 
@@ -71,3 +72,4 @@ def test_exec_subagent_only_forwards_supported_loop_kwargs(monkeypatch):
     accepted = set(inspect.signature(harness.runtime_execute_subagent_loop).parameters)
     unsupported = set(captured) - accepted
     assert not unsupported, f"_exec_subagent forwards kwargs the subagent loop rejects: {unsupported}"
+    assert captured["step_id"] == "step"

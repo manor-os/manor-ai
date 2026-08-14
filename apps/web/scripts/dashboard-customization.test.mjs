@@ -63,6 +63,17 @@ test("dashboard customization persists widgets and generated modules", () => {
   assert.match(dashboardSource, /page\.dashboard\.restore_defaults/);
 });
 
+test("daily brief is hidden by default without overriding saved visibility", () => {
+  assert.match(
+    dashboardSource,
+    /DASHBOARD_WIDGET_DEFAULT_VISIBILITY[\s\S]*daily_brief:\s*false/,
+  );
+  assert.match(
+    dashboardSource,
+    /typeof raw\?\.visible === "boolean"[\s\S]*\? raw\.visible[\s\S]*: DASHBOARD_WIDGET_DEFAULT_VISIBILITY\[id\]/,
+  );
+});
+
 test("dashboard customization supports accessible and responsive ordering controls", () => {
   assert.match(dashboardSource, /page\.dashboard\.move_up/);
   assert.match(dashboardSource, /page\.dashboard\.move_down/);

@@ -211,9 +211,10 @@ celery_app.conf.beat_schedule = {
         "schedule": 300.0,  # every 5 minutes
     },
     "embedding-sweep-pending": {
-        # Picks up documents stuck at 'pending' (task dispatch lost).
+        # Recovers stale processing heartbeats and pending dispatch loss. The
+        # sweep is DB-only and fans indexing back out to the work queue.
         "task": "embeddings.sweep_pending",
-        "schedule": 300.0,  # every 5 minutes
+        "schedule": 60.0,
     },
     # Ops monitoring — host + Docker container snapshot + alerting.
     # Collector writes to Redis (ops:snapshot, TTL 2 min). Alerter

@@ -12,8 +12,8 @@ Exercises:
   * missing ToolDefinition raises InstallError (fast-fail)
   * missing MCPServer becomes an InstallTodo (not an error)
   * governance preset never_allow blocks bound tools at install time
-  * knowledge_pack creates a DocumentGroup; inline_text mode emits
-    knowledge_pack_document todos
+  * knowledge_pack creates a DocumentGroup; inline_text mode materializes
+    searchable starter documents
   * starter_memory rows land at the agent level (no user_id, no workspace_id)
 """
 
@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.blueprints.installer import InstallError, InstallMode, install_blueprint
 from packages.core.models.base import generate_ulid
-from packages.core.models.document import DocumentGroup
+from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
 from packages.core.models.memory import AgentMemory
 from packages.core.models.skill import AgentSkillBinding, Skill
@@ -34,6 +34,7 @@ from packages.core.models.workspace import (
     AgentSubscription,
     AgentToolBinding,
     ToolDefinition,
+    Workspace,
 )
 from packages.core.models.worker import SubscriptionWorker
 
@@ -97,6 +98,42 @@ def _base_payload(**overrides) -> dict:
             cursor = cursor.setdefault(s, {})
         cursor[sections[-1]] = v
     return payload
+
+
+async def test_simulate_install_materializes_blueprint_experience_into_workspace_settings(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    result = await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        payload=_base_payload(),
+        mode=InstallMode.SIMULATE,
+    )
+    workspace = (
+        await db_session.execute(select(Workspace).where(Workspace.id == result.workspace_id))
+    ).scalar_one()
+    experience = workspace.settings["simulation_experience"]
+    assert workspace.settings["sandbox"] is True
+    assert experience["schema_version"] == "1.0"
+    assert experience["artifacts"]
+
+
+async def test_live_install_does_not_persist_simulation_only_settings(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    result = await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        payload=_base_payload(),
+        mode=InstallMode.LIVE,
+    )
+    workspace = (
+        await db_session.execute(select(Workspace).where(Workspace.id == result.workspace_id))
+    ).scalar_one()
+    assert "sandbox" not in workspace.settings
+    assert "simulation_experience" not in workspace.settings
 
 
 # ── Skills ────────────────────────────────────────────────────────────
@@ -661,7 +698,7 @@ async def test_knowledge_pack_creates_document_group(
     assert not any(t.kind == "knowledge_pack_document" for t in result.todos)
 
 
-async def test_knowledge_pack_inline_text_emits_todos(
+async def test_knowledge_pack_inline_text_materializes_documents(
     db_session: AsyncSession,
     entity_id: str,
 ):
@@ -675,7 +712,16 @@ async def test_knowledge_pack_inline_text_emits_todos(
                     "mode": "inline_text",
                     "folder_structure": [],
                     "starter_documents": [
-                        {"path": "voice.md", "body_md": "# Voice\n\nFounder-led."},
+                        {
+                            "path": "voice.md",
+                            "body_md": "# Voice\n\nFounder-led.",
+                            "template": {
+                                "id": "test-live-voice",
+                                "mode": "live_projection",
+                                "renderer": "test_live_voice",
+                                "version": 1,
+                            },
+                        },
                         {"path": "examples.md", "body_md": "# Examples"},
                     ],
                     "external_source": None,
@@ -685,11 +731,43 @@ async def test_knowledge_pack_inline_text_emits_todos(
     )
     result = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
     await db_session.commit()
-    todos = [t for t in result.todos if t.kind == "knowledge_pack_document"]
-    assert len(todos) == 2
-    paths = [t.payload["path"] for t in todos]
-    assert "voice.md" in paths
-    assert "examples.md" in paths
+    assert not any(t.kind == "knowledge_pack_document" for t in result.todos)
+    group = (await db_session.execute(
+        select(DocumentGroup).where(DocumentGroup.entity_id == entity_id)
+    )).scalar_one()
+    documents = list((await db_session.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .where(DocumentGroupMember.group_id == group.id)
+        .order_by(Document.name)
+    )).scalars().all())
+    assert [document.name for document in documents] == ["examples.md", "voice.md"]
+    assert documents[1].metadata_["content_text"] == "# Voice\n\nFounder-led."
+    assert documents[1].metadata_["origin"]["workspace_id"] == result.workspace_id
+    assert documents[1].metadata_["blueprint_template"] == {
+        "id": "test-live-voice",
+        "mode": "live_projection",
+        "renderer": "test_live_voice",
+        "version": 1,
+    }
+    assert documents[1].source == "blueprint"
+    assert documents[1].visibility == "workspace"
+
+    # Re-installing the same payload reuses both the pack and its documents;
+    # it must not create duplicates or overwrite an operator's later edits.
+    documents[1].metadata_ = {**documents[1].metadata_, "content_text": "Edited"}
+    await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    await db_session.commit()
+    reloaded = list((await db_session.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .where(DocumentGroupMember.group_id == group.id)
+    )).scalars().all())
+    assert len(reloaded) == 2
+    assert next(row for row in reloaded if row.name == "voice.md").metadata_["content_text"] == "Edited"
+    assert next(row for row in reloaded if row.name == "voice.md").metadata_["blueprint_template"]["id"] == (
+        "test-live-voice"
+    )
 
 
 # ── End-to-end roundtrip ──────────────────────────────────────────────

@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
+
 from packages.core.services.workspace_readiness import (
     build_workspace_readiness_report,
     declared_channel_requirements,
+    iter_declared_service_keys,
     missing_required_channels,
 )
 
@@ -143,6 +146,32 @@ def test_readiness_requires_every_declared_service_and_worker_binding() -> None:
     assert agents.missing_setup_key == "no_agents"
     assert agents.details["missing_service_keys"] == ["publishing"]
     assert agents.details["unbound_subscription_ids"] == ["sub_research"]
+
+
+def test_readiness_accepts_legacy_service_key_field_without_losing_blocker() -> None:
+    report = build_workspace_readiness_report(
+        operating_model={"services": [{"key": "publishing"}]},
+        subscriptions=[],
+        goals=[SimpleNamespace(id="goal_1")],
+        declared_provider_keys=set(),
+        active_provider_keys=set(),
+        configured_integrations=[],
+        configured_channels=[],
+        knowledge_nets=[],
+        governance_policy=None,
+        operating_memory="",
+    )
+
+    agents = next(part for part in report.parts if part.key == "agents")
+    assert agents.details["declared_service_keys"] == ["publishing"]
+    assert agents.details["missing_service_keys"] == ["publishing"]
+
+
+def test_declared_service_key_conflict_fails_closed() -> None:
+    with pytest.raises(ValueError, match="conflicting key and service_key"):
+        iter_declared_service_keys(
+            {"services": [{"key": "research", "service_key": "publishing"}]}
+        )
 
 
 def test_readiness_blocks_when_only_some_declared_integrations_are_connected() -> None:

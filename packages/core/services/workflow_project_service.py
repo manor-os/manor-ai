@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
@@ -32,12 +33,14 @@ async def create_workflow_project(
     schema_version: int = 1,
     current_stage: str = "draft",
     last_run_id: str | None = None,
+    project_key: str | None = None,
 ) -> WorkflowProject:
     project = WorkflowProject(
         id=generate_ulid(),
         entity_id=entity_id,
         workspace_id=workspace_id,
         project_type=project_type,
+        project_key=project_key,
         schema_version=schema_version,
         current_stage=current_stage,
         state=dict(state),
@@ -48,6 +51,60 @@ async def create_workflow_project(
     db.add(project)
     await db.flush()
     return project
+
+
+async def claim_workflow_project(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    project_type: str,
+    project_key: str,
+    state: dict,
+    created_by: str,
+    schema_version: int = 1,
+    current_stage: str = "draft",
+    last_run_id: str | None = None,
+) -> tuple[WorkflowProject, bool]:
+    """Atomically claim one business execution key.
+
+    Returns ``(project, True)`` for the winner and the existing project with
+    ``False`` for duplicate dispatches. The unique business-key index is the
+    concurrency boundary; the SAVEPOINT keeps a losing insert from poisoning
+    the caller's transaction.
+    """
+    normalized_key = str(project_key or "").strip()
+    if not normalized_key:
+        raise ValueError("Workflow project claim requires project_key")
+
+    project = WorkflowProject(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        project_type=project_type,
+        project_key=normalized_key,
+        schema_version=schema_version,
+        current_stage=current_stage,
+        state=dict(state),
+        revision=0,
+        last_run_id=last_run_id,
+        created_by=created_by,
+    )
+    try:
+        async with db.begin_nested():
+            db.add(project)
+            await db.flush()
+    except IntegrityError:
+        existing = (await db.execute(
+            select(WorkflowProject).where(
+                WorkflowProject.entity_id == entity_id,
+                WorkflowProject.workspace_id == workspace_id,
+                WorkflowProject.project_type == project_type,
+                WorkflowProject.project_key == normalized_key,
+            )
+        )).scalar_one()
+        return existing, False
+    return project, True
 
 
 async def get_workflow_project(

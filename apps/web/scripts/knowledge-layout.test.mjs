@@ -135,6 +135,41 @@ test("Knowledge page uses the browse endpoint without showing pagination control
   assert.doesNotMatch(knowledgeSource, /<Pagination\b/);
 });
 
+test("Knowledge caches browse data and polls only lightweight indexing statuses", () => {
+  assert.match(apiSource, /function\s+listDocumentIndexingStatuses\s*\(ids:\s*string\[\]\)/);
+  assert.match(apiSource, /\/documents\/indexing-status\?\$\{q\}/);
+  assert.match(apiSource, /indexingStatuses:\s*listDocumentIndexingStatuses/);
+  assert.match(knowledgeSource, /queryFn:\s*\(\)\s*=>\s*api\.documents\.indexingStatuses\(inProgressDocumentIds\)/);
+  assert.match(knowledgeSource, /queryKey:\s*\["document-indexing-status",\s*inProgressDocumentIds\]/);
+  assert.match(knowledgeSource, /queryClient\.setQueryData\(documentBrowseCacheKey/);
+
+  const browseQuery = knowledgeSource.slice(
+    knowledgeSource.indexOf("const { data, isLoading } = useQuery"),
+    knowledgeSource.indexOf("const inProgressDocumentIds"),
+  );
+  assert.doesNotMatch(browseQuery, /refetchInterval/);
+});
+
+test("Knowledge cards request bounded server thumbnails before original media", () => {
+  for (const functionName of [
+    "fetchDocumentVideoThumbnailUrl",
+    "fetchDocumentImageThumbnailUrl",
+    "fetchDocumentPresentationThumbnailUrl",
+  ]) {
+    const start = apiSource.indexOf(`async function ${functionName}`);
+    assert.notEqual(start, -1, `${functionName} should exist`);
+    const nextFunction = apiSource.indexOf("\nasync function ", start + 1);
+    const source = apiSource.slice(start, nextFunction === -1 ? undefined : nextFunction);
+    const thumbnailCall = source.indexOf("fetchDocumentThumbnailUrl(id, options)");
+    const originalDownload = source.indexOf("fetchDocumentBlob(id, options)");
+    assert.ok(thumbnailCall >= 0, `${functionName} should request the server thumbnail`);
+    assert.ok(
+      originalDownload === -1 || thumbnailCall < originalDownload,
+      `${functionName} must not load original media before trying the thumbnail`,
+    );
+  }
+});
+
 test("Knowledge folder state comes from the route before the breadcrumb is hydrated", () => {
   assert.match(knowledgeSource, /const\s+routeFolderId\s*=\s*selectedWorkspaceId\s*\?\s*null\s*:\s*normalizeKnowledgeFolderId\(searchParams\.get\("folder_id"\)\);/);
   assert.match(knowledgeSource, /const\s+currentFolderId\s*=\s*selectedWorkspaceId\s*\?\s*null\s*:\s*\(routeFolderId\s*\|\|\s*folderPath\[folderPath\.length\s*-\s*1\]\?\.id\s*\|\|\s*null\);/);

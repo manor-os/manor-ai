@@ -31,6 +31,7 @@ _MASTER_EAGER_CAPABILITY_TOOLS = {
         "sandbox_write_file",
         "sandbox_save_result",
         "sandbox_destroy",
+        "video_edit",
     ),
     "manor.composite": ("manor",),
     "cli.execute": ("bash",),
@@ -38,7 +39,7 @@ _MASTER_EAGER_CAPABILITY_TOOLS = {
 
 _WORKSPACE_AGENT_EAGER_CAPABILITY_TOOLS = {
     **_AGENT_EAGER_CAPABILITY_TOOLS,
-    "workspace.operate": ("workspace_agent", "workspace_operation", "workspace_resolve_hitl", "workspace_create_task"),
+    "workspace.operate": ("workspace_agent", "workspace_operation", "workspace_resolve_hitl", "answer_task_blocker", "workspace_create_task"),
     "workspace.search": ("workspace_search", "workspace_list_knowledge", "rag"),
     "workspace.task": ("workspace_create_task", "workspace_update_task_runtime", "workspace_agent"),
     "workspace.knowledge": (
@@ -85,6 +86,13 @@ _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS = {
         "cancel_workflow_run",
         "resume_workflow_run",
         "import_workflow",
+    ),
+    "workflow.run": (
+        "list_workspace_flows",
+        "start_workspace_flow",
+        "get_workflow_run",
+        "cancel_workflow_run",
+        "resume_workflow_run",
     ),
     "communication.notify": ("find_team_members", "notify_user"),
 }

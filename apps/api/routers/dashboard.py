@@ -76,12 +76,23 @@ DASHBOARD_WIDGET_IDS = (
     "task_trend",
 )
 
+DASHBOARD_WIDGET_DEFAULT_VISIBILITY = {
+    "daily_brief": False,
+}
+
+
+def _dashboard_widget_default_visibility(widget_id: str) -> bool:
+    return DASHBOARD_WIDGET_DEFAULT_VISIBILITY.get(widget_id, True)
+
 
 def _default_dashboard_layout() -> dict:
     return {
         "version": 2,
         "widgets": [
-            {"id": widget_id, "visible": True}
+            {
+                "id": widget_id,
+                "visible": _dashboard_widget_default_visibility(widget_id),
+            }
             for widget_id in DASHBOARD_WIDGET_IDS
         ],
         "modules": [],
@@ -101,11 +112,26 @@ def _normalize_dashboard_layout(value: object) -> dict:
         if widget_id not in DASHBOARD_WIDGET_IDS or widget_id in seen:
             continue
         seen.add(widget_id)
-        widgets.append({"id": widget_id, "visible": bool(item.get("visible", True))})
+        widgets.append(
+            {
+                "id": widget_id,
+                "visible": bool(
+                    item.get(
+                        "visible",
+                        _dashboard_widget_default_visibility(widget_id),
+                    )
+                ),
+            }
+        )
 
     for widget_id in DASHBOARD_WIDGET_IDS:
         if widget_id not in seen:
-            widgets.append({"id": widget_id, "visible": True})
+            widgets.append(
+                {
+                    "id": widget_id,
+                    "visible": _dashboard_widget_default_visibility(widget_id),
+                }
+            )
 
     modules: list[dict] = []
     module_ids: set[str] = set()
@@ -152,7 +178,17 @@ def _merge_dashboard_layout_suggestion(
             if widget_id not in DASHBOARD_WIDGET_IDS or widget_id in seen:
                 continue
             seen.add(widget_id)
-            widgets.append({"id": widget_id, "visible": bool(item.get("visible", True))})
+            widgets.append(
+                {
+                    "id": widget_id,
+                    "visible": bool(
+                        item.get(
+                            "visible",
+                            _dashboard_widget_default_visibility(widget_id),
+                        )
+                    ),
+                }
+            )
 
     if not widgets:
         widgets = [dict(item) for item in current["widgets"]]

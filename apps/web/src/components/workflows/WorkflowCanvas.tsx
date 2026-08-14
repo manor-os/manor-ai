@@ -5,7 +5,6 @@ import {
   BackgroundVariant,
   Controls,
   MiniMap,
-  Panel,
   Handle,
   Position,
   useNodesState,
@@ -75,6 +74,7 @@ const NODE_CATEGORY: Record<string, keyof typeof CAT_COLOR> = {
   transform: "data", split: "data", sort: "data", aggregate: "data", filter: "data",
   dedupe: "data", limit: "data", datetime: "data", extractfromfile: "data", code: "data",
   http: "io", connector: "io", respond: "io", notify: "io", subworkflow: "io", tool: "io",
+  publication_receipt: "io",
   image: "media", video: "media", audio: "media", media: "media",
   end: "term", stop: "term", unsupported: "term",
   note: "note",
@@ -88,7 +88,7 @@ const TYPE_LABEL: Record<string, string> = {
   limit: "LIMIT", respond: "RESPOND", sort: "SORT", dedupe: "DEDUPE", stop: "STOP",
   extractfromfile: "EXTRACT FILE", transform: "SET", classifier: "CLASSIFY", wait: "WAIT",
   notify: "NOTIFY", end: "END", media: "MEDIA", image: "IMAGE", video: "VIDEO", audio: "AUDIO",
-  unsupported: "UNSUPPORTED", note: "NOTE", stage: "STAGE",
+  unsupported: "UNSUPPORTED", note: "NOTE", stage: "STAGE", publication_receipt: "RECEIPT",
 };
 
 // canonical node type -> accent colour (from its category) + short label
@@ -139,6 +139,7 @@ const ICON_PATHS: Record<string, string> = {
   sort: "M3 7.5L7.5 3m0 0L12 7.5M7.5 3v13.5m6.75 3l3.75-3.75m0 0L21 16.5m-3-3.75V21",
   dedupe: "M16.5 8.25V6a2.25 2.25 0 00-2.25-2.25H6A2.25 2.25 0 003.75 6v8.25A2.25 2.25 0 006 16.5h2.25m4.5 0v3.75A2.25 2.25 0 0010.5 22.5h7.5A2.25 2.25 0 0020.25 20.25v-7.5A2.25 2.25 0 0018 10.5h-7.5A2.25 2.25 0 008.25 12.75v3.75",
   stop: "M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
+  publication_receipt: "M9 12.75l2.25 2.25L15 9.75m4.5 12-1.875-1.875L15.75 21l-1.875-1.125L12 21l-1.875-1.125L8.25 21l-1.875-1.125L4.5 21V3l1.875 1.125L8.25 3l1.875 1.125L12 3l1.875 1.125L15.75 3l1.875 1.125L19.5 3v18z",
   extractfromfile: "M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z",
   note: "M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125M18 14v4.75A2.25 2.25 0 0115.75 21H5.25A2.25 2.25 0 013 18.75V8.25A2.25 2.25 0 015.25 6H10",
 };
@@ -155,6 +156,7 @@ const ICON_CATEGORY: Record<string, string> = {
   rag: "knowledge",
   tool: "tool",
   connector: "connector",
+  publication_receipt: "publication_receipt",
   condition: "branch",
   switch: "switch",
   image: "image",
@@ -805,7 +807,6 @@ export default function WorkflowCanvas({
   onStepsChange,
   onNodeOpen,
   onAddFrom,
-  onAddNode,
   statusById,
   previewById,
   issueById,
@@ -816,7 +817,6 @@ export default function WorkflowCanvas({
   onStepsChange?: (steps: CanvasStep[]) => void;
   onNodeOpen?: (stepId: string) => void;
   onAddFrom?: (sourceId: string) => void;
-  onAddNode?: () => void;
   statusById?: Record<string, string>;
   previewById?: Record<string, MediaRef>;
   issueById?: Record<string, "error" | "warning">;
@@ -956,12 +956,7 @@ export default function WorkflowCanvas({
     <EdgeDeleteContext.Provider value={editable ? onDeleteEdge : null}>
     <NoteEditContext.Provider value={editable ? onEditNote : null}>
     <AddFromContext.Provider value={onAddFrom || null}>
-    <div
-      style={{ width: "100%", height: "100%", borderRadius: 16, overflow: "hidden" }}
-      onDoubleClick={(e) => {
-        if (onAddNode && (e.target as HTMLElement).classList?.contains("react-flow__pane")) onAddNode();
-      }}
-    >
+    <div style={{ width: "100%", height: "100%", borderRadius: 16, overflow: "hidden" }}>
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -987,24 +982,6 @@ export default function WorkflowCanvas({
         proOptions={{ hideAttribution: true }}
         style={{ background: "var(--surface-app)" }}
       >
-        {onAddNode && (
-          <Panel position="top-left">
-            <button
-              onClick={onAddNode}
-              style={{
-                display: "flex", alignItems: "center", gap: 6,
-                padding: "8px 13px", borderRadius: 10, border: "none", cursor: "pointer",
-                background: "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 600,
-                boxShadow: "0 2px 8px rgba(15,118,110,0.25)",
-              }}
-            >
-              <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
-                <path d="M12 5v14M5 12h14" />
-              </svg>
-              Add node
-            </button>
-          </Panel>
-        )}
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="rgba(28,25,23,0.12)" />
         <Controls showInteractive={false} />
         <MiniMap

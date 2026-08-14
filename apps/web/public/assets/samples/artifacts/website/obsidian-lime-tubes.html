@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Obsidian & Lime — Interactive Tubes</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --black: #000000;
+      --obsidian: #0c0c0c;
+      --obsidian-2: #0a0a0a;
+      --lime: #ccff00;
+      --emerald: #10b981;
+      --white: #ebebeb;
+      --white-60: rgba(235, 235, 235, 0.6);
+      --white-30: rgba(235, 235, 235, 0.3);
+      --glass: rgba(255, 255, 255, 0.03);
+      --glass-border: rgba(255, 255, 255, 0.1);
+      --ease: cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--black);
+      color: var(--white);
+      font-family: "Space Grotesk", sans-serif;
+      overflow-x: hidden;
+    }
+
+    a { color: inherit; text-decoration: none; }
+    button { font-family: inherit; }
+
+    .viewport {
+      min-height: 100vh;
+      padding: 24px;
+      background:
+        radial-gradient(circle at 50% -10%, rgba(204, 255, 0, 0.08), transparent 34%),
+        #000;
+    }
+
+    .shell {
+      position: relative;
+      max-width: 1600px;
+      margin: 0 auto;
+      overflow: hidden;
+      border-radius: 2.5rem;
+      background: var(--obsidian);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow: 0 28px 90px rgba(0, 0, 0, 0.7);
+      isolation: isolate;
+    }
+
+    .shell::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px);
+      background-size: 60px 60px;
+      mask-image: radial-gradient(circle at 50% 20%, black, transparent 75%);
+      opacity: 0.72;
+    }
+
+    .shell::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 10;
+      opacity: 0.15;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 220 220' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.72' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.7'/%3E%3C/svg%3E");
+      mix-blend-mode: overlay;
+    }
+
+    .tubes-stage {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      pointer-events: auto;
+      opacity: 0.62;
+    }
+
+    .tubes-stage canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+
+    .tubes-stage::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      pointer-events: none;
+      background:
+        linear-gradient(90deg, rgba(12,12,12,0.15), rgba(12,12,12,0.78) 48%, rgba(12,12,12,0.4)),
+        radial-gradient(circle at 22% 30%, rgba(204,255,0,0.16), transparent 34%),
+        radial-gradient(circle at 78% 24%, rgba(16,185,129,0.12), transparent 28%),
+        linear-gradient(180deg, rgba(12,12,12,0.15), rgba(12,12,12,0.9) 100%);
+    }
+
+    .glow-sphere {
+      position: absolute;
+      width: 340px;
+      height: 340px;
+      border-radius: 999px;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 1;
+    }
+    .glow-1 { top: 120px; right: 8%; background: rgba(204, 255, 0, 0.26); }
+    .glow-2 { top: 540px; left: -80px; background: rgba(16, 185, 129, 0.18); }
+
+    .content-layer {
+      position: relative;
+      z-index: 3;
+    }
+
+    .header {
+      position: absolute;
+      top: 28px;
+      left: 28px;
+      right: 28px;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 24px;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+    }
+
+    .logo-mark {
+      width: 42px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      border-radius: 14px;
+      background: var(--lime);
+      color: #000;
+      box-shadow: 0 0 30px rgba(204, 255, 0, 0.35);
+    }
+
+    .nav-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+    }
+
+    .nav-pill a {
+      padding: 10px 16px;
+      border-radius: 999px;
+      color: rgba(255,255,255,0.7);
+      font-size: 14px;
+      transition: 220ms var(--ease);
+    }
+
+    .nav-pill a:hover {
+      color: #000;
+      background: var(--lime);
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 16px;
+    }
+
+    .system-tag {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-family: "JetBrains Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.2em;
+      font-size: 10px;
+      color: rgba(235,235,235,0.7);
+      white-space: nowrap;
+    }
+
+    .pulse-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--lime);
+      animation: pulse 2s infinite;
+      box-shadow: 0 0 18px rgba(204,255,0,0.8);
+    }
+
+    .white-button {
+      padding: 12px 18px;
+      border: 0;
+      border-radius: 999px;
+      background: #fff;
+      color: #000;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .hero {
+      min-height: 900px;
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 32px;
+      align-items: center;
+      padding: 150px 64px 96px;
+    }
+
+    .hero-copy { grid-column: span 7; }
+    .hero-visual { grid-column: span 5; position: relative; min-height: 560px; }
+
+    .mono-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 26px;
+      font-family: "JetBrains Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.2em;
+      font-size: 11px;
+      color: rgba(235,235,235,0.7);
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 820px;
+      font-size: clamp(4.6rem, 8.4vw, 7.5rem);
+      line-height: 0.85;
+      letter-spacing: -0.06em;
+      font-weight: 700;
+    }
+
+    .gradient-italic {
+      font-style: italic;
+      font-weight: 300;
+      background: linear-gradient(100deg, var(--lime), #ffffff 72%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .hero-text {
+      max-width: 610px;
+      margin: 32px 0 0;
+      color: var(--white-60);
+      font-size: 19px;
+      line-height: 1.65;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      margin-top: 40px;
+      flex-wrap: wrap;
+    }
+
+    .neon-button {
+      position: relative;
+      overflow: hidden;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 1rem 2rem;
+      border-radius: 9999px;
+      border: 0;
+      background: var(--lime);
+      color: #000;
+      font-weight: 700;
+      box-shadow: 0 0 30px rgba(204, 255, 0, 0.3);
+      cursor: pointer;
+      transition: transform 220ms var(--ease), box-shadow 220ms var(--ease);
+    }
+
+    .neon-button:hover { transform: scale(1.05); box-shadow: 0 0 42px rgba(204, 255, 0, 0.45); }
+
+    .ghost-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: rgba(235,235,235,0.72);
+      font-family: "JetBrains Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-size: 11px;
+    }
+
+    .mockup-shell {
+      position: absolute;
+      inset: 30px 0 0;
+      border-radius: 2.5rem;
+      background: rgba(255, 255, 255, 0.03);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 32px 80px rgba(0,0,0,0.45);
+      overflow: hidden;
+    }
+
+    .mockup-shell::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(circle at 50% 0%, rgba(204,255,0,0.18), transparent 42%),
+        linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+      background-size: auto, 36px 36px, 36px 36px;
+      opacity: 0.8;
+    }
+
+    .mockup-header {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 24px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .window-dots { display: flex; gap: 8px; }
+    .window-dots span { width: 10px; height: 10px; border-radius: 99px; background: rgba(255,255,255,0.18); }
+    .window-dots span:first-child { background: var(--lime); }
+
+    .ai-cursor {
+      position: absolute;
+      z-index: 4;
+      top: 110px;
+      right: 28px;
+      padding: 9px 13px;
+      border-radius: 999px;
+      background: var(--lime);
+      color: #000;
+      font-family: "JetBrains Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-size: 10px;
+      font-weight: 700;
+      animation: float 6s infinite ease-in-out;
+      box-shadow: 0 0 30px rgba(204,255,0,0.35);
+    }
+
+    .glass-card {
+      position: absolute;
+      z-index: 3;
+      background: rgba(255, 255, 255, 0.03);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 1.5rem;
+      animation: float 6s infinite ease-in-out;
+    }
+
+    .card-a { left: 34px; top: 115px; width: 58%; padding: 24px; }
+    .card-b { right: 32px; bottom: 115px; width: 54%; padding: 20px; animation-delay: -2s; }
+    .card-c { left: 60px; bottom: 54px; width: 34%; padding: 18px; animation-delay: -3.8s; }
+
+    .metric {
+      font-size: 48px;
+      line-height: 1;
+      letter-spacing: -0.06em;
+      font-weight: 700;
+    }
+
+    .metric small {
+      color: var(--lime);
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    .bars {
+      display: flex;
+      gap: 8px;
+      align-items: end;
+      height: 90px;
+      margin-top: 20px;
+    }
+    .bars span {
+      flex: 1;
+      min-width: 12px;
+      border-radius: 999px 999px 4px 4px;
+      background: linear-gradient(180deg, var(--lime), rgba(204,255,0,0.12));
+    }
+
+    .features {
+      padding: 24px 64px 96px;
+    }
+
+    .section-kicker {
+      font-family: "JetBrains Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.2em;
+      font-size: 11px;
+      color: var(--lime);
+      margin-bottom: 14px;
+    }
+
+    .section-title {
+      margin: 0 0 34px;
+      font-size: clamp(2.4rem, 5vw, 5rem);
+      line-height: 0.95;
+      letter-spacing: -0.06em;
+    }
+
+    .bento {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 18px;
+    }
+
+    .bento-card {
+      min-height: 260px;
+      padding: 26px;
+      border-radius: 2.5rem;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255, 255, 255, 0.03);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      transition: border-color 240ms var(--ease), transform 240ms var(--ease);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .bento-card:hover {
+      border-color: rgba(204,255,0,0.4);
+      transform: translateY(-4px);
+    }
+
+    .bento-large { grid-column: span 2; grid-row: span 2; min-height: 540px; }
+    .bento-tall { grid-row: span 2; min-height: 540px; }
+    .bento-accent { background: var(--lime); color: #000; }
+
+    .bento-card h3 {
+      margin: 0 0 12px;
+      font-size: 30px;
+      line-height: 1;
+      letter-spacing: -0.05em;
+    }
+    .bento-card p { margin: 0; color: rgba(235,235,235,0.6); line-height: 1.55; }
+    .bento-accent p { color: rgba(0,0,0,0.62); }
+
+    .viz {
+      position: absolute;
+      left: 26px;
+      right: 26px;
+      bottom: 26px;
+      display: flex;
+      align-items: end;
+      gap: 14px;
+      height: 260px;
+    }
+    .viz span {
+      flex: 1;
+      border-radius: 999px 999px 12px 12px;
+      background: linear-gradient(180deg, var(--lime), rgba(204,255,0,0.04));
+      border: 1px solid rgba(204,255,0,0.25);
+    }
+
+    .swatches { margin-top: 34px; display: grid; gap: 14px; }
+    .swatch {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: rgba(235,235,235,0.6);
+    }
+    .swatch i { width: 30px; height: 30px; border-radius: 99px; display: block; }
+
+    .methodology {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 54px;
+      align-items: center;
+      padding: 92px 64px;
+      background: #e5e5e5;
+      color: #000;
+      border-radius: 4rem 4rem 0 0;
+    }
+
+    .methodology .section-kicker { color: #000; opacity: 0.55; }
+    .methodology .section-title { color: #000; }
+
+    .steps { display: grid; gap: 18px; margin-top: 34px; }
+    .step {
+      display: grid;
+      grid-template-columns: 58px 1fr;
+      gap: 18px;
+      align-items: start;
+      padding: 18px 0;
+      border-top: 1px solid rgba(0,0,0,0.12);
+    }
+    .step-num {
+      width: 48px;
+      height: 48px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      border: 1px solid rgba(0,0,0,0.18);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .step h4 { margin: 0 0 6px; font-size: 22px; letter-spacing: -0.04em; }
+    .step p { margin: 0; color: rgba(0,0,0,0.58); line-height: 1.55; }
+
+    .portrait-wrap {
+      position: relative;
+      min-height: 520px;
+      display: grid;
+      place-items: center;
+    }
+    .portrait {
+      width: min(420px, 78vw);
+      height: min(420px, 78vw);
+      border-radius: 999px;
+      filter: grayscale(1);
+      background:
+        radial-gradient(circle at 50% 34%, #d8d8d8 0 24%, transparent 25%),
+        radial-gradient(circle at 50% 58%, #bcbcbc 0 38%, transparent 39%),
+        linear-gradient(135deg, #111, #bbb);
+      border: 1px solid rgba(0,0,0,0.08);
+      box-shadow: 0 30px 80px rgba(0,0,0,0.18);
+    }
+    .testimonial {
+      position: absolute;
+      bottom: 34px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: min(390px, 90%);
+      padding: 22px;
+      border-radius: 1.5rem;
+      background: rgba(255,255,255,0.45);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255,255,255,0.55);
+      box-shadow: 0 22px 70px rgba(0,0,0,0.16);
+    }
+    .testimonial p { margin: 0; color: rgba(0,0,0,0.72); line-height: 1.5; }
+
+    .footer {
+      position: relative;
+      overflow: hidden;
+      background: #000;
+      padding: 80px 64px 38px;
+    }
+    .watermark {
+      position: absolute;
+      top: 6px;
+      left: 40px;
+      font-size: clamp(6rem, 14vw, 10rem);
+      line-height: 1;
+      letter-spacing: -0.08em;
+      font-weight: 700;
+      color: rgba(255,255,255,0.05);
+      pointer-events: none;
+    }
+    .footer-cta {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 32px;
+      padding: 70px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    .footer-cta h2 {
+      margin: 0;
+      max-width: 820px;
+      font-size: clamp(3rem, 7vw, 7rem);
+      line-height: 0.86;
+      letter-spacing: -0.07em;
+    }
+    .slide-button {
+      position: relative;
+      overflow: hidden;
+      flex: 0 0 auto;
+      padding: 24px 34px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--lime);
+      color: #000;
+      font-size: 18px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .slide-button span { position: relative; z-index: 2; }
+    .slide-button::before {
+      content: "";
+      position: absolute;
+      inset: auto 0 0 0;
+      height: 0;
+      background: #fff;
+      transition: height 280ms var(--ease);
+    }
+    .slide-button:hover::before { height: 100%; }
+
+    .footer-bottom {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 24px;
+      align-items: center;
+      padding-top: 32px;
+      color: rgba(235,235,235,0.52);
+      font-size: 14px;
+    }
+    .footer-links, .socials { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+    .socials a {
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.18);
+    }
+    .copyright {
+      justify-self: end;
+      font-family: "JetBrains Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 10px;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-10px); }
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(1.45); }
+    }
+
+    @media (max-width: 1180px) {
+      .header { grid-template-columns: 1fr; position: relative; top: auto; left: auto; right: auto; padding: 24px 24px 0; }
+      .nav-pill { justify-self: start; overflow-x: auto; max-width: 100%; }
+      .header-right { justify-content: flex-start; }
+      .hero { grid-template-columns: 1fr; padding: 70px 32px 72px; min-height: auto; }
+      .hero-copy, .hero-visual { grid-column: auto; }
+      .hero-visual { min-height: 520px; }
+      .features, .methodology, .footer { padding-left: 32px; padding-right: 32px; }
+      .bento { grid-template-columns: repeat(2, 1fr); }
+      .methodology { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 720px) {
+      .viewport { padding: 10px; }
+      .shell { border-radius: 2rem; }
+      .nav-pill { display: none; }
+      .system-tag { display: none; }
+      .hero { padding: 46px 20px 56px; }
+      h1 { font-size: clamp(3.8rem, 18vw, 5.6rem); }
+      .hero-text { font-size: 16px; }
+      .hero-visual { min-height: 440px; }
+      .card-a { width: 72%; left: 18px; }
+      .card-b { width: 68%; right: 18px; }
+      .card-c { display: none; }
+      .features { padding: 20px 20px 58px; }
+      .bento { grid-template-columns: 1fr; }
+      .bento-large, .bento-tall { grid-column: auto; grid-row: auto; min-height: 360px; }
+      .methodology { border-radius: 2.5rem 2.5rem 0 0; padding: 58px 20px; }
+      .portrait-wrap { min-height: 430px; }
+      .footer { padding: 62px 20px 30px; }
+      .footer-cta { flex-direction: column; align-items: start; }
+      .footer-bottom { grid-template-columns: 1fr; }
+      .copyright { justify-self: start; }
+    }
+  </style>
+</head>
+<body>
+  <main class="viewport">
+    <div class="shell" id="interactiveShell">
+      <div class="tubes-stage" aria-hidden="true">
+        <canvas id="tubesCanvas"></canvas>
+      </div>
+      <div class="glow-sphere glow-1"></div>
+      <div class="glow-sphere glow-2"></div>
+
+      <header class="header content-layer">
+        <a class="logo" href="#">
+          <span class="logo-mark">O</span>
+          <span>Obsidian</span>
+        </a>
+        <nav class="nav-pill" aria-label="Primary navigation">
+          <a href="#system">System</a>
+          <a href="#features">Features</a>
+          <a href="#method">Method</a>
+          <a href="#contact">Launch</a>
+        </nav>
+        <div class="header-right">
+          <div class="system-tag"><span class="pulse-dot"></span> WebGL online</div>
+          <button class="white-button">Request Access</button>
+        </div>
+      </header>
+
+      <section class="hero content-layer" id="system">
+        <div class="hero-copy">
+          <div class="mono-label"><span class="pulse-dot"></span> AI interface layer / cursor reactive</div>
+          <h1>Designing <span class="gradient-italic">super</span> systems for the machine age.</h1>
+          <p class="hero-text">A dark-mode-first glassmorphism system upgraded with an interactive WebGL tubes layer. Move through the interface and the background follows, while lime accents keep every action high contrast.</p>
+          <div class="hero-actions">
+            <button class="neon-button">Start building <span>→</span></button>
+            <a class="ghost-link" href="#features">Click shell to randomize colors</a>
+          </div>
+        </div>
+
+        <div class="hero-visual">
+          <div class="mockup-shell">
+            <div class="mockup-header">
+              <div class="window-dots"><span></span><span></span><span></span></div>
+              <div class="system-tag"><span class="pulse-dot"></span> Neural canvas</div>
+            </div>
+            <div class="ai-cursor">AI Cursor</div>
+            <div class="glass-card card-a">
+              <div class="system-tag"><span class="pulse-dot"></span> Signal quality</div>
+              <div class="metric">98<small>%</small></div>
+              <div class="bars"><span style="height:42%"></span><span style="height:76%"></span><span style="height:58%"></span><span style="height:92%"></span><span style="height:68%"></span></div>
+            </div>
+            <div class="glass-card card-b">
+              <div class="system-tag"><span class="pulse-dot"></span> Active model</div>
+              <p style="margin:14px 0 0;color:rgba(235,235,235,0.68);line-height:1.5">Glass panels preserve legibility while the tubes animate behind the layout.</p>
+            </div>
+            <div class="glass-card card-c">
+              <div class="metric" style="font-size:30px">16px</div>
+              <div class="system-tag" style="margin-top:8px">blur lock</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="features content-layer" id="features">
+        <div class="section-kicker">Bento grid / interface tokens</div>
+        <h2 class="section-title">Multi-layered cards with hardware-like radius.</h2>
+        <div class="bento">
+          <article class="bento-card bento-large">
+            <h3>Realtime visual rhythm</h3>
+            <p>The hero tubes stay behind the system, while bento modules keep data dense, readable, and interactive.</p>
+            <div class="viz"><span style="height:45%"></span><span style="height:70%"></span><span style="height:38%"></span><span style="height:92%"></span><span style="height:62%"></span><span style="height:84%"></span></div>
+          </article>
+          <article class="bento-card bento-tall">
+            <h3>Color tokens</h3>
+            <p>Obsidian shell, glass overlays, lime actions, emerald glow.</p>
+            <div class="swatches">
+              <div class="swatch"><i style="background:#000"></i>#000000</div>
+              <div class="swatch"><i style="background:#0c0c0c"></i>#0c0c0c</div>
+              <div class="swatch"><i style="background:#ccff00"></i>#ccff00</div>
+              <div class="swatch"><i style="background:#10b981"></i>#10b981</div>
+            </div>
+          </article>
+          <article class="bento-card bento-accent">
+            <h3>Click reactive</h3>
+            <p>The shell listens for clicks and reassigns tube/light colors using a lime-biased palette.</p>
+          </article>
+          <article class="bento-card">
+            <h3>16px glass</h3>
+            <p>Every translucent element uses a minimum 16px blur with a white 3% surface.</p>
+          </article>
+          <article class="bento-card">
+            <h3>Mono metadata</h3>
+            <p>Technical labels use JetBrains Mono, uppercase text, and wide tracking.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="methodology content-layer" id="method">
+        <div>
+          <div class="section-kicker">Methodology</div>
+          <h2 class="section-title">Built for contrast, depth, and motion.</h2>
+          <div class="steps">
+            <div class="step"><div class="step-num">01</div><div><h4>Place WebGL below content</h4><p>The tubes live as a clipped background layer inside the floating shell, keeping the site architectural.</p></div></div>
+            <div class="step"><div class="step-num">02</div><div><h4>Protect legibility</h4><p>Dark overlays, glass cards, and blur isolate text from the moving neon geometry.</p></div></div>
+            <div class="step"><div class="step-num">03</div><div><h4>Keep interactions intentional</h4><p>Cursor movement drives the 3D layer. Clicking randomizes a controlled lime, emerald, and white palette.</p></div></div>
+          </div>
+        </div>
+        <div class="portrait-wrap">
+          <div class="portrait"></div>
+          <div class="testimonial"><p>“The motion feels technical without becoming noisy. The interface still reads first.”</p></div>
+        </div>
+      </section>
+
+      <footer class="footer content-layer" id="contact">
+        <div class="watermark">SUPER</div>
+        <div class="footer-cta">
+          <h2>Deploy the obsidian interface.</h2>
+          <button class="slide-button"><span>Launch System →</span></button>
+        </div>
+        <div class="footer-bottom">
+          <div class="footer-links"><a href="#">Privacy</a><a href="#">Terms</a><a href="#">Security</a></div>
+          <div class="socials"><a href="#">X</a><a href="#">G</a><a href="#">L</a></div>
+          <div class="copyright">© 2026 / SYSTEM ONLINE</div>
+        </div>
+      </footer>
+    </div>
+  </main>
+
+  <script type="module">
+    const randomFromPalette = (count) => {
+      const palette = ["#ccff00", "#10b981", "#ebebeb", "#84cc16", "#bef264", "#22c55e"];
+      return Array.from({ length: count }, () => palette[Math.floor(Math.random() * palette.length)]);
+    };
+
+    const canvas = document.getElementById("tubesCanvas");
+    const shell = document.getElementById("interactiveShell");
+    let tubesApp = null;
+
+    async function initTubes() {
+      if (!canvas) return;
+
+      try {
+        const module = await import("https://cdn.jsdelivr.net/npm/threejs-components@0.0.19/build/cursors/tubes1.min.js");
+        const TubesCursor = module.default;
+
+        tubesApp = TubesCursor(canvas, {
+          tubes: {
+            colors: ["#ccff00", "#10b981", "#ebebeb"],
+            lights: {
+              intensity: 180,
+              colors: ["#ccff00", "#10b981", "#84cc16", "#ffffff"]
+            }
+          }
+        });
+      } catch (error) {
+        console.error("Failed to load TubesCursor:", error);
+        const stage = document.querySelector(".tubes-stage");
+        if (stage) {
+          stage.style.background = "radial-gradient(circle at 50% 20%, rgba(204,255,0,.18), transparent 34%), radial-gradient(circle at 75% 18%, rgba(16,185,129,.14), transparent 26%)";
+        }
+      }
+    }
+
+    shell?.addEventListener("click", (event) => {
+      const interactive = event.target.closest("a, button");
+      if (interactive || !tubesApp?.tubes) return;
+      tubesApp.tubes.setColors(randomFromPalette(3));
+      tubesApp.tubes.setLightsColors(randomFromPalette(4));
+    });
+
+    initTubes();
+  </script>
+</body>
+</html>

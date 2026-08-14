@@ -75,6 +75,10 @@ from packages.core.workers import (
     rotate_worker_secret,
     update_worker_status,
 )
+from packages.core.services.local_worker_targeting import (
+    local_worker_display_name,
+    normalize_local_worker_name,
+)
 
 
 router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
@@ -144,6 +148,10 @@ class WorkerResponse(BaseModel):
     expires_at: Optional[datetime]
     created_at: datetime
     updated_at: Optional[datetime]
+
+
+class WorkerRenameRequest(BaseModel):
+    display_name: str = Field(..., min_length=1, max_length=80)
 
 
 # ── Heartbeat schemas ────────────────────────────────────────────────
@@ -626,6 +634,45 @@ async def list_workers(
     return [_to_worker_response(w) for w in rows]
 
 
+@router.patch("/{worker_id}", response_model=WorkerResponse)
+async def rename_worker(
+    worker_id: str,
+    req: WorkerRenameRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    worker = (
+        await db.execute(
+            _user_worker_scope(select(Worker), user).where(Worker.id == worker_id)
+        )
+    ).scalar_one_or_none()
+    if worker is None:
+        raise HTTPException(404, "worker not found")
+    if worker.kind != "custom_http":
+        raise HTTPException(409, "only paired local computers can be renamed")
+    display_name = await _ensure_local_worker_name_available(
+        db,
+        user=user,
+        display_name=req.display_name,
+        exclude_worker_id=worker.id,
+    )
+    previous_name = local_worker_display_name(worker)
+    worker.display_name = display_name
+    db.add(
+        WorkerActivityLog(
+            worker_id=worker.id,
+            event="renamed",
+            payload_summary={
+                "previous_name": previous_name,
+                "display_name": display_name,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(worker)
+    return _to_worker_response(worker)
+
+
 
 @router.get("/{worker_id}", response_model=WorkerResponse)
 async def get_worker_detail(
@@ -826,6 +873,7 @@ async def _heartbeat_inner(
     dispatcher = Dispatcher()
     now = datetime.now(timezone.utc)
     instructions: list[HeartbeatInstruction] = []
+    wake_plan_ids: set[str] = set()
 
     # Phase 1 — drain completions. Each one is independent; tolerate
     # already-terminated leases (worker may have retried over a flaky
@@ -839,11 +887,15 @@ async def _heartbeat_inner(
                     cost=c.cost,
                     evidence_refs=c.evidence_refs,
                 )
+                if completed_lease.plan_id:
+                    wake_plan_ids.add(completed_lease.plan_id)
             else:
                 failed_lease = await dispatcher.fail_lease(
                     db, c.lease_id,
                     error=c.error or {"type": "WorkerReportedFailure", "message": "no detail"},
                 )
+                if failed_lease.plan_id:
+                    wake_plan_ids.add(failed_lease.plan_id)
         except LeaseNotActive:
             # Already terminal — ignore.
             pass
@@ -949,6 +1001,9 @@ async def _heartbeat_inner(
         ))
 
     await db.commit()
+    from packages.core.plans.wakeup import wake_plan_cycle
+    for plan_id in wake_plan_ids:
+        wake_plan_cycle(plan_id)
 
     next_in = int((worker.preferences or {}).get("heartbeat_interval_seconds", 2))
     return HeartbeatResponse(
@@ -977,6 +1032,8 @@ async def lease_complete(
     except LeaseNotActive as exc:
         raise HTTPException(409, str(exc))
     await db.commit()
+    from packages.core.plans.wakeup import wake_plan_cycle
+    wake_plan_cycle(completed_lease.plan_id)
 
 
 @router.post("/leases/{lease_id}/fail", status_code=204)
@@ -994,6 +1051,8 @@ async def lease_fail(
     except LeaseNotActive as exc:
         raise HTTPException(409, str(exc))
     await db.commit()
+    from packages.core.plans.wakeup import wake_plan_cycle
+    wake_plan_cycle(failed_lease.plan_id)
 
 
 @router.post("/leases/{lease_id}/need-human", status_code=204)

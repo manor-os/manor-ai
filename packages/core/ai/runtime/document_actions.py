@@ -6,6 +6,9 @@ import hashlib
 import json
 import os
 from typing import Any
+from urllib.parse import quote
+
+from packages.core.services.generated_file_refs import canonical_file_markdown_link
 
 
 RUNTIME_DOCUMENT_TOOL_CACHE_TTL_SECONDS = int(os.getenv("DOCUMENT_TOOL_CACHE_TTL_SECONDS", "900"))
@@ -14,12 +17,36 @@ RUNTIME_DOCUMENT_LIST_MAX_LIMIT = 50
 RUNTIME_DOCUMENT_CACHE_NAMESPACE = "documents"
 
 
+def runtime_document_viewer_url(document_id: Any) -> str | None:
+    """Return the canonical in-app route for a Knowledge document."""
+
+    value = str(document_id or "").strip()
+    if not value:
+        return None
+    return f"/viewer/{quote(value, safe='')}"
+
+
+def runtime_document_markdown_link(name: Any, document_id: Any) -> str | None:
+    """Return the exact Markdown form the assistant should copy to its answer."""
+
+    viewer_url = runtime_document_viewer_url(document_id)
+    if not viewer_url:
+        return None
+    return canonical_file_markdown_link(name or "Knowledge file", viewer_url)
+
+
 def runtime_document_to_dict(doc: Any, *, detail: str = "summary") -> dict[str, Any]:
+    viewer_url = runtime_document_viewer_url(getattr(doc, "id", None))
     data = {
         "id": doc.id,
         "name": doc.name,
         "file_type": doc.file_type,
         "file_size": doc.file_size,
+        "viewer_url": viewer_url,
+        "markdown_link": runtime_document_markdown_link(
+            getattr(doc, "name", None),
+            getattr(doc, "id", None),
+        ),
     }
     if detail == "details":
         created_at = getattr(doc, "created_at", None)

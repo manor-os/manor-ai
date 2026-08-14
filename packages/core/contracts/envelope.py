@@ -188,6 +188,30 @@ def envelope_indicates_failure(result: Any) -> bool:
     return isinstance(result, dict) and result.get("status") == "failed"
 
 
+def step_result_output_text(result: Any, *, limit: int | None = None) -> str:
+    """Return the deliverable text from canonical and legacy step results.
+
+    ``summary`` describes the outcome; ``outputs.text`` carries the actual
+    deliverable in the StepResult envelope. Legacy worker results stored their
+    deliverable at the top level, so those keys remain supported as fallbacks.
+    """
+    if not isinstance(result, dict):
+        text = str(result or "").strip()
+    else:
+        outputs = result.get("outputs")
+        output_text = outputs.get("text") if isinstance(outputs, dict) else None
+        if isinstance(output_text, str) and output_text.strip():
+            text = output_text.strip()
+        else:
+            text = ""
+            for key in ("text", "value", "result", "content", "answer", "output", "message", "summary"):
+                value = result.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+                    break
+    return text[:limit] if limit is not None else text
+
+
 def build_step_result_envelope(raw: Any) -> dict:
     """Deterministically wrap ANY raw step output in a valid envelope.
 

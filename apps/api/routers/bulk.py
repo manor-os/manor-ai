@@ -119,6 +119,16 @@ async def import_tasks(
 ):
     """Import tasks from a CSV file."""
     content = await file.read()
+    from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+    try:
+        await inspect_upload_content(
+            content,
+            filename=file.filename,
+            declared_content_type=file.content_type,
+            allowed_extensions={".csv"},
+        )
+    except UploadSecurityError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
     csv_text = content.decode("utf-8")
     count = await import_tasks_csv(db, user.entity_id, csv_text, creator_id=user.id)
     return {"count": count}

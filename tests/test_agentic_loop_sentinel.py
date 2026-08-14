@@ -4,6 +4,9 @@ from packages.core.ai.agentic_loop import (
     FINAL_RESPONSE_SENTINEL,
     _strip_final_response_sentinel,
 )
+from packages.core.services.chat_service import (
+    _strip_final_response_sentinel as _strip_chat_final_response_sentinel,
+)
 
 
 def test_strip_marker_at_start_keeps_answer():
@@ -22,6 +25,12 @@ def test_no_marker_is_unchanged_apart_from_trim():
 
 def test_closing_variant_is_removed():
     assert _strip_final_response_sentinel("answer</manor-final-response>") == "answer"
+
+
+def test_provider_final_control_tags_are_removed_from_all_chat_paths():
+    text = "<final>answer</final>"
+    assert _strip_final_response_sentinel(text) == "answer"
+    assert _strip_chat_final_response_sentinel(text) == "answer"
 
 
 def test_none_and_empty():

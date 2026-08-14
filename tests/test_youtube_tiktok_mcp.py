@@ -22,9 +22,10 @@ _TOKEN = "oauth-test-token"
 
 
 class _FakeResp:
-    def __init__(self, status=200, json_body=None, text=None):
+    def __init__(self, status=200, json_body=None, text=None, headers=None):
         self.status_code = status
         self._json = json_body
+        self.headers = headers or {}
         if text is not None:
             self.text = text
         elif json_body is not None:
@@ -56,8 +57,14 @@ class _FakeClient:
     async def __aexit__(self, *_a):
         return False
 
-    async def request(self, method, url, headers=None, json=None):
-        _FakeClient.calls.append({"method": method, "url": url, "headers": headers, "json": json})
+    async def request(self, method, url, headers=None, json=None, content=None):
+        _FakeClient.calls.append({
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "json": json,
+            "content": content,
+        })
         if _FakeClient.route is not None:
             return _FakeClient.route(method, url)
         return _FakeClient.response
@@ -137,6 +144,84 @@ async def test_yt_list_captions(yt_http):
 
 
 # ── YouTube: publish / engagement ────────────────────────────────────────────
+
+
+async def test_yt_upload_video_resumable(yt_http, monkeypatch, tmp_path):
+    source = tmp_path / "demo.mp4"
+    source.write_bytes(b"video-bytes")
+
+    async def _stage(_url):
+        return source, source.stat().st_size, "video/mp4"
+
+    monkeypatch.setattr(yt, "_stage_video_source", _stage)
+
+    def _route(method, url):
+        if method == "POST":
+            return _FakeResp(200, None, "", {"location": "https://upload.youtube.test/session/1"})
+        return _FakeResp(200, {"id": "uploaded-1", "status": {"privacyStatus": "private"}})
+
+    yt_http.route = _route
+    out = await yt.call_tool(
+        "upload_video",
+        {
+            "video_url": "https://cdn.example.com/demo.mp4",
+            "title": "Demo",
+            "description": "Scope review demo",
+            "tags": "manor, oauth",
+            "made_for_kids": False,
+        },
+        _TOKEN,
+    )
+
+    assert out["isError"] is False
+    assert json.loads(out["content"][0]["text"])["id"] == "uploaded-1"
+    assert len(yt_http.calls) == 2
+
+    init, upload = yt_http.calls
+    path, query = _split(init["url"])
+    assert init["method"] == "POST"
+    assert path.endswith("/upload/youtube/v3/videos")
+    assert query == {
+        "uploadType": "resumable",
+        "part": "snippet,status",
+        "notifySubscribers": "false",
+    }
+    assert init["json"]["snippet"]["tags"] == ["manor", "oauth"]
+    assert init["json"]["status"] == {
+        "privacyStatus": "private",
+        "selfDeclaredMadeForKids": False,
+    }
+    assert init["headers"]["X-Upload-Content-Type"] == "video/mp4"
+
+    assert upload["method"] == "PUT"
+    assert upload["url"] == "https://upload.youtube.test/session/1"
+    assert upload["content"] == b"video-bytes"
+    assert upload["headers"]["Content-Range"] == "bytes 0-10/11"
+    # The uploader owns and removes its staged temporary file after completion.
+    assert not source.exists()
+
+
+async def test_yt_upload_video_rejects_unsafe_release_settings(yt_http):
+    out = await yt.call_tool(
+        "upload_video",
+        {"video_url": "https://cdn.example.com/v.mp4", "title": "x", "privacy": "friends"},
+        _TOKEN,
+    )
+    assert "privacy must be" in out["content"][0]["text"]
+    assert not yt_http.calls
+
+    out = await yt.call_tool(
+        "upload_video",
+        {
+            "video_url": "https://cdn.example.com/v.mp4",
+            "title": "x",
+            "privacy": "public",
+            "publish_at": "2026-08-10T12:00:00Z",
+        },
+        _TOKEN,
+    )
+    assert "publish_at requires privacy=private" in out["content"][0]["text"]
+    assert not yt_http.calls
 
 
 async def test_yt_post_comment_body(yt_http):

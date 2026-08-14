@@ -5,7 +5,7 @@ Tools (only registered when SANDBOX_SERVICE_URL is set):
   sandbox_create      – Create an isolated Docker container for a skill
   sandbox_exec        – Execute a command inside a sandbox
   sandbox_read_file   – Read a file from inside a sandbox
-  sandbox_write_file  – Write a file into a sandbox (direct content or from MinIO)
+  sandbox_write_file  – Write a file into a sandbox (direct content or entity filesystem)
   sandbox_save_result – Save a sandbox output file/URL, optionally registering it in Knowledge
   sandbox_destroy     – Destroy a sandbox and release its resources
 
@@ -21,6 +21,8 @@ import json
 import logging
 import mimetypes
 import os
+import shlex
+from pathlib import PurePosixPath
 from typing import Any
 
 from packages.core.ai.runtime.file_actions import (
@@ -39,6 +41,7 @@ from packages.core.ai.runtime.sandbox import (
     runtime_load_sandbox_context,
     runtime_save_sandbox_context,
 )
+from packages.core.ai.runtime.streams import runtime_tool_error_result
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
 
 logger = logging.getLogger(__name__)
@@ -100,8 +103,21 @@ async def _delete_ctx(conversation_id: str) -> None:
     await runtime_delete_sandbox_context(conversation_id)
 
 
-async def _init_ctx(conversation_id: str, sandbox_id: str, skill_id: str) -> dict:
-    return await runtime_init_sandbox_context(conversation_id, sandbox_id, skill_id)
+async def _init_ctx(
+    conversation_id: str,
+    sandbox_id: str,
+    skill_id: str,
+    *,
+    entity_id: str,
+    user_id: str | None,
+) -> dict:
+    return await runtime_init_sandbox_context(
+        conversation_id,
+        sandbox_id,
+        skill_id,
+        entity_id=entity_id,
+        user_id=user_id,
+    )
 
 
 def _sandbox_available() -> bool:
@@ -162,6 +178,7 @@ async def _sandbox_create(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
     skill_id = skill_id.strip()
     if not skill_id:
         return "skill_id is required."
@@ -223,7 +240,13 @@ async def _sandbox_create(
         )
 
         if conversation_id:
-            await _init_ctx(conversation_id, result.sandbox_id, skill_id)
+            await _init_ctx(
+                conversation_id,
+                result.sandbox_id,
+                skill_id,
+                entity_id=entity_id,
+                user_id=runtime_context.user_id,
+            )
         logger.info(
             "[sandbox] created: skill=%s sandbox=%s entity=%s",
             skill_id, result.sandbox_id, entity_id or "(none)",
@@ -277,7 +300,7 @@ async def _sandbox_exec(
         timeout = 60
 
     if not sandbox_id or not command:
-        return "sandbox_id and command are required."
+        return runtime_tool_error_result("sandbox_id and command are required.")
 
     try:
         client = _get_client()
@@ -293,8 +316,13 @@ async def _sandbox_exec(
             parts.append(f"[stderr]\n{result.stderr}")
         parts.append(f"[exit_code: {result.exit_code}]")
 
+        output = "\n".join(parts)
         logger.info("[sandbox] exec: sandbox=%s exit=%s cmd=%s", sandbox_id, result.exit_code, command[:80])
-        return "\n".join(parts)
+        if result.exit_code != 0:
+            return runtime_tool_error_result(
+                f"Sandbox command exited with status {result.exit_code}.\n{output}"
+            )
+        return output
 
     except Exception as exc:
         logger.exception("[sandbox] exec failed: sandbox=%s error=%s", sandbox_id, exc)
@@ -305,7 +333,7 @@ async def _sandbox_exec(
             cmd_lower = command.lower()
             is_poll = any(kw in cmd_lower for kw in ("poll", "wait", "status", "check"))
             retry_timeout = 120 if is_poll else 30
-            return (
+            return runtime_tool_error_result(
                 f"Command timed out after {timeout}s. The sandbox is still running.\n\n"
                 "The task is likely still in progress. You MUST retry:\n"
                 f"  sandbox_exec(sandbox_id=\"{sandbox_id}\", "
@@ -313,7 +341,7 @@ async def _sandbox_exec(
                 "IMPORTANT: Always use `bash` (not `sh`) to run scripts.\n"
                 "Do NOT destroy the sandbox. Do NOT give up."
             )
-        return f"Sandbox exec failed: {exc}"
+        return runtime_tool_error_result(f"Sandbox exec failed: {exc}")
 
 
 _SANDBOX_EXEC_SCHEMA = {
@@ -430,29 +458,37 @@ async def _sandbox_write_file(
 
     try:
         file_content = content
+        binary_content: bytes | None = None
         if workspace_path:
-            # Load from MinIO (entity's workspace storage)
             try:
-                # workspace_path is arbitrary; try a direct MinIO read
-                from packages.core.services.skill_file_storage import _get_client as _mc
-                mc = _mc()
-                if mc is None:
-                    return f"File not found in workspace (MinIO unavailable): {workspace_path}"
-                from packages.core.config import get_settings
-                bucket = get_settings().MINIO_BUCKET
-                obj = mc.get_object(bucket, workspace_path)
-                file_content = obj.read().decode("utf-8")
+                if not entity_id:
+                    return "entity_id is required when workspace_path is provided."
+                from packages.core.services.entity_fs import resolve_path
+
+                source_path = resolve_path(entity_id, workspace_path.lstrip("/"))
+                if not source_path or not os.path.isfile(source_path):
+                    return f"File not found in workspace: {workspace_path}"
+                with open(source_path, "rb") as source_file:
+                    binary_content = source_file.read()
             except Exception as exc:
                 return f"File not found in workspace: {workspace_path} ({exc})"
 
         client = _get_client()
         try:
-            result = await client.write_file(
-                sandbox_id=sandbox_id, path=path, content=file_content, mkdir=True,
-            )
+            if binary_content is not None:
+                result = await client.write_file_base64(
+                    sandbox_id=sandbox_id,
+                    path=path,
+                    content_base64=base64.b64encode(binary_content).decode("ascii"),
+                    mkdir=True,
+                )
+            else:
+                result = await client.write_file(
+                    sandbox_id=sandbox_id, path=path, content=file_content, mkdir=True,
+                )
         finally:
             await client.close()
-        source = f"workspace:{workspace_path}" if workspace_path else "direct content"
+        source = f"entity-fs:{workspace_path}" if workspace_path else "direct content"
         return f"Written to {result.path} (source: {source})"
     except Exception as exc:
         logger.exception("[sandbox] write_file failed: sandbox=%s error=%s", sandbox_id, exc)
@@ -464,9 +500,9 @@ _SANDBOX_WRITE_FILE_SCHEMA = {
     "function": {
         "name": "sandbox_write_file",
         "description": (
-            "Write a file into a sandbox from direct content or workspace_path. "
-            "Provide exactly one source. Prefer this over sandbox_exec heredocs, "
-            "especially for Unicode."
+            "Write a file into a sandbox from direct text content or from a path "
+            "in the current entity filesystem. Provide exactly one source. This "
+            "supports binary workspace files such as generated PNG images."
         ),
         "parameters": {
             "type": "object",
@@ -474,7 +510,7 @@ _SANDBOX_WRITE_FILE_SCHEMA = {
                 "sandbox_id": {"type": "string", "description": "Sandbox ID returned by sandbox_create"},
                 "path": {"type": "string", "description": "Absolute destination path inside the sandbox, e.g. '/skill/data.csv'"},
                 "content": {"type": "string", "description": "Text content to write directly"},
-                "workspace_path": {"type": "string", "description": "Relative MinIO path to copy from, e.g. 'documents/sales.csv'"},
+                "workspace_path": {"type": "string", "description": "Relative entity-filesystem path to copy, e.g. 'images/page-01.png'"},
             },
             "required": ["sandbox_id", "path"],
         },
@@ -485,6 +521,206 @@ _SANDBOX_WRITE_FILE_SCHEMA = {
 # ────────────────────────────────────────────────────────────────
 # sandbox_save_result
 # ────────────────────────────────────────────────────────────────
+
+_PPTX_FINAL_GATE_MIN_SCORE = 90
+_DOCX_FINAL_GATE_MIN_SCORE = 90
+
+
+def _normalized_sandbox_path(path: str) -> PurePosixPath:
+    normalized = path.strip()
+    if not normalized.startswith("/"):
+        normalized = f"/skill/{normalized.lstrip('/')}"
+    return PurePosixPath(normalized)
+
+
+def _pptx_project_export_context(file_path: str, filename: str) -> tuple[str, str, str] | None:
+    """Return canonical project, render, and report paths for a project export."""
+    if not file_path.strip():
+        return None
+    path = _normalized_sandbox_path(file_path)
+    if path.parent.name != "exports":
+        return None
+    project = path.parent.parent
+    if project.parent.name != "projects" or str(project.parent.parent) != "/skill":
+        return None
+    if path.suffix.lower() != ".pptx" and PurePosixPath(filename).suffix.lower() != ".pptx":
+        return None
+    return (
+        str(project),
+        str(project / "qa" / "final-render"),
+        str(project / "qa" / "pptx-quality.json"),
+    )
+
+
+def _docx_project_export_context(file_path: str, filename: str) -> tuple[str, str, str] | None:
+    """Return canonical project, render, and report paths for a DOCX export."""
+    if not file_path.strip():
+        return None
+    path = _normalized_sandbox_path(file_path)
+    if path.parent.name != "exports":
+        return None
+    project = path.parent.parent
+    if project.parent.name != "projects" or str(project.parent.parent) != "/skill":
+        return None
+    if path.suffix.lower() != ".docx" and PurePosixPath(filename).suffix.lower() != ".docx":
+        return None
+    return (
+        str(project),
+        str(project / "qa" / "final-render"),
+        str(project / "qa" / "docx-quality.json"),
+    )
+
+
+def _pptx_quality_evidence_error(
+    *,
+    file_path: str,
+    content_bytes: bytes,
+    gate_exit_code: int,
+    report_bytes: bytes | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Verify that the server-run gate passed for these exact PPTX bytes."""
+    if not report_bytes:
+        return "the machine quality report was not produced", None
+    try:
+        payload = json.loads(report_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"the machine quality report is unreadable ({exc})", None
+    if not isinstance(payload, dict):
+        return "the machine quality report is not a JSON object", None
+
+    errors = payload.get("errors")
+    error_list = [str(item) for item in errors] if isinstance(errors, list) else []
+    repair_actions = payload.get("repair_actions")
+    repair_list = []
+    if isinstance(repair_actions, list):
+        for item in repair_actions[:3]:
+            if isinstance(item, dict) and item.get("action"):
+                repair_list.append(str(item["action"]))
+
+    metrics = payload.get("metrics")
+    layout_defects = metrics.get("layout_defects") if isinstance(metrics, dict) else None
+    defect_list: list[str] = []
+    if isinstance(layout_defects, list):
+        for defect in layout_defects[:5]:
+            if not isinstance(defect, dict):
+                continue
+            slide = defect.get("slide")
+            kind = str(defect.get("kind") or "layout-defect")
+            shapes = defect.get("shapes")
+            shape_list = shapes if isinstance(shapes, list) else []
+            shape_refs = []
+            for shape in shape_list[:2]:
+                if not isinstance(shape, dict):
+                    continue
+                shape_id = shape.get("shape_id")
+                text = str(shape.get("text") or "").strip()
+                label = f"shape {shape_id}"
+                if text:
+                    label += f" {text[:40]!r}"
+                shape_refs.append(label)
+            detail = f"slide {slide}: {kind}"
+            if shape_refs:
+                detail += " (" + ", ".join(shape_refs) + ")"
+            defect_list.append(detail)
+
+    def _with_repairs(details: str) -> str:
+        if defect_list:
+            details += " Layout evidence: " + "; ".join(defect_list) + "."
+        if not repair_list:
+            return details
+        return details + " Required repair: " + " ".join(repair_list)
+
+    if gate_exit_code != 0:
+        details = "; ".join(error_list[:5]) or f"quality command exited with status {gate_exit_code}"
+        return _with_repairs(details), payload
+    if payload.get("status") != "pass":
+        details = "; ".join(error_list[:5]) or "the quality report status is not pass"
+        return _with_repairs(details), payload
+    try:
+        quality_score = int(payload.get("quality_score", -1))
+        minimum_score = int(payload.get("minimum_score", -1))
+        slide_count = int(payload.get("slide_count", 0))
+    except (TypeError, ValueError):
+        return "the quality report contains invalid numeric evidence", payload
+    if minimum_score < _PPTX_FINAL_GATE_MIN_SCORE or quality_score < _PPTX_FINAL_GATE_MIN_SCORE:
+        return (
+            f"quality score {quality_score} does not meet the enforced "
+            f"minimum {_PPTX_FINAL_GATE_MIN_SCORE}",
+            payload,
+        )
+    if slide_count <= 0:
+        return "the quality report has no verified slides", payload
+
+    if not isinstance(metrics, dict):
+        return "the quality report is missing metrics", payload
+    expected_hash = hashlib.sha256(content_bytes).hexdigest()
+    if metrics.get("pptx_sha256") != expected_hash:
+        return "the report is stale or belongs to a different PPTX", payload
+    if metrics.get("pptx_size_bytes") != len(content_bytes):
+        return "the report file-size evidence does not match the PPTX", payload
+    if metrics.get("rendered_slide_count") != slide_count:
+        return "not every final slide has verified render evidence", payload
+
+    reported_path = str(payload.get("pptx") or "")
+    if reported_path and _normalized_sandbox_path(reported_path) != _normalized_sandbox_path(file_path):
+        return "the report points to a different PPTX path", payload
+    return None, payload
+
+
+def _docx_quality_evidence_error(
+    *,
+    file_path: str,
+    content_bytes: bytes,
+    gate_exit_code: int,
+    report_bytes: bytes | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Verify that the server-run gate passed for these exact DOCX bytes."""
+    if not report_bytes:
+        return "the machine quality report was not produced", None
+    try:
+        payload = json.loads(report_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"the machine quality report is unreadable ({exc})", None
+    if not isinstance(payload, dict):
+        return "the machine quality report is not a JSON object", None
+
+    errors = payload.get("errors")
+    error_list = [str(item) for item in errors] if isinstance(errors, list) else []
+    if gate_exit_code != 0:
+        details = "; ".join(error_list[:5]) or f"quality command exited with status {gate_exit_code}"
+        return details, payload
+    if payload.get("status") != "pass":
+        return "; ".join(error_list[:5]) or "the quality report status is not pass", payload
+    try:
+        quality_score = int(payload.get("quality_score", -1))
+        minimum_score = int(payload.get("minimum_score", -1))
+        page_count = int(payload.get("page_count", 0))
+    except (TypeError, ValueError):
+        return "the quality report contains invalid numeric evidence", payload
+    if minimum_score < _DOCX_FINAL_GATE_MIN_SCORE or quality_score < _DOCX_FINAL_GATE_MIN_SCORE:
+        return (
+            f"quality score {quality_score} does not meet the enforced "
+            f"minimum {_DOCX_FINAL_GATE_MIN_SCORE}",
+            payload,
+        )
+    if page_count <= 0:
+        return "the quality report has no verified pages", payload
+
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict):
+        return "the quality report is missing metrics", payload
+    expected_hash = hashlib.sha256(content_bytes).hexdigest()
+    if metrics.get("docx_sha256") != expected_hash:
+        return "the report is stale or belongs to a different DOCX", payload
+    if metrics.get("docx_size_bytes") != len(content_bytes):
+        return "the report file-size evidence does not match the DOCX", payload
+    if metrics.get("rendered_page_count") != page_count:
+        return "not every final page has verified render evidence", payload
+
+    reported_path = str(payload.get("docx") or "")
+    if reported_path and _normalized_sandbox_path(reported_path) != _normalized_sandbox_path(file_path):
+        return "the report points to a different DOCX path", payload
+    return None, payload
 
 async def _sandbox_save_result(
     entity_id: str = "",
@@ -516,18 +752,124 @@ async def _sandbox_save_result(
         )
 
     content_bytes: bytes | None = None
+    quality_evidence: dict[str, Any] | None = None
 
     if sandbox_id and file_path:
+        pptx_gate_context = _pptx_project_export_context(file_path, filename)
+        docx_gate_context = _docx_project_export_context(file_path, filename)
+        is_pptx = (
+            PurePosixPath(file_path).suffix.lower() == ".pptx"
+            or PurePosixPath(filename).suffix.lower() == ".pptx"
+        )
+        pptx_is_deliverable = is_pptx and (
+            artifact_role == "final"
+            or display_as_artifact
+            or _coerce_bool(save_to_knowledge, True)
+        )
+        is_final_docx = artifact_role == "final" and (
+            PurePosixPath(file_path).suffix.lower() == ".docx"
+            or PurePosixPath(filename).suffix.lower() == ".docx"
+        )
+        if pptx_is_deliverable and pptx_gate_context is None:
+            return runtime_tool_error_result(
+                "PPTX_FINAL_QUALITY_GATE_BLOCKED: PPTX deliverables must be exported "
+                "from /skill/projects/<project>/exports/ so Manor can verify project, "
+                "render, and quality evidence. No file was saved."
+            )
+        if is_final_docx and docx_gate_context is None:
+            return runtime_tool_error_result(
+                "DOCX_FINAL_QUALITY_GATE_BLOCKED: final DOCX files must be exported "
+                "from /skill/projects/<project>/exports/ so Manor can verify project, "
+                "render, and quality evidence. No file was saved."
+            )
+        gate_context = pptx_gate_context or docx_gate_context
+        gate_kind = "pptx" if pptx_gate_context is not None else "docx"
         try:
             client = _get_client()
             try:
+                gate_result = None
+                report_bytes = None
+                if gate_context is not None:
+                    project_path, render_path, report_path = gate_context
+                    if gate_kind == "pptx":
+                        command_parts = [
+                            "python3",
+                            "/skill/scripts/pptx_quality_gate.py",
+                            shlex.quote(file_path),
+                            "--mode",
+                            "auto",
+                            "--project",
+                            shlex.quote(project_path),
+                            "--render-dir",
+                            shlex.quote(render_path),
+                            "--min-score",
+                            str(_PPTX_FINAL_GATE_MIN_SCORE),
+                            "--report",
+                            shlex.quote(report_path),
+                        ]
+                    else:
+                        command_parts = [
+                            "python3",
+                            "/skill/scripts/docx_quality_gate.py",
+                            shlex.quote(file_path),
+                            "--project",
+                            shlex.quote(project_path),
+                            "--render-dir",
+                            shlex.quote(render_path),
+                            "--min-score",
+                            str(_DOCX_FINAL_GATE_MIN_SCORE),
+                            "--report",
+                            shlex.quote(report_path),
+                        ]
+                    command = " ".join(command_parts)
+                    gate_result = await client.exec(
+                        sandbox_id=sandbox_id,
+                        command=command,
+                        timeout=240,
+                    )
                 result = await client.read_file_base64(sandbox_id=sandbox_id, path=file_path)
+                if gate_context is not None:
+                    try:
+                        report_result = await client.read_file_base64(
+                            sandbox_id=sandbox_id,
+                            path=gate_context[2],
+                        )
+                        report_bytes = base64.b64decode(report_result.content_base64)
+                    except Exception:
+                        report_bytes = None
             finally:
                 await client.close()
             content_bytes = base64.b64decode(result.content_base64)
+            if gate_context is not None:
+                evidence_checker = (
+                    _pptx_quality_evidence_error
+                    if gate_kind == "pptx"
+                    else _docx_quality_evidence_error
+                )
+                evidence_error, quality_evidence = evidence_checker(
+                    file_path=file_path,
+                    content_bytes=content_bytes,
+                    gate_exit_code=gate_result.exit_code if gate_result is not None else -1,
+                    report_bytes=report_bytes,
+                )
+                if evidence_error:
+                    label = gate_kind.upper()
+                    logger.warning(
+                        "[sandbox] blocked %s delivery: sandbox=%s file=%s reason=%s",
+                        label,
+                        sandbox_id,
+                        file_path,
+                        evidence_error,
+                    )
+                    return runtime_tool_error_result(
+                        f"{label}_FINAL_QUALITY_GATE_BLOCKED: "
+                        f"{evidence_error}. Fix the source, re-export it, render every "
+                        f"{'slide' if gate_kind == 'pptx' else 'page'}, and call "
+                        f"sandbox_save_result again. The current {label} was not saved."
+                    )
         except Exception as exc:
             logger.exception("[sandbox] save_result read failed: %s", exc)
-            return (
+            return runtime_tool_error_result(
                 f"Failed to read file from sandbox: {exc}. No file was saved. "
                 "Check that the prior sandbox_exec command succeeded and that "
                 f"'{file_path}' actually exists before calling sandbox_save_result again."
@@ -592,7 +934,14 @@ async def _sandbox_save_result(
     except Exception as exc:  # noqa: BLE001
         return f"Entity filesystem is not available: {exc}"
 
-    knowledge_sync_enabled = _coerce_bool(save_to_knowledge, True)
+    # Temporary editor previews may remain filesystem-only. Once the caller
+    # labels a result as a visible/final Artifact, however, Knowledge
+    # registration is part of the delivery contract and cannot be disabled.
+    knowledge_sync_enabled = (
+        display_as_artifact
+        or artifact_role == "final"
+        or _coerce_bool(save_to_knowledge, True)
+    )
     rel_path = _os.path.relpath(target, entity_dir).replace(_os.sep, "/")
     mime_type = mimetypes.guess_type(target)[0] or "application/octet-stream"
     if not knowledge_sync_enabled:
@@ -607,6 +956,7 @@ async def _sandbox_save_result(
             "fs_path": rel_path,
             "result_url": f"/api/v1/fs/{entity_id}/{rel_path}",
             "message": f"File '{_os.path.basename(target)}' saved for this run but not registered in Knowledge.",
+            **({"quality_gate": quality_evidence} if quality_evidence else {}),
         })
 
     try:
@@ -651,6 +1001,7 @@ async def _sandbox_save_result(
             "fs_path": getattr(doc, "fs_path", rel_path),
             "result_url": f"/api/v1/fs/{entity_id}/{getattr(doc, 'fs_path', rel_path)}",
             "message": f"File '{doc.name}' saved to knowledge base.",
+            **({"quality_gate": quality_evidence} if quality_evidence else {}),
         })
     except Exception as exc:
         logger.exception("[sandbox] save_result doc register failed: %s", exc)
@@ -661,28 +1012,31 @@ _SANDBOX_SAVE_RESULT_SCHEMA = {
     "type": "function",
     "function": {
         "name": "sandbox_save_result",
-        "description": "Save sandbox output.",
+        "description": (
+            "Save sandbox output. DOCX/PPTX artifacts must come from "
+            "/skill/projects/*/exports/ and pass server render/quality checks."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "sandbox_id": {"type": "string", "description": "Sandbox ID."},
-                "file_path": {"type": "string", "description": "Absolute sandbox path."},
-                "url": {"type": "string", "description": "External http(s) URL."},
-                "filename": {"type": "string", "description": "Saved filename."},
+                "file_path": {"type": "string", "description": "File path."},
+                "url": {"type": "string", "description": "URL."},
+                "filename": {"type": "string", "description": "Filename."},
                 "save_to_knowledge": {
                     "type": "boolean",
-                    "description": "Register as Knowledge; default true.",
+                    "description": "Add to Knowledge; default true.",
                 },
                 "display_as_artifact": {
                     "type": "boolean",
-                    "description": "Show card for final deliverable.",
+                    "description": "Show final card.",
                 },
                 "artifact_role": {
                     "type": "string",
                     "enum": ["intermediate", "final"],
-                    "description": "final shows card; default intermediate.",
+                    "description": "Artifact role; default intermediate.",
                 },
-                "approval_token": {"type": "string", "description": "Approval token when required."},
+                "approval_token": {"type": "string", "description": "Approval token."},
             },
             "required": ["filename"],
         },

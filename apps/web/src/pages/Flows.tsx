@@ -1,16 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { t } from "../lib/i18n";
 import { useToastStore } from "../stores/toast";
-import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
+import PageHeader, {
+  PageHeaderAddButton,
+  PageHeaderTitle,
+} from "../components/ui/PageHeader";
 import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import Button from "../components/ui/Button";
+import AiEditButton from "../components/ui/AiEditButton";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import { CardGridSkeleton } from "../components/ui/Skeleton";
@@ -28,8 +32,10 @@ import {
   IconClock,
   IconInfo,
   IconMoreHorizontal,
+  IconPause,
   IconPlay,
   IconPlus,
+  IconStop,
   IconTrash,
   IconUpload,
 } from "../components/icons";
@@ -39,8 +45,8 @@ import WorkflowDeployModal from "../components/workflows/WorkflowDeployModal";
 import WorkflowCanvas, { NodeIcon, type CanvasStep } from "../components/workflows/WorkflowCanvas";
 import WorkflowNodePalette from "../components/workflows/WorkflowNodePalette";
 import WorkflowNodeConfigPanel from "../components/workflows/WorkflowNodeConfigPanel";
+import { workflowStepOutputs } from "../lib/workflowBindings";
 import MediaPreview from "../components/workflows/MediaPreview";
-import AiEditButton from "../components/ui/AiEditButton";
 import WorkflowTemplates, { type WorkflowTemplate } from "../components/workflows/WorkflowTemplates";
 import { closeEditorLiveChat, openEditorLiveChat } from "../lib/editorLiveChat";
 import { parseWorkflowLiveEdit, serializeWorkflowLiveEdit } from "../lib/workflowLiveEdit";
@@ -101,6 +107,15 @@ interface WorkflowMetadata {
     status: string;
     created_at: string;
   }>;
+}
+
+function getWorkflowReturnTo(state: unknown): string | null {
+  if (!state || typeof state !== "object") return null;
+  const value = (state as { chatReturnTo?: unknown; returnTo?: unknown }).chatReturnTo
+    ?? (state as { returnTo?: unknown }).returnTo;
+  return typeof value === "string" && value.startsWith("/") && !value.startsWith("//")
+    ? value
+    : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -323,6 +338,9 @@ type WorkflowRunInput = {
   required: boolean;
   placeholder?: string;
   defaultValue: string;
+  integer?: boolean;
+  minimum?: number;
+  maximum?: number;
 };
 
 function runInputDefault(value: unknown, variables?: Record<string, unknown>): unknown {
@@ -359,12 +377,15 @@ export function workflowRunInputs(flow: Pick<Flow, "steps" | "variables">): Work
       : Array.isArray(step.config?.inputs) ? step.config.inputs : [];
     for (const row of rows) {
       const key = String(row?.key || row?.name || "").trim();
-      if (!key || seen.has(key)) continue;
+      if (!key || row?.hidden || seen.has(key)) continue;
       seen.add(key);
       const rawType = String(row?.type || "string").toLowerCase();
-      const type: WorkflowRunInput["type"] = ["number", "boolean", "json"].includes(rawType)
-        ? rawType as WorkflowRunInput["type"]
-        : "string";
+      const type: WorkflowRunInput["type"] = rawType === "integer"
+        ? "number"
+        : ["number", "boolean", "json"].includes(rawType)
+          ? rawType as WorkflowRunInput["type"]
+          : "string";
+      const schema = row?.schema && typeof row.schema === "object" ? row.schema : {};
       const rawDefault = row?.defaultValue ?? row?.default ?? row?.value;
       const formattedDefault = formatRunInputValue(runInputDefault(rawDefault, flow.variables));
       result.push({
@@ -374,6 +395,9 @@ export function workflowRunInputs(flow: Pick<Flow, "steps" | "variables">): Work
         required: row?.required ?? row?.requiredField ?? true,
         placeholder: row?.placeholder ? String(row.placeholder) : undefined,
         defaultValue: type === "boolean" && formattedDefault === "" ? "false" : formattedDefault,
+        integer: rawType === "integer" || schema.type === "integer",
+        minimum: typeof schema.minimum === "number" ? schema.minimum : undefined,
+        maximum: typeof schema.maximum === "number" ? schema.maximum : undefined,
       });
     }
   }
@@ -381,22 +405,13 @@ export function workflowRunInputs(flow: Pick<Flow, "steps" | "variables">): Work
 }
 
 function workflowNodeOutputs(step: any): { name: string; type: string }[] {
-  const configured = Array.isArray(step.config?.outputs) ? step.config.outputs : null;
-  const rows = configured ?? (
-    ["trigger", "webhook"].includes(step.type) && Array.isArray(step.config?.run_inputs)
-      ? step.config.run_inputs
-      : []
-  );
-  const named = rows
+  const named = workflowStepOutputs(step)
     .map((output: any) => ({
       name: String(output?.key || output?.name || "").trim(),
       type: String(output?.type || "any").toLowerCase() === "string" ? "text" : output?.type || "any",
     }))
     .filter((output: any) => output.name);
-  return [
-    ...named,
-    ...(step.config?.output_var ? [{ name: String(step.config.output_var), type: "any" }] : []),
-  ];
+  return named;
 }
 
 type WorkflowFinalResult = {
@@ -476,7 +491,12 @@ function WorkflowFinalResultPanel({
   const output = failed ? run?.error : result?.output;
   const media = failed ? [] : extractMediaRefs(output, 3);
   const runInputs = Object.entries(run?.trigger_data || {}).filter(
-    ([key, value]) => key && value !== undefined,
+    ([key, value]) => (
+      key
+      && !key.startsWith("_")
+      && key !== "runtime_context"
+      && value !== undefined
+    ),
   );
   return (
     <section
@@ -557,8 +577,12 @@ function WorkflowFinalResultPanel({
 export default function Flows() {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const location = useLocation();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedWorkflowId = searchParams.get("workflow");
+  const requestedRunId = searchParams.get("run") || searchParams.get("workflow_run");
+  const workflowReturnTo = getWorkflowReturnTo(location.state);
 
   const [search, setSearch] = useState("");
   const [selectedFlow, setSelectedFlow] = useState<Flow | null>(null);
@@ -605,6 +629,7 @@ export default function Flows() {
   const [editingStep, setEditingStep] = useState<FlowStep | null>(null);
   const [showRunHistory, setShowRunHistory] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [cancelRunTarget, setCancelRunTarget] = useState<string | null>(null);
   const [showIdentityModal, setShowIdentityModal] = useState(false);
   const [identityTarget, setIdentityTarget] = useState<Flow | null>(null);
   const [identityName, setIdentityName] = useState("");
@@ -639,16 +664,26 @@ export default function Flows() {
   // editor in the URL so refresh/back navigation preserves that context.
   useEffect(() => {
     if (!requestedWorkflowId || !flows?.length) return;
-    if (selectedFlow?.id === requestedWorkflowId) return;
-    const requested = (flows as Flow[]).find((flow) => flow.id === requestedWorkflowId);
+    if (
+      selectedFlow?.id === requestedWorkflowId
+      || selectedFlow?.name === requestedWorkflowId
+    ) return;
+    const requested = (flows as Flow[]).find((flow) => flow.id === requestedWorkflowId)
+      || (flows as Flow[]).find((flow) => flow.name === requestedWorkflowId);
     if (requested) setSelectedFlow(requested);
   }, [flows, requestedWorkflowId, selectedFlow?.id]);
 
   const closeWorkflow = () => {
     closeEditorLiveChat();
     setSelectedFlow(null);
+    if (workflowReturnTo) {
+      navigate(workflowReturnTo);
+      return;
+    }
     const next = new URLSearchParams(searchParams);
     next.delete("workflow");
+    next.delete("run");
+    next.delete("workflow_run");
     setSearchParams(next, { replace: true });
   };
 
@@ -670,8 +705,48 @@ export default function Flows() {
   // requiring a separate History click made successful results look lost.
   useEffect(() => {
     if (!selectedFlow || !runs?.length) return;
+    if (requestedRunId) {
+      const requested = runs.find((run: any) => run.id === requestedRunId);
+      if (requested && runResult?.id !== requested.id) setRunResult(requested);
+      return;
+    }
     if (runResult?.workflow_id !== selectedFlow.id) setRunResult(runs[0]);
-  }, [runs, runResult?.workflow_id, selectedFlow?.id]);
+  }, [requestedRunId, runs, runResult?.id, runResult?.workflow_id, selectedFlow?.id]);
+
+  // Chat result cards deep-link to an exact run. It may be older than the
+  // compact first history page, so hydrate it directly when necessary.
+  useEffect(() => {
+    if (!selectedFlow || !requestedRunId) return;
+    if (runResult?.id === requestedRunId) return;
+    if (runs?.some((run: any) => run.id === requestedRunId)) return;
+    let active = true;
+    void api.workflows.getRun(requestedRunId).then((detail: any) => {
+      if (!active || detail?.workflow_id !== selectedFlow.id) return;
+      setRunResult(detail);
+    }).catch(() => {
+      // Keep the workflow definition usable when an old run is unavailable.
+    });
+    return () => { active = false; };
+  }, [requestedRunId, runResult?.id, runs, selectedFlow?.id]);
+
+  // Run lists are intentionally compact and omit node-level results. Hydrate a
+  // selected summary once so reopening a workflow restores its canvas state
+  // and progress instead of showing an empty 0/N terminal run.
+  const runResultHasDetail = !!runResult
+    && Object.prototype.hasOwnProperty.call(runResult, "step_results");
+  useEffect(() => {
+    if (!runResult?.id || runResultHasDetail) return;
+    let active = true;
+    void api.workflows.getRun(runResult.id).then((detail: any) => {
+      if (!active) return;
+      setRunResult((current: any) => (
+        current?.id === detail?.id ? { ...current, ...detail } : current
+      ));
+    }).catch(() => {
+      // Keep the compact history row usable if detail hydration is unavailable.
+    });
+    return () => { active = false; };
+  }, [runResult?.id, runResultHasDetail]);
 
   // Reveal each completed/failed run once. Closing stays respected until a
   // different run is selected or a new run completes.
@@ -689,24 +764,34 @@ export default function Flows() {
     if (!refreshed) return;
     const resultCount = Object.keys(runResult.step_results || {}).length;
     const refreshedCount = Object.keys(refreshed.step_results || {}).length;
+    const refreshedHasResults = Object.prototype.hasOwnProperty.call(refreshed, "step_results");
     if (
       refreshed.status !== runResult.status ||
       refreshed.completed_at !== runResult.completed_at ||
-      refreshedCount !== resultCount
+      (refreshedHasResults && refreshedCount !== resultCount)
     ) {
-      setRunResult(refreshed);
+      // Compact polling rows must never erase the full node results received
+      // from the SSE completion frame or the detail endpoint.
+      setRunResult((current: any) => (
+        current?.id === refreshed.id ? { ...current, ...refreshed } : current
+      ));
     }
   }, [runs, runResult]);
 
-  // Create a workflow from a template and jump straight into its editor.
+  // Install by stable catalogue id; the returned workflow id is the runtime
+  // identity used by bindings, Tasks, Automations, Proposals, and subflows.
   const templateMutation = useMutation({
     mutationFn: (tpl: WorkflowTemplate) =>
-      api.workflows.create({ name: tpl.name, description: tpl.description, icon: tpl.icon, trigger_type: tpl.trigger_type, steps: tpl.steps }),
-    onSuccess: (created: any) => {
+      api.workflows.installTemplate(tpl.id),
+    onSuccess: (result: any) => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
+      queryClient.invalidateQueries({ queryKey: ["workflow-templates"] });
       setShowTemplates(false);
-      setSelectedFlow(created);
-      toast.success("Created from template");
+      setSelectedFlow(result.workflow);
+      toast.success(result.already_installed ? "Opened installed Flow" : "Flow installed");
+    },
+    onError: (error: any) => {
+      toast.error("Couldn't install Flow", error?.message || "Please try again.");
     },
   });
 
@@ -748,6 +833,31 @@ export default function Flows() {
     },
     onError: (e: any) => {
       toast.error("Couldn't resume workflow", e?.message || "Please try again.");
+    },
+  });
+
+  const pauseMutation = useMutation({
+    mutationFn: (runId: string) => api.workflows.pauseRun(runId),
+    onSuccess: (updated: any) => {
+      setRunResult(updated);
+      queryClient.invalidateQueries({ queryKey: ["workflow-runs"] });
+      toast.success("Workflow paused", "The current node may finish; no next node will start.");
+    },
+    onError: (e: any) => {
+      toast.error("Couldn't pause workflow", e?.message || "Please try again.");
+    },
+  });
+
+  const cancelRunMutation = useMutation({
+    mutationFn: (runId: string) => api.workflows.cancelRun(runId),
+    onSuccess: (updated: any) => {
+      setRunResult(updated);
+      setCancelRunTarget(null);
+      queryClient.invalidateQueries({ queryKey: ["workflow-runs"] });
+      toast.success("Workflow stopped", "No additional nodes will start.");
+    },
+    onError: (e: any) => {
+      toast.error("Couldn't stop workflow", e?.message || "Please try again.");
     },
   });
 
@@ -817,6 +927,8 @@ export default function Flows() {
     setSelectedFlow(flow);
     const next = new URLSearchParams(searchParams);
     next.set("workflow", flow.id);
+    next.delete("run");
+    next.delete("workflow_run");
     setSearchParams(next, { replace: true });
   };
 
@@ -998,6 +1110,16 @@ export default function Flows() {
       const finalRun = await api.workflows.runStream(
         flow.id,
         (nodeId, status) => setLiveStatus((previous) => ({ ...previous, [nodeId]: status })),
+        (runId) => {
+          setRunResult({
+            id: runId,
+            workflow_id: flow.id,
+            status: "running",
+            step_results: {},
+            started_at: new Date().toISOString(),
+          });
+          queryClient.invalidateQueries({ queryKey: ["workflow-runs", flow.id] });
+        },
         { trigger_data: triggerData },
       );
       if (finalRun) setRunResult(finalRun);
@@ -1037,6 +1159,9 @@ export default function Flows() {
       if (input.type === "number") {
         const parsed = Number(value);
         if (!Number.isFinite(parsed)) errors[input.key] = "Enter a valid number.";
+        else if (input.integer && !Number.isInteger(parsed)) errors[input.key] = "Enter a whole number.";
+        else if (input.minimum !== undefined && parsed < input.minimum) errors[input.key] = `Enter ${input.minimum} or more.`;
+        else if (input.maximum !== undefined && parsed > input.maximum) errors[input.key] = `Enter ${input.maximum} or less.`;
         else triggerData[input.key] = parsed;
       } else if (input.type === "boolean") {
         triggerData[input.key] = value === "true";
@@ -1110,6 +1235,9 @@ export default function Flows() {
                   setRunInputErrors((current) => ({ ...current, [input.key]: "" }));
                 }}
                 type={input.type === "number" ? "number" : "text"}
+                min={input.minimum}
+                max={input.maximum}
+                step={input.integer ? 1 : undefined}
                 placeholder={input.placeholder || "Enter a value"}
                 error={runInputErrors[input.key]}
                 autoFocus={index === 0}
@@ -1271,12 +1399,13 @@ export default function Flows() {
     const executableSteps = steps.filter((step: any) => step.type !== "note");
     const doneCount = executableSteps.filter((step: any) => statusById[step.id] === "completed").length;
     const showBanner = streaming || !!lastRun;
-    const bannerStatus = streaming ? "running" : lastRun?.status;
-    const runBannerColor = streaming
-      ? "#0f766e"
-      : lastRun
+    const bannerStatus = lastRun?.status || (streaming ? "starting" : undefined);
+    const runBannerColor = lastRun
         ? lastRun.status === "completed" ? "#4f9c84" : lastRun.status === "failed" ? "#d65f59" : "#cf9b44"
-        : null;
+        : streaming ? "#0f766e" : null;
+    const runCanPause = !!lastRun && ["pending", "running"].includes(lastRun.status);
+    const runCanResume = !!lastRun && lastRun.status === "paused";
+    const runCanStop = !!lastRun && ["pending", "running", "paused"].includes(lastRun.status);
     return (
       <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "1rem", overflow: "hidden", position: "relative", zIndex: 10 }}>
         {/* Back + editor identity + a consistent metadata/action toolbar. */}
@@ -1284,8 +1413,8 @@ export default function Flows() {
           <button
             type="button"
             className="workflow-editor-back"
-            aria-label="Back to flows"
-            title="Back to flows"
+            aria-label={workflowReturnTo ? "Back to chat" : "Back to flows"}
+            title={workflowReturnTo ? "Back to chat" : "Back to flows"}
             onClick={() => {
               closeWorkflow();
             }}
@@ -1297,7 +1426,7 @@ export default function Flows() {
               {workflowIconGlyph(flow.icon, 20)}
             </IconTile>
             <div className="workflow-editor-heading">
-              <h1>
+              <PageHeaderTitle variant="editor">
                 <button
                   type="button"
                   className="workflow-editor-identity-edit"
@@ -1308,7 +1437,7 @@ export default function Flows() {
                   <span>{flow.name}</span>
                   <IconEdit size={15} />
                 </button>
-              </h1>
+              </PageHeaderTitle>
               <p>{flow.description || "Add a description"}</p>
             </div>
           </div>
@@ -1337,14 +1466,25 @@ export default function Flows() {
                 {t(TRIGGER_LABELS[triggerKind] || triggerKind)}
               </StatusBadge>
             </div>
-            <div className="workflow-editor-actions" aria-label="Workflow actions">
-              <AiEditButton className="workflow-editor-action" onClick={openWorkflowAiEdit} />
-              <Button className="workflow-editor-action" variant="outline" onClick={() => openAddStep(steps.length)}>
-                + Node
+            <div className="workflow-editor-actions" role="toolbar" aria-label="Workflow actions">
+              <AiEditButton
+                className="workflow-editor-action workflow-editor-action-ai"
+                onClick={openWorkflowAiEdit}
+              />
+              <Button
+                className="workflow-editor-action"
+                variant="outline"
+                onClick={() => openAddStep(steps.length)}
+                title="Add node"
+                ariaLabel="Add node"
+              >
+                <IconPlus size={17} />
               </Button>
               <Button
                 className="workflow-editor-action"
                 variant="outline"
+                title="Deploy workflow"
+                ariaLabel="Deploy workflow"
                 onClick={() => {
                   if (errorCount > 0) {
                     setShowIssues(true);
@@ -1354,38 +1494,41 @@ export default function Flows() {
                   setDeployFlow(flow);
                 }}
               >
-                Deploy
+                <IconUpload size={16} />
               </Button>
               <Button
                 className="workflow-editor-action"
                 variant="primary"
                 onClick={() => runStep()}
                 disabled={streaming || errorCount > 0}
-                title={errorCount > 0 ? "Fix workflow errors before running" : undefined}
+                title={errorCount > 0 ? "Fix workflow errors before running" : t("page.flows.run")}
+                ariaLabel={streaming ? t("page.flows.starting") : t("page.flows.run")}
               >
-                {streaming ? t("page.flows.starting") : t("page.flows.run")}
+                {streaming ? <LoadingSpinner size={15} /> : <IconPlay size={16} />}
               </Button>
               <Button
-                className="workflow-editor-action workflow-editor-action-history"
+                className="workflow-editor-action"
                 variant="outline"
+                title={t("page.flows.history")}
+                ariaLabel={t("page.flows.history")}
                 onClick={() => {
                   const opening = !showRunHistory;
                   setShowRunHistory(opening);
                   if (opening && !lastRun && runs && runs.length) setRunResult(runs[0]);
                 }}
               >
-                {t("page.flows.history")}
+                <IconClock size={16} />
               </Button>
               <Button
-                className="workflow-editor-action workflow-editor-action-delete"
+                className="workflow-editor-action"
                 variant="danger"
                 onClick={() => setDeleteTarget(flow.id)}
                 disabled={streaming || deleteMutation.isPending}
                 loading={deleteMutation.isPending && deleteTarget === flow.id}
                 title={t("page.flows.delete_flow")}
+                ariaLabel={t("page.flows.delete_flow")}
               >
-                <IconTrash size={14} />
-                {t("action.delete")}
+                {!(deleteMutation.isPending && deleteTarget === flow.id) && <IconTrash size={16} />}
               </Button>
             </div>
           </div>
@@ -1427,17 +1570,41 @@ export default function Flows() {
               <span style={{ color: "var(--text-strong)", textTransform: "capitalize" }}>{bannerStatus}</span>
               <span className="mono" style={{ color: "var(--text-faint)" }}>{doneCount}/{executableSteps.length}</span>
               {!streaming && lastRun?.error && <span style={{ color: "#d65f59", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>· {lastRun.error}</span>}
-              {!streaming && lastRun?.status === "paused" && (
+              {runCanPause && (
                 <button
                   type="button"
-                  onClick={() => resumeMutation.mutate(lastRun.id)}
-                  disabled={resumeMutation.isPending}
-                  style={{
-                    border: "none", borderRadius: 7, padding: "3px 8px", cursor: "pointer",
-                    background: "rgba(207,155,68,0.14)", color: "#9a6d1f", fontSize: 11.5, fontWeight: 700,
-                  }}
+                  className="workflow-run-banner-action"
+                  onClick={() => pauseMutation.mutate(lastRun.id)}
+                  disabled={pauseMutation.isPending || cancelRunMutation.isPending}
+                  aria-label="Pause workflow after the current node"
+                  title="Pause after the current node finishes"
                 >
+                  <IconPause size={12} />
+                  {pauseMutation.isPending ? "Pausing…" : "Pause"}
+                </button>
+              )}
+              {runCanResume && (
+                <button
+                  type="button"
+                  className="workflow-run-banner-action"
+                  onClick={() => resumeMutation.mutate(lastRun.id)}
+                  disabled={resumeMutation.isPending || cancelRunMutation.isPending}
+                >
+                  <IconPlay size={12} />
                   {resumeMutation.isPending ? "Resuming…" : "Resume"}
+                </button>
+              )}
+              {runCanStop && (
+                <button
+                  type="button"
+                  className="workflow-run-banner-action is-danger"
+                  onClick={() => setCancelRunTarget(lastRun.id)}
+                  disabled={cancelRunMutation.isPending}
+                  aria-label="Stop workflow run"
+                  title="Stop before another node starts"
+                >
+                  <IconStop size={12} />
+                  Stop
                 </button>
               )}
               {!streaming && lastRun && ["completed", "failed"].includes(lastRun.status) && (
@@ -1464,7 +1631,6 @@ export default function Flows() {
             }
             onNodeOpen={(id) => setConfigStepId(id)}
             onAddFrom={(id) => { setAddFromId(id); setShowAddStep(true); }}
-            onAddNode={() => { setAddFromId(null); setShowAddStep(true); }}
           />
         </div>
         );
@@ -1618,7 +1784,14 @@ export default function Flows() {
                   return (
                     <button
                       key={run.id}
-                      onClick={() => setRunResult(run)}
+                      onClick={() => {
+                        setRunResult(run);
+                        const next = new URLSearchParams(searchParams);
+                        next.set("workflow", flow.id);
+                        next.set("run", run.id);
+                        next.delete("workflow_run");
+                        setSearchParams(next, { replace: true });
+                      }}
                       style={{
                         display: "flex", alignItems: "center", gap: 10, padding: "9px 11px", borderRadius: 10,
                         border: "none", cursor: "pointer", textAlign: "left",
@@ -1698,6 +1871,19 @@ export default function Flows() {
           confirmLabel={t("action.delete")}
           danger
           loading={deleteMutation.isPending}
+          closeOnConfirm={false}
+        />
+
+        <ConfirmDialog
+          open={!!cancelRunTarget}
+          onClose={() => { if (!cancelRunMutation.isPending) setCancelRunTarget(null); }}
+          onConfirm={() => { if (cancelRunTarget) cancelRunMutation.mutate(cancelRunTarget); }}
+          title="Stop workflow run?"
+          message="The current node may finish, including any external action already submitted. No additional nodes will start."
+          confirmLabel="Stop run"
+          cancelLabel="Keep running"
+          danger
+          loading={cancelRunMutation.isPending}
           closeOnConfirm={false}
         />
 
@@ -1941,6 +2127,7 @@ export default function Flows() {
         open={showTemplates}
         onClose={() => setShowTemplates(false)}
         onPick={(tpl) => templateMutation.mutate(tpl)}
+        installingId={templateMutation.isPending ? templateMutation.variables?.id || null : null}
       />
 
       {/* Deploy from the list-view card drawer (the editor has its own copy). */}

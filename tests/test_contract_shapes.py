@@ -17,6 +17,7 @@ def test_artifact_shape_normalizes_path_alias_to_fs_path():
 def test_artifact_shape_json_schema_requires_fs_path():
     shape = get_shape("ArtifactResult")
     schema = shape.json_schema()
+    assert schema["properties"]["files"]["minItems"] == 1
     item = schema["properties"]["files"]["items"]
     assert "fs_path" in item["required"]
     assert "name" in item["required"]

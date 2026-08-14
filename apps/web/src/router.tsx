@@ -6,6 +6,10 @@ import RouteErrorBoundary from "./components/RouteErrorBoundary";
 import { PageLoading } from "./components/ui/Skeleton";
 import { t } from "./lib/i18n";
 import { useConfigStore } from "./stores/config";
+import {
+  type PreviewFeature,
+  usePreviewFeatureAccess,
+} from "./lib/previewFeatureAccess";
 
 // Lazy load all pages
 const Login = lazy(() => import("./pages/Login"));
@@ -16,7 +20,6 @@ const TaskBoard = lazy(() => import("./pages/TaskBoard"));
 const TaskCollections = lazy(() => import("./pages/TaskCollections"));
 const TaskProcess = lazy(() => import("./pages/TaskProcess"));
 const TaskEvaluate = lazy(() => import("./pages/TaskEvaluate"));
-const GoalExplorer = lazy(() => import("./pages/GoalExplorer"));
 const Knowledge = lazy(() => import("./pages/Knowledge"));
 const DocEditor = lazy(() => import("./pages/DocEditor"));
 const FileViewer = lazy(() => import("./pages/FileViewer"));
@@ -70,6 +73,19 @@ function S({ children }: { children: React.ReactNode }) {
   return <Suspense fallback={<PageLoader />}>{children}</Suspense>;
 }
 
+
+function PreviewFeatureRoute({
+  feature,
+  children,
+}: {
+  feature: PreviewFeature;
+  children: React.ReactNode;
+}) {
+  const access = usePreviewFeatureAccess(feature);
+  if (!access.loaded) return <PageLoader />;
+  if (!access.enabled) return <Navigate to="/skills" replace />;
+  return <>{children}</>;
+}
 
 export const router = createBrowserRouter([
   // Public routes
@@ -302,9 +318,11 @@ export const router = createBrowserRouter([
           {
             path: "/flows",
             element: (
-              <S>
-                <Flows />
-              </S>
+              <PreviewFeatureRoute feature="flows">
+                <S>
+                  <Flows />
+                </S>
+              </PreviewFeatureRoute>
             ),
           },
           {

@@ -1,5 +1,7 @@
 """E2E tests: workflow definitions, runs, and step execution."""
+import asyncio
 import json
+from copy import deepcopy
 
 import pytest
 from httpx import AsyncClient
@@ -700,6 +702,33 @@ def test_retry_variables_restore_inherited_shared_checkpoint_output():
     assert variables["retry_segment_ids"] == ["SEG-002"]
 
 
+def test_retry_inherits_completed_ancestors_through_unexecuted_condition():
+    from packages.core.services.workflow_service import retry_inherited_step_ids
+
+    steps = [
+        {"id": "start", "type": "trigger", "next": ["producer"]},
+        {"id": "producer", "type": "tool", "next": ["gate"]},
+        {
+            "id": "gate",
+            "type": "condition",
+            "next": ["blocked"],
+            "true_next": ["publish"],
+            "false_next": ["blocked"],
+        },
+        {"id": "blocked", "type": "stop", "next": []},
+        {"id": "publish", "type": "tool", "next": []},
+    ]
+    prior_results = {
+        "start": {"status": "completed"},
+        "producer": {"status": "completed", "output": {"video_id": "video-1"}},
+    }
+
+    assert retry_inherited_step_ids(steps, prior_results, "publish") == {
+        "start",
+        "producer",
+    }
+
+
 def test_retry_variables_remove_stale_internal_stage_outputs():
     from packages.core.services.workflow_service import _retry_variables
 
@@ -806,6 +835,381 @@ def test_retry_variables_remove_stale_internal_stage_outputs():
         "quality_result",
     ):
         assert stale_key not in variables
+
+
+def test_retry_variables_preserve_declared_input_when_stage_output_reuses_its_name():
+    from packages.core.services.workflow_service import _retry_variables
+
+    request = {
+        "product_name": "Manor Workspace",
+        "start_url": "http://localhost:3010/workspaces",
+        "must_show": ["Workspace list", "Marketplace"],
+    }
+    workflow = SimpleNamespace(steps=[
+        {
+            "id": "start",
+            "type": "trigger",
+            "config": {
+                "run_inputs": [{
+                    "key": "start_url",
+                    "target": "request.start_url",
+                }],
+            },
+            "next": ["prepare"],
+        },
+        {
+            "id": "prepare",
+            "type": "stage",
+            "config": {
+                "operations": [{
+                    "id": "normalize_request",
+                    "type": "agent",
+                    "config": {"output_var": "request"},
+                }],
+            },
+            "next": ["check_browser"],
+        },
+    ])
+    prior = SimpleNamespace(
+        variables={
+            "request": request,
+            "normalize_request": {"status": "failed"},
+            "__stage_execution": {
+                "prepare": {
+                    "status": "failed",
+                    "failed_operation_id": "normalize_request",
+                    "operation_results": {
+                        "normalize_request": {"status": "failed"},
+                    },
+                },
+            },
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "prepare": {"status": "failed"},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start"},
+        None,
+        "prepare",
+    )
+
+    assert variables["request"] == request
+    assert "normalize_request" not in variables
+
+
+def test_retry_variables_restart_a_completed_target_stage_from_its_entry():
+    from packages.core.services.workflow_service import _retry_variables
+
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["check_browser"]},
+        {
+            "id": "check_browser",
+            "type": "stage",
+            "config": {
+                "operations": [{
+                    "id": "browser_preflight",
+                    "type": "agent",
+                    "config": {"output_var": "browser_preflight"},
+                }],
+            },
+            "next": ["discover"],
+        },
+        {"id": "discover", "type": "stage", "config": {"operations": []}, "next": []},
+    ])
+    prior = SimpleNamespace(
+        variables={
+            "browser_preflight": {"available": False},
+            "__stage_execution": {
+                "check_browser": {
+                    "status": "completed",
+                    "operation_results": {
+                        "browser_preflight": {"status": "completed"},
+                    },
+                },
+            },
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "check_browser": {"status": "completed"},
+            "discover": {"status": "completed", "next_override": []},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start"},
+        None,
+        "check_browser",
+    )
+
+    assert "__stage_execution" not in variables
+    assert "browser_preflight" not in variables
+
+
+def test_retry_variables_restore_outputs_from_an_inherited_stage_operation():
+    from packages.core.services.workflow_service import _retry_variables
+
+    created_project = {"project_id": "project-1", "revision": 0}
+    latest_project = {"project_id": "project-1", "revision": 4}
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["prepare_project"]},
+        {
+            "id": "prepare_project",
+            "type": "stage",
+            "config": {
+                "operations": [
+                    {
+                        "id": "create_project",
+                        "type": "workflow_project",
+                        "config": {"output_var": "project"},
+                    },
+                    {
+                        "id": "prepare_shared",
+                        "type": "transform",
+                        "config": {
+                            "set": {"shared_value": "inherited"},
+                            "outputs": [{
+                                "key": "named_value",
+                                "value": "{{prepare_shared.shared_value}}",
+                            }],
+                        },
+                    },
+                ],
+            },
+            "next": ["check_browser"],
+        },
+        {
+            "id": "check_browser",
+            "type": "stage",
+            "config": {"operations": []},
+            "next": ["discover"],
+        },
+        {
+            "id": "discover",
+            "type": "stage",
+            "config": {
+                "operations": [
+                    {
+                        "id": "mark_discovering",
+                        "type": "workflow_project",
+                        "config": {"output_var": "project"},
+                    },
+                    {
+                        "id": "overwrite_shared",
+                        "type": "transform",
+                        "config": {
+                            "set": {"shared_value": "descendant"},
+                            "outputs": [{
+                                "key": "named_value",
+                                "value": "descendant-named",
+                            }],
+                        },
+                    },
+                ],
+            },
+            "next": [],
+        },
+    ])
+    prior = SimpleNamespace(
+        variables={
+            "project": latest_project,
+            "create_project": created_project,
+            "prepare_shared": {
+                "project": created_project,
+                "shared_value": "inherited",
+            },
+            "shared_value": "descendant",
+            "named_value": "descendant-named",
+            "mark_discovering": latest_project,
+            "overwrite_shared": {
+                "project": latest_project,
+                "shared_value": "descendant",
+                "named_value": "descendant-named",
+            },
+            "__stage_execution": {
+                "prepare_project": {
+                    "status": "completed",
+                    "operation_results": {
+                        "create_project": {"status": "completed"},
+                        "prepare_shared": {"status": "completed"},
+                    },
+                },
+                "discover": {
+                    "status": "completed",
+                    "operation_results": {
+                        "mark_discovering": {"status": "completed"},
+                        "overwrite_shared": {"status": "completed"},
+                    },
+                },
+            },
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "prepare_project": {"status": "completed"},
+            "check_browser": {"status": "completed"},
+            "discover": {"status": "completed", "next_override": []},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start", "prepare_project"},
+        None,
+        "check_browser",
+    )
+
+    assert variables["project"] == created_project
+    assert variables["shared_value"] == "inherited"
+    assert variables["named_value"] == "inherited"
+
+
+def test_retry_variables_restore_inherited_stage_outputs_across_linked_attempts():
+    from packages.core.services.workflow_service import _retry_variables
+
+    created_project = {"project_id": "project-1", "revision": 0}
+    latest_project = {"project_id": "project-1", "revision": 4}
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["prepare_project"]},
+        {
+            "id": "prepare_project",
+            "type": "stage",
+            "config": {
+                "operations": [{
+                    "id": "create_project",
+                    "type": "workflow_project",
+                    "config": {"output_var": "project"},
+                }],
+            },
+            "next": ["check_browser"],
+        },
+        {
+            "id": "check_browser",
+            "type": "stage",
+            "config": {"operations": []},
+            "next": ["discover"],
+        },
+        {
+            "id": "discover",
+            "type": "stage",
+            "config": {
+                "operations": [{
+                    "id": "mark_discovering",
+                    "type": "workflow_project",
+                    "config": {"output_var": "project"},
+                }],
+            },
+            "next": [],
+        },
+    ])
+    prior = SimpleNamespace(
+        variables={
+            "project": latest_project,
+            "create_project": created_project,
+            "mark_discovering": latest_project,
+            "__stage_execution": {
+                "discover": {
+                    "status": "completed",
+                    "operation_results": {
+                        "mark_discovering": {"status": "completed"},
+                    },
+                },
+            },
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "prepare_project": {"status": "completed"},
+            "check_browser": {"status": "completed"},
+            "discover": {"status": "completed", "next_override": []},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start", "prepare_project"},
+        None,
+        "check_browser",
+    )
+
+    assert variables["project"] == created_project
+
+
+def test_retry_variables_do_not_flatten_a_completed_stage_output_into_cleanup_keys():
+    from packages.core.services.workflow_service import _retry_variables
+
+    schema = {"type": "object", "required": ["request"]}
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["retry_here"]},
+        {"id": "retry_here", "type": "stage", "config": {"operations": []}, "next": ["later"]},
+        {
+            "id": "later",
+            "type": "stage",
+            "config": {
+                "operations": [{
+                    "id": "build_handoff",
+                    "type": "transform",
+                    "config": {"set": {"input": {"business_outcome": "needs_input"}}},
+                }],
+            },
+            "next": [],
+        },
+    ])
+    prior = SimpleNamespace(
+        variables={
+            "request": {"product_name": "Manor"},
+            "product_video_project_schema": schema,
+            "runtime_context": {"workspace_id": "workspace-1"},
+            "input": {"business_outcome": "needs_input"},
+            "build_handoff": {
+                "request": {"product_name": "Manor"},
+                "product_video_project_schema": schema,
+                "runtime_context": {"workspace_id": "workspace-1"},
+                "input": {"business_outcome": "needs_input"},
+            },
+            "__stage_execution": {
+                "later": {
+                    "status": "completed",
+                    "operation_results": {
+                        "build_handoff": {"status": "completed"},
+                    },
+                },
+            },
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "retry_here": {"status": "completed"},
+            "later": {
+                "status": "completed",
+                "next_override": [],
+                "output": {
+                    "request": {"product_name": "Manor"},
+                    "product_video_project_schema": schema,
+                    "runtime_context": {"workspace_id": "workspace-1"},
+                    "input": {"business_outcome": "needs_input"},
+                },
+            },
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start"},
+        None,
+        "retry_here",
+    )
+
+    assert variables["request"] == {"product_name": "Manor"}
+    assert variables["product_video_project_schema"] == schema
+    assert variables["runtime_context"] == {"workspace_id": "workspace-1"}
+    assert "input" not in variables
 
 
 def test_retry_variable_patch_resolves_run_inputs_from_nested_targets():
@@ -923,6 +1327,69 @@ async def test_retry_refreshes_the_latest_durable_project_revision(db_session):
     assert variables["project"]["revision"] == 1
     assert variables["project"]["state"]["phase"] == "discovery"
     assert variables["project"]["last_run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_retry_preserves_legacy_product_video_asset_evidence_for_validation(
+    db_session,
+):
+    from packages.core.services.workflow_project_service import (
+        create_workflow_project,
+    )
+    from packages.core.services.workflow_service import (
+        _refresh_retry_workflow_project,
+    )
+
+    scene = {
+        "scene_id": "scene-1",
+        "required_asset_types": ["recording", "screenshot"],
+        "acceptance_evidence": [
+            {
+                "must_show": "Workspace list",
+                "observable": "Workspace list is visible",
+                "required_asset_type": "recording",
+            }
+        ],
+    }
+    state = {
+        "business_outcome": "needs_input",
+        "plan": {
+            "scene_ids": ["scene-1"],
+            "scenes": [deepcopy(scene)],
+            "must_show_coverage": [
+                {
+                    "requirement": "Workspace list",
+                    "scene_ids": ["scene-1"],
+                    "acceptance_evidence": deepcopy(scene["acceptance_evidence"]),
+                }
+            ],
+        },
+        "scenes": [deepcopy(scene)],
+    }
+    project = await create_workflow_project(
+        db_session,
+        entity_id="entity-pv-retry",
+        workspace_id="workspace-pv-retry",
+        project_type="product_video",
+        state=state,
+        created_by="user-pv-retry",
+        last_run_id="run-pv-retry",
+    )
+    await db_session.commit()
+    prior = SimpleNamespace(
+        entity_id="entity-pv-retry",
+        workspace_id="workspace-pv-retry",
+    )
+
+    variables = await _refresh_retry_workflow_project(
+        db_session,
+        prior,
+        {"project": {"project_id": project.id}},
+    )
+
+    runtime_state = variables["project"]["state"]
+    assert runtime_state == state
+    assert project.state == state
 
 
 @pytest.mark.asyncio
@@ -2458,11 +2925,333 @@ async def test_cancel_run(client: AsyncClient):
     data = step_resp.json()
     assert data.get("error") == "Run not active"
 
-    # Cancelling again should return 400
+    # Cancellation is idempotent so stale clients can reconcile terminal state.
     cancel2 = await client.post(
         f"/api/v1/workflows/runs/{run['id']}/cancel", headers=headers
     )
-    assert cancel2.status_code == 400
+    assert cancel2.status_code == 200
+    assert cancel2.json()["id"] == run["id"]
+    assert cancel2.json()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_accepts_completed_actionable_outcome_but_not_normal_completion(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wf_cancel_actionable")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancel actionable", "steps": _simple_steps(["work"])},
+    )).json()
+
+    actionable = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    actionable_row = await db_session.get(WorkflowRun, actionable["id"])
+    actionable_row.status = "completed"
+    actionable_row.variables = {
+        "project": {
+            "state": {
+                "business_outcome": "needs_input",
+                "retry_state": {"retry_from_step_id": "work"},
+            },
+        },
+    }
+    await db_session.commit()
+
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{actionable['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+
+    completed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    completed_row = await db_session.get(WorkflowRun, completed["id"])
+    completed_row.status = "completed"
+    completed_row.variables = {"project": {"state": {"business_outcome": "completed"}}}
+    await db_session.commit()
+
+    rejected = await client.post(
+        f"/api/v1/workflows/runs/{completed['id']}/cancel",
+        headers=headers,
+    )
+    assert rejected.status_code == 400
+    assert "already completed" in rejected.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_targets_latest_retry_attempt_from_stale_family_id(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wf_cancel_stale_attempt")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancel latest only", "steps": _simple_steps(["work"])},
+    )).json()
+    first = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    first_row = await db_session.get(WorkflowRun, first["id"])
+    first_row.status = "failed"
+    first_row.current_step_id = "work"
+    await db_session.commit()
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{first['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+    assert retried.status_code == 201, retried.text
+
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{first['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["id"] == retried.json()["id"]
+    assert cancelled.json()["status"] == "cancelled"
+
+    await db_session.refresh(first_row)
+    retried_row = await db_session.get(WorkflowRun, retried.json()["id"])
+    assert first_row.status == "failed"
+    assert retried_row.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_run_detail_enriches_visible_artifact_document_names(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.document import Document
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wf_artifact_names")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Artifact names", "steps": _simple_steps(["render"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    document = Document(
+        entity_id=me["entity_id"],
+        name="manor-workspace-final.mp4",
+        fs_path="workflow-results/manor-workspace-final.mp4",
+        file_type="mp4",
+        mime_type="video/mp4",
+        source="agent",
+        vector_status="ready",
+        created_by="wf_artifact_names",
+    )
+    db_session.add(document)
+    await db_session.flush()
+    run_row = await db_session.get(WorkflowRun, run["id"])
+    run_row.execution_trace = [{
+        "sequence": 1,
+        "node_id": "render",
+        "status": "completed",
+        "artifact_refs": [{
+            "document_id": document.id,
+            "mime_type": "video/mp4",
+            "status": "ready",
+        }],
+    }]
+    run_row.step_results = {
+        "render": {
+            "status": "completed",
+            "artifact_refs": {"document_id": document.id},
+        },
+    }
+    await db_session.commit()
+
+    detail = await client.get(
+        f"/api/v1/workflows/runs/{run['id']}",
+        headers=headers,
+    )
+    assert detail.status_code == 200, detail.text
+    artifact = detail.json()["execution_trace"][0]["artifact_refs"][0]
+    assert artifact["document_id"] == document.id
+    assert artifact["name"] == "manor-workspace-final.mp4"
+    result_artifact = detail.json()["step_results"]["render"]["artifact_refs"]
+    assert result_artifact["name"] == "manor-workspace-final.mp4"
+
+
+@pytest.mark.asyncio
+async def test_manual_pause_resumes_without_consuming_current_node_as_approval(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "wfmanualpause")
+    wf = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Manual pause test", "steps": _simple_steps(["p1", "p2"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{wf['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    paused_response = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/pause",
+        headers=headers,
+    )
+    assert paused_response.status_code == 200
+    paused = paused_response.json()
+    assert paused["status"] == "paused"
+    assert paused["trigger_data"]["_workflow_run_control"]["state"] == "manual_paused"
+
+    compact = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}?detail=false",
+        headers=headers,
+    )).json()
+    assert compact["intervention"]["kind"] == "workflow_resume"
+    assert compact["intervention"]["options"] == ["resume", "cancel"]
+
+    resumed_response = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/resume",
+        headers=headers,
+        json={},
+    )
+    assert resumed_response.status_code == 200, resumed_response.text
+    resumed = resumed_response.json()
+    assert resumed["status"] == "completed"
+    assert resumed["step_results"]["p1"]["status"] == "completed"
+    assert resumed["step_results"]["p2"]["status"] == "completed"
+    assert resumed["trigger_data"]["_workflow_run_control"]["state"] == "resumed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_in_flight_node_prevents_following_node(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    headers = await _auth(client, "wfcancelinflight")
+    wf = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancel in flight", "steps": _simple_steps(["slow", "never"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{wf['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = WorkflowRunner._execute_step_safe
+
+    async def controlled_execute(self, step, current_run, db):
+        if step["id"] == "slow":
+            entered.set()
+            await release.wait()
+        return await original_execute(self, step, current_run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", controlled_execute)
+    runner_task = asyncio.create_task(WorkflowRunner().run(run["id"]))
+    await asyncio.wait_for(entered.wait(), timeout=3)
+
+    cancelled_response = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled_response.status_code == 200
+    assert cancelled_response.json()["status"] == "cancelled"
+    release.set()
+    await asyncio.wait_for(runner_task, timeout=3)
+
+    final = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}",
+        headers=headers,
+    )).json()
+    assert final["status"] == "cancelled"
+    assert final["step_results"]["slow"]["status"] == "completed"
+    assert "never" not in final["step_results"]
+
+
+@pytest.mark.asyncio
+async def test_pause_during_in_flight_node_freezes_then_resumes_next_node(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    headers = await _auth(client, "wfpauseinflight")
+    wf = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Pause in flight", "steps": _simple_steps(["slow", "later"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{wf['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = WorkflowRunner._execute_step_safe
+
+    async def controlled_execute(self, step, current_run, db):
+        if step["id"] == "slow":
+            entered.set()
+            await release.wait()
+        return await original_execute(self, step, current_run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", controlled_execute)
+    runner_task = asyncio.create_task(WorkflowRunner().run(run["id"]))
+    await asyncio.wait_for(entered.wait(), timeout=3)
+
+    paused_response = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/pause",
+        headers=headers,
+    )
+    assert paused_response.status_code == 200
+    assert paused_response.json()["status"] == "paused"
+    release.set()
+    await asyncio.wait_for(runner_task, timeout=3)
+
+    paused = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}",
+        headers=headers,
+    )).json()
+    assert paused["status"] == "paused"
+    assert paused["step_results"]["slow"]["status"] == "completed"
+    assert "later" not in paused["step_results"]
+
+    resumed_response = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/resume",
+        headers=headers,
+        json={},
+    )
+    assert resumed_response.status_code == 200, resumed_response.text
+    resumed = resumed_response.json()
+    assert resumed["status"] == "completed"
+    assert resumed["step_results"]["later"]["status"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -3017,6 +3806,52 @@ async def test_retry_attempt_restarts_failed_node_with_corrected_input(
 
 
 @pytest.mark.asyncio
+async def test_retry_attempt_can_resume_cancelled_run(client: AsyncClient):
+    headers = await _auth(client, "wfretrycancelled")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Retry cancelled run",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["work"]},
+                {
+                    "id": "work",
+                    "type": "transform",
+                    "config": {"set": {"recovered": True}},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    pending = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    cancelled = (await client.post(
+        f"/api/v1/workflows/runs/{pending['id']}/cancel",
+        headers=headers,
+    )).json()
+    assert cancelled["status"] == "cancelled"
+
+    response = await client.post(
+        f"/api/v1/workflows/runs/{pending['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "start", "execute": True},
+    )
+
+    assert response.status_code == 201, response.text
+    retried = response.json()
+    assert retried["status"] == "completed"
+    assert retried["retry_of_run_id"] == pending["id"]
+    assert retried["retry_from_step_id"] == "start"
+    assert retried["attempt_number"] == 2
+    assert retried["variables"]["recovered"] is True
+
+
+@pytest.mark.asyncio
 async def test_retry_attempt_resumes_failed_operation_inside_stage(client: AsyncClient):
     headers = await _auth(client, "wfstagretry")
     workflow = (await client.post(
@@ -3194,6 +4029,148 @@ async def test_retry_attempt_accepts_retryable_completed_business_outcome(
         headers=headers,
     )).json()
     assert unchanged["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_business_retry_reexecutes_completed_stage_with_durable_project(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "wfbusinessstagereexecute")
+    state_schema = {"type": "object", "additionalProperties": True}
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Retry completed browser stage",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["prepare_project"]},
+                {
+                    "id": "prepare_project",
+                    "type": "stage",
+                    "config": {
+                        "entry_operation_id": "create_project",
+                        "operations": [{
+                            "id": "create_project",
+                            "type": "workflow_project",
+                            "config": {
+                                "operation": "create",
+                                "project_type": "retry_test",
+                                "schema_version": 1,
+                                "state_schema": state_schema,
+                                "state": {"business_outcome": "in_progress"},
+                                "output_var": "project",
+                            },
+                            "next": ["prepared"],
+                        }],
+                        "routes": {"prepared": "check_browser"},
+                    },
+                    "next": ["check_browser"],
+                },
+                {
+                    "id": "check_browser",
+                    "type": "stage",
+                    "config": {
+                        "entry_operation_id": "record_check",
+                        "operations": [{
+                            "id": "record_check",
+                            "type": "transform",
+                            "config": {"set": {"check_value": "{{corrected_input}}"}},
+                            "next": ["checked"],
+                        }],
+                        "routes": {"checked": "mark_needs_input"},
+                    },
+                    "next": ["mark_needs_input"],
+                },
+                {
+                    "id": "mark_needs_input",
+                    "type": "stage",
+                    "config": {
+                        "entry_operation_id": "save_handoff",
+                        "operations": [{
+                            "id": "save_handoff",
+                            "type": "workflow_project",
+                            "config": {
+                                "operation": "patch",
+                                "project_id": "{{project.project_id}}",
+                                "project_type": "retry_test",
+                                "schema_version": 1,
+                                "expected_revision": "{{project.revision}}",
+                                "state_schema": state_schema,
+                                "patch": {
+                                    "business_outcome": "needs_input",
+                                    "retry_state": {
+                                        "retry_from_step_id": "check_browser",
+                                    },
+                                },
+                                "output_var": "project",
+                            },
+                            "next": ["needs_input"],
+                        }],
+                        "routes": {"needs_input": None},
+                    },
+                    "next": [],
+                },
+            ],
+            "variables": {"corrected_input": "initial"},
+        },
+    )).json()
+    workspace = (await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Retry completed browser stage"},
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={
+            "workflow_id": workflow["id"],
+            "workspace_id": workspace["id"],
+            "trigger_type": "manual",
+        },
+    )).json()
+    prior = (await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run",
+        headers=headers,
+        json={},
+    )).json()
+
+    assert prior["status"] == "completed", json.dumps(
+        {
+            "error": prior.get("error"),
+            "step_results": prior.get("step_results"),
+            "variables": prior.get("variables"),
+        },
+        indent=2,
+        default=str,
+    )
+    assert prior["business_outcome"] == "needs_input"
+    assert prior["variables"]["check_value"] == "initial"
+    project_id = prior["variables"]["project"]["project_id"]
+    prior_revision = prior["variables"]["project"]["revision"]
+
+    response = await client.post(
+        f"/api/v1/workflows/runs/{prior['id']}/retry",
+        headers=headers,
+        json={
+            "variables": {"corrected_input": "ready"},
+            "execute": True,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    retried = response.json()
+    assert retried["status"] == "completed"
+    assert retried["retry_from_step_id"] == "check_browser"
+    assert retried["variables"]["check_value"] == "ready"
+    assert retried["variables"]["project"]["project_id"] == project_id
+    assert retried["variables"]["project"]["revision"] > prior_revision
+    assert retried["step_results"]["prepare_project"] == prior["step_results"][
+        "prepare_project"
+    ]
+    assert retried["step_results"]["check_browser"]["status"] == "completed"
+    assert retried["variables"]["__stage_execution"]["check_browser"][
+        "operation_results"
+    ]["record_check"]["status"] == "completed"
 
 
 @pytest.mark.asyncio

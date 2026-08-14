@@ -32,6 +32,53 @@ def _usage_is_byok(usage: dict) -> bool:
     return False
 
 
+def chat_llm_usage_is_byok(usage: dict | None = None) -> bool:
+    """Return whether the active chat call or its normalized usage is BYOK."""
+    from packages.core.ai.runtime import runtime_is_byok_call_active
+
+    return runtime_is_byok_call_active() or _usage_is_byok(usage or {})
+
+
+def chat_llm_usage_to_credits(usage: dict) -> int:
+    """Convert normalized chat usage with the same pricing path as the ledger."""
+    if not usage:
+        return 0
+
+    try:
+        reported_cost = float(usage.get("cost_usd") or 0)
+    except (TypeError, ValueError):
+        reported_cost = 0.0
+    if reported_cost > 0:
+        try:
+            import math
+
+            from packages.core.services.billing_service import AI_MARGIN, CREDITS_PER_USD
+
+            return max(1, math.ceil(reported_cost * (1 + AI_MARGIN) * CREDITS_PER_USD))
+        except Exception:
+            logger.debug("Failed to convert chat LLM cost to credits", exc_info=True)
+
+    try:
+        from packages.core.services.billing_service import tokens_to_credits
+
+        return int(tokens_to_credits(
+            int(usage.get("prompt") or usage.get("prompt_tokens") or 0),
+            int(usage.get("completion") or usage.get("completion_tokens") or 0),
+            str(usage.get("model") or "") or None,
+            pricing_source=str(usage.get("pricing_source") or usage.get("llm_pricing_source") or ""),
+            provider=str(usage.get("provider") or ""),
+            cache_read_tokens=int(usage.get("cache_read") or usage.get("cache_read_input_tokens") or 0),
+            cache_creation_tokens=int(
+                usage.get("cache_creation") or usage.get("cache_creation_input_tokens") or 0
+            ),
+            audio_input_tokens=int(usage.get("audio_in") or usage.get("audio_input_tokens") or 0),
+            audio_output_tokens=int(usage.get("audio_out") or usage.get("audio_output_tokens") or 0),
+        ))
+    except Exception:
+        logger.debug("Failed to estimate chat LLM usage credits", exc_info=True)
+        return 0
+
+
 async def _token_usage_has_context_breakdown(db: AsyncSession) -> bool:
     global _token_usage_context_breakdown_exists
     if _token_usage_context_breakdown_exists is not None:
@@ -336,6 +383,8 @@ async def record_llm_usage(
     duration_ms: int = 0,
     rounds: int | None = None,
     source: str = "chat",
+    operation_id: str | None = None,
+    strict: bool = False,
 ) -> None:
     """Record LLM usage in one call: token log + billing + AI budget.
 
@@ -344,7 +393,9 @@ async def record_llm_usage(
     and (optionally) ``provider`` — captured at auto-record time so
     fallback routing is visible in slice-by-provider reports.
 
-    Best-effort — failures are logged, never raised.
+    Best-effort by default — failures are logged, never raised. Callers that
+    need a durable provider settlement can use ``strict=True`` and commit the
+    resulting transaction themselves.
     """
     prompt_tokens = int(usage.get("prompt_tokens") or usage.get("prompt") or 0)
     completion_tokens = int(usage.get("completion_tokens") or usage.get("completion") or 0)
@@ -433,6 +484,8 @@ async def record_llm_usage(
         )
     except Exception:
         logger.warning("record_llm_usage: token log failed", exc_info=True)
+        if strict:
+            raise
         await db.rollback()
 
     # 2. Credit billing (model-aware pricing)
@@ -451,6 +504,7 @@ async def record_llm_usage(
                 workspace_id=workspace_id,
                 agent_id=agent_id, user_id=user_id,
                 conversation_id=conversation_id,
+                operation_id=operation_id,
                 cache_read_tokens=cache_read,
                 cache_creation_tokens=cache_creation,
                 audio_input_tokens=audio_in,
@@ -491,6 +545,8 @@ async def record_llm_usage(
             await record_ai_cost(db, entity_id, provider_cost, model_name)
     except Exception:
         logger.warning("record_llm_usage: billing failed", exc_info=True)
+        if strict:
+            raise
 
 
 async def record_chat_llm_usage(
@@ -505,6 +561,8 @@ async def record_chat_llm_usage(
     duration_ms: int | None = None,
     fallback_model: str | None = None,
     rounds: int | None = None,
+    operation_id: str | None = None,
+    strict: bool = False,
 ) -> None:
     """Best-effort chat LLM usage persistence with chat-specific metadata."""
 
@@ -543,9 +601,53 @@ async def record_chat_llm_usage(
             duration_ms=duration_ms or 0,
             rounds=rounds,
             source=RUNTIME_CHAT_SOURCE,
+            operation_id=operation_id,
+            strict=strict,
         )
     except Exception:
         logger.warning("record_chat_llm_usage: failed", exc_info=True)
+        if strict:
+            raise
+
+
+async def settle_chat_llm_call_usage(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    source_id: str,
+    user_id: str | None,
+    agent_id: str | None,
+    workspace_id: str | None,
+    conversation_id: str | None,
+    usage: dict,
+    duration_ms: int,
+    consumed_credits: int | None = None,
+) -> None:
+    """Write one completed chat LLM call and consume its durable reservation.
+
+    The caller must commit this transaction. If it fails, the separately
+    committed active reservation continues to block further billable work.
+    """
+    from packages.core.services.credit_reservations import consume_reservation_by_source
+
+    await record_chat_llm_usage(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        usage=usage,
+        duration_ms=duration_ms,
+        operation_id=source_id,
+        strict=True,
+    )
+    await consume_reservation_by_source(
+        db,
+        source_kind="chat_llm_call",
+        source_id=source_id,
+        consumed_credits=consumed_credits,
+    )
 
 
 # ── Tool-call logging ────────────────────────────────────────────────

@@ -3,6 +3,7 @@ export interface PendingChatRetry {
   conversationId?: string;
   documentIds?: string[];
   agentId?: string;
+  localWorkerId?: string;
   workspaceId?: string;
   manualSkillIds?: string[];
   chatMode?: string;

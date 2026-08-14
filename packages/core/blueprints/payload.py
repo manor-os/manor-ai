@@ -21,7 +21,7 @@ v1.1 shape (5 sections — see the reference comment block at the bottom):
   recipe     how the workspace runs (operating_model, strategist,
              prompts, subscriptions, scheduled_jobs, workflows, goals,
              task_categories, custom_fields, sla_policies,
-             escalation_rules)
+             escalation_rules, simulation_experience)
   policy     governance + post-install checks + expected baseline
 
 Backward compat: v1.0 payloads (flat top-level title/workspace/
@@ -42,13 +42,23 @@ What ``validate_payload`` enforces:
   * strategist.business_model.model_type is a known enum
   * strategist.evaluation_rubric.weights sum to 1.0
   * governance never_allow and auto_approve don't overlap
+  * simulation_experience artifacts are safe, portable, and explicitly typed
 
 Versioning: bump ``BLUEPRINT_VERSION`` on a breaking change and add a
 per-version migrator. Minor / additive changes don't bump the version.
 """
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from typing import Any
+
+from packages.core.blueprints.simulation import (
+    SIMULATION_ACTION_KINDS,
+    SIMULATION_ARTIFACT_KINDS,
+    SIMULATION_EXPERIENCE_VERSION,
+    SIMULATION_STAGE_AUTHORS,
+    SIMULATION_STAGE_KINDS,
+)
 
 BLUEPRINT_VERSION = "1.1"
 
@@ -224,7 +234,8 @@ def _migrate_v10_to_v11(p: dict[str, Any]) -> dict[str, Any]:
     All v1.1-new sections (variables, requires, embedded.skills/agents,
     strategist, workflows, task_categories, sla_policies,
     escalation_rules, post_install_checks, expected_baseline) become
-    empty/null. The installer treats them as optional.
+    empty/null. Proposal-generated Task instances and task templates are
+    runtime concerns and are never migrated into a Blueprint.
     """
     ws = p.get("workspace") if isinstance(p.get("workspace"), dict) else {}
 
@@ -306,6 +317,7 @@ def _migrate_v10_to_v11(p: dict[str, Any]) -> dict[str, Any]:
             "subscriptions": list(p.get("subscriptions") or []),
             "scheduled_jobs": list(p.get("scheduled_jobs") or []),
             "workflows": [],
+            "stats": list(p.get("stats") or []),
             "goals": list(p.get("goals") or []),
             "task_categories": [],
             "custom_fields": list(p.get("custom_fields") or []),
@@ -333,6 +345,7 @@ _LIST_PATHS = (
     ("recipe", "subscriptions"),
     ("recipe", "scheduled_jobs"),
     ("recipe", "workflows"),
+    ("recipe", "stats"),
     ("recipe", "goals"),
     ("recipe", "task_categories"),
     ("recipe", "custom_fields"),
@@ -340,6 +353,51 @@ _LIST_PATHS = (
     ("recipe", "escalation_rules"),
     ("policy", "post_install_checks"),
 )
+
+
+def _validate_task_policy_sections(recipe: dict[str, Any]) -> None:
+    """Reject entity-shared task policy and validate descriptive rules.
+
+    Categories and SLA rows have entity scope rather than Workspace ownership,
+    so Blueprint installation cannot safely create or update them. A rule with
+    an SLA reference is likewise executable entity policy and is rejected. A
+    condition-only rule is retained as operating guidance and never materialized
+    as a ``TaskEscalationRule`` row.
+    """
+    for section in ("task_categories", "sla_policies"):
+        values = recipe.get(section) or []
+        if values:
+            raise PayloadError(
+                f"recipe.{section} is not portable; task policy is entity-scoped"
+            )
+
+    for index, rule in enumerate(recipe.get("escalation_rules") or []):
+        if not isinstance(rule, dict):
+            raise PayloadError(f"recipe.escalation_rules[{index}] must be an object")
+        if str(rule.get("sla_policy_key") or rule.get("sla_key") or "").strip():
+            raise PayloadError(
+                f"recipe.escalation_rules[{index}] is not portable; "
+                "SLA-linked rules are entity-scoped"
+            )
+        if not str(rule.get("key") or rule.get("slug") or "").strip():
+            raise PayloadError(f"recipe.escalation_rules[{index}] requires key")
+        if not str(rule.get("action") or rule.get("action_type") or "").strip():
+            raise PayloadError(f"recipe.escalation_rules[{index}] requires action")
+        if not str(rule.get("condition") or "").strip():
+            raise PayloadError(
+                f"recipe.escalation_rules[{index}] requires condition"
+            )
+        if rule.get("notify_user_ids"):
+            raise PayloadError(
+                f"recipe.escalation_rules[{index}].notify_user_ids is not portable; "
+                "resolve target users in the runtime entity"
+            )
+
+
+def _validate_prompts(recipe: dict[str, Any]) -> None:
+    for index, prompt in enumerate(recipe.get("prompts") or []):
+        if not isinstance(prompt, dict):
+            raise PayloadError(f"recipe.prompts[{index}] must be an object")
 
 
 def _validate_v11(p: dict[str, Any]) -> None:
@@ -355,6 +413,15 @@ def _validate_v11(p: dict[str, Any]) -> None:
     embedded = p["embedded"]
     recipe = p["recipe"]
     policy = p["policy"]
+
+    # Proposal/Strategist creates concrete Task rows at runtime. A template
+    # payload would introduce a competing task-generation path and cannot
+    # reproduce the business-context-dependent proposal, so fail closed.
+    if recipe.get("task_templates"):
+        raise PayloadError(
+            "recipe.task_templates is not portable; Proposal generates Task "
+            "instances at runtime"
+        )
 
     # 2) blueprint_version must match (we don't roundtrip "1.0" — it
     #    should have been migrated already).
@@ -380,6 +447,9 @@ def _validate_v11(p: dict[str, Any]) -> None:
                 f"payload.{'.'.join(path)} must be an array "
                 f"(got {type(node).__name__})"
             )
+
+    _validate_prompts(recipe)
+    _validate_task_policy_sections(recipe)
 
     # 4) embedded.agents[].tool_bindings ⊆ contract.requires.tools
     declared_tools = set(
@@ -455,6 +525,28 @@ def _validate_v11(p: dict[str, Any]) -> None:
                     f"knowledge_pack {kp.get('slug')!r}: starter_documents "
                     f"must be .md files only (got {path!r})"
                 )
+            template = d.get("template")
+            if template is None:
+                continue
+            if not isinstance(template, dict):
+                raise PayloadError(
+                    f"knowledge_pack {kp.get('slug')!r}: starter document "
+                    f"template must be an object (got {type(template).__name__})"
+                )
+            template_id = str(template.get("id") or "").strip()
+            mode = str(template.get("mode") or "").strip()
+            renderer = str(template.get("renderer") or "").strip()
+            version = template.get("version")
+            if not template_id or mode != "live_projection" or not renderer:
+                raise PayloadError(
+                    f"knowledge_pack {kp.get('slug')!r}: live Knowledge "
+                    "template requires id, mode='live_projection', and renderer"
+                )
+            if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+                raise PayloadError(
+                    f"knowledge_pack {kp.get('slug')!r}: live Knowledge "
+                    "template version must be a positive integer"
+                )
 
     # 9) strategist.business_model.model_type enum.
     strategist = recipe.get("strategist")
@@ -498,7 +590,13 @@ def _validate_v11(p: dict[str, Any]) -> None:
                 f"auto_approve_actions overlap: {sorted(overlap)}"
             )
 
-    # 12) Belt-and-suspenders forbidden-key scan on the migrated tree.
+    # 12) Optional Blueprint-owned simulation experience. Older payloads may
+    #     omit it; exporter and installer materialise a deterministic fallback.
+    experience = recipe.get("simulation_experience")
+    if experience is not None:
+        _validate_simulation_experience(experience)
+
+    # 13) Belt-and-suspenders forbidden-key scan on the migrated tree.
     #     The pre-migration scan in validate_payload catches v1.0 leaks;
     #     this one catches a hand-authored v1.1 payload with bad keys.
     leaked = _scan_forbidden_keys(p)
@@ -507,6 +605,126 @@ def _validate_v11(p: dict[str, Any]) -> None:
             f"payload contains forbidden field names "
             f"(would leak credentials): {sorted(leaked)}"
         )
+
+
+def _validate_simulation_experience(experience: Any) -> None:
+    if not isinstance(experience, dict):
+        raise PayloadError("recipe.simulation_experience must be an object")
+    if experience.get("schema_version") != SIMULATION_EXPERIENCE_VERSION:
+        raise PayloadError(
+            "recipe.simulation_experience.schema_version must be "
+            f"{SIMULATION_EXPERIENCE_VERSION!r}"
+        )
+    for field in ("title", "sample_prompt", "completion_summary"):
+        value = experience.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise PayloadError(
+                f"recipe.simulation_experience.{field} must be a non-empty string"
+            )
+
+    artifacts = experience.get("artifacts")
+    if not isinstance(artifacts, list) or not (1 <= len(artifacts) <= 8):
+        raise PayloadError(
+            "recipe.simulation_experience.artifacts must contain 1 to 8 artifacts"
+        )
+    seen_ids: set[str] = set()
+    for index, artifact in enumerate(artifacts):
+        path = f"recipe.simulation_experience.artifacts[{index}]"
+        if not isinstance(artifact, dict):
+            raise PayloadError(f"{path} must be an object")
+        for field in ("id", "kind", "title", "filename", "mime_type"):
+            value = artifact.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise PayloadError(f"{path}.{field} must be a non-empty string")
+        artifact_id = artifact["id"].strip()
+        if artifact_id in seen_ids:
+            raise PayloadError(f"{path}.id must be unique (got {artifact_id!r})")
+        seen_ids.add(artifact_id)
+        if artifact["kind"] not in SIMULATION_ARTIFACT_KINDS:
+            raise PayloadError(
+                f"{path}.kind must be one of {sorted(SIMULATION_ARTIFACT_KINDS)}"
+            )
+
+        filename = artifact["filename"].strip()
+        if (
+            PurePosixPath(filename).name != filename
+            or filename in {".", ".."}
+            or "\\" in filename
+        ):
+            raise PayloadError(f"{path}.filename must be a safe filename, not a path")
+        mime_type = artifact["mime_type"].strip().lower()
+        if artifact["kind"] == "video" and not mime_type.startswith("video/"):
+            raise PayloadError(f"{path}.mime_type must be video/* for video artifacts")
+        if artifact["kind"] == "image" and not mime_type.startswith("image/"):
+            raise PayloadError(f"{path}.mime_type must be image/* for image artifacts")
+        preview_url = artifact.get("preview_url")
+        if preview_url is not None and (
+            not isinstance(preview_url, str)
+            or not preview_url.startswith("/assets/")
+            or ".." in preview_url
+        ):
+            raise PayloadError(
+                f"{path}.preview_url must be a local /assets/ path"
+            )
+        duration = artifact.get("duration_seconds")
+        if duration is not None and (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not (0 < duration <= 3600)
+        ):
+            raise PayloadError(f"{path}.duration_seconds must be between 0 and 3600")
+
+    stages = experience.get("stages")
+    if stages is None:
+        # Additive backwards compatibility: authored v1.0 experiences created
+        # before the persisted runtime shipped are enriched by
+        # resolve_simulation_experience() during export/install/start.
+        return
+    if not isinstance(stages, list) or not (1 <= len(stages) <= 30):
+        raise PayloadError(
+            "recipe.simulation_experience.stages must contain 1 to 30 stages"
+        )
+    seen_stage_ids: set[str] = set()
+    for index, stage in enumerate(stages):
+        path = f"recipe.simulation_experience.stages[{index}]"
+        if not isinstance(stage, dict):
+            raise PayloadError(f"{path} must be an object")
+        for field in ("id", "kind", "title", "author", "body"):
+            value = stage.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise PayloadError(f"{path}.{field} must be a non-empty string")
+        stage_id = stage["id"].strip()
+        if stage_id in seen_stage_ids:
+            raise PayloadError(f"{path}.id must be unique (got {stage_id!r})")
+        seen_stage_ids.add(stage_id)
+        if stage["kind"] not in SIMULATION_STAGE_KINDS:
+            raise PayloadError(
+                f"{path}.kind must be one of {sorted(SIMULATION_STAGE_KINDS)}"
+            )
+        if stage["author"] not in SIMULATION_STAGE_AUTHORS:
+            raise PayloadError(
+                f"{path}.author must be one of {sorted(SIMULATION_STAGE_AUTHORS)}"
+            )
+        action = stage.get("pending_action")
+        if action is not None:
+            if not isinstance(action, dict):
+                raise PayloadError(f"{path}.pending_action must be an object")
+            action_kind = action.get("kind")
+            if action_kind not in SIMULATION_ACTION_KINDS:
+                raise PayloadError(
+                    f"{path}.pending_action.kind must be one of "
+                    f"{sorted(SIMULATION_ACTION_KINDS)}"
+                )
+        artifact_ids = stage.get("artifact_ids")
+        if artifact_ids is not None:
+            if (
+                not isinstance(artifact_ids, list)
+                or not artifact_ids
+                or any(not isinstance(item, str) or item not in seen_ids for item in artifact_ids)
+            ):
+                raise PayloadError(
+                    f"{path}.artifact_ids must reference declared artifacts"
+                )
 
 
 # ── Forbidden key scanner ─────────────────────────────────────────────

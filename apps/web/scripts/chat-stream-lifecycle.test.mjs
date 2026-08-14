@@ -71,6 +71,59 @@ async function runStream(frames) {
   return { messages, result, currentConvId };
 }
 
+async function runResponse(response, signal) {
+  let messages = [
+    { role: "user", content: "List documents" },
+    { role: "assistant", content: "" },
+  ];
+  let currentConvId;
+  const result = await processSSEStream(
+    response,
+    {
+      setMessages(updater) {
+        messages = typeof updater === "function" ? updater(messages) : updater;
+      },
+      setCurrentConvId(updater) {
+        currentConvId =
+          typeof updater === "function" ? updater(currentConvId) : updater;
+      },
+    },
+    undefined,
+    signal,
+  );
+  return { messages, result, currentConvId };
+}
+
+function openResponseWithDelayedTerminalFrame(frames, delayMs = 220) {
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(frames[0]));
+      setTimeout(() => {
+        controller.enqueue(new TextEncoder().encode(frames.slice(1).join("")));
+      }, delayMs);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return {
+    response: new Response(body),
+    wasCancelled: () => cancelled,
+  };
+}
+
+async function resolveBeforeTimeout(promise, controller, timeoutMs = 1200) {
+  const completed = await Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+  ]);
+  if (completed !== null) return completed;
+  controller.abort();
+  await promise;
+  assert.fail("stream_end must finish the chat stream without waiting for the connection to close");
+}
+
 const lifecycleFrames = [
   sseFrame("stream_start", {
     conversation_id: "conv_1",
@@ -227,6 +280,48 @@ assert.deepEqual(
   guardedAssistant.tool_calls || [],
   [],
   "events tagged with another conversation/message should not add tool calls to this turn",
+);
+
+const terminalFrames = [
+  sseFrame("stream_start", {
+    conversation_id: "conv_terminal",
+    message_id: "msg_terminal",
+  }) + sseFrame("tool_start", {
+    tool_call: {
+      name: "invoke_skill",
+      status: "pending",
+      arguments: { skill: "chrome" },
+    },
+  }),
+  sseFrame("summary_start", {}) +
+    sseFrame("text_delta", { content: "Finished checking the workspace." }) +
+    sseFrame("stream_end", {
+      conversation_id: "conv_terminal",
+      message_id: "msg_terminal",
+      persisted: true,
+    }),
+];
+const openTerminalResponse = openResponseWithDelayedTerminalFrame(terminalFrames);
+const terminalAbortController = new AbortController();
+const terminalStream = runResponse(
+  openTerminalResponse.response,
+  terminalAbortController.signal,
+);
+const terminalRun = await resolveBeforeTimeout(
+  terminalStream,
+  terminalAbortController,
+);
+const terminalAssistant = terminalRun.messages.at(-1);
+
+assert.equal(
+  terminalAssistant.tool_calls?.[0]?.status,
+  "success",
+  "stream_end should settle a visible tool that did not receive a separate tool_end",
+);
+assert.equal(
+  openTerminalResponse.wasCancelled(),
+  true,
+  "stream_end should close the remaining SSE connection",
 );
 
 console.log("chat stream lifecycle checks passed");

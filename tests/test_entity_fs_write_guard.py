@@ -377,18 +377,24 @@ async def test_task_attachment_requires_persistent_mount_in_cloud(fs_settings, m
 
 
 @pytest.mark.asyncio
-async def test_avatar_upload_requires_persistent_mount_in_cloud(fs_settings):
+async def test_avatar_upload_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
     from fastapi import HTTPException
     from apps.api.routers import auth
+    from packages.core.services import upload_security
 
     fs_settings.DEPLOYMENT_MODE = "cloud"
+
+    async def accept_valid_upload(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(upload_security, "inspect_upload_content", accept_valid_upload)
 
     class FakeUpload:
         filename = "avatar.png"
         content_type = "image/png"
 
         async def read(self):
-            return b"image-bytes"
+            return b"\x89PNG\r\n\x1a\nimage-bytes"
 
     class FakeDB:
         flushed = False

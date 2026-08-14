@@ -70,6 +70,23 @@ async def dependency_status(
         )
     )).all())
     statuses = {task_id: status for task_id, status in rows}
+    if rows:
+        # A completed retry plan can race with or predate the task status
+        # projection. Reconcile each found predecessor before applying the
+        # dependency gate so dependents do not remain blocked by stale status.
+        from packages.core.services.task_execution_reconcile import (
+            reconcile_task_from_latest_completed_plan,
+        )
+
+        tasks = list((await db.execute(
+            select(Task).where(
+                Task.entity_id == entity_id,
+                Task.id.in_(statuses),
+            )
+        )).scalars().all())
+        for task in tasks:
+            await reconcile_task_from_latest_completed_plan(db, task)
+        statuses = {task.id: task.status for task in tasks}
     if any(dep_id not in statuses for dep_id in dep_ids):
         return "blocked", statuses
     if any(statuses.get(dep_id) in {"failed", "cancelled"} for dep_id in dep_ids):
@@ -260,7 +277,7 @@ def _output_summary(actual: dict[str, Any]) -> str:
             if text:
                 bits.append(str(text))
         if bits:
-            return "\n".join(bits)[:1200]
+            return "\n".join(bits)[:4000]
     return ""
 
 

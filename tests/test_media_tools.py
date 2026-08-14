@@ -13,6 +13,8 @@ def test_media_tools_registered():
         "wait_media_jobs",
         "merge_videos",
         "align_subtitles",
+        "build_narration_timeline",
+        "prepare_narration_timeline",
         "normalize_audio_loudness",
         "compose_video_timeline",
         "probe_media",
@@ -65,6 +67,827 @@ def test_align_subtitles_accepts_canonical_transcript_and_audio_sources():
 
     assert "transcript_path" in props
     assert "audio_path" in props
+
+
+def test_build_narration_timeline_requires_canonical_transcript_and_segments():
+    schemas = {
+        schema["function"]["name"]: schema["function"]["parameters"]
+        for schema, _handler in media_tools.get_tools()
+    }
+
+    schema = schemas["build_narration_timeline"]
+
+    assert schema["required"] == ["transcript_path", "segments"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["segments"]["minItems"] == 1
+    assert schema["properties"]["segments"]["items"]["required"] == ["audio_path"]
+    assert schema["properties"]["segments"]["items"]["properties"][
+        "start_seconds"
+    ]["minimum"] == 0
+    assert schema["properties"]["block_durations_seconds"]["minItems"] == 1
+    assert schema["properties"]["minimum_block_fill_ratio"]["default"] == 0.72
+    assert schema["properties"]["maximum_block_fill_ratio"]["default"] == 0.9
+
+
+def test_narration_segment_cue_bounds_use_decoded_duration_and_silence():
+    start, end = media_tools._narration_segment_cue_bounds(
+        duration_seconds=2.5,
+        leading_silence_seconds=0.3,
+        trailing_silence_seconds=0.2,
+        padding_seconds=0.08,
+    )
+
+    assert start == pytest.approx(0.22)
+    assert end == pytest.approx(2.38)
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_writes_measured_cues_without_stt(monkeypatch, tmp_path):
+    (tmp_path / "narration-script.txt").write_text(
+        "First line. Second line.", encoding="utf-8"
+    )
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+    (tmp_path / "line-2.wav").write_bytes(b"RIFF-second")
+
+    async def fake_probe(_ffprobe, path):
+        return {"duration_seconds": 2.5 if path.endswith("line-1.wav") else 1.5}
+
+    async def fake_run(args, *, timeout_seconds):
+        assert timeout_seconds >= 120
+        input_path = args[args.index("-i") + 1]
+        if input_path.endswith("line-1.wav"):
+            return "", "silence_start: 0\nsilence_end: 0.3\nsilence_start: 2.3\nsilence_end: 2.5\n"
+        return "", "silence_start: 0\nsilence_end: 0.1\nsilence_start: 1.1\nsilence_end: 1.5\n"
+
+    async def fake_provenance(*, audio_rel_path, transcript, **_kwargs):
+        assert audio_rel_path in {"line-1.wav", "line-2.wav"}
+        assert transcript in {"First line.", "Second line."}
+        return True
+
+    async def unexpected_stt(**_kwargs):
+        raise AssertionError("segment timing must not call STT")
+
+    async def fake_target(*, output_name, **_kwargs):
+        filename = Path(output_name).name
+        return SimpleNamespace(
+            abs_dir=str(tmp_path),
+            abs_path=str(tmp_path / filename),
+            rel_path=filename,
+            filename=filename,
+        )
+
+    def fake_write(_entity_id, rel_path, data, **_kwargs):
+        target = tmp_path / rel_path
+        target.write_bytes(data)
+        return str(target)
+
+    registered = []
+
+    async def fake_register(**kwargs):
+        registered.append(kwargs)
+        return f"doc-{len(registered)}"
+
+    async def fake_bind(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.write_entity_file_atomic",
+        fake_write,
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run)
+    monkeypatch.setattr(media_tools, "_audio_prompt_matches_transcript", fake_provenance)
+    monkeypatch.setattr(media_tools, "_transcribe_narration_audio", unexpected_stt)
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", fake_bind)
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            transcript_path="narration-script.txt",
+            segments=[
+                {"audio_path": "line-1.wav", "text": "First line."},
+                {
+                    "audio_path": "line-2.wav",
+                    "text": "Second line.",
+                    "start_seconds": 15,
+                },
+            ],
+            manifest_name="narration-manifest.json",
+            timeline_name="narration-timeline.json",
+            cues_name="subtitle-cues.json",
+            require_normalized_segments=False,
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["total_duration_seconds"] == pytest.approx(16.5)
+    assert result["cue_count"] == 2
+    assert result["timing_source"] == "measured_tts_segment_audio"
+    assert result["audio_tracks"] == [
+        {
+            "id": "narration-001",
+            "type": "narration",
+            "path": "line-1.wav",
+            "start": 0.0,
+            "end": 2.5,
+        },
+        {
+            "id": "narration-002",
+            "type": "narration",
+            "path": "line-2.wav",
+            "start": 15.0,
+            "end": 16.5,
+        },
+    ]
+    cues = json.loads((tmp_path / "subtitle-cues.json").read_text(encoding="utf-8"))
+    assert cues["cues"] == [
+        {
+            "type": "narration",
+            "text": "First line.",
+            "start": 0.22,
+            "end": 2.38,
+            "measured": True,
+            "timing_source": "measured_tts_segment_audio",
+        },
+        {
+            "type": "narration",
+            "text": "Second line.",
+            "start": 15.02,
+            "end": 16.18,
+            "measured": True,
+            "timing_source": "measured_tts_segment_audio",
+        },
+    ]
+    assert len(registered) == 3
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_rejects_segment_with_mismatched_provenance(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "narration-script.txt").write_text("Exact line.", encoding="utf-8")
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+
+    async def mismatched_provenance(**_kwargs):
+        return False
+
+    async def receipt_provenance(**_kwargs):
+        return "Different line.", "line-1.wav"
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        media_tools,
+        "_audio_prompt_matches_transcript",
+        mismatched_provenance,
+    )
+    monkeypatch.setattr(media_tools, "_audio_prompt_provenance", receipt_provenance)
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="narration-script.txt",
+            segments=[{"audio_path": "line-1.wav", "text": "Exact line."}],
+            require_normalized_segments=False,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "narration_segment_provenance_mismatch"
+    assert result["provided_text"] == "Exact line."
+    assert result["receipt_text"] == "Different line."
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_derives_text_from_audio_receipt(monkeypatch, tmp_path):
+    (tmp_path / "narration-script.txt").write_text("Receipt line.", encoding="utf-8")
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+
+    async def receipt_provenance(**_kwargs):
+        return "Receipt line.", "tts-source.wav"
+
+    async def matching_provenance(*, transcript, **_kwargs):
+        assert transcript == "Receipt line."
+        return True
+
+    async def fake_profile(**_kwargs):
+        return {
+            "version": 1,
+            "provider": "google",
+            "model": "tts",
+            "voice": "Puck",
+            "voice_instructions": "Clear.",
+        }
+
+    async def fake_probe(_ffprobe, _path):
+        return {"duration_seconds": 1.0}
+
+    async def fake_run(_args, *, timeout_seconds):
+        assert timeout_seconds >= 120
+        return "", ""
+
+    async def fake_target(*, output_name, **_kwargs):
+        filename = Path(output_name).name
+        return SimpleNamespace(
+            abs_dir=str(tmp_path),
+            abs_path=str(tmp_path / filename),
+            rel_path=filename,
+            filename=filename,
+        )
+
+    def fake_write(_entity_id, rel_path, data, **_kwargs):
+        target = tmp_path / rel_path
+        target.write_bytes(data)
+        return str(target)
+
+    async def fake_register(**_kwargs):
+        return "doc-1"
+
+    async def fake_bind(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path)
+    )
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.write_entity_file_atomic", fake_write
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_audio_prompt_provenance", receipt_provenance)
+    monkeypatch.setattr(media_tools, "_audio_prompt_matches_transcript", matching_provenance)
+    monkeypatch.setattr(media_tools, "_audio_narrator_profile", fake_profile)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run)
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", fake_bind)
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="narration-script.txt",
+            segments=[{"audio_path": "line-1.wav"}],
+            manifest_name="manifest.json",
+            timeline_name="timeline.json",
+            cues_name="cues.json",
+            require_normalized_segments=False,
+        )
+    )
+
+    assert result["status"] == "completed"
+    cues = json.loads((tmp_path / "cues.json").read_text(encoding="utf-8"))
+    assert cues["cues"][0]["text"] == "Receipt line."
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_rejects_segments_with_different_narrator_profiles(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "narration-script.txt").write_text(
+        "First line. Second line.", encoding="utf-8"
+    )
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+    (tmp_path / "line-2.wav").write_bytes(b"RIFF-second")
+
+    async def fake_provenance(**_kwargs):
+        return True
+
+    async def fake_profile(*, audio_rel_path, **_kwargs):
+        return {
+            "version": 1,
+            "provider": "google",
+            "model": "google/gemini-3.1-flash-tts-preview",
+            "voice": "Puck" if audio_rel_path.endswith("line-1.wav") else "Zephyr",
+            "voice_instructions": "Warm, deliberate delivery.",
+        }
+
+    async def fake_probe(_ffprobe, _path):
+        return {"duration_seconds": 1.0}
+
+    async def fake_run(_args, *, timeout_seconds):
+        assert timeout_seconds >= 120
+        return "", ""
+
+    async def fake_target(*, output_name, **_kwargs):
+        filename = Path(output_name).name
+        return SimpleNamespace(
+            abs_dir=str(tmp_path),
+            abs_path=str(tmp_path / filename),
+            rel_path=filename,
+            filename=filename,
+        )
+
+    def fake_write(_entity_id, rel_path, data, **_kwargs):
+        target = tmp_path / rel_path
+        target.write_bytes(data)
+        return str(target)
+
+    async def fake_register(**_kwargs):
+        return "document-1"
+
+    async def fake_bind(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.write_entity_file_atomic",
+        fake_write,
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_audio_prompt_matches_transcript", fake_provenance)
+    monkeypatch.setattr(media_tools, "_audio_narrator_profile", fake_profile, raising=False)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run)
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", fake_bind)
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="narration-script.txt",
+            segments=[
+                {"audio_path": "line-1.wav", "text": "First line."},
+                {"audio_path": "line-2.wav", "text": "Second line."},
+            ],
+            require_normalized_segments=False,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "narration_segment_profile_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_requires_duration_normalized_segments(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "narration-script.txt").write_text("Exact line.", encoding="utf-8")
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+
+    async def missing_normalization(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        media_tools,
+        "_audio_normalization_provenance",
+        missing_normalization,
+    )
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="narration-script.txt",
+            segments=[{"audio_path": "line-1.wav", "text": "Exact line."}],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "narration_segment_not_normalized"
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_rejects_unnatural_normalized_tempo(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "narration-script.txt").write_text("Exact line.", encoding="utf-8")
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+
+    async def unnatural_normalization(**_kwargs):
+        return {
+            "operation": "normalize_audio_loudness",
+            "target_duration_seconds": 2.0,
+            "tempo_factor": 3.25,
+            "narration_profile": {"voice": "Puck"},
+        }
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        media_tools,
+        "_audio_normalization_provenance",
+        unnatural_normalization,
+    )
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="narration-script.txt",
+            segments=[{"audio_path": "line-1.wav"}],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "narration_segment_tempo_out_of_range"
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_rejects_inconsistent_tempo_within_block(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "narration-script.txt").write_text("First.Second.", encoding="utf-8")
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+    (tmp_path / "line-2.wav").write_bytes(b"RIFF-second")
+
+    async def normalization(*, audio_rel_path, **_kwargs):
+        return {
+            "operation": "normalize_audio_loudness",
+            "target_duration_seconds": 6.3,
+            "tempo_factor": 1.0 if audio_rel_path == "line-1.wav" else 1.25,
+            "narration_profile": {"voice": "Puck"},
+        }
+
+    async def matching_provenance(**_kwargs):
+        return True
+
+    async def same_profile(**_kwargs):
+        return {"voice": "Puck"}
+
+    async def fake_probe(_ffprobe, _path):
+        return {"duration_seconds": 6.3}
+
+    async def fake_run(_args, *, timeout_seconds):
+        assert timeout_seconds >= 120
+        return "", ""
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_audio_normalization_provenance", normalization)
+    monkeypatch.setattr(
+        media_tools, "_audio_prompt_matches_transcript", matching_provenance
+    )
+    monkeypatch.setattr(media_tools, "_audio_narrator_profile", same_profile)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run)
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="narration-script.txt",
+            segments=[
+                {"audio_path": "line-1.wav", "text": "First.", "start_seconds": 0},
+                {"audio_path": "line-2.wav", "text": "Second."},
+            ],
+            block_durations_seconds=[15],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "narration_block_tempo_inconsistent"
+
+
+@pytest.mark.asyncio
+async def test_build_narration_timeline_rejects_underfilled_visual_block(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "narration-script.txt").write_text("Exact line.", encoding="utf-8")
+    (tmp_path / "line-1.wav").write_bytes(b"RIFF-first")
+
+    async def matching_provenance(**_kwargs):
+        return True
+
+    async def fake_probe(_ffprobe, _path):
+        return {"duration_seconds": 2.0}
+
+    async def fake_run(_args, *, timeout_seconds):
+        assert timeout_seconds >= 120
+        return "", ""
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        media_tools,
+        "_audio_prompt_matches_transcript",
+        matching_provenance,
+    )
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run)
+
+    result = json.loads(
+        await media_tools._build_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="narration-script.txt",
+            segments=[
+                {"audio_path": "line-1.wav", "text": "Exact line.", "start_seconds": 0}
+            ],
+            require_normalized_segments=False,
+            block_durations_seconds=[15],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["code"] == "narration_block_fill_out_of_range"
+
+
+def test_narration_audio_output_names_preserve_run_namespace():
+    assert media_tools._narrator_profile_audio_output_name(
+        "runs/topic/audio/normalized/segment-01.wav", "Puck"
+    ) == "runs/topic/audio/normalized/puck/segment-01.wav"
+    assert media_tools._narrator_profile_audio_output_name(
+        "runs/topic/audio/puck/segment-01.wav", "Puck"
+    ) == "runs/topic/audio/puck/segment-01.wav"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "segment_id_template",
+    ["S{index:03d}", "segment-{index:03d}"],
+)
+@pytest.mark.parametrize("source_extension", ["wav", "mp3"])
+async def test_prepare_narration_timeline_uses_one_measured_tempo_per_block(
+    monkeypatch,
+    tmp_path,
+    segment_id_template,
+    source_extension,
+):
+    (tmp_path / "technical").mkdir()
+    (tmp_path / "audio" / "puck").mkdir(parents=True)
+    (tmp_path / "technical" / "script.txt").write_text(
+        "First clause. Second clause. Third clause. Fourth clause.",
+        encoding="utf-8",
+    )
+    (tmp_path / "technical" / "segments.json").write_text(
+        json.dumps(
+            [
+                {"segment_id": segment_id_template.format(index=1), "block_id": "B01", "text": "First clause."},
+                {"segment_id": segment_id_template.format(index=2), "block_id": "B01", "text": "Second clause."},
+                {"segment_id": segment_id_template.format(index=3), "block_id": "B02", "text": "Third clause."},
+                {"segment_id": segment_id_template.format(index=4), "block_id": "B02", "text": "Fourth clause."},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for index in range(1, 5):
+        (tmp_path / "audio" / "puck" / f"segment-{index:03d}.{source_extension}").write_bytes(
+            b"RIFF"
+        )
+
+    durations = {
+        f"segment-001.{source_extension}": 4.0,
+        f"segment-002.{source_extension}": 8.0,
+        f"segment-003.{source_extension}": 3.0,
+        f"segment-004.{source_extension}": 9.0,
+    }
+    normalized_calls = []
+    timeline_calls = []
+
+    async def fake_workspace_base(**_kwargs):
+        return ""
+
+    async def matching_provenance(**_kwargs):
+        return True
+
+    async def same_profile(**_kwargs):
+        return {"voice": "Puck"}
+
+    async def fake_probe(_ffprobe, path):
+        return {"duration_seconds": durations[Path(path).name]}
+
+    async def fake_normalize(**kwargs):
+        normalized_calls.append(kwargs)
+        index = len(normalized_calls)
+        return json.dumps(
+            {
+                "status": "completed",
+                "fs_path": f"audio/normalized/puck/segment-{index:03d}.wav",
+            }
+        )
+
+    async def fake_build(**kwargs):
+        timeline_calls.append(kwargs)
+        return json.dumps(
+            {
+                "status": "completed",
+                "total_duration_seconds": 27.6,
+                "minimum_narration_fill_ratio": 0.8,
+            }
+        )
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path)
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_workspace_media_base_dir", fake_workspace_base)
+    monkeypatch.setattr(media_tools, "_audio_prompt_matches_transcript", matching_provenance)
+    monkeypatch.setattr(media_tools, "_audio_narrator_profile", same_profile)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(media_tools, "_normalize_audio_loudness_handler", fake_normalize)
+    monkeypatch.setattr(media_tools, "_build_narration_timeline_handler", fake_build)
+
+    result = json.loads(
+        await media_tools._prepare_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="technical/script.txt",
+            segment_manifest_path="technical/segments.json",
+            source_audio_directory="audio",
+            normalized_output_directory="audio/normalized",
+            block_durations_seconds=[15, 15],
+            timeline_name="technical/timeline.json",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["source_segment_count"] == 4
+    assert result["normalized_segment_count"] == 4
+    assert result["block_tempo_factors"] == {"B01": pytest.approx(12 / 12.6), "B02": pytest.approx(12 / 12.6)}
+    assert result["block_occupancy_ratios"] == {"B01": 0.84, "B02": 0.84}
+    first_targets = [
+        call["target_duration_seconds"] for call in normalized_calls[:2]
+    ]
+    assert first_targets == pytest.approx([4.2, 8.4])
+    assert first_targets[1] / first_targets[0] == pytest.approx(2.0)
+    assert timeline_calls[0]["segments"] == [
+        {"audio_path": "audio/normalized/puck/segment-001.wav", "start_seconds": 0.0},
+        {"audio_path": "audio/normalized/puck/segment-002.wav"},
+        {"audio_path": "audio/normalized/puck/segment-003.wav", "start_seconds": 15.0},
+        {"audio_path": "audio/normalized/puck/segment-004.wav"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_narration_timeline_adapts_fill_before_slowing_below_natural_tempo(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "technical").mkdir()
+    (tmp_path / "audio" / "alloy").mkdir(parents=True)
+    (tmp_path / "technical" / "script.txt").write_text("A short natural clause.", encoding="utf-8")
+    (tmp_path / "technical" / "segments.json").write_text(
+        json.dumps([{"segment_id": "segment-001", "block_id": "B01", "text": "A short natural clause."}]),
+        encoding="utf-8",
+    )
+    (tmp_path / "audio" / "alloy" / "segment-001.mp3").write_bytes(b"ID3")
+    normalized_calls = []
+
+    async def fake_workspace_base(**_kwargs):
+        return ""
+
+    async def matching_provenance(**_kwargs):
+        return True
+
+    async def same_profile(**_kwargs):
+        return {"voice": "Alloy"}
+
+    async def fake_probe(_ffprobe, _path):
+        return {"duration_seconds": 3.0}
+
+    async def fake_normalize(**kwargs):
+        normalized_calls.append(kwargs)
+        return json.dumps({"status": "completed", "fs_path": "audio/normalized/segment-001.wav"})
+
+    async def fake_build(**_kwargs):
+        return json.dumps({"status": "completed", "minimum_narration_fill_ratio": 0.8})
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_workspace_media_base_dir", fake_workspace_base)
+    monkeypatch.setattr(media_tools, "_audio_prompt_matches_transcript", matching_provenance)
+    monkeypatch.setattr(media_tools, "_audio_narrator_profile", same_profile)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(media_tools, "_normalize_audio_loudness_handler", fake_normalize)
+    monkeypatch.setattr(media_tools, "_build_narration_timeline_handler", fake_build)
+
+    result = json.loads(
+        await media_tools._prepare_narration_timeline_handler(
+            entity_id="entity-1",
+            transcript_path="technical/script.txt",
+            segment_manifest_path="technical/segments.json",
+            source_audio_directory="audio",
+            normalized_output_directory="audio/normalized",
+            block_durations_seconds=[5],
+            occupancy_ratio=0.84,
+            minimum_block_fill_ratio=0.72,
+            maximum_block_fill_ratio=0.9,
+            timeline_name="technical/timeline.json",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["block_occupancy_ratios"] == {"B01": 0.8}
+    assert result["block_tempo_factors"] == {"B01": 0.75}
+    assert normalized_calls[0]["target_duration_seconds"] == pytest.approx(4.0)
+
+
+@pytest.mark.asyncio
+async def test_align_subtitles_renders_measured_tts_segment_cues_without_stt(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "subtitle-cues.json").write_text(
+        json.dumps(
+            {
+                "cues": [
+                    {
+                        "type": "narration",
+                        "text": "First line.",
+                        "start": 0.22,
+                        "end": 2.38,
+                        "measured": True,
+                        "timing_source": "measured_tts_segment_audio",
+                    },
+                    {
+                        "type": "narration",
+                        "text": "Second line.",
+                        "start": 2.52,
+                        "end": 3.68,
+                        "measured": True,
+                        "timing_source": "measured_tts_segment_audio",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "narration-script.txt").write_text(
+        "First line. Second line.", encoding="utf-8"
+    )
+    output_path = tmp_path / "subtitles.ass"
+
+    async def unexpected_stt(**_kwargs):
+        raise AssertionError("measured TTS segment cues must not call STT")
+
+    async def fake_target(**_kwargs):
+        return SimpleNamespace(
+            abs_dir=str(tmp_path),
+            abs_path=str(output_path),
+            rel_path="subtitles.ass",
+            filename="subtitles.ass",
+        )
+
+    def fake_write(_entity_id, _rel_path, data, **_kwargs):
+        output_path.write_bytes(data)
+        return str(output_path)
+
+    async def fake_register(**_kwargs):
+        return "doc-1"
+
+    async def fake_bind(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.write_entity_file_atomic",
+        fake_write,
+    )
+    monkeypatch.setattr(media_tools, "_transcribe_narration_audio", unexpected_stt)
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", fake_bind)
+
+    result = json.loads(
+        await media_tools._align_subtitles_handler(
+            entity_id="entity-1",
+            cues_path="subtitle-cues.json",
+            transcript_path="narration-script.txt",
+            output_name="subtitles.ass",
+            format="ass",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["transcript_matches"] is True
+    assert result["alignment_metrics"]["measured_timestamps"] is True
+    assert result["alignment_metrics"]["transcription_model"] == "tts_segment_provenance"
+    assert result["alignment_metrics"]["timing_sources"] == [
+        "measured_tts_segment_audio"
+    ]
 
 
 def test_semantic_alignment_uses_measured_english_segment_boundaries():
@@ -1167,6 +1990,139 @@ async def test_align_subtitles_handler_uses_measured_semantic_alignment(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_measured_alignment_preserves_natural_cues_within_one_sentence(
+    monkeypatch,
+    tmp_path,
+):
+    transcript = (
+        "End the day with one finished note, one tiny next action, "
+        "and one clear surface."
+    )
+    cue_texts = [
+        "End the day with one finished note,",
+        "one tiny next action,",
+        "and one clear surface.",
+    ]
+    (tmp_path / "cues.json").write_text(
+        json.dumps(
+            {
+                "cues": [
+                    {
+                        "type": "narration",
+                        "start": index * 2,
+                        "end": (index + 1) * 2,
+                        "text": text,
+                        "estimated": True,
+                    }
+                    for index, text in enumerate(cue_texts)
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "narration.txt").write_text(transcript, encoding="utf-8")
+    (tmp_path / "narration.wav").write_bytes(b"RIFF-test-audio")
+    output_path = tmp_path / "subtitles.ass"
+
+    async def fake_probe(_ffprobe, _path):
+        return {"duration_seconds": 6.3}
+
+    async def fake_audio_transcript_match(**_kwargs):
+        return True
+
+    async def fake_transcribe_narration(**_kwargs):
+        return SimpleNamespace(
+            text=transcript,
+            duration_seconds=5.8,
+            model="groq/whisper-large-v3",
+            segments=[{"start": 0.4, "end": 5.8, "text": transcript}],
+            words=[
+                {"start": 0.4, "end": 0.7, "text": "End"},
+                {"start": 0.75, "end": 0.9, "text": "the"},
+                {"start": 0.95, "end": 1.2, "text": "day"},
+                {"start": 1.25, "end": 1.5, "text": "with"},
+                {"start": 1.55, "end": 1.75, "text": "one"},
+                {"start": 1.8, "end": 2.2, "text": "finished"},
+                {"start": 2.25, "end": 2.6, "text": "note,"},
+                {"start": 2.9, "end": 3.1, "text": "one"},
+                {"start": 3.15, "end": 3.45, "text": "tiny"},
+                {"start": 3.5, "end": 3.8, "text": "next"},
+                {"start": 3.85, "end": 4.2, "text": "action,"},
+                {"start": 4.5, "end": 4.7, "text": "and"},
+                {"start": 4.75, "end": 4.95, "text": "one"},
+                {"start": 5.0, "end": 5.35, "text": "clear"},
+                {"start": 5.4, "end": 5.8, "text": "surface."},
+            ],
+        )
+
+    async def fake_target(**_kwargs):
+        return SimpleNamespace(
+            abs_dir=str(tmp_path),
+            abs_path=str(output_path),
+            rel_path="subtitles.ass",
+            filename="subtitles.ass",
+        )
+
+    def fake_write(_entity_id, _rel_path, data, **_kwargs):
+        output_path.write_bytes(data)
+        return str(output_path)
+
+    async def fake_register(**_kwargs):
+        return "doc-1"
+
+    async def fake_bind(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.write_entity_file_atomic",
+        fake_write,
+    )
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe)
+    monkeypatch.setattr(
+        media_tools,
+        "_audio_prompt_matches_transcript",
+        fake_audio_transcript_match,
+    )
+    monkeypatch.setattr(
+        media_tools,
+        "_transcribe_narration_audio",
+        fake_transcribe_narration,
+    )
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", fake_bind)
+
+    result = json.loads(
+        await media_tools._align_subtitles_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            cues_path="cues.json",
+            transcript_path="narration.txt",
+            audio_path="narration.wav",
+            output_name="subtitles.ass",
+            format="ass",
+            max_chars_per_line=32,
+            max_lines=2,
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["cue_count"] == 3
+    assert result["alignment_metrics"]["alignment_unit"] == "subtitle_cue"
+    assert result["alignment_metrics"]["timing_sources"] == ["measured_stt_words"]
+    rendered = output_path.read_text(encoding="utf-8")
+    assert "Dialogue: 0,0:00:00.40,0:00:02.60" in rendered
+    assert "Dialogue: 0,0:00:02.90,0:00:04.20" in rendered
+    assert "Dialogue: 0,0:00:04.50,0:00:05.80" in rendered
+    assert all(text in rendered.replace(r"\N", " ") for text in cue_texts)
+
+
+@pytest.mark.asyncio
 async def test_measured_alignment_requires_timestamp_capable_stt(monkeypatch, tmp_path):
     (tmp_path / "cues.json").write_text(
         json.dumps(
@@ -1956,6 +2912,9 @@ async def test_normalize_audio_scopes_workspace_relative_input_path(monkeypatch,
     async def fake_register_file_artifact(**_kwargs):
         return "document-1"
 
+    async def fake_probe_media(_ffprobe, _path):
+        return {"duration_seconds": 3.0, "has_audio": True}
+
     async def fake_bind_artifact_to_workspace(**_kwargs):
         return None
 
@@ -1969,6 +2928,7 @@ async def test_normalize_audio_scopes_workspace_relative_input_path(monkeypatch,
         fake_workspace_base_dir,
     )
     monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe_media)
     monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register_file_artifact)
     monkeypatch.setattr(
         media_tools,
@@ -1990,6 +2950,104 @@ async def test_normalize_audio_scopes_workspace_relative_input_path(monkeypatch,
         "Product Videos/project-1/audio/narration-normalized.wav"
     )
     assert captured["input_path"] == str(physical_input)
+
+
+@pytest.mark.asyncio
+async def test_normalize_task_narration_preserves_voice_folder_and_profile(monkeypatch, tmp_path):
+    source = tmp_path / "audio" / "puck" / "segment-01.wav"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"RIFF-source-audio")
+    profile = {
+        "version": 1,
+        "provider": "google",
+        "model": "google/gemini-3.1-flash-tts-preview",
+        "voice": "Puck",
+        "voice_instructions": "Warm, deliberate delivery.",
+    }
+    captured: dict = {}
+
+    async def fake_profile(*, audio_rel_path, **_kwargs):
+        assert audio_rel_path == "audio/puck/segment-01.wav"
+        return profile
+
+    async def fake_workspace_base_dir(**_kwargs):
+        return ""
+
+    async def fake_target(*, output_name, **_kwargs):
+        captured["output_name"] = output_name
+        target = tmp_path / output_name
+        return SimpleNamespace(
+            abs_dir=str(target.parent),
+            abs_path=str(target),
+            rel_path=output_name,
+            filename=target.name,
+        )
+
+    async def fake_run_process(args, **_kwargs):
+        captured["run_count"] = captured.get("run_count", 0) + 1
+        captured["ffmpeg_args"] = args
+        output_path = Path(args[-1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"RIFF-normalized-audio")
+        return "", ""
+
+    async def fake_probe_media(_ffprobe, _path):
+        return {"duration_seconds": 6.0, "has_audio": True}
+
+    async def fake_register_file_artifact(**kwargs):
+        captured["generation"] = kwargs["generation"]
+        return "document-1"
+
+    async def fake_bind_artifact_to_workspace(**_kwargs):
+        return None
+
+    monkeypatch.setattr(media_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        "packages.core.services.entity_fs.get_entity_root",
+        lambda _entity_id: str(tmp_path),
+    )
+    monkeypatch.setattr(media_tools, "_workspace_media_base_dir", fake_workspace_base_dir)
+    monkeypatch.setattr(media_tools, "_audio_narrator_profile", fake_profile)
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
+    monkeypatch.setattr(media_tools, "_probe_media", fake_probe_media)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", fake_register_file_artifact)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", fake_bind_artifact_to_workspace)
+
+    result = json.loads(
+        await media_tools._normalize_audio_loudness_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            input_path="audio/puck/segment-01.wav",
+            output_name="normalized-segment-01.wav",
+            target_duration_seconds=4.5,
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["fs_path"] == "audio/puck/normalized-segment-01.wav"
+    assert captured["output_name"] == "audio/puck/normalized-segment-01.wav"
+    assert captured["generation"]["voice"] == "Puck"
+    assert captured["generation"]["narration_profile"] == profile
+    assert captured["generation"]["target_duration_seconds"] == 4.5
+    assert captured["generation"]["tempo_factor"] == pytest.approx(4 / 3)
+    audio_filter = captured["ffmpeg_args"][captured["ffmpeg_args"].index("-af") + 1]
+    assert "atempo=1.333333" in audio_filter
+    assert "loudnorm=" in audio_filter
+
+    blocked = json.loads(
+        await media_tools._normalize_audio_loudness_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            input_path="audio/puck/segment-01.wav",
+            output_name="normalized-segment-01.wav",
+            target_duration_seconds=1.0,
+        )
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["code"] == "narration_tempo_out_of_range"
+    assert blocked["tempo_factor"] == 6.0
+    assert captured["run_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -2021,6 +3079,7 @@ async def test_normalize_clip_replaces_provider_audio_with_silence_by_default(mo
     assert "anullsrc=channel_layout=stereo:sample_rate=48000" in args
     assert args[args.index("-map") + 1] == "0:v:0"
     assert "0:a:0" not in args
+    assert args[args.index("-t", args.index("-c:a")) + 1] == "5.000"
 
 
 @pytest.mark.asyncio
@@ -2051,6 +3110,7 @@ async def test_normalize_clip_can_preserve_source_audio_when_requested(monkeypat
     args = captured["args"]
     assert "0:a:0" in args
     assert "anullsrc=channel_layout=stereo:sample_rate=48000" not in args
+    assert args[args.index("-t", args.index("-c:a")) + 1] == "5.000"
 
 
 def test_target_dimensions_are_even_and_ratio_aware():
@@ -2470,6 +3530,93 @@ def test_loudnorm_filter_uses_broadcast_defaults_and_clamps():
 
 
 @pytest.mark.asyncio
+async def test_two_pass_loudnorm_uses_measured_values_and_preserves_video(tmp_path, monkeypatch):
+    source = tmp_path / "final.mp4"
+    source.write_bytes(b"mixed")
+    calls: list[list[str]] = []
+    peak_measurements = iter((-0.6, -1.2))
+
+    async def fake_run_process(args, *, timeout_seconds):
+        calls.append(args)
+        filter_value = args[args.index("-af") + 1] if "-af" in args else ""
+        if filter_value.startswith("loudnorm=") and "print_format=json" in filter_value:
+            return "", '''
+            {
+                "input_i" : "-12.60",
+                "input_tp" : "-0.40",
+                "input_lra" : "1.10",
+                "input_thresh" : "-22.80",
+                "target_offset" : "-1.30"
+            }
+            '''
+        if filter_value.startswith("ebur128="):
+            peak = next(peak_measurements)
+            return "", f"Summary:\n I: -14.0 LUFS\n LRA: 1.1 LU\n Peak: {peak:.1f} dBFS\n"
+        Path(args[-1]).write_bytes(b"normalized")
+        return "", ""
+
+    monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
+    await media_tools._apply_two_pass_loudnorm(
+        ffmpeg="/usr/bin/ffmpeg",
+        input_path=str(source),
+        config={"enabled": True, "target_lufs": -14, "true_peak": -1, "lra": 11},
+        total_duration=5.0,
+    )
+
+    assert source.read_bytes() == b"normalized"
+    correction = calls[1][calls[1].index("-af") + 1]
+    assert "measured_I=-12.600" in correction
+    assert "measured_TP=-0.400" in correction
+    assert "offset=-1.300" in correction
+    assert "linear=true" in correction
+    assert calls[1][calls[1].index("-c:v") + 1] == "copy"
+    assert calls[1][calls[1].index("-t") + 1] == "5.000"
+    safety_filter = calls[3][calls[3].index("-af") + 1]
+    assert safety_filter == "volume=-0.500dB"
+    assert calls[3][calls[3].index("-c:v") + 1] == "copy"
+    assert len(calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_two_pass_loudnorm_skips_safety_encode_when_encoded_peak_passes(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "final.mp4"
+    source.write_bytes(b"mixed")
+    calls: list[list[str]] = []
+
+    async def fake_run_process(args, *, timeout_seconds):
+        calls.append(args)
+        filter_value = args[args.index("-af") + 1] if "-af" in args else ""
+        if filter_value.startswith("loudnorm=") and "print_format=json" in filter_value:
+            return "", '''
+            {
+                "input_i" : "-12.60",
+                "input_tp" : "-0.40",
+                "input_lra" : "1.10",
+                "input_thresh" : "-22.80",
+                "target_offset" : "-1.30"
+            }
+            '''
+        if filter_value.startswith("ebur128="):
+            return "", "Summary:\n I: -14.0 LUFS\n LRA: 1.1 LU\n Peak: -1.1 dBFS\n"
+        Path(args[-1]).write_bytes(b"normalized")
+        return "", ""
+
+    monkeypatch.setattr(media_tools, "_run_process", fake_run_process)
+    await media_tools._apply_two_pass_loudnorm(
+        ffmpeg="/usr/bin/ffmpeg",
+        input_path=str(source),
+        config={"enabled": True, "target_lufs": -14, "true_peak": -1, "lra": 11},
+        total_duration=5.0,
+    )
+
+    assert source.read_bytes() == b"normalized"
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
 async def test_compose_video_filter_attaches_audio_input_without_empty_filter(tmp_path, monkeypatch):
     captured: dict = {}
 
@@ -2534,6 +3681,7 @@ async def test_compose_video_filter_attaches_audio_input_without_empty_filter(tm
     filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
     assert "[1:a:0]aresample=48000" in filter_complex
     assert "[1:a:0],aresample" not in filter_complex
+    assert captured["args"][captured["args"].index("-t") + 1] == "5.000"
 
 
 @pytest.mark.asyncio
@@ -4001,3 +5149,31 @@ async def test_merge_videos_accepts_single_clip_for_clean_master(tmp_path, monke
     assert captured["resolve_paths"] == ["project/clips/shot-01.mp4"]
     assert captured["input_count"] == 1
     assert captured["include_source_audio"] is False
+
+
+def test_image_response_json_surfaces_non_json_bodies():
+    from packages.core.ai.tools.extended_tools import _image_response_json
+
+    class _Resp:
+        def __init__(self, status_code, text):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            import json as _json
+
+            return _json.loads(self.text)
+
+    data, err = _image_response_json(_Resp(200, '{"ok": true}'), provider="OpenAI")
+    assert data == {"ok": True} and err == ""
+
+    # Empty body (gateway timeout) — the exact shape behind the staging
+    # "Expecting value: line 1 column 1 (char 0)" failure.
+    data, err = _image_response_json(_Resp(524, ""), provider="OpenAI")
+    assert data == {}
+    assert "HTTP 524" in err and "empty body" in err
+
+    # HTML error page from an edge proxy.
+    data, err = _image_response_json(_Resp(502, "<html>Bad gateway</html>"), provider="Google")
+    assert data == {}
+    assert "HTTP 502" in err and "<html>" in err

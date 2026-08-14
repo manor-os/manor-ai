@@ -20,7 +20,7 @@
     },
     "cover_image_url": null,
     "forked_from_id": null,
-    "changelog": "Frozen on 2026-06-03: first runnable owner-operated workspace blueprint."
+    "changelog": "Updated on 2026-08-04: workflow starter inputs now resolve from the trigger payload before downstream stages run. Frozen on 2026-06-03: first runnable owner-operated workspace blueprint."
   },
   "contract": {
     "variables": [
@@ -384,28 +384,7 @@
         "priority": 3
       }
     ],
-    "task_categories": [
-      {
-        "key": "offer",
-        "label": "Offer",
-        "sort_order": 10
-      },
-      {
-        "key": "pipeline",
-        "label": "Pipeline",
-        "sort_order": 20
-      },
-      {
-        "key": "proposal",
-        "label": "Proposal",
-        "sort_order": 30
-      },
-      {
-        "key": "finance",
-        "label": "Finance",
-        "sort_order": 40
-      }
-    ],
+    "task_categories": [],
     "custom_fields": [
       {
         "name": "lead_stage",
@@ -447,14 +426,7 @@
         "sort_order": 30
       }
     ],
-    "sla_policies": [
-      {
-        "key": "operator_review",
-        "target": "task",
-        "threshold_hours": 24,
-        "description": "Review generated assets or decisions within one workday."
-      }
-    ],
+    "sla_policies": [],
     "escalation_rules": [
       {
         "key": "public_or_financial_action",

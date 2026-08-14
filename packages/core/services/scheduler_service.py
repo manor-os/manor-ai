@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select, func, or_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import DEFAULT_AGENT_MAX_TURNS
 from packages.core.models.base import generate_ulid
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun, AgentExecution
+from packages.core.models.workflow import WorkflowBinding
 
 
 # ── Scheduled Jobs ──
@@ -86,6 +88,7 @@ async def list_scheduled_jobs(
     status: str = "all",
     agent_id: str | None = None,
     include_workflows: bool = True,
+    readable_workspace_ids: set[str] | None = None,
 ) -> tuple[list[ScheduledJob], int]:
     filters = _scheduled_job_filters(
         entity_id,
@@ -93,6 +96,7 @@ async def list_scheduled_jobs(
         search=search,
         agent_id=agent_id,
         include_workflows=include_workflows,
+        readable_workspace_ids=readable_workspace_ids,
     )
     q = select(ScheduledJob).where(*filters)
     count_q = select(func.count()).select_from(ScheduledJob).where(*filters)
@@ -128,6 +132,7 @@ async def summarize_scheduled_jobs(
     search: str | None = None,
     agent_id: str | None = None,
     include_workflows: bool = True,
+    readable_workspace_ids: set[str] | None = None,
 ) -> dict[str, int]:
     """Return list-level totals without applying the selected status tab."""
     filters = _scheduled_job_filters(
@@ -136,6 +141,7 @@ async def summarize_scheduled_jobs(
         search=search,
         agent_id=agent_id,
         include_workflows=include_workflows,
+        readable_workspace_ids=readable_workspace_ids,
     )
     count_q = select(func.count()).select_from(ScheduledJob).where(*filters)
     enabled_q = count_q.where(ScheduledJob.enabled == True)  # noqa: E712
@@ -157,10 +163,18 @@ def _scheduled_job_filters(
     search: str | None = None,
     agent_id: str | None = None,
     include_workflows: bool = True,
+    readable_workspace_ids: set[str] | None = None,
 ) -> list:
     filters = [ScheduledJob.entity_id == entity_id]
     if workspace_id:
         filters.append(ScheduledJob.workspace_id == workspace_id)
+    if readable_workspace_ids is not None:
+        filters.append(
+            or_(
+                ScheduledJob.workspace_id.is_(None),
+                ScheduledJob.workspace_id.in_(readable_workspace_ids),
+            )
+        )
     if agent_id:
         filters.append(ScheduledJob.agent_id == agent_id)
     if not include_workflows:
@@ -175,6 +189,7 @@ def _scheduled_job_filters(
         pattern = f"%{normalized_search}%"
         filters.append(
             or_(
+                ScheduledJob.id.ilike(pattern),
                 ScheduledJob.name.ilike(pattern),
                 ScheduledJob.job_id.ilike(pattern),
                 ScheduledJob.job_type.ilike(pattern),
@@ -291,6 +306,105 @@ async def toggle_scheduled_job(
     return job
 
 
+async def pause_workspace_automations(
+    db: AsyncSession,
+    workspace_id: str,
+    entity_id: str,
+) -> dict[str, int]:
+    """Pause every automation deployed into a workspace.
+
+    Manual workflow bindings are workspace attachments, not automations, so
+    they remain available. Scheduled jobs and inbound/event workflow bindings
+    are the executable automation definitions shown in the Automations UI.
+    """
+    jobs = list((await db.execute(
+        select(ScheduledJob).where(
+            ScheduledJob.entity_id == entity_id,
+            ScheduledJob.workspace_id == workspace_id,
+        )
+    )).scalars().all())
+    bindings = list((await db.execute(
+        select(WorkflowBinding).where(
+            WorkflowBinding.entity_id == entity_id,
+            WorkflowBinding.workspace_id == workspace_id,
+            WorkflowBinding.trigger_type != "manual",
+        )
+    )).scalars().all())
+
+    now = datetime.now(timezone.utc)
+    paused_jobs = 0
+    for job in jobs:
+        if job.enabled:
+            job.enabled = False
+            job.updated_at = now
+            paused_jobs += 1
+
+    paused_bindings = 0
+    for binding in bindings:
+        if binding.enabled or binding.status == "active":
+            binding.enabled = False
+            binding.status = "paused"
+            binding.updated_at = now
+            paused_bindings += 1
+
+    await db.flush()
+    if paused_jobs:
+        from packages.core.services.realtime import broadcast_job_update
+
+        await broadcast_job_update(entity_id, {
+            "workspace_id": workspace_id,
+            "enabled": False,
+            "event": "workspace_paused",
+        })
+    return {
+        "scheduled_jobs": paused_jobs,
+        "workflow_bindings": paused_bindings,
+    }
+
+
+async def delete_workspace_automations(
+    db: AsyncSession,
+    workspace_id: str,
+    entity_id: str,
+) -> dict[str, int]:
+    """Delete every automation deployed into a workspace.
+
+    Workflow definitions and manual workspace attachments are intentionally
+    retained: deleting an automation must not destroy the reusable Flow.
+    """
+    jobs = list((await db.execute(
+        select(ScheduledJob).where(
+            ScheduledJob.entity_id == entity_id,
+            ScheduledJob.workspace_id == workspace_id,
+        )
+    )).scalars().all())
+    bindings = list((await db.execute(
+        select(WorkflowBinding).where(
+            WorkflowBinding.entity_id == entity_id,
+            WorkflowBinding.workspace_id == workspace_id,
+            WorkflowBinding.trigger_type != "manual",
+        )
+    )).scalars().all())
+
+    for job in jobs:
+        await db.delete(job)
+    for binding in bindings:
+        await db.delete(binding)
+    await db.flush()
+
+    if jobs:
+        from packages.core.services.realtime import broadcast_job_update
+
+        await broadcast_job_update(entity_id, {
+            "workspace_id": workspace_id,
+            "event": "workspace_deleted",
+        })
+    return {
+        "scheduled_jobs": len(jobs),
+        "workflow_bindings": len(bindings),
+    }
+
+
 # ── Job Runs ──
 
 async def create_job_run(
@@ -304,10 +418,12 @@ async def create_job_run(
     duration_ms: float | None = None,
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
+    idempotency_key: str | None = None,
 ) -> ScheduledJobRun:
     run = ScheduledJobRun(
         id=generate_ulid(),
         job_id=job_id,
+        idempotency_key=idempotency_key,
         status=status,
         trigger_type=trigger_type,
         result=result,
@@ -319,6 +435,61 @@ async def create_job_run(
     db.add(run)
     await db.flush()
     return run
+
+
+async def claim_job_run(
+    db: AsyncSession,
+    job_id: str,
+    status: str,
+    *,
+    idempotency_key: str,
+    trigger_type: str | None = None,
+    started_at: datetime | None = None,
+) -> tuple[ScheduledJobRun, bool]:
+    """Atomically claim one scheduler occurrence.
+
+    Celery delivery is at-least-once.  The unique ``(job_id,
+    idempotency_key)`` index therefore decides whether this worker owns the
+    occurrence.  A different key always creates a different run, including
+    multiple manual or scheduled runs on the same day.
+    """
+
+    clean_key = str(idempotency_key or "").strip()
+    if not clean_key:
+        raise ValueError("idempotency_key is required when claiming a job run")
+    if len(clean_key) > 200:
+        raise ValueError("idempotency_key must be at most 200 characters")
+
+    run_id = generate_ulid()
+    statement = (
+        pg_insert(ScheduledJobRun)
+        .values(
+            id=run_id,
+            job_id=job_id,
+            idempotency_key=clean_key,
+            status=status,
+            trigger_type=trigger_type,
+            started_at=started_at,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["job_id", "idempotency_key"],
+        )
+        .returning(ScheduledJobRun.id)
+    )
+    claimed_id = (await db.execute(statement)).scalar_one_or_none()
+    if claimed_id:
+        claimed = await db.get(ScheduledJobRun, claimed_id)
+        if claimed is None:  # pragma: no cover - RETURNING row must be readable
+            raise RuntimeError("Claimed scheduled job run could not be loaded")
+        return claimed, True
+
+    existing = (await db.execute(
+        select(ScheduledJobRun).where(
+            ScheduledJobRun.job_id == job_id,
+            ScheduledJobRun.idempotency_key == clean_key,
+        )
+    )).scalar_one()
+    return existing, False
 
 
 async def list_job_runs(
@@ -369,11 +540,20 @@ async def list_agent_executions(
     entity_id: str,
     agent_id: str | None = None,
     task_id: str | None = None,
+    readable_workspace_ids: set[str] | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[AgentExecution], int]:
     q = select(AgentExecution).where(AgentExecution.entity_id == entity_id)
     count_q = select(func.count()).select_from(AgentExecution).where(AgentExecution.entity_id == entity_id)
+
+    if readable_workspace_ids is not None:
+        scope = or_(
+            AgentExecution.workspace_id.is_(None),
+            AgentExecution.workspace_id.in_(readable_workspace_ids),
+        )
+        q = q.where(scope)
+        count_q = count_q.where(scope)
 
     if agent_id:
         q = q.where(AgentExecution.agent_id == agent_id)

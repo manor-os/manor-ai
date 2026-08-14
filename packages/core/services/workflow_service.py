@@ -18,6 +18,7 @@ from packages.core.models.workflow import (
     WorkflowDefinition,
     WorkflowProject,
     WorkflowRun,
+    WorkflowTemplateInstallation,
 )
 from packages.core.models.workspace import Workspace
 from packages.core.services.workflow_run_trace import (
@@ -125,11 +126,75 @@ def require_entry_step_id(steps: list[dict] | None) -> str:
     return entry
 
 
+def workflow_service_keys(steps: list[dict] | None) -> set[str]:
+    """Collect Workspace service dependencies declared by a workflow graph.
+
+    Only executable node configs participate. This avoids treating arbitrary
+    nested input/schema dictionaries as nodes, while still covering durable
+    stage operation lists that the runner executes from the same graph.
+    """
+    keys: set[str] = set()
+
+    def visit(nodes: object) -> None:
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            config = node.get("config") if isinstance(node.get("config"), dict) else {}
+            if not str(config.get("agent_id") or "").strip():
+                key = str(config.get("service_key") or "").strip()
+                if key:
+                    keys.add(key)
+            visit(config.get("operations"))
+
+    visit(steps)
+    return keys
+
+
+async def _validate_workspace_service_dependencies(
+    db: AsyncSession,
+    *,
+    workflow: WorkflowDefinition,
+    workspace_id: str | None,
+) -> None:
+    """Fail before Run creation when a Workspace graph lacks active services."""
+    if not workspace_id:
+        return
+    required = workflow_service_keys(workflow.steps or [])
+    if not required:
+        return
+
+    from packages.core.models.workspace import AgentSubscription
+
+    rows = (await db.execute(
+        select(AgentSubscription.service_key).where(
+            AgentSubscription.entity_id == workflow.entity_id,
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.status == "active",
+            AgentSubscription.service_key.in_(required),
+        )
+    )).scalars().all()
+    missing = sorted(required - {str(value).strip() for value in rows if value})
+    if missing:
+        raise ValueError(
+            "Workflow preflight missing active Workspace services: "
+            + ", ".join(missing)
+        )
+
+
 def _required_step_config_fields(step_type: str, config: dict) -> tuple[str, ...]:
     operation = str(config.get("operation") or "").strip().lower()
     if step_type == "workflow_project":
         if operation == "create":
             return ("project_type", "schema_version", "state_schema")
+        if operation == "claim":
+            return (
+                "project_type",
+                "project_key",
+                "schema_version",
+                "state_schema",
+            )
         if operation == "get":
             return ("project_id", "project_type", "schema_version", "state_schema")
         if operation == "patch":
@@ -160,6 +225,8 @@ def _required_step_config_fields(step_type: str, config: dict) -> tuple[str, ...
         if operation not in {"", "decide"}:
             return (*required, "operation")
         return required
+    if step_type == "publication_receipt":
+        return ("receipt",)
     return ()
 
 
@@ -552,6 +619,12 @@ async def get_workflow_metadata(
         entity_id,
         workflow_id=workflow_id,
     )
+    template_sources = list((await db.execute(
+        select(WorkflowTemplateInstallation).where(
+            WorkflowTemplateInstallation.entity_id == entity_id,
+            WorkflowTemplateInstallation.workflow_id == workflow_id,
+        )
+    )).scalars().all())
     workspace_ids = sorted({
         binding.workspace_id for binding in bindings if binding.workspace_id
     })
@@ -586,6 +659,15 @@ async def get_workflow_metadata(
         "version": wf.version,
         "status": wf.status,
         "trigger_type": wf.trigger_type,
+        "template_sources": [
+            {
+                "template_id": source.template_id,
+                "component_key": source.component_key,
+                "installed_version": source.installed_version,
+                "source_type": source.source_type,
+            }
+            for source in template_sources
+        ],
         "binding_count": len(bindings),
         "workspace_count": len({
             binding.workspace_id for binding in bindings if binding.workspace_id
@@ -651,6 +733,14 @@ async def delete_workflow(db: AsyncSession, workflow_id: str, entity_id: str) ->
     wf = await get_workflow(db, workflow_id, entity_id)
     if not wf:
         return False
+    sources = list((await db.execute(
+        select(WorkflowTemplateInstallation).where(
+            WorkflowTemplateInstallation.entity_id == entity_id,
+            WorkflowTemplateInstallation.workflow_id == workflow_id,
+        )
+    )).scalars().all())
+    for source in sources:
+        await db.delete(source)
     await db.delete(wf)
     await db.flush()
     return True
@@ -974,8 +1064,30 @@ def _selected_step_targets(step: dict, result: dict | None) -> list[str]:
         if value in (None, ""):
             return []
         return [str(item) for item in (value if isinstance(value, list) else [value])]
-    value = step.get("next") or []
-    return [str(item) for item in (value if isinstance(value, list) else [value])]
+    if result is not None:
+        value = step.get("next") or []
+        return [str(item) for item in (value if isinstance(value, list) else [value])]
+
+    # A checkpoint retry can target a node beyond an intermediate condition
+    # that never persisted a result (for example, when the process restarted
+    # immediately after its producer completed).  Follow every declared branch
+    # while discovering ancestors; filtering below still inherits only steps
+    # with completed receipts.  Using only ``next`` here loses ``true_next`` in
+    # normalized graphs where ``next`` contains the fallback branch.
+    targets: list[str] = []
+    for key in ("next", "true_next", "false_next"):
+        value = step.get(key) or []
+        targets.extend(value if isinstance(value, list) else [value])
+    if step.get("type") == "switch":
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        for case in config.get("cases") or []:
+            if not isinstance(case, dict):
+                continue
+            value = case.get("next") or []
+            targets.extend(value if isinstance(value, list) else [value])
+        value = config.get("default_next") or []
+        targets.extend(value if isinstance(value, list) else [value])
+    return list(dict.fromkeys(str(item) for item in targets if item))
 
 
 def retry_inherited_step_ids(
@@ -1015,7 +1127,26 @@ def _retry_variables(
     variables: dict | None,
     retry_from_step_id: str | None = None,
 ) -> dict:
-    updated = deepcopy(prior.variables or {})
+    prior_variables = prior.variables or {}
+    updated = deepcopy(prior_variables)
+    declared_input_roots: set[str] = set()
+    for step in workflow.steps or []:
+        if step.get("type") not in {"trigger", "webhook"}:
+            continue
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        for item in config.get("run_inputs") or []:
+            if not isinstance(item, dict):
+                continue
+            target = str(item.get("target") or item.get("key") or "").strip()
+            root = target.split(".", 1)[0]
+            if root:
+                declared_input_roots.add(root)
+    preserved_input_values = {
+        root: deepcopy(prior_variables[root])
+        for root in declared_input_roots
+        if root in prior_variables
+    }
+    prior_results = prior.step_results or {}
     stage_execution = (
         updated.get("__stage_execution")
         if isinstance(updated.get("__stage_execution"), dict)
@@ -1023,13 +1154,21 @@ def _retry_variables(
     )
     retry_stage_id = str(retry_from_step_id or "").strip()
     retained_stage_state = stage_execution.get(retry_stage_id)
+    retry_stage_result = prior_results.get(retry_stage_id) or {}
+    if (
+        isinstance(retained_stage_state, dict)
+        and (
+            retry_stage_result.get("status") == "completed"
+            or retained_stage_state.get("status") == "completed"
+        )
+    ):
+        retained_stage_state = None
     if retry_stage_id and isinstance(retained_stage_state, dict):
         updated["__stage_execution"] = {
             retry_stage_id: deepcopy(retained_stage_state),
         }
     else:
         updated.pop("__stage_execution", None)
-    prior_results = prior.step_results or {}
 
     def remove_step_outputs(step: dict, result: dict | None = None) -> None:
         step_id = str(step.get("id") or "")
@@ -1061,17 +1200,58 @@ def _retry_variables(
                 if updated.get(key) == value:
                     updated.pop(key, None)
 
+    missing_output = object()
+
+    def resolve_inherited_named_output(
+        operation_id: str,
+        operation_output: object,
+        raw: object,
+    ) -> object:
+        if raw in (None, ""):
+            return operation_output
+        text = str(raw).strip()
+        if not (text.startswith("{{") and text.endswith("}}")):
+            return raw
+        parts = [part for part in text[2:-2].strip().split(".") if part]
+        if not parts:
+            return missing_output
+        if parts[0] == operation_id:
+            current = operation_output
+            parts = parts[1:]
+        elif isinstance(operation_output, dict) and parts[0] in operation_output:
+            current = operation_output
+        else:
+            current = prior_variables.get(parts[0], missing_output)
+            parts = parts[1:]
+        for part in parts:
+            if isinstance(current, dict):
+                current = current.get(part, missing_output)
+            elif isinstance(current, list) and part.isdigit():
+                index = int(part)
+                current = current[index] if index < len(current) else missing_output
+            else:
+                return missing_output
+            if current is missing_output:
+                return missing_output
+        return current
+
     for step in workflow.steps or []:
         step_id = str(step.get("id") or "")
         if not step_id or step_id in inherited_step_ids:
             continue
-        remove_step_outputs(step, prior_results.get(step_id))
+        step_result = prior_results.get(step_id)
+        if step.get("type") == "stage" and isinstance(step_result, dict):
+            step_result = {
+                key: value for key, value in step_result.items()
+                if key != "output"
+            }
+        remove_step_outputs(step, step_result)
         config = step.get("config") if isinstance(step.get("config"), dict) else {}
         if step.get("type") != "stage":
             continue
         stage_state = (
             retained_stage_state
-            if step_id == retry_stage_id and isinstance(retained_stage_state, dict)
+            if step_id == retry_stage_id
             else stage_execution.get(step_id)
         )
         operation_results = (
@@ -1087,6 +1267,7 @@ def _retry_variables(
             operation_result = operation_results.get(operation_id)
             keep_completed_retry_operation = (
                 step_id == retry_stage_id
+                and isinstance(retained_stage_state, dict)
                 and isinstance(operation_result, dict)
                 and (
                     operation_result.get("status") == "completed"
@@ -1104,7 +1285,65 @@ def _retry_variables(
         result = prior_results.get(step_id) or {}
         if output_var and result.get("status") == "completed" and "output" in result:
             updated[output_var] = deepcopy(result["output"])
+        if step.get("type") != "stage":
+            continue
+        inherited_stage_state = stage_execution.get(step_id)
+        operation_results = (
+            inherited_stage_state.get("operation_results")
+            if isinstance(inherited_stage_state, dict)
+            and isinstance(inherited_stage_state.get("operation_results"), dict)
+            else {}
+        )
+        for operation in config.get("operations") or []:
+            if not isinstance(operation, dict):
+                continue
+            operation_id = str(operation.get("id") or "")
+            operation_result = operation_results.get(operation_id) or {}
+            operation_output = prior_variables.get(operation_id, missing_output)
+            operation_completed = (
+                operation_result.get("status") == "completed"
+                or operation_result.get("continued") is True
+                or (
+                    result.get("status") == "completed"
+                    and operation_output is not missing_output
+                )
+            )
+            if not operation_completed:
+                continue
+            operation_config = (
+                operation.get("config")
+                if isinstance(operation.get("config"), dict)
+                else {}
+            )
+            if operation_output is missing_output:
+                continue
+            updated[operation_id] = deepcopy(operation_output)
+            operation_output_var = str(
+                operation_config.get("output_var") or ""
+            ).strip()
+            if operation_output_var:
+                updated[operation_output_var] = deepcopy(operation_output)
+            if operation.get("type") == "transform" and isinstance(
+                operation_output, dict
+            ):
+                for key in operation_config.get("set") or {}:
+                    if str(key) in operation_output:
+                        updated[str(key)] = deepcopy(operation_output[str(key)])
+            for item in operation_config.get("outputs") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key") or item.get("name") or "").strip()
+                if not key:
+                    continue
+                value = resolve_inherited_named_output(
+                    operation_id,
+                    operation_output,
+                    item.get("value"),
+                )
+                if value is not missing_output:
+                    updated[key] = deepcopy(value)
     updated.pop("__result", None)
+    updated.update(preserved_input_values)
     if variables:
         updated.update(deepcopy(variables))
     return updated
@@ -1264,6 +1503,9 @@ async def start_workflow(
         raise ValueError("Workflow not found")
     if not wf.is_active or wf.status != "active":
         raise ValueError("Workflow is inactive")
+    await _validate_workspace_service_dependencies(
+        db, workflow=wf, workspace_id=workspace_id,
+    )
 
     # Merge workflow-level default variables with runtime overrides
     merged_vars = dict(wf.variables or {})
@@ -1334,6 +1576,9 @@ async def start_workflow_from_binding(
     ):
         raise ValueError("Workflow binding belongs to another workspace")
     effective_workspace_id = binding.workspace_id or execution_workspace_id
+    await _validate_workspace_service_dependencies(
+        db, workflow=wf, workspace_id=effective_workspace_id,
+    )
 
     merged_vars = dict(wf.variables or {})
     merged_vars.update(binding.variables or {})
@@ -1623,7 +1868,7 @@ async def retry_workflow_run(
         prior.status == "completed"
         and business_outcome in {"needs_input", "revision_required"}
     )
-    if prior.status != "failed" and not retryable_business_outcome:
+    if prior.status not in {"failed", "cancelled"} and not retryable_business_outcome:
         raise ValueError("Workflow run is not retryable")
 
     workflow = await get_workflow(db, prior.workflow_id, entity_id)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.document import Integration
@@ -107,8 +107,10 @@ async def list_runtime_integration_accounts(
         select(OAuthAccount).where(
             OAuthAccount.user_id == user_id,
             OAuthAccount.provider.in_(aliases),
-            OAuthAccount.access_token.is_not(None),
-            OAuthAccount.access_token != "",
+            or_(
+                OAuthAccount.credential_ref.is_not(None),
+                OAuthAccount.access_token.is_not(None),
+            ),
         ).order_by(OAuthAccount.created_at.desc())
     )).scalars().all())
 

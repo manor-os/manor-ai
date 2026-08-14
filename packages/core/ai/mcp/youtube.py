@@ -6,30 +6,40 @@ config), same auth model as the gmail / google_drive modules. Tools follow
 ``mcp__youtube__{tool_name}`` naming via the MCP tool pool.
 
 Scopes used:
-  - youtube.readonly   : search, video/channel/playlist reads, comments, captions
-  - youtube.force-ssl  : post/reply/delete comments, rate, playlists, video edits
+  - youtube.force-ssl  : authenticated reads plus comments, ratings, playlists,
+                         video edits, and resumable video uploads
 
-Note on uploads: publishing a *new* video file is a resumable multipart upload
-(megabytes of media), which is out of scope for this lightweight JSON wrapper.
-The publish surface here is engagement + metadata (comments, ratings,
-playlists, video title/description/tags) — the operations an agent realistically
-drives. Use Instagram Reels (facebook module) / TikTok (tiktok module) for
-video *file* publishing from a hosted URL.
+``youtube.force-ssl`` is deliberately the only YouTube scope. It authorizes all
+of the API operations exposed here, including ``videos.insert``; requesting
+``youtube.readonly`` or ``youtube.upload`` alongside it would be redundant.
 """
 from __future__ import annotations
 
 import json
 import logging
+import mimetypes
+import os
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
+
+from packages.core.services.dashboard_http import (
+    _resolve_public_host,
+    validate_dashboard_http_url,
+)
 
 logger = logging.getLogger(__name__)
 
 _API = "https://www.googleapis.com/youtube/v3"
+_UPLOAD_API = "https://www.googleapis.com/upload/youtube/v3/videos"
 _MAX_CHARS = 12_000
 _TIMEOUT = 30.0
+_UPLOAD_TIMEOUT = httpx.Timeout(600.0, connect=15.0)
+_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # YouTube chunks must be a multiple of 256 KiB.
+_MAX_VIDEO_BYTES = 256 * 1024 * 1024 * 1024
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -274,6 +284,177 @@ async def _add_to_playlist(token: str, args: Dict) -> str:
     })
 
 
+async def _stage_video_source(source_url: str) -> tuple[Path, int, str]:
+    """Download one public HTTPS video to a temporary file without buffering
+    it in process memory.
+
+    The public-host checks and no-redirect policy keep the server-side fetch
+    from becoming an internal-network proxy. The temporary file lets the
+    subsequent YouTube upload retry by chunk while keeping memory bounded.
+    """
+    try:
+        normalized = validate_dashboard_http_url(source_url)
+    except Exception as exc:
+        raise RuntimeError(f"video_url must be a public standard-port HTTPS URL: {exc}") from exc
+
+    hostname = urlsplit(normalized).hostname or ""
+    await _resolve_public_host(hostname)
+
+    suffix = Path(urlsplit(normalized).path).suffix[:16]
+    fd, raw_path = tempfile.mkstemp(prefix="manor-youtube-", suffix=suffix)
+    os.close(fd)
+    path = Path(raw_path)
+    total = 0
+    media_type = ""
+    try:
+        async with httpx.AsyncClient(
+            timeout=_UPLOAD_TIMEOUT,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            async with client.stream(
+                "GET",
+                normalized,
+                headers={"Accept": "video/*,application/octet-stream"},
+            ) as response:
+                if response.is_redirect:
+                    raise RuntimeError("video_url redirects are not followed")
+                response.raise_for_status()
+                media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if media_type and not (
+                    media_type.startswith("video/")
+                    or media_type == "application/octet-stream"
+                ):
+                    raise RuntimeError(f"video_url returned unsupported content type: {media_type}")
+                declared = response.headers.get("content-length", "").strip()
+                if declared:
+                    try:
+                        declared_size = int(declared)
+                    except ValueError:
+                        declared_size = 0
+                    if declared_size > _MAX_VIDEO_BYTES:
+                        raise RuntimeError("video exceeds YouTube's 256 GB upload limit")
+
+                with path.open("wb") as output:
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > _MAX_VIDEO_BYTES:
+                            raise RuntimeError("video exceeds YouTube's 256 GB upload limit")
+                        output.write(chunk)
+        if total == 0:
+            raise RuntimeError("video_url returned an empty file")
+        if not media_type:
+            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return path, total, media_type
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _upload_error(response: httpx.Response) -> str:
+    if response.status_code == 401:
+        return "YouTube authentication failed. Reconnect Google/YouTube on the Integration page."
+    if response.status_code == 403:
+        return f"YouTube forbidden (quota, scope, or permissions): {response.text[:300]}"
+    return f"YouTube upload error ({response.status_code}): {response.text[:300]}"
+
+
+async def _upload_video(token: str, args: Dict) -> str:
+    """Upload a public HTTPS video with YouTube's resumable upload protocol."""
+    privacy = str(args.get("privacy", "private")).lower()
+    if privacy not in {"private", "unlisted", "public"}:
+        return "privacy must be one of: private, unlisted, public."
+
+    tags = args.get("tags")
+    if tags is not None and not isinstance(tags, list):
+        tags = [part.strip() for part in str(tags).split(",") if part.strip()]
+
+    snippet: Dict[str, Any] = {
+        "title": args["title"],
+        "description": args.get("description", ""),
+        "categoryId": str(args.get("category_id", "22")),
+    }
+    if tags:
+        snippet["tags"] = tags
+
+    status: Dict[str, Any] = {"privacyStatus": privacy}
+    if args.get("made_for_kids") is not None:
+        status["selfDeclaredMadeForKids"] = bool(args["made_for_kids"])
+    if args.get("publish_at"):
+        if privacy != "private":
+            return "publish_at requires privacy=private per the YouTube API."
+        status["publishAt"] = args["publish_at"]
+
+    path: Path | None = None
+    try:
+        path, size, media_type = await _stage_video_source(args["video_url"])
+        params = {
+            "uploadType": "resumable",
+            "part": "snippet,status",
+            "notifySubscribers": str(bool(args.get("notify_subscribers", False))).lower(),
+        }
+        init_url = f"{_UPLOAD_API}?{urlencode(params)}"
+        auth_headers = {"Authorization": f"Bearer {token}"}
+
+        async with httpx.AsyncClient(timeout=_UPLOAD_TIMEOUT) as client:
+            init_response = await client.request(
+                "POST",
+                init_url,
+                headers={
+                    **auth_headers,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json; charset=UTF-8",
+                    "X-Upload-Content-Length": str(size),
+                    "X-Upload-Content-Type": media_type,
+                },
+                json={"snippet": snippet, "status": status},
+            )
+            if not init_response.is_success:
+                return _upload_error(init_response)
+            session_url = init_response.headers.get("location")
+            if not session_url:
+                return "YouTube upload error: resumable session URL was not returned."
+
+            uploaded = 0
+            final_response: httpx.Response | None = None
+            with path.open("rb") as source:
+                while uploaded < size:
+                    chunk = source.read(min(_UPLOAD_CHUNK_BYTES, size - uploaded))
+                    if not chunk:
+                        return "YouTube upload error: source ended before the declared size."
+                    end = uploaded + len(chunk) - 1
+                    response = await client.request(
+                        "PUT",
+                        session_url,
+                        headers={
+                            **auth_headers,
+                            "Accept": "application/json",
+                            "Content-Type": media_type,
+                            "Content-Length": str(len(chunk)),
+                            "Content-Range": f"bytes {uploaded}-{end}/{size}",
+                        },
+                        content=chunk,
+                    )
+                    if response.status_code == 308:
+                        uploaded = end + 1
+                        continue
+                    if not response.is_success:
+                        return _upload_error(response)
+                    uploaded = end + 1
+                    final_response = response
+
+        if final_response is None:
+            return "YouTube upload error: upload completed without a final response."
+        try:
+            result = final_response.json()
+        except Exception:
+            return final_response.text[:_MAX_CHARS]
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)[:_MAX_CHARS]
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
 def _prop(desc: str, type_: str = "string", **extra) -> Dict[str, Any]:
@@ -333,6 +514,21 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": [],
     },
     # ── Publish / engagement ──
+    "upload_video": {
+        "description": "Upload a new YouTube video from a public HTTPS URL using resumable upload",
+        "properties": {
+            "video_url": _prop("Public standard-port HTTPS URL of the video file"),
+            "title": _prop("Video title"),
+            "description": _prop("Video description (optional)"),
+            "tags": _prop("Tags (comma-separated or array)"),
+            "category_id": _prop("YouTube category id (default: 22)"),
+            "privacy": _prop("private, unlisted, or public (default: private)"),
+            "made_for_kids": _prop("User-attested Made for Kids setting", "boolean"),
+            "publish_at": _prop("Optional RFC 3339 scheduled publish time; requires privacy=private"),
+            "notify_subscribers": _prop("Notify subscribers (default: false)", "boolean"),
+        },
+        "required": ["video_url", "title"],
+    },
     "post_comment": {
         "description": "Post a top-level comment on a video",
         "properties": {
@@ -402,6 +598,7 @@ _HANDLERS = {
     "list_captions": _list_captions,
     "list_my_videos": _list_my_videos,
     # Publish / engagement
+    "upload_video": _upload_video,
     "post_comment": _post_comment,
     "reply_comment": _reply_comment,
     "delete_comment": _delete_comment,

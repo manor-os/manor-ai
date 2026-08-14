@@ -1,0 +1,24 @@
+{
+  "invoice_number": "GL-1048",
+  "issue_date": "DEC 02, 2026",
+  "due_date": "DEC 16, 2026",
+  "seller": {
+    "name": "GRIDLINE SYSTEMS",
+    "address": "Portland, Oregon",
+    "email": "accounts@gridline.example"
+  },
+  "customer": {
+    "name": "ATLAS ARCHITECTURE",
+    "address": "Austin, Texas",
+    "email": "finance@atlas-architecture.example"
+  },
+  "currency": "USD",
+  "items": [
+    {"description": "Operations dashboard design", "quantity": 1, "unit_price": 12400},
+    {"description": "Data connector implementation", "quantity": 3, "unit_price": 2850},
+    {"description": "Team onboarding workshop", "quantity": 2, "unit_price": 1600}
+  ],
+  "tax_rate": 0,
+  "notes": "Thank you. Please reference GL-1048 with your payment.",
+  "payment": "ACH transfer / Routing details supplied separately"
+}

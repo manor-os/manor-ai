@@ -20,6 +20,30 @@ from packages.core.services.step_deadline import (
 logger = logging.getLogger(__name__)
 
 
+async def runtime_assert_credit_available(*args, **kwargs):
+    """Lazy Runtime import so Celery module loading stays lightweight."""
+    from packages.core.ai.runtime import runtime_assert_credit_available as _assert
+
+    return await _assert(*args, **kwargs)
+
+
+async def _scheduled_job_skill_generation_byok(job, *, db=None) -> bool:
+    try:
+        from packages.core.ai.llm_client import metadata_has_native_byok
+        from packages.core.services.model_resolver import resolve_llm_metadata_for_user
+
+        metadata = await resolve_llm_metadata_for_user(
+            "skill_generator",
+            user_id=getattr(job, "user_id", None),
+            entity_id=getattr(job, "entity_id", None),
+            db=db,
+        )
+        return metadata_has_native_byok(metadata)
+    except Exception:
+        logger.debug("Unable to resolve scheduled skill-generation BYOK metadata", exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Helpers — mark plan/task as failed when Celery retries are exhausted
 # ---------------------------------------------------------------------------
@@ -380,14 +404,18 @@ def cleanup_expired_leases(self):
         from packages.core.database import create_worker_session
 
         async def _go():
+            plan_ids: set[str] = set()
             async with create_worker_session()() as db:
-                n = await Dispatcher().expire_leases(db)
+                n = await Dispatcher().expire_leases(db, plan_ids=plan_ids)
                 await db.commit()
-                return n
+                return n, plan_ids
 
-        n = _run_async(_go())
+        n, plan_ids = _run_async(_go())
         if n:
             logger.info("cleanup_expired_leases: reclaimed %d", n)
+            from packages.core.plans.wakeup import wake_plan_cycle
+            for plan_id in plan_ids:
+                wake_plan_cycle(plan_id)
     except Exception:
         logger.exception("cleanup_expired_leases failed")
 
@@ -879,6 +907,48 @@ def run_goal_measurement(
     )
 
 
+@celery_app.task(bind=True, max_retries=2)
+def run_workspace_stat_collection(
+    self,
+    stat_id: str,
+    *,
+    run_id: str | None = None,
+    job_id_str: str | None = None,
+):
+    """Collect one deterministic Workspace Stat observation."""
+    logger.info("Collecting workspace stat %s (attempt %d)", stat_id, self.request.retries + 1)
+
+    async def _go():
+        from sqlalchemy import select
+        from packages.core.database import create_worker_session
+        from packages.core.models.workspace_stat import WorkspaceStat
+        from packages.core.stats.service import StatError, collect_stat
+
+        async with create_worker_session()() as db:
+            stat = (await db.execute(
+                select(WorkspaceStat).where(WorkspaceStat.id == stat_id)
+            )).scalar_one_or_none()
+            if stat is None:
+                raise StatError(f"stat {stat_id} not found")
+            observation = await collect_stat(db, stat)
+            await db.commit()
+            return {
+                "stat_id": stat_id,
+                "observation_id": observation.id,
+                "value": float(observation.value),
+            }
+
+    return _run_scheduled(
+        self,
+        "Workspace stat collection",
+        stat_id,
+        _go,
+        run_id=run_id,
+        job_id_str=job_id_str,
+        countdown_on_retry=300,
+    )
+
+
 @celery_app.task(bind=True, max_retries=3)
 def run_plan(self, plan_id: str):
     """Drive an ExecutionPlan one cycle (Demo A v0 pre-Worker shape).
@@ -1005,59 +1075,146 @@ def _update_job_run_status(session_factory, task_id: str, result: dict):
     """Update the ScheduledJobRun and ScheduledJob status after agent execution."""
     import asyncio
 
-    async def _update():
-        from datetime import datetime, timezone
-        from sqlalchemy import select
-        from packages.core.models.task import Task
-        from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
-
-        async with session_factory() as db:
-            # Load task to get scheduled_run_id from details
-            tr = await db.execute(select(Task).where(Task.id == task_id))
-            task = tr.scalar_one_or_none()
-            if not task:
-                return
-            run_id = (task.details or {}).get("scheduled_run_id")
-            job_id_str = (task.details or {}).get("scheduled_job_id")
-            if not run_id and not job_id_str:
-                return
-
-            status = "success" if result.get("status") == "completed" else "error"
-            duration_ms = result.get("duration_ms")
-            error_msg = None if status == "success" else result.get("response", "")[:500]
-
-            # Update the run record
-            if run_id:
-                rr = await db.execute(select(ScheduledJobRun).where(ScheduledJobRun.id == run_id))
-                run = rr.scalar_one_or_none()
-                if run:
-                    run.status = status
-                    run.duration_ms = duration_ms
-                    run.error = error_msg
-                    run.completed_at = datetime.now(timezone.utc)
-                    run.result = result if isinstance(result, dict) else {"value": result}
-
-            # Update the job's last_status
-            if job_id_str:
-                jr = await db.execute(select(ScheduledJob).where(ScheduledJob.job_id == job_id_str))
-                job = jr.scalar_one_or_none()
-                if job:
-                    job.last_status = status
-                    if status == "error":
-                        job.consecutive_errors = (job.consecutive_errors or 0) + 1
-                    else:
-                        job.consecutive_errors = 0
-                if job and run_id:
-                    # Ledger (M1): final automation run status, same transaction.
-                    from packages.core.ledger.adapters import record_automation_run_finished
-                    await record_automation_run_finished(db, job, run_id=run_id, status=status)
-
-            await db.commit()
-
     try:
-        asyncio.run(_update())
+        asyncio.run(_update_job_run_status_async(session_factory, task_id, result))
     except Exception as e:
         logger.warning("Failed to update job run status for task %s: %s", task_id, e)
+
+
+async def _update_job_run_status_async(session_factory, task_id: str, result: dict):
+    """Finalize a scheduled agent run and deliver successful Chat results once."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.models.task import Task
+
+    async with session_factory() as db:
+        task = (
+            await db.execute(select(Task).where(Task.id == task_id))
+        ).scalar_one_or_none()
+        if not task:
+            return
+        run_id = (task.details or {}).get("scheduled_run_id")
+        job_id_str = (task.details or {}).get("scheduled_job_id")
+        if not run_id and not job_id_str:
+            return
+
+        status = "success" if result.get("status") == "completed" else "error"
+        duration_ms = result.get("duration_ms")
+        error_msg = None if status == "success" else result.get("response", "")[:500]
+        run = None
+        run_was_running = False
+        if run_id:
+            run = (
+                await db.execute(
+                    select(ScheduledJobRun).where(ScheduledJobRun.id == run_id)
+                )
+            ).scalar_one_or_none()
+            if run:
+                run_was_running = run.status == "running"
+                run.status = status
+                run.duration_ms = duration_ms
+                run.error = error_msg
+                run.completed_at = datetime.now(timezone.utc)
+                run.result = result if isinstance(result, dict) else {"value": result}
+
+        job = None
+        if job_id_str:
+            job = (
+                await db.execute(
+                    select(ScheduledJob).where(ScheduledJob.job_id == job_id_str)
+                )
+            ).scalar_one_or_none()
+            if job:
+                job.last_status = status
+                if status == "error":
+                    job.consecutive_errors = (job.consecutive_errors or 0) + 1
+                else:
+                    job.consecutive_errors = 0
+            if job and run_id:
+                from packages.core.ledger.adapters import record_automation_run_finished
+
+                await record_automation_run_finished(
+                    db,
+                    job,
+                    run_id=run_id,
+                    status=status,
+                )
+
+        if run_was_running and job and status == "success":
+            await _deliver_scheduled_agent_result(
+                db,
+                task=task,
+                job=job,
+                run_id=run_id,
+                result=result,
+            )
+
+        await db.commit()
+
+
+async def _deliver_scheduled_agent_result(
+    db,
+    *,
+    task,
+    job,
+    run_id: str | None,
+    result: dict,
+) -> None:
+    """Post the final response to the main Workspace Chat when requested."""
+    delivery_mode = str(
+        job.default_delivery_mode
+        or (task.details or {}).get("default_delivery_mode")
+        or ""
+    ).strip()
+    response = str(result.get("response") or "").strip()
+    if (
+        delivery_mode != "workspace_chat"
+        or not task.entity_id
+        or not task.workspace_id
+        or not response
+    ):
+        return
+
+    from sqlalchemy import select
+
+    from packages.core.models.workspace import AgentSubscription
+    from packages.core.workspace_chat import service as chat_service
+
+    subscription_id = None
+    if job.agent_id:
+        subscription_id = (
+            await db.execute(
+                select(AgentSubscription.id).where(
+                    AgentSubscription.entity_id == task.entity_id,
+                    AgentSubscription.workspace_id == task.workspace_id,
+                    AgentSubscription.agent_id == job.agent_id,
+                    AgentSubscription.status == "active",
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+
+    await chat_service.post_message(
+        db,
+        entity_id=task.entity_id,
+        workspace_id=task.workspace_id,
+        body=response,
+        message_kind="text",
+        author_kind="agent",
+        author_subscription_id=subscription_id,
+        refs=[
+            {"type": "task", "id": task.id},
+            {"type": "scheduled_job", "id": job.id},
+        ],
+        meta={
+            "delivery_mode": "workspace_chat",
+            "scheduled_job_id": job.job_id,
+            "scheduled_run_id": run_id,
+            "task_id": task.id,
+        },
+    )
 
 
 @celery_app.task(bind=True, max_retries=2)
@@ -1086,11 +1243,23 @@ def generate_job_skill(self, job_id: str, payload_message: str, job_name: str = 
                     logger.warning("Job %s not found for skill generation", job_id)
                     return
 
+                entity_id = str(job.entity_id or "").strip()
+                if not entity_id:
+                    logger.warning("Job %s has no entity_id for skill generation", job_id)
+                    return
+                await runtime_assert_credit_available(
+                    entity_id,
+                    source="scheduled_job",
+                    user_id=job.user_id,
+                    workspace_id=job.workspace_id,
+                    byok=await _scheduled_job_skill_generation_byok(job, db=db),
+                )
+
                 # Generate a Skill via LLM (creates a real Skill entity in DB)
                 prompt = f"Scheduled automation: {job_name or job.name or 'Scheduled Task'}\n\n{payload_message}"
                 skill = await generate_skill(
                     prompt=prompt,
-                    entity_id=job.entity_id or "",
+                    entity_id=entity_id,
                     db=db,
                     category="automation",
                     tags=["auto-generated", "scheduled-job", job.job_id],
@@ -1336,7 +1505,12 @@ def fetch_and_index_url_document(self, document_id: str, url: str):
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
-@celery_app.task(bind=True, max_retries=3)
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    soft_time_limit=6_900,
+    time_limit=7_200,
+)
 def process_document_embeddings(self, document_id: str):
     """Generate embeddings for a document (RAG pipeline).
 
@@ -1355,7 +1529,10 @@ def process_document_embeddings(self, document_id: str):
         async def _index():
             session_factory = create_worker_session()
             async with session_factory() as db:
-                success = await index_document(db, document_id)
+                # Queue deliveries are not an explicit reindex request. If an
+                # older duplicate starts after another run already completed,
+                # it must not claim the now-ready document again.
+                success = await index_document(db, document_id, allow_ready=False)
                 await db.commit()
                 return success
 

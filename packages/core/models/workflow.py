@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, query_expression
 
@@ -52,6 +52,50 @@ class WorkflowDefinition(Base, TimestampMixin):
     # cosmetic edits (description, icon, tags) don't create a new revision.
     revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1",
+    )
+
+
+class WorkflowTemplateInstallation(Base, TimestampMixin):
+    """Stable template identity → entity-owned workflow instance.
+
+    Marketplace/template ids identify portable source content. Runtime callers
+    must never execute those ids directly: installing a template mints (or
+    reuses) a normal ``WorkflowDefinition.id`` and records the relationship
+    here. ``component_key`` lets one Blueprint own several independently
+    installable Flows without falling back to a mutable name or slug for
+    identity.
+    """
+
+    __tablename__ = "workflow_template_installations"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_id",
+            "template_id",
+            "component_key",
+            name="uq_workflow_template_installations_source",
+        ),
+        Index(
+            "ix_workflow_template_installations_workflow",
+            "workflow_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+    entity_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    template_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    component_key: Mapped[str] = mapped_column(
+        String(120), nullable=False, default="main", server_default="main",
+    )
+    workflow_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    installed_version: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="1.0.0", server_default="1.0.0",
+    )
+    installed_by: Mapped[Optional[str]] = mapped_column(String(26), index=True)
+    source_type: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="flow_template", server_default="flow_template",
+    )
+    installation_metadata: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}",
     )
 
 
@@ -223,12 +267,21 @@ class WorkflowProject(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_workflow_projects_workspace_stage", "workspace_id", "current_stage"),
         Index("ix_workflow_projects_entity_type", "entity_id", "project_type"),
+        Index(
+            "uq_workflow_projects_business_key",
+            "entity_id",
+            "workspace_id",
+            "project_type",
+            "project_key",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     workspace_id: Mapped[str] = mapped_column(String(26), nullable=False)
     project_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    project_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     current_stage: Mapped[str] = mapped_column(String(40), nullable=False, default="draft")
     state: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

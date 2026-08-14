@@ -34,12 +34,13 @@ it was wrong, undo".
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.blueprints.freshness import (
@@ -70,6 +71,14 @@ APPLIED_REVISIONS_KEY = "applied_revisions"
 
 #: A fresh install that never behaviourally changed.
 PRISTINE_REVISION = 1
+
+# WorkflowDefinition revisions move when the executable graph or variables
+# change. Keep this set aligned with workflow_service's revision fields so an
+# operator edit is never overwritten merely because another field is not
+# revision-tracked.
+WORKFLOW_CONTENT_REVISION_FIELDS: frozenset[str] = frozenset(
+    {"steps", "variables"}
+)
 
 
 def _is_workspace_edited(row: Any, applied: dict[str, Any]) -> bool:
@@ -104,7 +113,11 @@ class UpgradeAction(str, Enum):
 
 
 def _fields_for(kind: str) -> frozenset[str]:
-    return SKILL_CONTENT_REVISION_FIELDS if kind == "skill" else AGENT_CONTENT_REVISION_FIELDS
+    if kind == "skill":
+        return SKILL_CONTENT_REVISION_FIELDS
+    if kind == "workflow":
+        return WORKFLOW_CONTENT_REVISION_FIELDS
+    return AGENT_CONTENT_REVISION_FIELDS
 
 
 def _desired_content(kind: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -113,10 +126,17 @@ def _desired_content(kind: str, spec: dict[str, Any]) -> dict[str, Any]:
     Only behaviour-affecting fields. A blueprint retitling its skill is not
     something to overwrite a workspace for.
     """
+    source = spec
+    if kind == "workflow":
+        from packages.core.blueprints.installer import (
+            _blueprint_workflow_definition_values,
+        )
+
+        source = _blueprint_workflow_definition_values(spec)
     return {
-        field: spec.get(field)
+        field: source.get(field)
         for field in _fields_for(kind)
-        if spec.get(field) is not None
+        if source.get(field) is not None
     }
 
 
@@ -135,9 +155,14 @@ def _preview(patch: dict[str, Any]) -> dict[str, str]:
     """
     out: dict[str, str] = {}
     for field, value in patch.items():
-        if not isinstance(value, str) or not value.strip():
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        elif isinstance(value, str):
+            text = value.strip()
+        else:
             continue
-        text = value.strip()
+        if not text:
+            continue
         out[field] = text if len(text) <= PREVIEW_CHARS else text[:PREVIEW_CHARS] + "…"
     return out
 
@@ -154,6 +179,10 @@ def _describe(kind: str, patch: dict[str, Any], row: Any) -> list[str]:
             notes.append(
                 f"instructions {len(str(old_value or ''))} → {len(str(new_value or ''))} characters"
             )
+        elif field == "steps":
+            notes.append(
+                f"workflow graph {len(old_value or [])} → {len(new_value or [])} steps"
+            )
         elif isinstance(new_value, (list, tuple)):
             added = sorted(set(map(str, new_value)) - set(map(str, old_value or [])))
             removed = sorted(set(map(str, old_value or [])) - set(map(str, new_value)))
@@ -164,6 +193,66 @@ def _describe(kind: str, patch: dict[str, Any], row: Any) -> list[str]:
         else:
             notes.append(f"{field} changes")
     return notes
+
+
+async def _installed_blueprint_workflows(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    internal_slugs: set[str] | None = None,
+) -> dict[str, Any]:
+    """Return the blueprint Flow definitions installed for this Workspace.
+
+    User-facing Flows are identified through their Workspace binding. Internal
+    orchestration Flows deliberately have no binding (otherwise they appear in
+    Chat and can be launched outside their parent), so resolve only the slugs
+    the payload explicitly marks internal by their entity-scoped definition
+    name as well.
+    """
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+
+    bindings = (await db.execute(
+        select(WorkflowBinding).where(
+            WorkflowBinding.entity_id == entity_id,
+            WorkflowBinding.workspace_id == workspace_id,
+        )
+    )).scalars().all()
+    candidate_ids: dict[str, str] = {}
+    for binding in sorted(bindings, key=lambda item: not bool(item.enabled)):
+        config = binding.config if isinstance(binding.config, dict) else {}
+        if config.get("source") != "blueprint":
+            continue
+        slug = str(config.get("workspace_blueprint_workflow_slug") or "").strip()
+        if slug and slug not in candidate_ids:
+            candidate_ids[slug] = binding.workflow_id
+    internal_slugs = {slug for slug in (internal_slugs or set()) if slug}
+    conditions = []
+    if candidate_ids:
+        conditions.append(WorkflowDefinition.id.in_(set(candidate_ids.values())))
+    if internal_slugs:
+        conditions.append(
+            (WorkflowDefinition.entity_id == entity_id)
+            & WorkflowDefinition.name.in_(internal_slugs)
+        )
+    if not conditions:
+        return {}
+
+    from sqlalchemy import or_
+
+    definitions = (await db.execute(
+        select(WorkflowDefinition).where(or_(*conditions))
+    )).scalars().all()
+    by_id = {row.id: row for row in definitions}
+    result = {
+        slug: by_id[workflow_id]
+        for slug, workflow_id in candidate_ids.items()
+        if workflow_id in by_id
+    }
+    for row in definitions:
+        if row.name in internal_slugs and row.name not in result:
+            result[row.name] = row
+    return result
 
 
 async def plan(
@@ -186,7 +275,16 @@ async def plan(
         "items": [],
         "can_revert": bool(record.get(RESTORE_POINT_KEY)),
     }
-    if not isinstance(payload, dict) or not record.get(BLUEPRINT_ID_KEY):
+    # ``payload`` is resolved by the API before the plan reaches us. Older
+    # built-in installs recorded only ``blueprint_slug`` (the stable
+    # ``builtin:<slug>`` id was added later), so requiring an id here makes
+    # the workspace banner correctly say "update available" while this
+    # dialog incorrectly returns an empty plan. A resolved payload is the
+    # authority; the apply endpoint repairs the durable id when confirmed.
+    has_blueprint_identity = bool(
+        record.get(BLUEPRINT_ID_KEY) or record.get("blueprint_slug")
+    )
+    if not isinstance(payload, dict) or not has_blueprint_identity:
         return result
 
     embedded = payload.get("embedded") or {}
@@ -232,6 +330,144 @@ async def plan(
                 "new_content": _preview(patch) if patch else {},
             })
 
+    workflow_specs = ((payload.get("recipe") or {}).get("workflows") or [])
+    internal_slugs = {
+        str(spec.get("slug") or "").strip()
+        for spec in workflow_specs
+        if isinstance(spec, dict) and spec.get("internal")
+    }
+    installed_workflows = await _installed_blueprint_workflows(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        internal_slugs=internal_slugs,
+    )
+    for spec in workflow_specs:
+        if not isinstance(spec, dict):
+            continue
+        slug = str(spec.get("slug") or "").strip()
+        if not slug:
+            continue
+        row = installed_workflows.get(slug)
+        label = spec.get("name") or slug
+        if row is None:
+            desired = _desired_content("workflow", spec)
+            result["items"].append({
+                "kind": "workflow", "slug": slug, "name": label,
+                "action": UpgradeAction.MISSING.value,
+                "changes": ["installs Blueprint Flow and Workspace binding"],
+                "new_content": _preview(desired),
+            })
+            continue
+
+        patch = content_patch_for(
+            row, _desired_content("workflow", spec), _fields_for("workflow"),
+        )
+        if not patch:
+            action = UpgradeAction.UNCHANGED
+        elif _is_workspace_edited(row, applied):
+            action = UpgradeAction.KEEP_YOURS
+        else:
+            action = UpgradeAction.UPDATE
+        result["items"].append({
+            "kind": "workflow",
+            "slug": slug,
+            "name": label,
+            "id": row.id,
+            "action": action.value,
+            "changes": _describe("workflow", patch, row) if patch else [],
+            "new_content": _preview(patch) if patch else {},
+        })
+
+    # Inline starter documents used to be emitted as manual install todos,
+    # which meant an installed Blueprint could advertise Workspace Knowledge
+    # while its Knowledge Net was empty. Include absent starter documents in
+    # the explicit upgrade plan so existing workspaces can be repaired with
+    # the same operator confirmation as any other Blueprint change.
+    from packages.core.blueprints.installer import (
+        _blueprint_document_template,
+        _knowledge_pack_document_rows,
+        _matches_blueprint_starter_document,
+    )
+    from packages.core.models.document import DocumentGroup
+
+    for kp in embedded.get("knowledge_packs") or []:
+        if not isinstance(kp, dict) or kp.get("mode") != "inline_text":
+            continue
+        pack_slug = str(kp.get("slug") or "").strip()
+        pack_title = str(kp.get("title") or pack_slug).strip()
+        if not pack_slug or not pack_title:
+            continue
+        group = (await db.execute(
+            select(DocumentGroup).where(
+                DocumentGroup.entity_id == entity_id,
+                DocumentGroup.workspace_id == workspace.id,
+                DocumentGroup.name == pack_title,
+            )
+        )).scalar_one_or_none()
+        # A missing pack is a separately missing Blueprint resource, not a
+        # document-content upgrade. Legacy installs always created the group;
+        # repair only those real legacy groups here so partial test/install
+        # surfaces are not silently expanded by an unrelated upgrade.
+        if group is None:
+            continue
+        rows = await _knowledge_pack_document_rows(
+            db, entity_id=entity_id, group_id=group.id,
+        )
+        for document in kp.get("starter_documents") or []:
+            if not isinstance(document, dict):
+                continue
+            path = str(document.get("path") or "").strip()
+            body = str(document.get("body_md") or "")
+            if not path or not body:
+                continue
+            existing_row = next((
+                row
+                for row in rows
+                if _matches_blueprint_starter_document(
+                    row, knowledge_pack_slug=pack_slug, path=path,
+                )
+            ), None)
+            template = _blueprint_document_template(document)
+            existing_metadata = (
+                existing_row.metadata_
+                if existing_row is not None and isinstance(existing_row.metadata_, dict)
+                else {}
+            )
+            template_binding_current = bool(
+                existing_row is not None
+                and (
+                    template is None
+                    or (
+                        existing_metadata.get("blueprint_knowledge_pack_slug") == pack_slug
+                        and existing_metadata.get("blueprint_starter_path") == path
+                        and existing_metadata.get("blueprint_template") == template
+                    )
+                )
+            )
+            if existing_row is None:
+                action = UpgradeAction.UPDATE.value
+                changes = ["adds starter Knowledge document"]
+                new_content = {"body_md": body}
+            elif not template_binding_current:
+                action = UpgradeAction.UPDATE.value
+                changes = ["updates live Knowledge template binding"]
+                new_content = {"template": template}
+            else:
+                action = UpgradeAction.UNCHANGED.value
+                changes = []
+                new_content = {}
+            result["items"].append({
+                "kind": "knowledge_document",
+                "slug": f"{pack_slug}:{path}",
+                "knowledge_pack_slug": pack_slug,
+                "document_path": path,
+                "name": path,
+                "action": action,
+                "changes": changes,
+                "new_content": new_content,
+            })
+
     return result
 
 
@@ -249,6 +485,7 @@ async def apply(
     has something to put back. Items the workspace edited are not touched.
     """
     from packages.core.blueprints.installer import _find_installed_skill
+    from packages.core.models.workflow import WorkflowDefinition
     from packages.core.models.workspace import Agent
 
     intended = await plan(db, workspace=workspace, payload=payload)
@@ -259,21 +496,187 @@ async def apply(
                             ("agent", embedded.get("agents") or []))
         for spec in specs
     }
+    by_slug.update({
+        ("workflow", str(spec.get("slug") or "").strip()): spec
+        for spec in ((payload or {}).get("recipe") or {}).get("workflows") or []
+        if isinstance(spec, dict)
+    })
+    knowledge_documents = {
+        (
+            str(kp.get("slug") or "").strip(),
+            str(document.get("path") or "").strip(),
+        ): (kp, document)
+        for kp in embedded.get("knowledge_packs") or []
+        if isinstance(kp, dict)
+        for document in kp.get("starter_documents") or []
+        if isinstance(document, dict)
+    }
 
     restored: list[dict[str, Any]] = []
     updated: list[dict[str, Any]] = []
     applied_now: dict[str, int] = {}
 
+    install_record = installed_blueprint_record(
+        getattr(workspace, "settings", None)
+    )
+    manifest = (payload or {}).get("manifest") or {}
+
     for item in intended["items"]:
-        if item["action"] != UpgradeAction.UPDATE.value:
+        installs_missing_workflow = (
+            item["kind"] == "workflow"
+            and item["action"] == UpgradeAction.MISSING.value
+        )
+        if (
+            item["action"] != UpgradeAction.UPDATE.value
+            and not installs_missing_workflow
+        ):
             continue
         kind, slug = item["kind"], item["slug"]
+        if kind == "knowledge_document":
+            pack_slug = str(item.get("knowledge_pack_slug") or "").strip()
+            document_path = str(item.get("document_path") or "").strip()
+            source = knowledge_documents.get((pack_slug, document_path))
+            if not source:
+                continue
+            pack, document = source
+            from packages.core.blueprints.installer import (
+                _install_knowledge_pack,
+                _knowledge_pack_document_rows,
+                _matches_blueprint_starter_document,
+            )
+            from packages.core.models.document import DocumentGroup
+
+            group = (await db.execute(
+                select(DocumentGroup).where(
+                    DocumentGroup.entity_id == workspace.entity_id,
+                    DocumentGroup.workspace_id == workspace.id,
+                    DocumentGroup.name == (pack.get("title") or pack_slug),
+                )
+            )).scalar_one_or_none()
+            existing_row = None
+            if group is not None:
+                existing_rows = await _knowledge_pack_document_rows(
+                    db, entity_id=workspace.entity_id, group_id=group.id,
+                )
+                existing_row = next((
+                    candidate for candidate in existing_rows
+                    if _matches_blueprint_starter_document(
+                        candidate,
+                        knowledge_pack_slug=pack_slug,
+                        path=document_path,
+                    )
+                ), None)
+            existing_metadata = (
+                dict(existing_row.metadata_)
+                if existing_row is not None and isinstance(existing_row.metadata_, dict)
+                else None
+            )
+            await _install_knowledge_pack(
+                db,
+                entity_id=workspace.entity_id,
+                workspace_id=workspace.id,
+                kp={**pack, "starter_documents": [document]},
+                todos=[],
+            )
+            group = group or (await db.execute(
+                select(DocumentGroup).where(
+                    DocumentGroup.entity_id == workspace.entity_id,
+                    DocumentGroup.workspace_id == workspace.id,
+                    DocumentGroup.name == (pack.get("title") or pack_slug),
+                )
+            )).scalar_one_or_none()
+            if group is None:
+                continue
+            rows = await _knowledge_pack_document_rows(
+                db, entity_id=workspace.entity_id, group_id=group.id,
+            )
+            row = next((
+                candidate for candidate in rows
+                if _matches_blueprint_starter_document(
+                    candidate,
+                    knowledge_pack_slug=pack_slug,
+                    path=document_path,
+                )
+            ), None)
+            if row is None:
+                continue
+            restored.append({
+                "kind": kind,
+                "id": row.id,
+                "name": document_path,
+                "delete_on_revert": existing_row is None,
+                **(
+                    {"before": {"metadata_": existing_metadata}}
+                    if existing_metadata is not None
+                    else {}
+                ),
+            })
+            updated.append({
+                "kind": kind,
+                "name": document_path,
+                "changes": item["changes"],
+            })
+            continue
         spec = by_slug.get((kind, slug))
         if not spec:
             continue
 
+        if installs_missing_workflow:
+            from packages.core.blueprints.installer import (
+                _install_workflow,
+                _install_workflow_binding,
+            )
+
+            source_template_id = str(
+                install_record.get(BLUEPRINT_ID_KEY)
+                or f"blueprint:{install_record.get('blueprint_slug') or manifest.get('slug') or blueprint_content_fingerprint(payload)}"
+            )
+            source_version = str(
+                current_version
+                or install_record.get(BLUEPRINT_VERSION_KEY)
+                or manifest.get("blueprint_version")
+                or "1.0.0"
+            )
+            workflow_id = await _install_workflow(
+                db,
+                entity_id=workspace.entity_id,
+                w=spec,
+                source_template_id=source_template_id,
+                source_version=source_version,
+                installed_by=by_user_id,
+            )
+            if not workflow_id:
+                continue
+            binding_id = None
+            if not bool(spec.get("internal")):
+                binding_id = await _install_workflow_binding(
+                    db,
+                    entity_id=workspace.entity_id,
+                    workspace_id=workspace.id,
+                    workflow_id=workflow_id,
+                    w=spec,
+                    source_template_id=source_template_id,
+                )
+            restored.append({
+                "kind": "workflow",
+                "id": workflow_id,
+                "binding_id": binding_id,
+                "name": spec.get("name") or slug,
+                "source_template_id": source_template_id,
+                "component_key": slug,
+                "delete_on_revert": True,
+            })
+            updated.append({
+                "kind": "workflow",
+                "name": spec.get("name") or slug,
+                "changes": item["changes"],
+            })
+            continue
+
         if kind == "skill":
             row = await _find_installed_skill(db, entity_id=workspace.entity_id, slug=slug)
+        elif kind == "workflow":
+            row = await db.get(WorkflowDefinition, item["id"])
         else:
             row = await db.get(Agent, item["id"])
         if row is None:
@@ -353,6 +756,7 @@ async def revert(
     comes back — that is the truth after a revert, not a failure of it.
     """
     from packages.core.models.skill import Skill
+    from packages.core.models.workflow import WorkflowDefinition
     from packages.core.models.workspace import Agent
 
     settings = dict(getattr(workspace, "settings", None) or {})
@@ -364,7 +768,75 @@ async def revert(
     reverted: list[dict[str, Any]] = []
     applied_after_revert: dict[str, int] = {}
     for entry in point["items"]:
-        model = Skill if entry.get("kind") == "skill" else Agent
+        if entry.get("kind") == "workflow" and entry.get("delete_on_revert"):
+            from packages.core.models.workflow import (
+                WorkflowBinding,
+                WorkflowRun,
+                WorkflowTemplateInstallation,
+            )
+
+            workflow_id = str(entry.get("id") or "")
+            binding_id = str(entry.get("binding_id") or "")
+            if binding_id:
+                await db.execute(
+                    delete(WorkflowBinding).where(WorkflowBinding.id == binding_id)
+                )
+            await db.execute(
+                delete(WorkflowTemplateInstallation).where(
+                    WorkflowTemplateInstallation.entity_id == workspace.entity_id,
+                    WorkflowTemplateInstallation.template_id
+                    == entry.get("source_template_id"),
+                    WorkflowTemplateInstallation.component_key
+                    == entry.get("component_key"),
+                    WorkflowTemplateInstallation.workflow_id == workflow_id,
+                )
+            )
+            row = await db.get(WorkflowDefinition, workflow_id)
+            if row is not None:
+                has_runs = (await db.execute(
+                    select(WorkflowRun.id).where(
+                        WorkflowRun.workflow_id == workflow_id,
+                    ).limit(1)
+                )).scalar_one_or_none()
+                if has_runs is None:
+                    await db.delete(row)
+                else:
+                    row.is_active = False
+                    row.status = "inactive"
+            reverted.append({
+                "kind": entry.get("kind"),
+                "name": entry.get("name"),
+            })
+            continue
+        if entry.get("kind") == "knowledge_document" and entry.get("delete_on_revert"):
+            from packages.core.models.document import Document, DocumentGroupMember
+
+            row = await db.get(Document, entry.get("id"))
+            if row is None:
+                continue
+            await db.execute(
+                delete(DocumentGroupMember).where(
+                    DocumentGroupMember.document_id == row.id,
+                )
+            )
+            await db.delete(row)
+            reverted.append({"kind": entry.get("kind"), "name": entry.get("name")})
+            continue
+        if entry.get("kind") == "knowledge_document":
+            from packages.core.models.document import Document
+
+            row = await db.get(Document, entry.get("id"))
+            if row is None:
+                continue
+            before = entry.get("before") or {}
+            if "metadata_" in before:
+                row.metadata_ = before["metadata_"]
+            reverted.append({"kind": entry.get("kind"), "name": entry.get("name")})
+            continue
+        model = {
+            "skill": Skill,
+            "workflow": WorkflowDefinition,
+        }.get(str(entry.get("kind")), Agent)
         row = await db.get(model, entry.get("id"))
         if row is None:
             logger.warning(

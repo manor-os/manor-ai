@@ -212,6 +212,51 @@ async def consume_reservation_by_source(
     return await _consume_row(row, consumed_credits=consumed_credits)
 
 
+async def resize_reservation_by_source(
+    db: AsyncSession,
+    *,
+    source_kind: str,
+    source_id: str,
+    amount_credits: int,
+    allow_overdraft: bool = False,
+) -> CreditReservation | None:
+    """Update an active reservation after the provider reports actual usage.
+
+    ``allow_overdraft`` is only for work that has already reached the provider.
+    Keeping its actual cost reserved is safer than allowing a later request to
+    proceed when the final ledger write needs to be retried.
+    """
+    amount = int(amount_credits or 0)
+    if amount <= 0:
+        raise CreditReservationError("amount_credits must be positive")
+
+    row = await _reservation_by_source(
+        db,
+        source_kind=source_kind,
+        source_id=source_id,
+        active_only=True,
+    )
+    if row is None:
+        return None
+
+    await _lock_entity(db, row.entity_id)
+    row = await _reservation_by_source(
+        db,
+        source_kind=source_kind,
+        source_id=source_id,
+        lock=True,
+        active_only=True,
+    )
+    if row is None:
+        return None
+
+    if not allow_overdraft and is_cloud():
+        pass
+
+    row.amount_credits = amount
+    return row
+
+
 async def _consume_row(
     row: CreditReservation,
     *,

@@ -32,10 +32,16 @@ import TaskLogItem from "../components/task/TaskLogItem";
 import TaskRecoveryPanel from "../components/task/TaskRecoveryPanel";
 import ChatMarkdown from "../components/ChatMarkdown";
 import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
+import {
+  dedupeGeneratedFileRecords,
+  generatedFileIdentity,
+  generatedFileLabel,
+  generatedFileOpenReference,
+} from "../lib/fileReferences";
 import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 import { inferRuntimeRuleFromText, shouldFallbackToWildcardRule } from "../lib/runtimeRules";
-import { formatTaskDescriptionForDisplay, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
+import { formatTaskDescriptionForDisplay, formatTaskOutputSummary, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
 import {
   ADD_SELECTION_TO_TASK_EVENT,
   SELECTED_TEXT_TASK_DRAFT_KEY,
@@ -995,7 +1001,7 @@ function _taskOutputFiles(task: Task): any[] {
   const stepFiles = Array.isArray(output.steps)
     ? output.steps.flatMap((step: any) => Array.isArray(step.files) ? step.files : [])
     : [];
-  return [...files, ...stepFiles];
+  return dedupeGeneratedFileRecords([...files, ...stepFiles]);
 }
 
 const GENERIC_OUTPUT_STEP_LABELS = new Set(["subagent", "agent", "human", "system", "tool", "worker"]);
@@ -1084,10 +1090,7 @@ function TaskOutputSummary({ task }: { task: Task }) {
   const batchId = typeof details.workspace_work_batch_id === "string" ? details.workspace_work_batch_id : "";
   const files = _taskOutputFiles(task);
   const steps = Array.isArray(output?.steps) ? output?.steps : [];
-  const summaryValue = output?.summary || output?.result_summary || output?.message || output?.text || "";
-  const summary = typeof summaryValue === "string"
-    ? summaryValue.trim()
-    : formatUserFacingStructuredText(summaryValue).trim();
+  const summary = formatTaskOutputSummary(output);
   const outputStatus = String(output?.plan_status || task.status || "").trim();
 
   if (!output && !batchId) return null;
@@ -1126,12 +1129,20 @@ function TaskOutputSummary({ task }: { task: Task }) {
       {files.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
           {files.slice(0, 4).map((file: any, i: number) => {
-            const reference = file.document_id || file.doc_id || file.id || file.url || file.path || file.fs_path || file.public_url || "";
-            const label = file.name || file.filename || file.original_name || (reference ? String(reference).split(/[\\/]/).pop() : file.type) || `File ${i + 1}`;
+            const reference = generatedFileOpenReference(file);
+            const label = generatedFileLabel(file, `File ${i + 1}`);
             return reference ? (
-              <InlineFileReferenceCard key={i} reference={String(reference)} label={String(label)} compact />
+              <InlineFileReferenceCard
+                key={generatedFileIdentity(file) || i}
+                reference={String(reference)}
+                label={String(label)}
+                fileType={file.file_type || file.fileType}
+                mimeType={file.mime_type || file.mimeType}
+                compact
+                trustedReference
+              />
             ) : (
-              <span key={i} className="task-output-summary-file" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#57534e" }}>
+              <span key={generatedFileIdentity(file) || i} className="task-output-summary-file" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#57534e" }}>
                 <IconDocument size={11} />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
               </span>

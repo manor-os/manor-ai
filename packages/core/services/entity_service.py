@@ -125,14 +125,22 @@ async def create_workspace(
     return ws
 
 
-async def update_workspace(db: AsyncSession, workspace_id: str, entity_id: str, **fields) -> Optional[Workspace]:
+async def update_workspace(
+    db: AsyncSession,
+    workspace_id: str,
+    entity_id: str,
+    *,
+    clear_fields: set[str] | None = None,
+    **fields,
+) -> Optional[Workspace]:
     ws = await get_workspace(db, workspace_id, entity_id)
     if not ws:
         return None
     framing_fields = {"name", "primary_work", "operating_context"}
     framing_touched = False
+    clear_fields = clear_fields or set()
     for k, v in fields.items():
-        if hasattr(ws, k) and v is not None:
+        if hasattr(ws, k) and (v is not None or k in clear_fields):
             old = getattr(ws, k, None)
             if k in framing_fields and old != v:
                 framing_touched = True
@@ -157,19 +165,21 @@ async def update_workspace(db: AsyncSession, workspace_id: str, entity_id: str, 
 async def soft_delete_workspace(
     db: AsyncSession, workspace_id: str, entity_id: str,
 ) -> bool:
-    """Mark a workspace as deleted but keep all rows on disk.
+    """Mark a workspace as deleted and remove its automation definitions.
 
-    The nightly ``ops.purge_soft_deleted_workspaces`` task hard-deletes
-    workspaces whose ``deleted_at`` is older than
-    ``WORKSPACE_PURGE_GRACE_DAYS``. Until then, ``restore_workspace``
-    can flip it back to active.
+    Other workspace data remains on disk. The nightly
+    ``ops.purge_soft_deleted_workspaces`` task hard-deletes workspaces whose
+    ``deleted_at`` is older than ``WORKSPACE_PURGE_GRACE_DAYS``. Until then,
+    ``restore_workspace`` can restore the workspace and its built-in runtime
+    jobs, but user-created automations stay deleted.
     """
     ws = await get_workspace(db, workspace_id, entity_id)
     if not ws:
         return False
     ws.deleted_at = datetime.now(timezone.utc)
-    from packages.core.services.workspace_runtime import remove_workspace_runtime_schedules
-    await remove_workspace_runtime_schedules(db, workspace_id)
+    from packages.core.services.scheduler_service import delete_workspace_automations
+
+    await delete_workspace_automations(db, workspace_id, entity_id)
     await db.flush()
     return True
 
@@ -250,6 +260,7 @@ async def purge_workspace(db: AsyncSession, workspace_id: str) -> bool:
     from packages.core.models.task import Task, TaskLog, Conversation, Message
     from packages.core.models.goal import Goal
     from packages.core.models.scheduler import ScheduledJob, AgentExecution
+    from packages.core.models.workflow import WorkflowBinding
     from packages.core.models.memory import AgentMemory
     from packages.core.models.document import DocumentGroup, Channel
     from packages.core.models.channel import ChannelConfig, Announcement
@@ -288,6 +299,7 @@ async def purge_workspace(db: AsyncSession, workspace_id: str) -> bool:
         GovernancePolicy, GovernanceRevision, AgentExecution,
         WorkspaceStaff, AgentSubscription, WorkspaceActivity,
         Goal, ScheduledJob, AgentMemory,
+        WorkflowBinding,
         DocumentGroup, Channel, ChannelConfig, Announcement,
     ]:
         await db.execute(sa_delete(model).where(model.workspace_id == workspace_id))

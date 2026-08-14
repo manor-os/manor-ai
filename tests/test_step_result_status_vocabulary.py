@@ -66,9 +66,30 @@ def test_canonical_statuses_are_judged_by_the_enum_not_the_keyword_set():
     assert blocker({"status": "succeeded", "summary": "s"}) is None
     assert blocker({"status": "done", "summary": "s"}) is None
     assert blocker({"status": "partial", "summary": "s"}) == "step reported status=partial"
+    assert blocker({
+        "status": "partial",
+        "summary": "verified artifact with unavailable checksum",
+        "outputs": {"data": {
+            "mp4_fs_path": "Workspaces/Demo/final.mp4",
+            "verification_status": "verified",
+        }},
+    }) == "step reported status=partial"
     assert blocker({"status": "blocked", "summary": "s"}) == "step reported status=failed"
     # Custom-schema words still handled by the keyword set.
     assert blocker({"status": "needs_input"}) == "step reported status=needs_input"
+
+
+def test_verified_artifact_partial_envelope_is_not_a_blocker_for_file_tasks():
+    from packages.core.plans.executor import _structured_result_blocker
+
+    assert _structured_result_blocker({
+        "status": "partial",
+        "summary": "verified artifact with unavailable checksum",
+        "outputs": {"data": {
+            "mp4_fs_path": "Workspaces/Demo/final.mp4",
+            "verification_status": "verified",
+        }},
+    }, artifact_required=True) is None
 
 
 def test_envelope_emitted_as_json_text_is_parsed_not_double_wrapped():

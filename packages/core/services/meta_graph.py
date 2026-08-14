@@ -21,6 +21,7 @@ The ``form`` vs ``json`` body distinction matters because Pages/comments
 take ``application/x-www-form-urlencoded`` while Messenger Send-API and
 WhatsApp Cloud insist on JSON. ``post(json_body=True)`` switches.
 """
+
 from __future__ import annotations
 
 import logging
@@ -120,11 +121,14 @@ class MetaGraphClient:
         path: str,
         *,
         token: str,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        p = dict(params or {})
+        p["access_token"] = token
         async with httpx.AsyncClient(timeout=self.timeout) as cx:
             r = await cx.delete(
                 self._url(path),
-                params={"access_token": token},
+                params=p,
             )
         return self._handle(r)
 

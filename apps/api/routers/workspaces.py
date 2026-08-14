@@ -393,33 +393,79 @@ async def _workspace_creator_summaries(
     return result
 
 
-async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tuple]:
-    """Map each workspace to the blueprint payload it would upgrade toward.
+def _workspace_blueprint_id(settings: Any) -> str:
+    """Return the durable blueprint id, including the legacy built-in repair.
 
-    Two sources, because there are two ways in. A built-in blueprint lives in
-    the config directory and is found by slug. A marketplace blueprint lives
-    in workspace_blueprints, and the install recorded its id — resolving those
-    by slug alone would find nothing, which is how "update available" would
-    have stayed silent for every marketplace install while quietly reporting
-    "unknown".
-
-    One query for all of them: this feeds the workspace list.
+    Older built-in installs wrote ``blueprint_slug`` but accidentally left
+    ``blueprint_id`` null. Platform blueprints are ordinary marketplace rows
+    now, with the stable id ``builtin:<slug>``. Resolve that historical shape
+    to the same row so existing workspaces can see and apply updates instead
+    of remaining permanently detached.
     """
     from packages.core.blueprints.freshness import (
         BLUEPRINT_ID_KEY,
         installed_blueprint_record,
     )
+    from packages.core.blueprints.seed import platform_blueprint_id
 
+    record = installed_blueprint_record(settings)
+    blueprint_id = str(record.get(BLUEPRINT_ID_KEY) or "").strip()
+    if blueprint_id:
+        return blueprint_id
+    slug = str(record.get("blueprint_slug") or "").strip()
+    return platform_blueprint_id(slug) if slug else ""
+
+
+def _workspace_blueprint_candidates(settings: Any) -> list[str]:
+    """Ids that may own an installed workspace, in preference order.
+
+    Marketplace deduplication removed old duplicate rows after platform
+    blueprints received stable ``builtin:<slug>`` ids. A workspace installed
+    from one of those duplicates can still carry the deleted ULID. Try that
+    exact id first, then the stable platform id for its recorded slug.
+    """
+    from packages.core.blueprints.freshness import (
+        BLUEPRINT_ID_KEY,
+        installed_blueprint_record,
+    )
+    from packages.core.blueprints.seed import platform_blueprint_id
+
+    record = installed_blueprint_record(settings)
+    candidates: list[str] = []
+    slug = str(record.get("blueprint_slug") or "").strip()
+    stable_id = platform_blueprint_id(slug) if slug else ""
+    # Prefer the stable platform row. Before platform blueprints were seeded
+    # under builtin:<slug>, the marketplace could contain a published Manor
+    # duplicate with a ULID. Those rows may still exist archived or hidden and
+    # carry the old payload; resolving them first makes an outdated workspace
+    # incorrectly report "nothing to update".
+    if stable_id:
+        candidates.append(stable_id)
+    exact_id = str(record.get(BLUEPRINT_ID_KEY) or "").strip()
+    if exact_id and exact_id not in candidates:
+        candidates.append(exact_id)
+    return candidates
+
+
+async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tuple]:
+    """Map each workspace to the blueprint payload it would upgrade toward.
+
+    Every current blueprint lives in ``workspace_blueprints``. New installs
+    record its id; the helper above maps the historical built-in slug-only
+    shape to that same stable row id.
+
+    One query for all of them: this feeds the workspace list.
+    """
     payloads: dict[str, tuple] = {}
-    wanted_ids: dict[str, list[str]] = {}
+    candidates_by_workspace: dict[str, list[str]] = {}
+    wanted_ids: set[str] = set()
 
     for ws in workspaces:
         settings = ws.settings if isinstance(getattr(ws, "settings", None), dict) else {}
-        blueprint_id = str(
-            installed_blueprint_record(settings).get(BLUEPRINT_ID_KEY) or ""
-        ).strip()
-        if blueprint_id:
-            wanted_ids.setdefault(blueprint_id, []).append(ws.id)
+        candidates = _workspace_blueprint_candidates(settings)
+        if candidates:
+            candidates_by_workspace[ws.id] = candidates
+            wanted_ids.update(candidates)
 
     if wanted_ids:
         try:
@@ -430,12 +476,18 @@ async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tup
                     WorkspaceBlueprint.id.in_(list(wanted_ids)),
                 )
             )).scalars().all()
-            for row in rows:
+            rows_by_id = {row.id: row for row in rows}
+            for workspace_id, candidates in candidates_by_workspace.items():
+                row = next(
+                    (rows_by_id[item_id] for item_id in candidates if item_id in rows_by_id),
+                    None,
+                )
+                if row is None:
+                    continue
                 payload = row.payload if isinstance(row.payload, dict) else None
                 if not payload:
                     continue
-                for workspace_id in wanted_ids.get(row.id, []):
-                    payloads[workspace_id] = (payload, row.content_version)
+                payloads[workspace_id] = (payload, row.content_version, row.id)
         except Exception:
             logger.warning("blueprint freshness: payload lookup failed", exc_info=True)
 
@@ -456,11 +508,23 @@ def _blueprint_update_for(ws, resolved: tuple | None = None) -> dict[str, Any] |
     )
 
     settings = ws.settings if isinstance(getattr(ws, "settings", None), dict) else {}
-    if not installed_blueprint_record(settings).get(BLUEPRINT_ID_KEY):
+    if not _workspace_blueprint_id(settings):
         return None
 
-    payload, current_version = resolved if resolved else (None, None)
-    summary = blueprint_update_summary(settings, payload, current_version=current_version)
+    payload, current_version, resolved_id = resolved if resolved else (None, None, None)
+    effective_settings = settings
+    record = installed_blueprint_record(settings)
+    if resolved_id and record.get(BLUEPRINT_ID_KEY) != resolved_id:
+        # Read-time compatibility for installs created by the old built-in
+        # route. The POST below persists this repair when the operator elects
+        # to update; a GET remains read-only.
+        effective_settings = dict(settings)
+        effective_record = dict(record)
+        effective_record[BLUEPRINT_ID_KEY] = resolved_id
+        effective_settings["_blueprint"] = effective_record
+    summary = blueprint_update_summary(
+        effective_settings, payload, current_version=current_version,
+    )
     if summary.get("status") == BlueprintFreshness.NOT_FROM_BLUEPRINT.value:
         return None
     return summary
@@ -997,7 +1061,7 @@ async def update_one_workspace(
         "heartbeat_enabled" in req.model_fields_set
         or "heartbeat_cadence" in req.model_fields_set
     )
-    update_fields = req.model_dump(exclude_none=True)
+    update_fields = req.model_dump(exclude_unset=True)
     heartbeat_payload: dict[str, Any] = {}
     if "heartbeat_enabled" in req.model_fields_set:
         heartbeat_payload["enabled"] = bool(req.heartbeat_enabled)
@@ -1007,7 +1071,14 @@ async def update_one_workspace(
         update_fields.pop("heartbeat_cadence", None)
 
     audit_fields = sorted(set(update_fields.keys()) | set(heartbeat_payload.keys()))
-    ws = await update_workspace(db, workspace_id, user.entity_id, **update_fields)
+    clear_fields = {key for key, value in update_fields.items() if value is None}
+    ws = await update_workspace(
+        db,
+        workspace_id,
+        user.entity_id,
+        clear_fields=clear_fields,
+        **update_fields,
+    )
     if not ws:
         raise HTTPException(404, "Workspace not found")
     if heartbeat_touched:
@@ -1047,9 +1118,13 @@ async def delete_one_workspace(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Soft-delete a workspace. The workspace remains restorable for
-    ``WORKSPACE_PURGE_GRACE_DAYS`` days; after that the nightly
-    ``ops.purge_soft_deleted_workspaces`` task hard-deletes it."""
+    """Soft-delete a workspace and delete its associated automations.
+
+    The workspace remains restorable for ``WORKSPACE_PURGE_GRACE_DAYS`` days;
+    after that the nightly ``ops.purge_soft_deleted_workspaces`` task
+    hard-deletes it. Restoring recreates built-in runtime jobs, not deleted
+    user automations.
+    """
     if user.role not in ("owner", "admin"):
         raise HTTPException(403, "Only owner/admin can delete workspaces")
     ok = await soft_delete_workspace(db, workspace_id, user.entity_id)
@@ -1112,9 +1187,14 @@ async def pause_workspace(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Pause a workspace — stops strategist, dispatcher, and heartbeat."""
+    """Pause a workspace — stops its automations and autonomous runtime."""
     ws = await _require_workspace_manage(db, workspace_id, user)
     if ws.status == "paused":
+        # Re-assert the lifecycle invariant in case an automation was created
+        # or enabled after the workspace originally entered the paused state.
+        from packages.core.services.scheduler_service import pause_workspace_automations
+
+        await pause_workspace_automations(db, workspace_id, user.entity_id)
         return {"status": "paused", "workspace_id": workspace_id}
     if ws.status != "active":
         raise HTTPException(
@@ -3717,7 +3797,20 @@ async def apply_blueprint_upgrade(
     from packages.core.blueprints.upgrade import apply
 
     resolved = (await _blueprint_payloads_for(db, [ws])).get(ws.id)
-    payload, current_version = resolved if resolved else (None, None)
+    payload, current_version, resolved_id = resolved if resolved else (None, None, None)
+    if resolved_id:
+        from packages.core.blueprints.freshness import (
+            BLUEPRINT_ID_KEY,
+            BLUEPRINT_SETTINGS_KEY,
+            installed_blueprint_record,
+        )
+
+        settings = dict(ws.settings or {})
+        record = dict(installed_blueprint_record(settings))
+        if record.get(BLUEPRINT_ID_KEY) != resolved_id:
+            record[BLUEPRINT_ID_KEY] = resolved_id
+            settings[BLUEPRINT_SETTINGS_KEY] = record
+            ws.settings = settings
     result = await apply(
         db, workspace=ws, payload=payload,
         by_user_id=user.id, current_version=current_version,

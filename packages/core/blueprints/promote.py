@@ -17,8 +17,8 @@ What we DON'T do:
 
   * Reset / clear the simulation history. The trial-run plans + chat
     are kept as evidence of what the operator decided to ship on.
-  * Change governance. The operator was already free to edit it during
-    simulation.
+  * Change operator-owned governance. The simulation-only proposal
+    auto-approval is removed; any explicit operator setting is preserved.
   * Touch budget. ``monthly_spent_usd`` resets on the calendar boundary
     via the existing monthly-reset job; promoting mid-month inherits
     the simulated spend (which under sandbox should have been near-zero
@@ -141,6 +141,13 @@ async def promote_workspace(
     # ── Flip ──
     bp_meta = dict(settings.get("_blueprint") or {})
     settings["sandbox"] = False
+    strategist_settings = dict(settings.get("strategist") or {})
+    if strategist_settings.get("auto_approve_proposals_source") == (
+        "blueprint_simulation"
+    ):
+        strategist_settings["auto_approve_proposals"] = False
+        strategist_settings.pop("auto_approve_proposals_source", None)
+        settings["strategist"] = strategist_settings
     if bp_meta.get("original_kind"):
         ws.kind = bp_meta["original_kind"]
 

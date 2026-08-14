@@ -1,5 +1,8 @@
 """E2E tests: scheduled jobs, job runs, agent executions."""
 
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
 import pytest
 from httpx import AsyncClient
 
@@ -251,6 +254,101 @@ async def test_list_scheduled_jobs_includes_latest_failure_reason(
 
 
 @pytest.mark.asyncio
+async def test_successful_workspace_chat_job_delivers_result_once(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import func, select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.models.task import Conversation, Message
+    from packages.core.services.task_service import create_task
+    from packages.core.tasks.ai_tasks import _update_job_run_status_async
+
+    headers = await _auth(client, "sched_workspace_delivery")
+    workspace_response = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Scheduled delivery"},
+    )
+    workspace = workspace_response.json()
+    job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=f"delivery:{workspace['id']}",
+        entity_id=workspace["entity_id"],
+        workspace_id=workspace["id"],
+        name="Daily public metrics",
+        job_type="cron",
+        timezone="UTC",
+        execution_type="agent",
+        default_delivery_mode="workspace_chat",
+        enabled=True,
+    )
+    db_session.add(job)
+    task = await create_task(
+        db_session,
+        workspace["entity_id"],
+        title="[Auto] Daily public metrics",
+        description="Read the public metrics once.",
+        task_type="ai_generated",
+        workspace_id=workspace["id"],
+        details={
+            "scheduled_job_id": job.job_id,
+            "default_delivery_mode": "workspace_chat",
+        },
+    )
+    task.status = "in_progress"
+    run = ScheduledJobRun(
+        id=generate_ulid(),
+        job_id=job.job_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    )
+    task.details = {**task.details, "scheduled_run_id": run.id}
+    job.manor_task_id = task.id
+    db_session.add(run)
+    await db_session.commit()
+
+    @asynccontextmanager
+    async def session_context():
+        yield db_session
+
+    result = {
+        "status": "completed",
+        "response": "**Daily YouTube public metrics** — views 0, comments unavailable.",
+        "duration_ms": 1250,
+    }
+    await _update_job_run_status_async(session_context, task.id, result)
+    await _update_job_run_status_async(session_context, task.id, result)
+
+    messages = (
+        await db_session.execute(
+            select(Message)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(
+                Conversation.workspace_id == workspace["id"],
+                Message.meta["scheduled_run_id"].as_string() == run.id,
+            )
+        )
+    ).scalars().all()
+    message_count = await db_session.scalar(
+        select(func.count())
+        .select_from(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(Conversation.workspace_id == workspace["id"])
+    )
+
+    assert message_count == 1
+    assert len(messages) == 1
+    assert messages[0].content == result["response"]
+    assert messages[0].author_kind == "agent"
+    assert messages[0].meta["scheduled_job_id"] == job.job_id
+    assert run.status == "success"
+    assert job.last_status == "success"
+
+
+@pytest.mark.asyncio
 async def test_update_scheduled_job(client: AsyncClient):
     headers = await _auth(client)
     create = await client.post(
@@ -350,6 +448,79 @@ async def test_job_runs(client: AsyncClient):
     resp = await client.get(f"/api/v1/jobs/{job_id}/runs", headers=headers)
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_job_run_occurrence_claim_is_idempotent(db_session):
+    from packages.core.services.scheduler_service import claim_job_run
+
+    first, first_claimed = await claim_job_run(
+        db_session,
+        "occurrence-claim-job",
+        "running",
+        idempotency_key="cron:2026-08-13T14:07:00+00:00",
+        trigger_type="cron",
+    )
+    duplicate, duplicate_claimed = await claim_job_run(
+        db_session,
+        "occurrence-claim-job",
+        "running",
+        idempotency_key="cron:2026-08-13T14:07:00+00:00",
+        trigger_type="cron",
+    )
+    next_run, next_claimed = await claim_job_run(
+        db_session,
+        "occurrence-claim-job",
+        "running",
+        idempotency_key="cron:2026-08-13T14:08:00+00:00",
+        trigger_type="cron",
+    )
+
+    assert first_claimed is True
+    assert duplicate_claimed is False
+    assert duplicate.id == first.id
+    assert next_claimed is True
+    assert next_run.id != first.id
+
+
+@pytest.mark.asyncio
+async def test_run_now_propagates_client_idempotency_key(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.tasks.scheduler_tasks import _dispatch_job_task
+
+    queued: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        _dispatch_job_task,
+        "delay",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
+    )
+    headers = await _auth(client, "sched_run_now_idempotency")
+    created = await client.post(
+        "/api/v1/jobs",
+        headers=headers,
+        json={"job_id": "manual-many-times", "name": "Manual many times"},
+    )
+    job_id = created.json()["id"]
+
+    first_headers = {**headers, "Idempotency-Key": "operator-request-1"}
+    first = await client.post(f"/api/v1/jobs/{job_id}/run_now", headers=first_headers)
+    redelivery = await client.post(f"/api/v1/jobs/{job_id}/run_now", headers=first_headers)
+    second = await client.post(
+        f"/api/v1/jobs/{job_id}/run_now",
+        headers={**headers, "Idempotency-Key": "operator-request-2"},
+    )
+
+    assert first.status_code == 202
+    assert redelivery.status_code == 202
+    assert second.status_code == 202
+    assert first.json()["idempotency_key"] == "operator-request-1"
+    assert redelivery.json()["idempotency_key"] == "operator-request-1"
+    assert second.json()["idempotency_key"] == "operator-request-2"
+    assert queued[0][1]["occurrence_key"] == "manual:operator-request-1"
+    assert queued[1][1]["occurrence_key"] == "manual:operator-request-1"
+    assert queued[2][1]["occurrence_key"] == "manual:operator-request-2"
 
 
 @pytest.mark.asyncio
@@ -489,3 +660,115 @@ async def test_scheduler_isolation(client: AsyncClient):
     # B's execution list is empty
     resp3 = await client.get("/api/v1/executions", headers=headers_b)
     assert resp3.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_workspace_job_routes_require_workspace_access(client: AsyncClient):
+    from tests.test_document_permissions import _create_entity_user
+    from tests.test_workspace_write_authz import _make_workspace
+
+    owner_headers = await _auth(client, "sched_scope_owner")
+    me = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    ws_id = await _make_workspace(me["entity_id"], "Private Scheduler", me.get("user_id") or me.get("id"))
+    created = await client.post(
+        "/api/v1/jobs",
+        headers=owner_headers,
+        json={"job_id": "private-scheduled-job", "name": "Private job", "workspace_id": ws_id},
+    )
+    assert created.status_code == 201, created.text
+    job_id = created.json()["id"]
+    outsider = await _create_entity_user(me["entity_id"], "sched_scope_outsider", "member")
+
+    assert (await client.get("/api/v1/jobs", headers=outsider["headers"])).json()["total"] == 0
+    assert (await client.get(f"/api/v1/jobs/{job_id}", headers=outsider["headers"])).status_code == 404
+    assert (await client.put(
+        f"/api/v1/jobs/{job_id}", headers=outsider["headers"], json={"name": "hijack"}
+    )).status_code == 403
+    assert (await client.post(
+        f"/api/v1/jobs/{job_id}/toggle", headers=outsider["headers"], json={"enabled": False}
+    )).status_code == 403
+    assert (await client.get(
+        f"/api/v1/jobs/{job_id}/runs", headers=outsider["headers"]
+    )).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_run_workspace_job_now(client: AsyncClient, monkeypatch):
+    """Manual dispatch is a write operation for Workspace-scoped jobs."""
+    from tests.test_document_permissions import _create_entity_user
+    from tests.test_workspace_write_authz import _add_member, _make_workspace
+
+    owner_headers = await _auth(client, "sched_run_now_owner")
+    me = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    owner_id = me.get("user_id") or me.get("id")
+    ws_id = await _make_workspace(me["entity_id"], "Run Now Private", owner_id)
+    created = await client.post(
+        "/api/v1/jobs",
+        headers=owner_headers,
+        json={"job_id": "run-now-private", "name": "Run now private", "workspace_id": ws_id},
+    )
+    assert created.status_code == 201, created.text
+    job_id = created.json()["id"]
+
+    viewer = await _create_entity_user(me["entity_id"], "sched_run_now_viewer", role="member")
+    await _add_member(ws_id, viewer["id"], "viewer")
+
+    class _UnexpectedDispatch:
+        def delay(self, *args, **kwargs):
+            raise AssertionError("viewer request reached the scheduler queue")
+
+    import packages.core.tasks.scheduler_tasks as scheduler_tasks
+    monkeypatch.setattr(scheduler_tasks, "_dispatch_job_task", _UnexpectedDispatch())
+
+    response = await client.post(
+        f"/api/v1/jobs/{job_id}/run_now",
+        headers=viewer["headers"],
+    )
+    assert response.status_code == 403, response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_execution_workspace_scope_is_read_write_protected(client: AsyncClient):
+    from tests.test_document_permissions import _create_entity_user
+    from tests.test_workspace_write_authz import _add_member, _make_workspace
+
+    owner_headers = await _auth(client, "execution_scope_owner")
+    me = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    owner_id = me.get("user_id") or me.get("id")
+    ws_id = await _make_workspace(me["entity_id"], "Execution Private", owner_id)
+    other_ws_id = await _make_workspace(me["entity_id"], "Execution Other", owner_id)
+    created = await client.post(
+        "/api/v1/executions",
+        headers=owner_headers,
+        json={"agent_id": "workspace-agent", "workspace_id": ws_id},
+    )
+    assert created.status_code == 201, created.text
+    execution_id = created.json()["id"]
+    other_created = await client.post(
+        "/api/v1/executions",
+        headers=owner_headers,
+        json={"agent_id": "other-workspace-agent", "workspace_id": other_ws_id},
+    )
+    assert other_created.status_code == 201, other_created.text
+
+    viewer = await _create_entity_user(me["entity_id"], "execution_scope_viewer", role="member")
+    await _add_member(ws_id, viewer["id"], "viewer")
+
+    listed = await client.get("/api/v1/executions", headers=viewer["headers"])
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["total"] == 1
+    assert listed.json()["items"][0]["id"] == execution_id
+
+    created_by_viewer = await client.post(
+        "/api/v1/executions",
+        headers=viewer["headers"],
+        json={"agent_id": "viewer-agent", "workspace_id": ws_id},
+    )
+    assert created_by_viewer.status_code == 403, created_by_viewer.text
+
+    updated_by_viewer = await client.put(
+        f"/api/v1/executions/{execution_id}",
+        headers=viewer["headers"],
+        json={"status": "completed"},
+    )
+    assert updated_by_viewer.status_code == 403, updated_by_viewer.text

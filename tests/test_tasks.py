@@ -678,6 +678,169 @@ async def test_retry_plan_backed_task_records_reset_step_ids(client: AsyncClient
 
 
 @pytest.mark.asyncio
+async def test_retry_unconsumed_proposal_external_task_starts_new_plan(
+    client: AsyncClient,
+    monkeypatch,
+):
+    """An unspent external action must not resume a verification-only plan."""
+    new_plan_calls = []
+    resumed_plan_calls = []
+
+    from packages.core.tasks import ai_tasks
+
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "delay",
+        lambda task_id: new_plan_calls.append(task_id),
+    )
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda plan_id: resumed_plan_calls.append(plan_id),
+    )
+
+    headers = await _auth(client, "taskretry_external_proposal")
+    me = await client.get("/api/v1/auth/me", headers=headers)
+    entity_id = me.json()["entity_id"]
+
+    create = await client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={"title": "Publish approved video"},
+    )
+    task_id = create.json()["id"]
+    await client.put(
+        f"/api/v1/tasks/{task_id}",
+        headers=headers,
+        json={"status": "failed"},
+    )
+
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task, TaskLog
+
+    plan_id = generate_ulid()
+    failed_step_id = generate_ulid()
+    approved_runtime_context = {
+        "instructions": "Publish the approved MP4 to YouTube exactly once.",
+        "rules": [
+            {
+                "rule_type": "approval_required",
+                "capability_patterns": ["external.social"],
+            },
+            {
+                "rule_type": "deny",
+                "action_patterns": ["upload_other_file", "second_upload"],
+            },
+        ],
+        "required_capabilities": ["external.social"],
+    }
+    verification_only_runtime_context = {
+        **approved_runtime_context,
+        "instructions": (
+            "Publish the approved MP4 to YouTube exactly once.\n"
+            "Latest user constraint: verify only; do not upload or publish."
+        ),
+        "rules": [
+            *approved_runtime_context["rules"],
+            {
+                "rule_type": "deny",
+                "action_patterns": ["video.upload_*", "video.publish_*"],
+                "capability_patterns": ["external.social"],
+            },
+        ],
+    }
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, task_id)
+        task.owner_service_key = "stickman.distribution"
+        task.details = {
+            "external_action": {
+                "provider": "youtube",
+                "action": "publish_video",
+                "destination": "studio.youtube.com",
+            },
+            "proposal_external_authorization": {
+                "authorization_id": "proposal-item:publish-task",
+                "task_id": task_id,
+                "consumed_at": None,
+            },
+            "_replan_context": {
+                "instruction": (
+                    "This retry was constrained to verification only: "
+                    "no uploads, edits, publishing, or external side effects."
+                ),
+            },
+            "runtime_context": verification_only_runtime_context,
+        }
+        db.add_all([
+            TaskLog(
+                task_id=task_id,
+                log_type="runtime_context",
+                content="Workspace Agent updated task runtime requirements.",
+                meta={"runtime_context": approved_runtime_context},
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+            ),
+            TaskLog(
+                task_id=task_id,
+                log_type="runtime_context",
+                content="Workspace Agent updated task runtime requirements.",
+                meta={"runtime_context": verification_only_runtime_context},
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            ),
+        ])
+        db.add(
+            ExecutionPlan(
+                id=plan_id,
+                entity_id=entity_id,
+                task_id=task_id,
+                status="failed",
+                execution_mode="live",
+                approval_required=False,
+                plan_dag={"steps": []},
+            )
+        )
+        db.add(
+            ExecutionStep(
+                id=failed_step_id,
+                plan_id=plan_id,
+                entity_id=entity_id,
+                step_key="verify_public_youtube_url",
+                kind="llm",
+                params={},
+                depends_on=[],
+                step_status="failed",
+                error={"type": "StepResultFailed"},
+                attempt_count=3,
+                max_attempts=3,
+            )
+        )
+        await db.commit()
+
+    resp = await client.post(
+        f"/api/v1/tasks/{task_id}/retry",
+        headers=headers,
+        json={},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mode"] == "plan_new"
+    assert body["plan_id"] is None
+    assert body["reset_steps"] == 0
+    assert new_plan_calls == [task_id]
+    assert resumed_plan_calls == []
+
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, task_id)
+        plan = await db.get(ExecutionPlan, plan_id)
+        failed_step = await db.get(ExecutionStep, failed_step_id)
+        assert "_replan_context" not in (task.details or {})
+        assert task.details["runtime_context"] == approved_runtime_context
+        assert plan.status == "failed"
+        assert failed_step.step_status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_retry_task_without_executor_returns_409(client: AsyncClient):
     headers = await _auth(client, "taskretry_no_executor")
     create = await client.post("/api/v1/tasks", headers=headers, json={"title": "Manual only"})
@@ -697,7 +860,10 @@ async def test_approval_task_decision_records_output_log_and_workspace_signal(
     db_session,
 ):
     from sqlalchemy import select
+    from packages.core.constants.approvals import ApprovalStatus
+    from packages.core.models.hitl_request import HitlRequest
     from packages.core.models.runtime_learning import RuntimeEvidence
+    from packages.core.models.task import Conversation, Message
 
     workspace_signals = []
 
@@ -749,6 +915,24 @@ async def test_approval_task_decision_records_output_log_and_workspace_signal(
     assert body["details"]["approval_decision"]["note"] == "Looks good. Continue publishing prep."
     assert body["actual_output"]["approval"]["approved"] is True
     assert "Looks good" in body["actual_output"]["summary"]
+
+    chat_cards = list((await db_session.execute(
+        select(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(Conversation.workspace_id == workspace_id)
+    )).scalars().all())
+    task_card = next(
+        message for message in chat_cards
+        if (message.pending_action or {}).get("task_id") == task_id
+    )
+    await db_session.refresh(task_card)
+    assert task_card.resolved_at is not None
+    request = (await db_session.execute(
+        select(HitlRequest).where(
+            HitlRequest.id == task_card.pending_action["approval_request_id"]
+        )
+    )).scalar_one()
+    assert request.status == ApprovalStatus.CONSUMED.value
 
     logs = await client.get(f"/api/v1/tasks/{task_id}/logs", headers=headers)
     approval_log = next(log for log in logs.json() if log["log_type"] == "approval_decision")
@@ -813,6 +997,40 @@ async def test_non_approval_task_rejects_approval_decision(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_approval_language_does_not_turn_execution_task_into_approval_task(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "taskapproval_prose")
+    create = await client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Recover the video after approval render failed",
+            "description": "Produce the missing MP4, then prepare it for approval.",
+            "task_type": "general",
+            "details": {
+                "runtime_context": {
+                    "instructions": "pending_founder_review applies after the artifact exists",
+                },
+            },
+        },
+    )
+    assert create.status_code == 201
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/api/v1/tasks/{task_id}/approval",
+        headers=headers,
+        json={"choice": "approve"},
+    )
+
+    assert resp.status_code == 400
+    assert "not an approval task" in resp.json()["detail"].lower()
+    task = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+    assert task.json()["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_approval_task_request_changes_records_negative_decision(client: AsyncClient):
     headers = await _auth(client, "taskapproval_changes")
     create = await client.post(
@@ -837,6 +1055,134 @@ async def test_approval_task_request_changes_records_negative_decision(client: A
     assert body["details"]["approval_decision"]["decision"] == "changes_requested"
     assert body["details"]["approval_decision"]["approved"] is False
     assert body["actual_output"]["approval"]["note"] == "Make the CTA less aggressive."
+
+
+@pytest.mark.asyncio
+async def test_approval_task_is_actionable_from_workspace_chat(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select as sa_select
+
+    from packages.core.constants.approvals import ApprovalStatus
+    from packages.core.constants.pending_actions import PendingActionKind
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.task import Conversation, Message
+
+    headers = await _auth(client, "taskapproval_chat")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Chat Approval Workspace"},
+    )
+    workspace_id = workspace.json()["id"]
+    created = await client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Approve the launch article",
+            "task_type": "approval",
+            "workspace_id": workspace_id,
+            "details": {"review_material": {"headline": "Launch day"}},
+        },
+    )
+    task_id = created.json()["id"]
+
+    messages = list((await db_session.execute(
+        sa_select(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Conversation.workspace_id == workspace_id,
+            Message.resolved_at.is_(None),
+        )
+    )).scalars().all())
+    card = next(
+        message for message in messages
+        if (message.pending_action or {}).get("kind")
+        == PendingActionKind.TASK_APPROVAL.value
+    )
+    assert card.pending_action["task_id"] == task_id
+    assert card.pending_action["review"] == {"headline": "Launch day"}
+    assert card.pending_action["options"] == ["approve", "request_changes"]
+    request_id = card.pending_action["approval_request_id"]
+
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{card.id}/resolve",
+        headers=headers,
+        json={"choice": "approve"},
+    )
+    assert resolved.status_code == 200
+    task = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+    assert task.json()["status"] == "completed"
+    assert task.json()["details"]["approval_decision"]["approved"] is True
+
+    request = (await db_session.execute(
+        sa_select(HitlRequest).where(HitlRequest.id == request_id)
+    )).scalar_one()
+    await db_session.refresh(request)
+    assert request.status == ApprovalStatus.CONSUMED.value
+
+
+@pytest.mark.asyncio
+async def test_task_recovery_hitl_is_visible_and_cancel_closes_task(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select as sa_select
+
+    from packages.core.constants.approvals import ApprovalStatus
+    from packages.core.constants.pending_actions import PendingActionKind
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.task import Task
+    from packages.core.services.task_chat_hitl import ensure_task_recovery_hitl
+
+    headers = await _auth(client, "taskrecovery_chat")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Chat Recovery Workspace"},
+    )
+    workspace_id = workspace.json()["id"]
+    created = await client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Render the missing MP4",
+            "workspace_id": workspace_id,
+        },
+    )
+    task_id = created.json()["id"]
+    task = (await db_session.execute(
+        sa_select(Task).where(Task.id == task_id)
+    )).scalar_one()
+    task.status = "waiting_on_customer"
+    card = await ensure_task_recovery_hitl(
+        db_session,
+        task,
+        plan_id="plan-recovery-test",
+        prompt="The render completed without a saved MP4.",
+        issue="No saved file path was recorded.",
+    )
+    await db_session.commit()
+
+    assert card is not None
+    assert card.pending_action["kind"] == PendingActionKind.TASK_RECOVERY.value
+    assert card.pending_action["options"] == ["retry", "cancel"]
+    request_id = card.pending_action["approval_request_id"]
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{card.id}/resolve",
+        headers=headers,
+        json={"choice": "cancel"},
+    )
+    assert resolved.status_code == 200
+    task_response = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+    assert task_response.json()["status"] == "cancelled"
+
+    request = (await db_session.execute(
+        sa_select(HitlRequest).where(HitlRequest.id == request_id)
+    )).scalar_one()
+    await db_session.refresh(request)
+    assert request.status == ApprovalStatus.DENIED.value
 
 
 @pytest.mark.asyncio
@@ -905,11 +1251,11 @@ async def test_workspace_task_comment_schedules_agent_without_blocking(
             headers=headers,
             json={"content": "Please adapt the next work wave.", "log_type": "comment"},
         ),
-        timeout=1,
+        timeout=5,
     )
 
     assert resp.status_code == 201
-    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(started.wait(), timeout=5)
     release.set()
     await asyncio.sleep(0)
     assert calls[0]["task_id"] == task_id

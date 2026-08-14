@@ -22,7 +22,11 @@ async def runtime_generate_document_file(
 ) -> str:
     """Generate a user-visible document file through the Runtime boundary."""
 
-    from packages.core.ai.runtime.document_actions import runtime_document_to_dict
+    from packages.core.ai.runtime.document_actions import (
+        runtime_document_markdown_link,
+        runtime_document_to_dict,
+        runtime_document_viewer_url,
+    )
     from packages.core.ai.runtime.file_actions import (
         runtime_entity_file_root,
         runtime_get_document_for_entity,
@@ -196,6 +200,11 @@ async def runtime_generate_document_file(
         "document": {
             "id": sync.document_id,
             "name": os.path.basename(clean_name),
+            "viewer_url": runtime_document_viewer_url(sync.document_id),
+            "markdown_link": runtime_document_markdown_link(
+                os.path.basename(clean_name),
+                sync.document_id,
+            ),
             "fs_path": clean_name,
             "file_size": file_size,
             "file_type": clean_file_type,

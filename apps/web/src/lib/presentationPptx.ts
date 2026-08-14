@@ -58,6 +58,7 @@ export interface PresentationShape {
   padding?: { l: number; t: number; r: number; b: number };
   texts: PresentationTextRun[];
   imgUrl?: string;
+  hyperlink?: string;
   imageFit?: "cover" | "contain";
   tableRows?: PresentationTableCell[][];
   tableColWidths?: number[];
@@ -285,6 +286,7 @@ async function addShapeToSlide(
       sizing: { type: model.imageFit || (model.imgCrop ? "cover" : "contain"), w: rect.w, h: rect.h },
       transparency: Math.round((1 - Math.max(0, Math.min(1, model.opacity ?? 1))) * 100),
       rounding: model.presetGeom === "ellipse" || model.presetGeom === "oval",
+      hyperlink: model.hyperlink ? { url: model.hyperlink } : undefined,
     });
   }
 

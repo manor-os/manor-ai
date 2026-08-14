@@ -576,6 +576,18 @@ export function IconList(props: IconProps) {
   );
 }
 
+/** View options — compact option rows */
+export function IconViewOptions(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="6.75" cy="7" r="2.25" />
+      <path d="M11.25 7h9" />
+      <circle cx="6.75" cy="17" r="2.25" />
+      <path d="M11.25 17h9" />
+    </Svg>
+  );
+}
+
 /* ================================================================
    DOMAIN-SPECIFIC (Manor OS)
    ================================================================ */
@@ -798,6 +810,14 @@ export function IconStore(props: IconProps) {
 }
 export function IconLayers(props: IconProps) {
   return (<Svg {...props}><polygon points="12 2 2 7 12 12 22 7 12 2" /><polyline points="2 17 12 22 22 17" /><polyline points="2 12 12 17 22 12" /></Svg>);
+}
+export function IconPresentation(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="3" y="4" width="18" height="12" rx="2" />
+      <path d="M7.5 12l2.5-2.5 2.25 2.25 3-3L18 11.5M12 16v4M8.5 20h7" />
+    </Svg>
+  );
 }
 export function IconGear(props: IconProps) {
   return (<Svg {...props}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" /></Svg>);

@@ -1,12 +1,11 @@
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "packages/core/ai/skills/pptx/scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from svg_quality_checker import SVGQualityChecker  # noqa: E402
+from svg_quality_checker import SVGQualityChecker
 
 
 def test_svg_quality_checker_rejects_low_contrast_text_on_solid_panel(tmp_path: Path) -> None:
@@ -42,3 +41,39 @@ def test_svg_quality_checker_allows_readable_text_on_solid_panel(tmp_path: Path)
 
     assert result["passed"]
     assert not any("Low-contrast text" in warning for warning in result["warnings"])
+
+
+def test_svg_quality_checker_rejects_text_that_escapes_its_panel(tmp_path: Path) -> None:
+    svg = tmp_path / "overflow.svg"
+    svg.write_text(
+        """<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="1280" height="720" fill="#FFFFFF"/>
+  <rect x="72" y="170" width="300" height="260" fill="#F4F6F8"/>
+  <text x="96" y="230" fill="#111827" font-size="24">This body sentence visibly escapes the narrow card.</text>
+</svg>
+""",
+        encoding="utf-8",
+    )
+
+    result = SVGQualityChecker().check_file(str(svg))
+
+    assert not result["passed"]
+    assert any("Text fit failure" in error for error in result["errors"])
+
+
+def test_svg_quality_checker_allows_text_that_fits_its_panel(tmp_path: Path) -> None:
+    svg = tmp_path / "fitting.svg"
+    svg.write_text(
+        """<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="1280" height="720" fill="#FFFFFF"/>
+  <rect x="72" y="170" width="720" height="260" fill="#F4F6F8"/>
+  <text x="96" y="230" fill="#111827" font-size="24">A concise body sentence.</text>
+</svg>
+""",
+        encoding="utf-8",
+    )
+
+    result = SVGQualityChecker().check_file(str(svg))
+
+    assert result["passed"]
+    assert not any("Text fit failure" in error for error in result["errors"])

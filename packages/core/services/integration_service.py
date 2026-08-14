@@ -16,8 +16,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.credentials import get_credential_service
+from packages.core.integrations.registry import register_integration
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Integration, Channel
+from packages.core.services.email_credentials import normalize_email_credentials
+from packages.core.services.provider_keys import canonical_provider_key, provider_key_aliases
 
 
 def _parse_csv_env(name: str) -> set[str]:
@@ -61,12 +64,15 @@ async def create_integration(
     config: dict | None = None, credentials: dict | None = None,
     created_by_user_id: str | None = None,
 ) -> Integration:
+    provider = canonical_provider_key(provider)
+    register_integration(provider)
+    provider_aliases = provider_key_aliases(provider)
     resolved_config = dict(config or {})
     if "is_default" not in resolved_config:
         sibling_exists = (await db.execute(
             select(Integration.id).where(
                 Integration.entity_id == entity_id,
-                Integration.provider == provider,
+                Integration.provider.in_(provider_aliases),
                 Integration.status == "active",
             ).limit(1)
         )).scalar_one_or_none()
@@ -80,6 +86,8 @@ async def create_integration(
         credentials={},
     )
     if credentials:
+        if provider == "email":
+            credentials = normalize_email_credentials(credentials)
         # store_integration sets credential_ref + credential_scheme and
         # leaves the legacy JSONB empty. Needs the row to have an id +
         # entity + provider populated (above) so the context is stable.
@@ -97,6 +105,8 @@ async def update_integration(
         return None
     # Pull credentials out of kwargs — those route through the vault.
     new_creds = kwargs.pop("credentials", None)
+    if kwargs.get("provider") is not None:
+        kwargs["provider"] = canonical_provider_key(kwargs["provider"])
     for key, value in kwargs.items():
         if value is not None and hasattr(integration, key):
             if key == "config" and isinstance(value, dict):
@@ -107,6 +117,8 @@ async def update_integration(
                 )
             setattr(integration, key, value)
     if new_creds is not None:
+        if integration.provider == "email":
+            new_creds = normalize_email_credentials(new_creds)
         get_credential_service().store_integration(integration, new_creds)
     await db.flush()
     await db.refresh(integration)
@@ -134,11 +146,12 @@ async def list_accounts_by_provider(
     provider supports multiple accounts (email inboxes, WhatsApp senders,
     WeChat bots, etc.).
     """
+    aliases = provider_key_aliases(provider)
     rows = (await db.execute(
         select(Integration)
         .where(
             Integration.entity_id == entity_id,
-            Integration.provider == provider,
+            Integration.provider.in_(aliases),
             Integration.status == "active",
         )
         .order_by(Integration.created_at.desc())

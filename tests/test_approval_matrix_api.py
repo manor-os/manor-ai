@@ -123,8 +123,22 @@ async def test_matrix_lists_every_strategist_key_and_other_grants(client: AsyncC
     assert by_key[AUTOMATION_DELETE_KEY]["risk_level"] == "high"
     assert by_key[AUTOMATION_DELETE_KEY]["operation"] == "delete"
     assert by_key["workspace.proposal.automation_change.pause"]["risk_level"] == "medium"
+
+    # Running a Workspace Flow is a decision a human makes on the cohort
+    # card, same as the change kinds — so it earns its own matrix row.
+    run_row = by_key["workspace.proposal.workflow_run"]
+    assert run_row["kind"] == "workflow_run"
+    assert run_row["risk_level"] == "medium"
+    assert run_row["label"]
+
+    # Deliberate list: a new proposal kind should not reach Settings →
+    # Approval automation until someone decides it belongs there. If this
+    # fails after adding a kind, either add it here (and give it a label
+    # and risk level in packages/core/proposals/constants.py) or keep it
+    # out of ACTION_KEY_BY_KIND.
     assert {row["kind"] for row in body["rows"]} == {
-        "task", "automation_change", "workflow_change", "goal_change", "experiment",
+        "task", "automation_change", "workflow_change", "goal_change",
+        "experiment", "workflow_run",
     }
 
     # Nothing existing disappears: the default capability grants ride along.

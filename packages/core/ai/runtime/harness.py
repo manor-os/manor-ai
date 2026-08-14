@@ -108,6 +108,7 @@ class RuntimeHarness:
         workspace_id: str | None,
         conversation_id: str | None,
         task_id: str | None = None,
+        step_id: str | None = None,
     ) -> str | None:
         """Run approval middleware and record any blocking result."""
         decision = await self.approval_middleware.guard_request(
@@ -119,6 +120,7 @@ class RuntimeHarness:
                 workspace_id=workspace_id,
                 conversation_id=conversation_id,
                 task_id=task_id,
+                step_id=step_id,
                 envelope=self.envelope,
             )
         )
@@ -221,6 +223,7 @@ async def runtime_execute_agentic_loop(
     workspace_id: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
+    step_id: str | None = None,
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     manual_skill_slugs: Iterable[str] | None = None,
@@ -235,11 +238,14 @@ async def runtime_execute_agentic_loop(
     on_tool_start: Callable[[str, dict[str, Any]], Any] | None = None,
     on_tool_end: Callable[..., Any] | None = None,
     on_llm_call: Callable[..., Any] | None = None,
+    on_llm_call_before: Callable[..., Any] | None = None,
+    on_llm_usage_settled: Callable[..., Any] | None = None,
     stream_handler: Callable[..., Any] | None = None,
     metadata: dict[str, Any] | None = None,
     forced_tool_calls: list[dict[str, Any]] | None = None,
     terminal_tool_result_policy: dict[str, Any] | None = None,
     output_schema: dict[str, Any] | None = None,
+    is_cancelled: Callable[[], Any] | None = None,
     dynamic_tool_handlers: Mapping[str, RuntimeDynamicToolHandler] | None = None,
     runtime_tool_context: Mapping[str, Any] | None = None,
     tool_executor: ToolExecutor | None = None,
@@ -331,6 +337,7 @@ async def runtime_execute_agentic_loop(
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
+            step_id=step_id,
             active_user_message=tool_context_message,
             manual_skill_selected=manual_skill_selected,
             manual_skill_slugs=list(manual_skill_slugs or []),
@@ -358,6 +365,8 @@ async def runtime_execute_agentic_loop(
         "on_tool_start": on_tool_start,
         "on_tool_end": on_tool_end,
         "on_llm_call": on_llm_call,
+        "on_llm_call_before": on_llm_call_before,
+        "on_llm_usage_settled": on_llm_usage_settled,
         "stream_handler": stream_handler,
         "metadata": resolved_metadata,
         "tool_schema_resolver": resolved_tool_schema,
@@ -365,6 +374,8 @@ async def runtime_execute_agentic_loop(
         "terminal_tool_result_policy": terminal_tool_result_policy,
         "output_schema": output_schema,
     }
+    if is_cancelled is not None:
+        loop_kwargs["is_cancelled"] = is_cancelled
     if temperature is not None:
         loop_kwargs["temperature"] = temperature
     if max_tokens is not None:
@@ -432,6 +443,7 @@ async def runtime_execute_subagent_loop(
     workspace_id: str | None,
     conversation_id: str | None,
     task_id: str | None = None,
+    step_id: str | None = None,
     active_user_message: str | None = None,
     tool_profile: str | None = None,
     allowed_tool_names: Iterable[str] | None = None,
@@ -464,6 +476,7 @@ async def runtime_execute_subagent_loop(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         task_id=task_id,
+        step_id=step_id,
         active_user_message=active_user_message,
         tool_profile=tool_profile,
         allowed_tool_names=allowed_tool_names,

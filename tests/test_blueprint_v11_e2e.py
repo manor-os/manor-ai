@@ -27,7 +27,7 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.memory import AgentMemory
 from packages.core.models.skill import AgentSkillBinding, Skill
-from packages.core.models.workflow import WorkflowDefinition
+from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import (
     Agent,
     AgentSubscription,
@@ -35,6 +35,7 @@ from packages.core.models.workspace import (
     ToolDefinition,
     Workspace,
 )
+from packages.core.blueprints.exporter import export_workspace
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -174,6 +175,117 @@ async def test_v11_full_export_install_roundtrip(
         await client.get(f"/api/v1/blueprints/{bp['id']}", headers=headers)
     ).json()
     assert source_detail["remix_count"] == 1
+
+
+async def test_v11_refreeze_replaces_only_same_workspace_editable_draft(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers, _ = await _register(client, "v11refreeze")
+    ws = await _create_workspace(client, headers, "Refreeze Source")
+    workspace_id = ws["id"]
+
+    first = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint",
+        headers=headers,
+        json={"slug": "refreeze-v1", "title": "Refreeze v1"},
+    )
+    assert first.status_code == 201, first.text
+    first_payload = first.json()
+
+    duplicate = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint",
+        headers=headers,
+        json={"slug": "refreeze-v1", "title": "Accidental overwrite"},
+    )
+    assert duplicate.status_code == 409
+
+    row = await db_session.get(Workspace, workspace_id)
+    assert row is not None
+    row.operating_context = "Updated portable context."
+    await db_session.commit()
+
+    replaced = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint",
+        headers=headers,
+        json={
+            "slug": "refreeze-v1",
+            "title": "Refreeze v2",
+            "replace_existing": True,
+        },
+    )
+    assert replaced.status_code == 201, replaced.text
+    replaced_payload = replaced.json()
+    assert replaced_payload["id"] == first_payload["id"]
+    assert replaced_payload["title"] == "Refreeze v2"
+    assert (
+        replaced_payload["payload"]["recipe"]["operating_model"]["context"]
+        == "Updated portable context."
+    )
+
+
+async def test_v11_workspace_workflow_export_install_roundtrip(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers, user = await _register(client, "v11workflowexport")
+    ws = await _create_workspace(client, headers, "Workflow Source")
+    source_workspace_id = ws["id"]
+    workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=user["entity_id"],
+        workspace_id=source_workspace_id,
+        name="workspace-daily-brief",
+        description="Create a brief from one topic.",
+        trigger_type="manual",
+        trigger_config={},
+        steps=[
+            {
+                "id": "start",
+                "type": "trigger",
+                "name": "Start",
+                "config": {},
+                "next": ["draft"],
+            },
+            {
+                "id": "draft",
+                "type": "llm",
+                "name": "Draft",
+                "config": {"prompt": "Create a concise brief."},
+                "next": [],
+            },
+        ],
+        variables={"topic": "launch"},
+        category="content",
+        tags=["brief"],
+        is_active=True,
+        status="active",
+    )
+    db_session.add(workflow)
+    await db_session.commit()
+
+    exported = await client.post(
+        f"/api/v1/workspaces/{source_workspace_id}/export-blueprint",
+        headers=headers,
+        json={"slug": "workflow-export-v1", "title": "Workflow Export"},
+    )
+    assert exported.status_code == 201, exported.text
+    [workflow_payload] = exported.json()["payload"]["recipe"]["workflows"]
+    assert workflow_payload["slug"] == "workspace-daily-brief"
+    assert workflow_payload["steps"] == workflow.steps
+
+    installed = await client.post(
+        f"/api/v1/blueprints/{exported.json()['id']}/install",
+        headers=headers,
+        json={"mode": "live", "workspace_name": "Workflow Copy"},
+    )
+    assert installed.status_code == 201, installed.text
+    [binding_id] = installed.json()["workflow_binding_ids"]
+    binding = await db_session.get(WorkflowBinding, binding_id)
+    assert binding is not None
+    copied = await db_session.get(WorkflowDefinition, binding.workflow_id)
+    assert copied is not None
+    assert copied.steps == workflow.steps
 
 
 # ── Test 2: install_count increments + listing ────────────────────────
@@ -719,6 +831,14 @@ async def test_v11_strategist_template_installs(
     assert strat["business_model"]["model_type"] == "social_growth"
     assert strat["proposal_shape"]["max_tasks_per_cycle"] == 3
     assert strat["do_not_propose"] == ["No mass DMs"]
+
+    exported = await export_workspace(
+        db_session,
+        new_ws_id,
+        title="Strategist Test Export",
+    )
+    assert exported["recipe"]["strategist"] == payload["recipe"]["strategist"]
+    assert "strategist" not in exported["recipe"]["operating_model"]
 
 
 # ── Test 8: payload validation surfaces 400 from the API ──────────────

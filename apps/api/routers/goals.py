@@ -44,6 +44,7 @@ class GoalResponse(BaseModel):
     id: str
     entity_id: str
     workspace_id: Optional[str]
+    stat_id: Optional[str]
     title: str
     description: Optional[str]
     metric_key: str
@@ -78,6 +79,7 @@ class GoalCreateRequest(BaseModel):
     baseline_value: Optional[float] = None
     deadline: Optional[date] = None
     workspace_id: Optional[str] = None
+    stat_id: Optional[str] = None
     measurement_source: Optional[dict] = None
     measurement_cadence: Optional[str] = None
     priority: int = Field(default=3, ge=1, le=5)
@@ -89,6 +91,7 @@ class GoalUpdateRequest(BaseModel):
     title: Optional[str] = None
     goal: Optional[str] = None
     description: Optional[str] = None
+    stat_id: Optional[str] = None
     target_value: Optional[float] = None
     deadline: Optional[date] = None
     status: Optional[str] = None
@@ -121,6 +124,7 @@ def _to_response(g: Goal, link_summary: Optional[dict[str, Any]] = None) -> Goal
         id=g.id,
         entity_id=g.entity_id,
         workspace_id=g.workspace_id,
+        stat_id=g.stat_id,
         title=g.title,
         description=g.description,
         metric_key=g.metric_key,
@@ -315,15 +319,35 @@ async def create_goal(
 
     if not req.title:
         raise HTTPException(422, "title is required")
+    linked_stat = None
+    if req.stat_id:
+        from packages.core.models.workspace_stat import WorkspaceStat
+        linked_stat = (await db.execute(select(WorkspaceStat).where(
+            WorkspaceStat.id == req.stat_id,
+            WorkspaceStat.entity_id == user.entity_id,
+        ))).scalar_one_or_none()
+        if linked_stat is None or linked_stat.workspace_id != req.workspace_id:
+            raise HTTPException(400, "stat_id must reference a stat in the selected workspace")
+        if not linked_stat.goal_eligible:
+            raise HTTPException(400, "the selected stat is not goal eligible")
     goal = await goal_service.create_goal(
         db,
         entity_id=user.entity_id,
         title=req.title,
-        metric_key=req.metric_key,
+        metric_key=(
+            linked_stat.key
+            if linked_stat is not None and "metric_key" not in req.model_fields_set
+            else req.metric_key
+        ),
         target_value=req.target_value,
         workspace_id=req.workspace_id,
+        stat_id=req.stat_id,
         description=req.description,
-        baseline_value=req.baseline_value,
+        baseline_value=(
+            linked_stat.current_value
+            if linked_stat is not None and req.baseline_value is None
+            else req.baseline_value
+        ),
         deadline=req.deadline,
         measurement_source=req.measurement_source,
         measurement_cadence=req.measurement_cadence,
@@ -378,6 +402,16 @@ async def update_goal(
     await require_workspace_writable(db, user, existing.workspace_id)
 
     payload = req.model_dump(exclude_unset=True)
+    if payload.get("stat_id") is not None:
+        from packages.core.models.workspace_stat import WorkspaceStat
+        linked_stat = (await db.execute(select(WorkspaceStat).where(
+            WorkspaceStat.id == payload["stat_id"],
+            WorkspaceStat.entity_id == user.entity_id,
+        ))).scalar_one_or_none()
+        if linked_stat is None or linked_stat.workspace_id != existing.workspace_id:
+            raise HTTPException(400, "stat_id must reference a stat in this workspace")
+        if not linked_stat.goal_eligible:
+            raise HTTPException(400, "the selected stat is not goal eligible")
     goal = await goal_service.update_goal(db, goal_id, user.entity_id, **payload)
     if not goal:
         raise HTTPException(404, "goal not found")

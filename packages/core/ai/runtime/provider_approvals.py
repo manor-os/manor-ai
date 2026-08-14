@@ -10,6 +10,12 @@ from typing import Any, Callable
 
 _PROVIDER_RETRY_ARGUMENTS_MAX_CHARS = 16_000
 _TOOL_CONTINUATION_KEY = "__manor_tool_continuation"
+_CHROME_CONFIRMATION_MODES = {
+    "always_action_time",
+    "preapproval_allowed",
+    "handoff_required",
+    "no_confirmation",
+}
 
 
 @dataclass
@@ -32,17 +38,33 @@ class ProviderApprovalCollector:
             return
         self.requests.append(request)
 
+    def _resolve(self, resolution: dict[str, Any] | None) -> None:
+        if not isinstance(resolution, dict):
+            return
+        identity = (
+            resolution.get("provider"),
+            resolution.get("provider_approval_id"),
+        )
+        self.requests = [
+            item
+            for item in self.requests
+            if (item.get("provider"), item.get("provider_approval_id")) != identity
+        ]
+
     def capture(
         self,
         tool_name: str,
         arguments: dict[str, Any] | None,
         result: str | dict[str, Any],
     ) -> None:
+        self._resolve(normalize_provider_approval_resolution(tool_name, arguments, result))
         self._append(normalize_provider_approval(tool_name, arguments, result))
 
     def capture_recorded_tool_call(self, tool_call: Any) -> None:
         if not isinstance(tool_call, dict):
             return
+        resolution = tool_call.get("provider_approval_resolution")
+        self._resolve(resolution if isinstance(resolution, dict) else None)
         request = tool_call.get("provider_approval")
         self._append(request if isinstance(request, dict) else None)
 
@@ -133,13 +155,35 @@ def _normalize_chrome_approval(
     retry_arguments = _retry_arguments(raw_retry_arguments)
     if retry_arguments is None:
         return None
+    for source_key, target_key in (
+        ("groupId", "groupId"),
+        ("group_id", "groupId"),
+        ("tabId", "tabId"),
+        ("tab_id", "tabId"),
+        ("ref", "ref"),
+        ("node_id", "ref"),
+        ("selector", "selector"),
+        ("snapshot_id", "snapshot_id"),
+    ):
+        if payload.get(source_key) is not None:
+            retry_arguments[target_key] = payload.get(source_key)
+
+    confirmation_arguments: dict[str, Any] = {"approvalId": approval_id}
+    confirmation_mode = str(payload.get("confirmation_mode") or "").strip()
+    policy_category = str(payload.get("policy_category") or "").strip()
+    if confirmation_mode in _CHROME_CONFIRMATION_MODES and policy_category:
+        confirmation_arguments.update({
+            "confirmation_mode": confirmation_mode,
+            "policy_category": policy_category,
+            "preapproved": payload.get("preapproved") is True,
+        })
 
     request = {
         "version": 1,
         "provider": "chrome",
         "provider_approval_id": approval_id,
         "confirmation_tool": "mcp__chrome__confirm_action",
-        "confirmation_arguments": {"approvalId": approval_id},
+        "confirmation_arguments": confirmation_arguments,
         "retry_tool": retry_tool,
         "retry_arguments": retry_arguments,
         "recovery_tool_names": ["mcp__chrome__read_page"],
@@ -157,6 +201,12 @@ def _normalize_chrome_approval(
         "url": str(payload.get("url") or "").strip() or None,
         "data_summary": str(payload.get("data_summary") or "").strip() or None,
     }
+    if confirmation_mode in _CHROME_CONFIRMATION_MODES and policy_category:
+        request.update({
+            "confirmation_mode": confirmation_mode,
+            "policy_category": policy_category,
+            "preapproved": payload.get("preapproved") is True,
+        })
     for source_key, target_key in (
         ("next_required_tool", "next_required_tool"),
         ("groupId", "groupId"),
@@ -196,6 +246,34 @@ def normalize_provider_approval(
     return None
 
 
+def normalize_provider_approval_resolution(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    result: str | dict[str, Any],
+) -> dict[str, Any] | None:
+    if tool_name != "mcp__chrome__confirm_action":
+        return None
+    payload = _json_payload(result)
+    if payload.get("ok") is not True or str(payload.get("status") or "").strip() != "approved":
+        return None
+    approval_id = str(
+        payload.get("approvalId")
+        or payload.get("approval_id")
+        or (arguments or {}).get("approvalId")
+        or (arguments or {}).get("approval_id")
+        or ""
+    ).strip()
+    approval_token = str(
+        payload.get("approvalToken") or payload.get("approval_token") or ""
+    ).strip()
+    if not approval_id or not approval_token:
+        return None
+    return {
+        "provider": "chrome",
+        "provider_approval_id": approval_id,
+    }
+
+
 def provider_approval_is_expired(request: dict[str, Any]) -> bool:
     value = str(request.get("expires_at") or "").strip()
     if not value:
@@ -231,6 +309,30 @@ def provider_approval_runtime_metadata(
     ):
         return None
 
+    metadata: dict[str, Any] = {}
+    if (
+        str(item.get("provider") or "").strip().lower() == "chrome"
+        and confirmation_tool == "mcp__chrome__confirm_action"
+    ):
+        from packages.core.ai.runtime.chrome_routing import (
+            runtime_restore_chrome_confirmation_receipt,
+        )
+
+        runtime_restore_chrome_confirmation_receipt(
+            runtime_metadata=metadata,
+            tool_name=retry_tool,
+            approval_id=(
+                item.get("provider_approval_id")
+                or continuation.get("provider_approval_id")
+            ),
+            confirmation_mode=continuation.get("confirmation_mode"),
+            policy_category=continuation.get("policy_category"),
+            preapproved=continuation.get("preapproved"),
+            arguments=retry_arguments,
+            destination=continuation.get("url"),
+            data_summary=continuation.get("data_summary"),
+        )
+
     arguments = dict(confirmation_arguments)
     arguments[_TOOL_CONTINUATION_KEY] = {
         "kind": "retry_with_result_token",
@@ -248,7 +350,7 @@ def provider_approval_runtime_metadata(
             for tool_name in recovery_tool_names
             if isinstance(tool_name, str) and tool_name.strip()
         )
-    return {
+    metadata.update({
         "extra_tool_names": sorted(extra_tool_names),
         "forced_tool_calls": [
             {
@@ -260,7 +362,8 @@ def provider_approval_runtime_metadata(
             "Resume the approved provider action using the supplied forced "
             "tool continuation. Do not rediscover or alter the approved action."
         ),
-    }
+    })
+    return metadata
 
 
 def provider_approval_runtime_event_data(

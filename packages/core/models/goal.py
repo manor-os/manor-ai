@@ -30,6 +30,7 @@ class Goal(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_goals_workspace_status", "workspace_id", "status"),
         Index("ix_goals_entity_status", "entity_id", "status"),
+        Index("ix_goals_stat_id", "stat_id"),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -39,6 +40,9 @@ class Goal(Base, TimestampMixin):
     # Strategist only looks at workspace goals when reviewing a
     # specific workspace — entity-level goals appear on the global
     # dashboard only.
+    stat_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # Optional WorkspaceStat source. When set, each new stat observation is
+    # copied into goal_measurements and drives current_value / pace / achieved.
 
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)

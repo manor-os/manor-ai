@@ -1137,6 +1137,37 @@ async def test_get_skill_by_slug_prefers_entity_skill_over_global_duplicate(db_s
 
 
 @pytest.mark.asyncio
+async def test_get_skill_by_slug_accepts_hyphen_underscore_aliases(db_session):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.skill import Skill
+    from packages.core.services.skill_service import get_skill_by_slug
+
+    entity_id = generate_ulid()
+    skill = Skill(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="stickman-video-creator",
+        slug="stickman_video_creator",
+        system_prompt="Create a complete stickman video.",
+        tools=[],
+        input_schema={},
+        status="active",
+        is_public=False,
+    )
+    db_session.add(skill)
+    await db_session.flush()
+
+    selected = await get_skill_by_slug(
+        db_session,
+        "stickman-video-creator",
+        entity_id,
+    )
+
+    assert selected is not None
+    assert selected.id == skill.id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["twitter_x", "stripe", "facebook", "analytics"])
 async def test_external_goal_measurement_requires_provider_evidence(
     client: AsyncClient,
@@ -1619,6 +1650,27 @@ def test_strategist_provider_scope_ignores_free_text_platform_mentions():
     )
 
     assert _workspace_declared_provider_keys(workspace, []) == set()
+
+
+def test_strategist_provider_scope_ignores_internal_and_manual_measurement_sources():
+    from types import SimpleNamespace
+    from packages.core.strategist.context import _workspace_declared_provider_keys
+
+    workspace = SimpleNamespace(settings={}, operating_model={})
+    goals = [
+        SimpleNamespace(measurement_source={
+            "provider": "workspace_internal",
+            "params": {"mode": "linked_task_impact"},
+        }),
+        SimpleNamespace(measurement_source={"provider": "manual"}),
+        SimpleNamespace(measurement_source={"provider": "manual_demo"}),
+        SimpleNamespace(measurement_source={"provider": "twitter_x"}),
+    ]
+
+    # workspace_internal is measured from Manor runtime evidence and manual
+    # goals are user-entered; neither has credentials to connect, so they
+    # must never surface as "missing credentials" integrations.
+    assert _workspace_declared_provider_keys(workspace, goals) == {"twitter_x"}
 
 
 @pytest.mark.asyncio
@@ -4138,6 +4190,185 @@ async def test_chat_runtime_context_resolves_workspace_task_thread(client: Async
 
 
 @pytest.mark.asyncio
+async def test_workspace_main_conversation_does_not_inherit_created_task_rules(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Task
+    from packages.core.services.workspace_runtime import load_conversation_runtime_context
+
+    headers = await _register(client, "ws_main_not_task_runtime")
+    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Main Control Plane"})
+    ws_body = ws.json()
+    conv_id = generate_ulid()
+    task_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Workspace",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    db_session.add(
+        Task(
+            id=task_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            conversation_id=conv_id,
+            title="Prepare verified outreach",
+            details={
+                "runtime_context": {
+                    "rules": [
+                        {
+                            "rule_key": "no_nested_tasks",
+                            "rule_type": "deny",
+                            "description": "Do not create another task from this task.",
+                            "action_patterns": ["workspace.task.create"],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    runtime = await load_conversation_runtime_context(
+        db_session,
+        conversation_id=conv_id,
+        entity_id=ws_body["entity_id"],
+    )
+
+    assert runtime["workspace_id"] == ws_body["id"]
+    assert "task_id" not in runtime
+    assert "extra_context" not in runtime
+
+
+@pytest.mark.asyncio
+async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
+    client: AsyncClient,
+    db_session,
+):
+    import json
+
+    from sqlalchemy import func, select
+
+    from packages.core.ai.tool_pool import ToolPool
+    from packages.core.ai.tools.workspace_agent_tools import (
+        WORKSPACE_AGENT_SCHEMA,
+        _workspace_agent_handler,
+    )
+    from packages.core.models.task import Task
+    from packages.core.services.workspace_runtime import (
+        ensure_workspace_task_conversation,
+        load_conversation_runtime_context,
+    )
+    from packages.core.workspace_chat.service import ensure_main_conversation
+
+    headers = await _register(client, "ws_task_rule_scope_e2e")
+    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Task Rule Scope E2E"})
+    ws_body = ws.json()
+    main = await ensure_main_conversation(
+        db_session,
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
+    )
+    await db_session.commit()
+
+    pool = ToolPool()
+    pool.register("workspace_agent", WORKSPACE_AGENT_SCHEMA, _workspace_agent_handler)
+    common = {
+        "entity_id": ws_body["entity_id"],
+        "user_id": "USER_TASK_RULE_SCOPE_E2E",
+        "workspace_id": ws_body["id"],
+    }
+
+    first = json.loads(
+        await pool.execute(
+            "workspace_agent",
+            {
+                "action": "create_task",
+                "params": {
+                    "title": "Prepare verified outreach",
+                    "rules": [
+                        {
+                            "rule_key": "no_nested_tasks",
+                            "rule_type": "deny",
+                            "description": "Do not create another task from this task.",
+                            "action_patterns": ["workspace.task.create"],
+                        }
+                    ],
+                },
+            },
+            conversation_id=main.id,
+            task_id=None,
+            **common,
+        )
+    )
+    assert first["created"] is True
+
+    main_runtime = await load_conversation_runtime_context(
+        db_session,
+        conversation_id=main.id,
+        entity_id=ws_body["entity_id"],
+    )
+    assert "task_id" not in main_runtime
+
+    second = json.loads(
+        await pool.execute(
+            "workspace_agent",
+            {
+                "action": "create_task",
+                "params": {"title": "Prepare partner contact packet"},
+            },
+            conversation_id=main.id,
+            task_id=main_runtime.get("task_id"),
+            **common,
+        )
+    )
+    assert second["created"] is True
+
+    task_thread = await ensure_workspace_task_conversation(
+        db_session,
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
+        task_id=first["task"]["id"],
+        title=first["task"]["title"],
+    )
+    await db_session.commit()
+    task_runtime = await load_conversation_runtime_context(
+        db_session,
+        conversation_id=task_thread.id,
+        entity_id=ws_body["entity_id"],
+    )
+    assert task_runtime["task_id"] == first["task"]["id"]
+
+    nested = json.loads(
+        await pool.execute(
+            "workspace_agent",
+            {
+                "action": "create_task",
+                "params": {"title": "Nested task must be blocked"},
+            },
+            conversation_id=task_thread.id,
+            task_id=task_runtime["task_id"],
+            **common,
+        )
+    )
+    assert nested["error"] == "blocked_by_governance"
+    assert nested["action_key"] == "workspace.task.create"
+    assert nested["matched_rule"] == "no_nested_tasks"
+
+    task_count = await db_session.scalar(
+        select(func.count()).select_from(Task).where(Task.workspace_id == ws_body["id"])
+    )
+    assert task_count == 2
+
+
+@pytest.mark.asyncio
 async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncClient, db_session):
     from packages.core.ai.runtime.profiles import (
         WORKSPACE_AGENT_TOOL_PROFILE,
@@ -4159,7 +4390,7 @@ async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncCli
 
     assert ctx.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
     assert ctx.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
-    assert {"search_tools", "workspace_agent", "workspace_resolve_hitl", "workspace_search", "rag"} <= eager_names
+    assert {"search_tools", "workspace_agent", "workspace_resolve_hitl", "answer_task_blocker", "workspace_search", "rag"} <= eager_names
     assert "bash" in eager_names
     assert "bash" in ctx.allowed_tool_names
     assert "browse_web" in ctx.allowed_tool_names
@@ -5324,10 +5555,91 @@ async def test_plan_finalize_updates_waiting_task_after_successful_replan(db_ses
             "source": "fs_path",
             "name": "draft-pack.md",
             "fs_path": "Workspaces/Social Ops/Artifacts/draft-pack.md",
+            "open_url": f"/api/v1/fs/{entity_id}/Workspaces/Social%20Ops/Artifacts/draft-pack.md",
+            "markdown_link": f"[draft-pack.md](/api/v1/fs/{entity_id}/Workspaces/Social%20Ops/Artifacts/draft-pack.md)",
         }
     ]
     assert event["event_type"] == "task.succeeded"
     assert event["payload"]["task_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_plan_finalize_dispatches_a_supervisor_requested_replan(db_session, monkeypatch):
+    from sqlalchemy import select
+    from packages.core.constants.supervisor import (
+        SupervisorDecision,
+        SupervisorDecisionSource,
+        SupervisorVerdict,
+    )
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.plans.executor import PlanExecutor
+    import packages.core.tasks.ai_tasks as ai_tasks
+
+    async def _needs_replan_supervisor(_db, _plan, _status):
+        return SupervisorDecision(
+            verdict=SupervisorVerdict.NEEDS_REPLAN,
+            evidence="the structured deliverable needs a different plan",
+            source=SupervisorDecisionSource.MODEL,
+        )
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(PlanExecutor, "_supervise_outcome", staticmethod(_needs_replan_supervisor))
+    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    task_id = generate_ulid()
+    plan_id = generate_ulid()
+    task = Task(
+        id=task_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        title="Select today's Stickman video topic",
+        status="in_progress",
+        task_type="general",
+    )
+    plan = ExecutionPlan(
+        id=plan_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        status="running",
+        plan_dag={},
+    )
+    db_session.add_all([
+        task,
+        plan,
+        ExecutionStep(
+            id=generate_ulid(),
+            plan_id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            step_key="select_topic_brief",
+            kind="subagent",
+            step_status="done",
+            result={
+                "status": "succeeded",
+                "summary": "Selected one producer-ready topic.",
+            },
+        ),
+    ])
+    await db_session.commit()
+
+    event = await PlanExecutor._finalize(db_session, plan, "completed")
+    await db_session.flush()
+
+    refreshed_task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
+    refreshed_plan = (
+        await db_session.execute(select(ExecutionPlan).where(ExecutionPlan.id == plan_id))
+    ).scalar_one()
+    assert event is None
+    assert refreshed_task.status == "in_progress"
+    assert refreshed_plan.status == "replanned"
+    assert dispatched == [task_id]
+    assert refreshed_task.details["_replan_context"]["reason"] == "supervisor_review"
+    assert refreshed_task.actual_output["supervisor_verdict"] == "needs_replan"
 
 
 @pytest.mark.asyncio
@@ -5671,6 +5983,9 @@ def test_task_output_artifact_refs_preserve_document_id_for_viewer_links():
             "name": "Maya Chen Follow-up Draft.md",
             "fs_path": "workspace/artifacts/maya-chen-follow-up.md",
             "document_id": "01DOCVIEWABLE000000000000",
+            "viewer_url": "/viewer/01DOCVIEWABLE000000000000",
+            "open_url": "/viewer/01DOCVIEWABLE000000000000",
+            "markdown_link": "[Maya Chen Follow-up Draft.md](/viewer/01DOCVIEWABLE000000000000)",
         }
     ]
 
@@ -5750,9 +6065,14 @@ async def test_task_detail_reconciles_duplicate_file_refs(client: AsyncClient, d
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["actual_output"]["files"] == [duplicate_ref]
+    expected_ref = {
+        **duplicate_ref,
+        "open_url": f"/api/v1/fs/{entity_id}/{file_path}",
+        "markdown_link": f"[x_drafts_next_week.md](/api/v1/fs/{entity_id}/{file_path})",
+    }
+    assert body["actual_output"]["files"] == [expected_ref]
     task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.actual_output["files"] == [duplicate_ref]
+    assert task.actual_output["files"] == [expected_ref]
 
 
 @pytest.mark.asyncio
@@ -6439,6 +6759,107 @@ async def test_workspace_agent_context_resolves_duplicate_operation_hitl_cards(
     assert messages.status_code == 200
     open_pending = [row for row in messages.json() if row.get("pending_action") and not row.get("resolved_at")]
     assert open_pending == []
+
+
+@pytest.mark.asyncio
+async def test_open_task_blockers_flow_from_context_to_answer_tool(client: AsyncClient, db_session):
+    """End-to-end chat↔task HITL bridge: a lease-origin blocker shows up in
+    the workspace chat context as Open Task Blockers, the answer tool
+    resolves it and resumes the step, and the section disappears — so a
+    user's chat answer reaches the paused task instead of spawning a fresh
+    delegation without the task's tools."""
+    from sqlalchemy import select
+    from packages.core.ai.tools import workspace_agent_tools
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus, HitlType
+    from packages.core.constants.execution import ExecutionPlanStatus, ExecutionStepStatus
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.services.workspace_runtime import resolve_workspace_runtime
+
+    headers = await _register(client, "ws_task_blocker_bridge")
+    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Blocker Bridge"})
+    ws_body = ws.json()
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+
+    plan = ExecutionPlan(
+        id=generate_ulid(),
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
+        status=ExecutionPlanStatus.PAUSED.value,
+        plan_dag={},
+    )
+    step = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan.id,
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
+        step_key="publish",
+        kind="subagent",
+        step_status=ExecutionStepStatus.WAITING_HUMAN.value,
+        human_input_prompt="Which screenshot should the company post use?",
+        params={},
+    )
+    request = HitlRequest(
+        id=generate_ulid(),
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
+        action_key="social_post.publish",
+        risk_level="medium",
+        origin_kind=ApprovalOriginKind.LEASE.value,
+        origin_step_id=step.id,
+        origin_plan_id=plan.id,
+        status=ApprovalStatus.PENDING.value,
+        dedup_key=f"lease:{generate_ulid()}:human_input",
+        reason="Which screenshot should the company post use?",
+        hitl_type=HitlType.INPUT.value,
+        context={"pending_kind": "human_input"},
+        payload={"question": "Which screenshot?", "why": "publish needs one"},
+    )
+    request_id, step_id = request.id, step.id
+    db_session.add_all([plan, step, request])
+    await db_session.commit()
+
+    envelope = await resolve_workspace_runtime(
+        db_session,
+        entity_id=ws_body["entity_id"],
+        user_id=me["id"],
+        workspace_id=ws_body["id"],
+    )
+    assert "Open Task Blockers" in (envelope.extra_context or "")
+    assert request_id in (envelope.extra_context or "")
+    assert "answer_task_blocker" in (envelope.extra_context or "")
+
+    answered = json.loads(
+        await workspace_agent_tools._answer_task_blocker_handler(
+            entity_id=ws_body["entity_id"],
+            user_id=me["id"],
+            workspace_id=ws_body["id"],
+            request_id=request_id,
+            answer="use the landing page screenshot",
+        )
+    )
+    assert answered["resolved"] is True
+    assert answered["decision"] == "answered"
+
+    db_session.expire_all()
+    fresh_step = (await db_session.execute(
+        select(ExecutionStep).where(ExecutionStep.id == step_id)
+    )).scalar_one()
+    assert fresh_step.step_status == ExecutionStepStatus.PENDING.value
+    assert fresh_step.human_input_response["note"] == "use the landing page screenshot"
+    fresh_request = (await db_session.execute(
+        select(HitlRequest).where(HitlRequest.id == request_id)
+    )).scalar_one()
+    assert fresh_request.status == ApprovalStatus.CONSUMED.value
+
+    refreshed = await resolve_workspace_runtime(
+        db_session,
+        entity_id=ws_body["entity_id"],
+        user_id=me["id"],
+        workspace_id=ws_body["id"],
+    )
+    assert "Open Task Blockers" not in (refreshed.extra_context or "")
 
 
 @pytest.mark.asyncio

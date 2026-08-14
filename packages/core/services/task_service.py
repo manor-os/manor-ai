@@ -8,7 +8,7 @@ from typing import Optional
 from sqlalchemy import select, func, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.task import TaskLogType
+from packages.core.constants.task import TaskLogType, TaskType
 from packages.core.constants.agents import (
     MANOR_AGENT_NAME,
     is_legacy_agent_author_placeholder,
@@ -221,6 +221,14 @@ async def create_task(
         db, task.id, TaskLogType.CREATE, f"Task created: {title}",
         actor=creator_actor, created_by=creator_display, metadata=creator_meta,
     )
+
+    # An explicit approval Task is itself a HITL request.  Project it into the
+    # Workspace Chat at creation time so Task Detail and Chat cannot disagree
+    # about whether a person is needed.
+    if task.task_type == TaskType.APPROVAL.value and task.workspace_id:
+        from packages.core.services.task_chat_hitl import ensure_task_approval_hitl
+
+        await ensure_task_approval_hitl(db, task)
 
     from packages.core.services.event_emitter import emit
     emit(entity_id, "task.created", source="task_service", payload={

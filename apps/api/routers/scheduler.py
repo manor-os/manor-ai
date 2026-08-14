@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +20,8 @@ from packages.core.services.scheduler_service import (
     list_job_runs,
     create_agent_execution, list_agent_executions, update_agent_execution,
 )
-from apps.api.deps import get_current_user
+from apps.api.deps import get_current_user, require_workspace_readable, require_workspace_writable
+from packages.core.services.workspace_access import readable_workspace_ids_for_user
 
 jobs_router = APIRouter(prefix="/api/v1/jobs", tags=["scheduled-jobs"])
 executions_router = APIRouter(prefix="/api/v1/executions", tags=["agent-executions"])
@@ -112,6 +113,7 @@ class ToggleRequest(BaseModel):
 class JobRunResponse(BaseModel):
     id: str
     job_id: str
+    idempotency_key: str | None = None
     status: str
     trigger_type: str | None = None
     result: dict | None = None
@@ -203,6 +205,7 @@ def _job_response(j, *, last_error: str | None = None) -> ScheduledJobResponse:
 def _run_response(r) -> JobRunResponse:
     return JobRunResponse(
         id=r.id, job_id=r.job_id, status=r.status,
+        idempotency_key=r.idempotency_key,
         trigger_type=r.trigger_type, result=r.result, error=r.error,
         duration_ms=r.duration_ms,
         prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens,
@@ -278,11 +281,30 @@ async def list_jobs(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Older entity-level automation rows may carry an opaque workspace label
+    # that has no Workspace row. Preserve that legacy filter behavior while
+    # enforcing membership for real, persisted Workspaces.
+    if workspace_id:
+        from packages.core.models.workspace import Workspace
+
+        workspace_exists = (await db.execute(
+            select(Workspace.id).where(
+                Workspace.id == workspace_id,
+                Workspace.entity_id == user.entity_id,
+                Workspace.deleted_at.is_(None),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if workspace_exists:
+            await require_workspace_readable(db, user, workspace_id)
+    readable_ws = await readable_workspace_ids_for_user(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
     jobs, total = await list_scheduled_jobs(
         db, user.entity_id, enabled_only=enabled_only,
         workspace_id=workspace_id,
         search=search, status=status, agent_id=agent_id,
         include_workflows=include_workflows,
+        readable_workspace_ids=readable_ws,
         limit=limit, offset=offset,
     )
     summary = await summarize_scheduled_jobs(
@@ -292,6 +314,7 @@ async def list_jobs(
         search=search,
         agent_id=agent_id,
         include_workflows=include_workflows,
+        readable_workspace_ids=readable_ws,
     )
     latest_errors = await _latest_job_errors(
         db,
@@ -315,6 +338,7 @@ async def create_job(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_writable(db, user, req.workspace_id)
     job = await create_scheduled_job(
         db, user.entity_id, req.job_id, req.name,
         job_type=req.job_type, schedule_kind=req.schedule_kind,
@@ -348,6 +372,7 @@ async def get_job(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    await require_workspace_readable(db, user, job.workspace_id)
     return _job_response(job)
 
 
@@ -364,6 +389,9 @@ async def update_job(
     # on skill regeneration, leaving the UI stuck on "saving".
     from packages.core.services.scheduler_service import get_scheduled_job
     _existing = await get_scheduled_job(db, job_id, user.entity_id)
+    if not _existing:
+        raise HTTPException(404, "Scheduled job not found")
+    await require_workspace_writable(db, user, _existing.workspace_id)
     _old_message = _existing.payload_message if _existing else None
 
     job = await update_scheduled_job(
@@ -409,6 +437,10 @@ async def delete_job(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    existing = await get_scheduled_job(db, job_id, user.entity_id)
+    if not existing:
+        raise HTTPException(404, "Scheduled job not found")
+    await require_workspace_writable(db, user, existing.workspace_id)
     deleted = await delete_scheduled_job(db, job_id, user.entity_id)
     if not deleted:
         raise HTTPException(404, "Scheduled job not found")
@@ -421,6 +453,10 @@ async def toggle_job(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    existing = await get_scheduled_job(db, job_id, user.entity_id)
+    if not existing:
+        raise HTTPException(404, "Scheduled job not found")
+    await require_workspace_writable(db, user, existing.workspace_id)
     job = await toggle_scheduled_job(db, job_id, user.entity_id, req.enabled)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
@@ -438,6 +474,7 @@ async def get_job_runs(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    await require_workspace_readable(db, user, job.workspace_id)
     runs = await list_job_runs(db, job.job_id, limit=limit)
     return [_run_response(r) for r in runs]
 
@@ -475,6 +512,7 @@ async def get_job_run_detail(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    await require_workspace_readable(db, user, job.workspace_id)
 
     run = (await db.execute(
         select(ScheduledJobRun).where(
@@ -543,11 +581,19 @@ async def get_job_run_detail(
 class RunNowResponse(BaseModel):
     job_id: str
     queued_at: str
+    idempotency_key: str
 
 
 @jobs_router.post("/{job_id}/run_now", response_model=RunNowResponse, status_code=202)
 async def run_job_now(
     job_id: str,
+    idempotency_key: str | None = Header(
+        None,
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    ),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -557,21 +603,34 @@ async def run_job_now(
     /runs after this call will surface it.
     """
     from datetime import datetime, timezone
+    from packages.core.models.base import generate_ulid
     from packages.core.tasks.scheduler_tasks import _dispatch_job_task
 
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    await require_workspace_writable(db, user, job.workspace_id)
     if not job.enabled:
         raise HTTPException(409, "Job is disabled — enable it before running")
 
     now = datetime.now(timezone.utc)
+    request_key = idempotency_key or generate_ulid()
+    occurrence_key = f"manual:{request_key}"
     try:
-        _dispatch_job_task.delay(job.id, now.isoformat(), manual=True)
+        _dispatch_job_task.delay(
+            job.id,
+            now.isoformat(),
+            manual=True,
+            occurrence_key=occurrence_key,
+        )
     except Exception as exc:
         raise HTTPException(503, f"Worker queue unreachable: {exc}") from exc
 
-    return RunNowResponse(job_id=job.job_id, queued_at=now.isoformat())
+    return RunNowResponse(
+        job_id=job.job_id,
+        queued_at=now.isoformat(),
+        idempotency_key=request_key,
+    )
 
 
 # ── Agent Execution Endpoints ──
@@ -585,9 +644,12 @@ async def list_executions(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    readable_ws = await readable_workspace_ids_for_user(
+        db, entity_id=user.entity_id, user_id=user.id, role=user.role,
+    )
     execs, total = await list_agent_executions(
         db, user.entity_id, agent_id=agent_id, task_id=task_id,
-        limit=limit, offset=offset,
+        readable_workspace_ids=readable_ws, limit=limit, offset=offset,
     )
     return AgentExecutionListResponse(items=[_exec_response(e) for e in execs], total=total)
 
@@ -598,6 +660,7 @@ async def create_execution(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_workspace_writable(db, user, req.workspace_id)
     execution = await create_agent_execution(
         db, user.entity_id, req.agent_id,
         task_id=req.task_id, conversation_id=req.conversation_id,
@@ -614,6 +677,16 @@ async def update_execution(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    from packages.core.models.scheduler import AgentExecution
+    execution_row = (await db.execute(
+        select(AgentExecution).where(
+            AgentExecution.id == execution_id,
+            AgentExecution.entity_id == user.entity_id,
+        )
+    )).scalar_one_or_none()
+    if not execution_row:
+        raise HTTPException(404, "Agent execution not found")
+    await require_workspace_writable(db, user, execution_row.workspace_id)
     execution = await update_agent_execution(
         db, execution_id, **req.model_dump(exclude_none=True),
     )

@@ -92,6 +92,18 @@ _DEFAULT_MAX_TURNS = DEFAULT_AGENT_MAX_TURNS
 _TERMINAL_STATUSES = {"completed", "cancelled", "failed"}
 
 
+def _task_runtime_metadata(task: Any) -> dict[str, Any] | None:
+    """Expose only Task-owned metadata that nested runtime calls must inherit."""
+
+    details = getattr(task, "details", None)
+    if not isinstance(details, dict):
+        return None
+    authorization = details.get("proposal_external_authorization")
+    if not isinstance(authorization, dict):
+        return None
+    return {"proposal_external_authorization": dict(authorization)}
+
+
 class TaskRunner:
     """Runs an agent against a task ticket with supervisor oversight.
 
@@ -122,6 +134,7 @@ class TaskRunner:
         conversation_id: str | None,
         runtime: Any,
         active_user_message: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         """Build the same workspace-aware prompt and tool surface used by chat."""
         async with self._get_session() as prompt_db:
@@ -137,6 +150,7 @@ class TaskRunner:
                 thread_ref_id=runtime.thread_ref_id,
                 message=active_user_message or "",
                 legacy_path="ai.task_runner._assemble_runtime_prompt",
+                metadata=metadata,
             )
             assembled = await runtime_assemble_prompt_for_turn(
                 prompt_db,
@@ -166,6 +180,7 @@ class TaskRunner:
 
             entity_id = task.entity_id
             task_user_id = runtime_task_billable_user_id(task)
+            task_runtime_metadata = _task_runtime_metadata(task)
 
             # Decide which catalog role to use:
             #   worker model (cheap) vs primary model (capable)
@@ -241,6 +256,7 @@ class TaskRunner:
                         conversation_id=task.conversation_id,
                         runtime=runtime,
                         active_user_message=active_task_text,
+                        metadata=task_runtime_metadata,
                     )
                     system_prompt = runtime_prompt_result.prompt
                 except Exception as exc:
@@ -272,6 +288,7 @@ class TaskRunner:
                             conversation_id=task.conversation_id,
                             runtime=runtime,
                             active_user_message=active_task_text,
+                            metadata=task_runtime_metadata,
                         )
                         system_prompt = runtime_prompt_result.prompt
                     except Exception as exc:
@@ -293,6 +310,7 @@ class TaskRunner:
                                     thread_ref_id=runtime.thread_ref_id,
                                     message=active_task_text,
                                     legacy_path="ai.task_runner.agent_prompt_fallback",
+                                    metadata=task_runtime_metadata,
                                 )
                                 fallback_appendix = await runtime_prepare_context_appendix_for_turn(
                                     db,
@@ -356,6 +374,7 @@ class TaskRunner:
                 thread_ref_id=runtime.thread_ref_id,
                 message=user_prompt,
                 legacy_path="ai.task_runner.prompt_fallback",
+                metadata=task_runtime_metadata,
             )
             async with self._get_session() as prompt_db:
                 runtime_prompt_result = await runtime_prepare_prompt_appendix_for_turn(
@@ -414,6 +433,7 @@ class TaskRunner:
         final_status = "failed"
         supervisor_verdict: Dict[str, Any] = {}
         tools_called_session: list[str] = []  # cross-turn record for supervisor
+        tool_evidence_session: list[dict[str, str]] = []
         loaded_tool_names = {
             t.get("function", {}).get("name")
             for t in tools
@@ -458,6 +478,7 @@ class TaskRunner:
 
                 if turn_result.had_tool_calls:
                     tools_called_session.extend(turn_result.tool_names)
+                    tool_evidence_session.extend(turn_result.supervisor_evidence)
                     await self._log(task_id, "ai_agent_turn",
                         f"[AI] Turn {turns_used}/{max_turns} — tools: [{', '.join(turn_result.tool_names)}]")
                     continue  # Don't supervisor-review tool calls, go to next turn
@@ -486,6 +507,7 @@ class TaskRunner:
                     turns_used=turns_used,
                     max_turns=max_turns,
                     tools_called=tools_called_session,
+                    tool_evidence=tool_evidence_session,
                 )
 
             verdict = supervisor_verdict.get("verdict", VERDICT_DONE)
@@ -568,6 +590,7 @@ class TaskRunner:
                     turns_used=turns_used,
                     max_turns=max_turns,
                     tools_called=tools_called_session,
+                    tool_evidence=tool_evidence_session,
                 )
             except Exception as exc:
                 logger.warning("Supervisor at exhaustion failed: %s", exc)
@@ -723,6 +746,7 @@ class TaskRunner:
         self, *, task_id: str, task_title: str, agent_response: str,
         done_when: str, turns_used: int, max_turns: int,
         tools_called: Optional[list[str]] = None,
+        tool_evidence: Optional[list[dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Evaluate agent's work using the 5-verdict supervisor LLM call.
 
@@ -739,6 +763,7 @@ class TaskRunner:
             turns_used=turns_used,
             max_turns=max_turns,
             tools_called=tools_called,
+            tool_evidence=tool_evidence,
             worker_model=getattr(self, "_worker_model", None),
             metadata=getattr(self, "_worker_llm_metadata", None),
         )

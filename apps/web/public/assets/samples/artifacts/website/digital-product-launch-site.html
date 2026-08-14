@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Northstar OS — Premium Productivity Template Bundle</title>
+  <style>
+    :root {
+      --ink: #241d18;
+      --muted: #78695c;
+      --paper: #fff8ed;
+      --paper-2: #f3e2ca;
+      --cream: #fffdf8;
+      --clay: #b96f4b;
+      --clay-2: #8f452f;
+      --gold: #d9a441;
+      --sage: #758667;
+      --olive: #4d6045;
+      --rose: #e6b6a8;
+      --line: rgba(36, 29, 24, 0.14);
+      --shadow: 0 24px 70px rgba(96, 51, 27, 0.16);
+      --radius-xl: 34px;
+      --radius-lg: 24px;
+      --radius-md: 16px;
+      --max: 1180px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; overflow-x: hidden; }
+    body {
+      margin: 0;
+      font-family: Georgia, 'Times New Roman', serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 7% 2%, rgba(217, 164, 65, .22), transparent 28rem),
+        radial-gradient(circle at 88% 9%, rgba(185, 111, 75, .18), transparent 30rem),
+        linear-gradient(180deg, var(--paper) 0%, #fffaf1 42%, #f8ead6 100%);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .28;
+      z-index: 0;
+      background-image:
+        linear-gradient(rgba(36,29,24,.055) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(36,29,24,.045) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: linear-gradient(to bottom, #000, transparent 78%);
+    }
+
+    a { color: inherit; text-decoration: none; }
+    button, input { font: inherit; }
+    .page { position: relative; z-index: 1; width: 100%; overflow: hidden; }
+    .wrap { width: min(var(--max), calc(100% - 40px)); margin: 0 auto; }
+
+    .nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      backdrop-filter: blur(18px);
+      background: rgba(255, 248, 237, .78);
+      border-bottom: 1px solid var(--line);
+    }
+    .nav-inner {
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; letter-spacing: -.02em; }
+    .mark {
+      width: 40px; height: 40px; border-radius: 50%;
+      background: conic-gradient(from 20deg, var(--gold), var(--clay), var(--sage), var(--gold));
+      position: relative;
+      box-shadow: inset 0 0 0 6px rgba(255,253,248,.72), 0 10px 24px rgba(143,69,47,.2);
+    }
+    .mark::after {
+      content: "✦"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--cream); font-size: 15px;
+    }
+    .nav-links { display: flex; align-items: center; gap: 22px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; font-size: 14px; color: var(--muted); }
+    .nav-links a:hover { color: var(--ink); }
+
+    .pill, .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+    .pill { padding: 9px 13px; font-size: 13px; color: var(--clay-2); background: rgba(255,253,248,.64); }
+    .btn {
+      min-height: 48px;
+      padding: 0 20px;
+      color: #fff8ed;
+      background: linear-gradient(135deg, var(--ink), #563125);
+      box-shadow: 0 13px 28px rgba(36,29,24,.18);
+      transition: transform .22s ease, box-shadow .22s ease;
+    }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 18px 38px rgba(36,29,24,.24); }
+    .btn.secondary { color: var(--ink); background: rgba(255,253,248,.68); box-shadow: none; }
+
+    .hero { padding: 82px 0 52px; }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.03fr) minmax(300px, .97fr);
+      gap: 42px;
+      align-items: center;
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 10px;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
+      color: var(--olive);
+    }
+    .eyebrow::before { content: ""; width: 34px; height: 1px; background: var(--sage); }
+    h1, h2, h3 { margin: 0; line-height: .98; letter-spacing: -.055em; }
+    h1 { font-size: clamp(3.55rem, 9.2vw, 8.2rem); max-width: 760px; margin-top: 18px; }
+    h2 { font-size: clamp(2.4rem, 5.6vw, 5.1rem); }
+    h3 { font-size: clamp(1.35rem, 2.4vw, 2rem); }
+    p { color: var(--muted); line-height: 1.72; font-size: 18px; }
+    .lead { max-width: 620px; font-size: clamp(1.08rem, 2vw, 1.35rem); margin: 24px 0 30px; }
+    .hero-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .microproof { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 28px; color: var(--muted); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; font-size: 14px; }
+    .microproof strong { color: var(--ink); }
+
+    .dashboard-shell {
+      position: relative;
+      border-radius: var(--radius-xl);
+      padding: 14px;
+      background: linear-gradient(145deg, rgba(255,253,248,.9), rgba(243,226,202,.72));
+      border: 1px solid rgba(36,29,24,.12);
+      box-shadow: var(--shadow);
+      transform: rotate(1.2deg);
+      animation: float 7s ease-in-out infinite;
+    }
+    .dashboard-shell::before {
+      content: "";
+      position: absolute;
+      width: 130px; height: 130px; border-radius: 50%;
+      right: -42px; top: -38px;
+      background: rgba(217,164,65,.34);
+      filter: blur(2px);
+      z-index: -1;
+    }
+    .dashboard {
+      border-radius: 24px;
+      overflow: hidden;
+      background: #fffdf8;
+      border: 1px solid var(--line);
+      min-height: 525px;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .dash-top {
+      min-height: 58px;
+      display: flex; align-items: center; justify-content: space-between; gap: 14px;
+      padding: 0 18px;
+      border-bottom: 1px solid var(--line);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      font-size: 13px;
+    }
+    .dots { display: flex; gap: 7px; }
+    .dots span { width: 10px; height: 10px; border-radius: 50%; background: var(--rose); }
+    .dots span:nth-child(2) { background: var(--gold); } .dots span:nth-child(3) { background: var(--sage); }
+    .dash-body { display: grid; grid-template-columns: 132px minmax(0, 1fr); }
+    .sidebar { padding: 18px 12px; background: #f7ead8; border-right: 1px solid var(--line); }
+    .side-item { padding: 10px 11px; border-radius: 12px; margin-bottom: 8px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--muted); }
+    .side-item.active { background: var(--ink); color: var(--cream); }
+    .main-panel { padding: 20px; min-width: 0; }
+    .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 15px; }
+    .metric, .card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255,248,237,.74);
+      padding: 14px;
+      min-width: 0;
+    }
+    .metric small, .card small { display: block; font-family: ui-sans-serif, system-ui, sans-serif; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .metric b { display: block; margin-top: 8px; font-size: 27px; letter-spacing: -.06em; }
+    .timeline { display: grid; gap: 11px; }
+    .task { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 12px; border-radius: 15px; background: #fffdf8; border: 1px solid var(--line); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+    .check { width: 18px; height: 18px; border-radius: 50%; background: var(--sage); color: white; display: grid; place-items: center; font-size: 11px; }
+    .tag { border-radius: 999px; background: rgba(217,164,65,.22); color: var(--clay-2); padding: 4px 8px; font-size: 11px; }
+    .chart { margin-top: 14px; height: 110px; border-radius: 18px; background: linear-gradient(180deg, rgba(117,134,103,.08), rgba(185,111,75,.08)); position: relative; overflow: hidden; border: 1px solid var(--line); }
+    .chart svg { width: 100%; height: 100%; display: block; }
+
+    section { padding: 64px 0; }
+    .section-head { display: flex; justify-content: space-between; gap: 24px; align-items: end; margin-bottom: 30px; }
+    .section-head p { max-width: 470px; margin: 0; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+    .feature-card, .proof-card, .price-card, .faq-item, .creator-card {
+      background: rgba(255,253,248,.72);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+      box-shadow: 0 18px 48px rgba(96,51,27,.08);
+    }
+    .feature-card .icon {
+      width: 46px; height: 46px; border-radius: 16px;
+      display: grid; place-items: center;
+      background: rgba(217,164,65,.2);
+      margin-bottom: 22px;
+      font-size: 22px;
+    }
+    .feature-card p, .proof-card p, .price-card p, .creator-card p { margin-bottom: 0; }
+
+    .proof { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .proof-card.before { background: rgba(255,253,248,.55); }
+    .proof-card.after { background: linear-gradient(145deg, rgba(255,253,248,.88), rgba(229,198,157,.5)); border-color: rgba(117,134,103,.35); }
+    .proof-list { list-style: none; padding: 0; margin: 18px 0 0; display: grid; gap: 12px; font-family: ui-sans-serif, system-ui, sans-serif; color: var(--muted); }
+    .proof-list li { display: flex; gap: 10px; align-items: flex-start; }
+
+    .asset-strip {
+      display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 14px;
+    }
+    .asset {
+      min-height: 190px;
+      border-radius: 26px;
+      border: 1px solid var(--line);
+      padding: 18px;
+      background: #fffdf8;
+      position: relative;
+      overflow: hidden;
+    }
+    .asset::after { content: ""; position: absolute; inset: auto -28px -42px auto; width: 120px; height: 120px; border-radius: 50%; background: rgba(185,111,75,.14); }
+    .asset b { display: block; font-size: 22px; letter-spacing: -.04em; }
+    .asset span { display: block; margin-top: 12px; color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+
+    .pricing-wrap { display: grid; grid-template-columns: .86fr 1.14fr; gap: 18px; align-items: stretch; }
+    .price-card.featured { background: var(--ink); color: var(--cream); position: relative; overflow: hidden; }
+    .price-card.featured p, .price-card.featured li { color: rgba(255,248,237,.78); }
+    .price { font-size: clamp(3rem, 6vw, 5.2rem); line-height: .9; letter-spacing: -.07em; margin: 18px 0 12px; }
+    .price small { font-size: 1rem; letter-spacing: 0; color: var(--muted); }
+    .featured .price small { color: rgba(255,248,237,.65); }
+    .checklist { list-style: none; padding: 0; margin: 22px 0; display: grid; gap: 12px; font-family: ui-sans-serif, system-ui, sans-serif; }
+    .checklist li::before { content: "✓"; color: var(--sage); font-weight: 900; margin-right: 9px; }
+
+    .creator-card { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 22px; align-items: center; }
+    .portrait {
+      width: 112px; height: 112px; border-radius: 50%;
+      background: radial-gradient(circle at 50% 32%, #f2c5aa 0 19%, transparent 20%), radial-gradient(circle at 50% 74%, var(--clay) 0 35%, transparent 36%), linear-gradient(135deg, var(--gold), var(--sage));
+      border: 8px solid rgba(255,253,248,.85);
+      box-shadow: 0 16px 30px rgba(36,29,24,.16);
+    }
+    .cred-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+
+    .faq-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .faq-item { padding: 0; overflow: hidden; }
+    .faq-q { width: 100%; border: 0; background: transparent; padding: 20px; text-align: left; display: flex; justify-content: space-between; gap: 16px; cursor: pointer; color: var(--ink); font-weight: 800; }
+    .faq-a { max-height: 0; overflow: hidden; transition: max-height .28s ease; }
+    .faq-a p { margin: 0; padding: 0 20px 20px; font-size: 16px; }
+    .faq-item.open .faq-a { max-height: 180px; }
+
+    .final-cta {
+      text-align: center;
+      border-radius: 42px;
+      padding: clamp(36px, 8vw, 78px) 24px;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(217,164,65,.26), transparent 18rem),
+        linear-gradient(145deg, rgba(255,253,248,.9), rgba(243,226,202,.86));
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+    .final-cta p { max-width: 620px; margin: 20px auto 28px; }
+    footer { padding: 34px 0 48px; color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; }
+    .footer-inner { display: flex; justify-content: space-between; gap: 18px; flex-wrap: wrap; border-top: 1px solid var(--line); padding-top: 24px; }
+
+    .reveal { opacity: 0; transform: translateY(22px); transition: opacity .7s ease, transform .7s ease; }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+    @keyframes float { 0%,100% { transform: rotate(1.2deg) translateY(0); } 50% { transform: rotate(.4deg) translateY(-12px); } }
+
+    @media (max-width: 920px) {
+      .nav-links a { display: none; }
+      .hero { padding-top: 54px; }
+      .hero-grid, .pricing-wrap, .proof { grid-template-columns: 1fr; }
+      .dashboard-shell { transform: none; animation: none; }
+      .section-head { display: block; }
+      .section-head p { margin-top: 14px; }
+      .grid-3, .asset-strip, .faq-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 620px) {
+      .wrap { width: min(100% - 28px, var(--max)); }
+      .nav-inner { min-height: 64px; }
+      .nav .btn { display: none; }
+      h1 { font-size: clamp(3rem, 17vw, 5rem); }
+      .hero-actions .btn { width: 100%; }
+      .microproof { display: grid; gap: 10px; }
+      .dash-body { grid-template-columns: 1fr; }
+      .sidebar { display: flex; gap: 6px; overflow: hidden; border-right: 0; border-bottom: 1px solid var(--line); padding: 10px; }
+      .side-item { margin: 0; flex: 1; text-align: center; padding: 9px 4px; font-size: 11px; }
+      .metric-grid, .grid-3, .asset-strip, .faq-grid, .creator-card { grid-template-columns: 1fr; }
+      .task { grid-template-columns: 18px minmax(0, 1fr); }
+      .task .tag { grid-column: 2; width: fit-content; }
+      .asset { min-height: 155px; }
+      .creator-card { text-align: center; }
+      .portrait { margin: 0 auto; }
+      .cred-row { justify-content: center; }
+      p { font-size: 16px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+      .reveal { opacity: 1; transform: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <nav class="nav">
+      <div class="wrap nav-inner">
+        <a class="brand" href="#top" aria-label="Northstar OS home"><span class="mark"></span><span>Northstar OS</span></a>
+        <div class="nav-links" aria-label="Primary navigation">
+          <a href="#preview">Preview</a>
+          <a href="#proof">Proof</a>
+          <a href="#inside">Inside</a>
+          <a href="#pricing">Pricing</a>
+          <a class="btn" href="#checkout">Get the bundle</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero" id="top">
+      <div class="wrap hero-grid">
+        <div class="reveal">
+          <span class="eyebrow">Premium operating system for focused people</span>
+          <h1>Turn scattered ambition into a weekly command center.</h1>
+          <p class="lead">Northstar OS is a warm, opinionated productivity template bundle for founders, creators, and operators who want one elegant place to plan goals, ship projects, protect energy, and review progress.</p>
+          <div class="hero-actions">
+            <a class="btn" href="#checkout">Launch your system today</a>
+            <a class="btn secondary" href="#preview">See dashboard preview</a>
+          </div>
+          <div class="microproof" aria-label="Product highlights">
+            <span><strong>14</strong> connected templates</span>
+            <span><strong>30 min</strong> guided setup</span>
+            <span><strong>Lifetime</strong> updates included</span>
+          </div>
+        </div>
+
+        <div class="dashboard-shell reveal" id="preview" aria-label="Product preview dashboard">
+          <div class="dashboard">
+            <div class="dash-top">
+              <div class="dots" aria-hidden="true"><span></span><span></span><span></span></div>
+              <strong>Northstar Weekly Command</strong>
+              <span>Week 34</span>
+            </div>
+            <div class="dash-body">
+              <aside class="sidebar">
+                <div class="side-item active">Today</div>
+                <div class="side-item">Goals</div>
+                <div class="side-item">Projects</div>
+                <div class="side-item">Review</div>
+                <div class="side-item">Vault</div>
+              </aside>
+              <main class="main-panel">
+                <div class="metric-grid">
+                  <div class="metric"><small>Focus hours</small><b>18.5</b></div>
+                  <div class="metric"><small>Active goals</small><b>04</b></div>
+                  <div class="metric"><small>Energy</small><b>82%</b></div>
+                </div>
+                <div class="card">
+                  <small>This week’s compass</small>
+                  <h3 style="margin-top:10px;">Ship the client portal without stealing Friday.</h3>
+                  <div class="timeline" style="margin-top:16px;">
+                    <div class="task"><span class="check">✓</span><span>Finalize onboarding flow copy</span><span class="tag">Deep work</span></div>
+                    <div class="task"><span class="check">✓</span><span>Record Loom walkthrough</span><span class="tag">Creator</span></div>
+                    <div class="task"><span class="check">•</span><span>QA handoff checklist</span><span class="tag">Ops</span></div>
+                  </div>
+                </div>
+                <div class="chart" aria-label="Momentum chart illustration">
+                  <svg viewBox="0 0 520 120" role="img" aria-label="Rising weekly momentum line">
+                    <path d="M0 88 C70 76, 82 44, 145 58 S245 98, 310 54 S410 20, 520 34" fill="none" stroke="#758667" stroke-width="7" stroke-linecap="round"/>
+                    <path d="M0 106 C80 82, 95 66, 145 72 S245 110, 310 66 S410 35, 520 48 L520 120 L0 120 Z" fill="rgba(117,134,103,.18)"/>
+                  </svg>
+                </div>
+              </main>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <section>
+      <div class="wrap section-head reveal">
+        <div><span class="eyebrow">The promise</span><h2>One ritual. One source of truth. Less mental weather.</h2></div>
+        <p>Instead of collecting another pretty template, you get a complete cadence: capture, clarify, commit, and review. Northstar OS makes your priorities visible before the week gets loud.</p>
+      </div>
+      <div class="wrap grid-3">
+        <article class="feature-card reveal"><div class="icon">☉</div><h3>Plan from outcomes</h3><p>Translate annual direction into quarterly bets, weekly commitments, and daily focus blocks without losing the thread.</p></article>
+        <article class="feature-card reveal"><div class="icon">✎</div><h3>Capture without clutter</h3><p>Inbox, meeting notes, ideas, and someday items flow into simple review lanes so nothing becomes a hidden obligation.</p></article>
+        <article class="feature-card reveal"><div class="icon">◒</div><h3>Review like an editor</h3><p>Gentle prompts help you spot what worked, what drained you, and what deserves a clean cut next week.</p></article>
+      </div>
+    </section>
+
+    <section id="proof">
+      <div class="wrap section-head reveal">
+        <div><span class="eyebrow">Before and after</span><h2>Designed to make progress obvious.</h2></div>
+      </div>
+      <div class="wrap proof">
+        <article class="proof-card before reveal">
+          <span class="pill">Before Northstar OS</span>
+          <ul class="proof-list">
+            <li>✕ Tasks split across notes, calendars, and half-finished boards.</li>
+            <li>✕ Planning sessions that create more anxiety than clarity.</li>
+            <li>✕ Goals reviewed only when something already feels off track.</li>
+            <li>✕ Busy weeks that look productive but do not compound.</li>
+          </ul>
+        </article>
+        <article class="proof-card after reveal">
+          <span class="pill">After setup</span>
+          <ul class="proof-list">
+            <li>✓ A weekly dashboard that shows priorities, capacity, and next actions.</li>
+            <li>✓ Connected project pages with decisions, milestones, and deliverables.</li>
+            <li>✓ Built-in proof logs that show what shipped and what changed.</li>
+            <li>✓ Calm end-of-week reviews that make Monday easier.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="inside">
+      <div class="wrap section-head reveal">
+        <div><span class="eyebrow">Included assets</span><h2>Everything you need to install a working rhythm.</h2></div>
+        <p>Built as a cohesive bundle, not a folder of disconnected downloads. Use it as-is or adapt each module to your stack.</p>
+      </div>
+      <div class="wrap asset-strip">
+        <div class="asset reveal"><b>Command Dashboard</b><span>Daily priorities, weekly compass, metrics, focus queue, and review prompts.</span></div>
+        <div class="asset reveal"><b>Goal Atlas</b><span>Annual vision, quarterly bets, outcome trees, and decision filters.</span></div>
+        <div class="asset reveal"><b>Project Rooms</b><span>Reusable briefs, milestones, stakeholder notes, launch checklists, and postmortems.</span></div>
+        <div class="asset reveal"><b>Energy Ledger</b><span>Capacity planning, habit loops, recovery blocks, and burnout warning signs.</span></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap creator-card reveal">
+        <div class="portrait" aria-hidden="true"></div>
+        <div>
+          <span class="eyebrow">Creator credibility</span>
+          <h2 style="font-size:clamp(2rem,4vw,3.6rem); margin-top:12px;">Made by a systems editor, not a template tourist.</h2>
+          <p>Created by Mara Vale, a fictional operations consultant who has spent nine years turning messy creative teams into calm shipping machines. Northstar OS distills her client workshop process into a self-guided template bundle.</p>
+          <div class="cred-row"><span class="pill">9 years in ops</span><span class="pill">120+ systems mapped</span><span class="pill">Built for solo teams</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pricing">
+      <div class="wrap section-head reveal">
+        <div><span class="eyebrow">Pricing</span><h2>Premium enough to commit. Simple enough to start.</h2></div>
+      </div>
+      <div class="wrap pricing-wrap">
+        <article class="price-card reveal">
+          <span class="pill">Starter</span>
+          <div class="price">$49 <small>one-time</small></div>
+          <p>For people who want the core dashboards and a clean weekly reset.</p>
+          <ul class="checklist"><li>Command Dashboard</li><li>Goal Atlas lite</li><li>Quick-start guide</li></ul>
+          <a class="btn secondary" href="#checkout">Choose starter</a>
+        </article>
+        <article class="price-card featured reveal">
+          <span class="pill">Most popular — Complete bundle</span>
+          <div class="price">$129 <small>one-time</small></div>
+          <p>The full Northstar OS with every template, walkthrough, review ritual, and future update.</p>
+          <ul class="checklist"><li>All 14 connected templates</li><li>Video setup walkthrough</li><li>Weekly review scripts</li><li>Lifetime improvements</li><li>Bonus launch planning board</li></ul>
+          <a class="btn" style="background:#fff8ed;color:#241d18;" href="#checkout">Get complete bundle</a>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap section-head reveal">
+        <div><span class="eyebrow">FAQ</span><h2>Questions before you reorganize everything?</h2></div>
+      </div>
+      <div class="wrap faq-grid">
+        <article class="faq-item reveal open"><button class="faq-q" type="button">Is this tied to a specific app?<span>+</span></button><div class="faq-a"><p>No. This sample product is presented as app-flexible. The structure can be recreated in common notes, docs, or database tools.</p></div></article>
+        <article class="faq-item reveal"><button class="faq-q" type="button">How long does setup take?<span>+</span></button><div class="faq-a"><p>The intended setup is about 30 minutes for the core dashboard, then deeper customization as your projects evolve.</p></div></article>
+        <article class="faq-item reveal"><button class="faq-q" type="button">Will it feel too complex?<span>+</span></button><div class="faq-a"><p>The system starts with one weekly command center. Advanced modules stay optional until you need them.</p></div></article>
+        <article class="faq-item reveal"><button class="faq-q" type="button">Is there a refund policy?<span>+</span></button><div class="faq-a"><p>For this fictional gallery sample, the checkout and policy are illustrative. A real product page should include clear merchant terms.</p></div></article>
+      </div>
+    </section>
+
+    <section id="checkout">
+      <div class="wrap final-cta reveal">
+        <span class="eyebrow" style="justify-content:center;">Checkout CTA</span>
+        <h2>Install the system your best weeks have been asking for.</h2>
+        <p>Get Northstar OS today and replace scattered ambition with a practical, beautiful weekly operating rhythm.</p>
+        <a class="btn" href="mailto:hello@example.com?subject=Northstar%20OS%20Bundle">Start checkout — $129</a>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap footer-inner">
+        <span>© 2026 Northstar OS. Fictional product sample.</span>
+        <span>No external assets. No remote fonts. Self-contained HTML.</span>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    const revealObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          revealObserver.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12 });
+
+    document.querySelectorAll('.reveal').forEach((el) => revealObserver.observe(el));
+
+    document.querySelectorAll('.faq-q').forEach((button) => {
+      button.addEventListener('click', () => {
+        const item = button.closest('.faq-item');
+        const isOpen = item.classList.toggle('open');
+        button.querySelector('span').textContent = isOpen ? '−' : '+';
+      });
+    });
+
+    function verifyNoHorizontalOverflow() {
+      const overflow = document.documentElement.scrollWidth > window.innerWidth + 1;
+      document.documentElement.dataset.overflowCheck = overflow ? 'horizontal-overflow-detected' : 'pass';
+      if (overflow) console.warn('Horizontal overflow detected', document.documentElement.scrollWidth, window.innerWidth);
+    }
+    window.addEventListener('load', verifyNoHorizontalOverflow);
+    window.addEventListener('resize', verifyNoHorizontalOverflow);
+  </script>
+</body>
+</html>

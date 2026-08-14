@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Solo AI Operations Consultant</title>
+  <meta name="description" content="AI operations consulting for founders and lean teams: workflow audits, automation builds, and monthly AI ops support." />
+  <style>
+    :root {
+      --bg: #08090d;
+      --panel: #11131a;
+      --panel-2: #171a22;
+      --text: #f4f0e8;
+      --muted: #a9a39a;
+      --line: rgba(244, 240, 232, 0.12);
+      --accent: #ff6b35;
+      --accent-soft: rgba(255, 107, 53, 0.16);
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+      --radius: 24px;
+      --max: 1120px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(255, 107, 53, 0.22), transparent 32rem),
+        radial-gradient(circle at 85% 10%, rgba(255, 255, 255, 0.08), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .page {
+      width: min(100% - 40px, var(--max));
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 28px 0;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 34px rgba(255, 107, 53, 0.55);
+      position: relative;
+    }
+
+    .mark::after {
+      content: "";
+      position: absolute;
+      inset: 9px;
+      border: 1.5px solid var(--bg);
+      border-radius: 50%;
+    }
+
+    .nav-cta {
+      border: 1px solid var(--line);
+      padding: 10px 16px;
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 14px;
+      transition: 180ms ease;
+    }
+
+    .nav-cta:hover {
+      color: var(--text);
+      border-color: rgba(255, 107, 53, 0.5);
+      background: var(--accent-soft);
+    }
+
+    .hero {
+      padding: 88px 0 70px;
+      display: grid;
+      grid-template-columns: 1.08fr 0.92fr;
+      gap: 56px;
+      align-items: center;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.13em;
+      margin-bottom: 22px;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 28px;
+      height: 1px;
+      background: var(--accent);
+    }
+
+    h1, h2, h3, p {
+      margin-top: 0;
+    }
+
+    h1 {
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(48px, 8vw, 88px);
+      line-height: 0.94;
+      letter-spacing: -0.07em;
+      margin-bottom: 24px;
+    }
+
+    .hero p {
+      max-width: 650px;
+      font-size: clamp(18px, 2vw, 22px);
+      color: var(--muted);
+      margin-bottom: 32px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 20px;
+      border-radius: 999px;
+      font-weight: 800;
+      transition: 180ms ease;
+    }
+
+    .button.primary {
+      background: var(--accent);
+      color: #160905;
+      box-shadow: 0 18px 40px rgba(255, 107, 53, 0.26);
+    }
+
+    .button.primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 22px 54px rgba(255, 107, 53, 0.36);
+    }
+
+    .button.secondary {
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .button.secondary:hover {
+      color: var(--text);
+      border-color: rgba(244, 240, 232, 0.28);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .hero-card {
+      background: linear-gradient(145deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.025));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 28px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero-card::before {
+      content: "";
+      position: absolute;
+      width: 260px;
+      height: 260px;
+      right: -110px;
+      top: -110px;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      filter: blur(2px);
+    }
+
+    .dashboard {
+      position: relative;
+      display: grid;
+      gap: 14px;
+    }
+
+    .dash-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 16px;
+      background: rgba(8, 9, 13, 0.72);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+
+    .dash-row span:first-child {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .dash-row strong {
+      font-size: 18px;
+    }
+
+    .pulse {
+      height: 9px;
+      width: 70px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent), rgba(255, 107, 53, 0.1));
+    }
+
+    section {
+      padding: 72px 0;
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 28px;
+      align-items: end;
+      margin-bottom: 28px;
+    }
+
+    h2 {
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(34px, 5vw, 56px);
+      line-height: 1;
+      letter-spacing: -0.055em;
+      margin-bottom: 0;
+      max-width: 720px;
+    }
+
+    .section-head p {
+      max-width: 360px;
+      color: var(--muted);
+      margin-bottom: 0;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 26px;
+      min-height: 280px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: 180ms ease;
+    }
+
+    .card:hover {
+      transform: translateY(-4px);
+      border-color: rgba(255, 107, 53, 0.42);
+      background: linear-gradient(180deg, rgba(255, 107, 53, 0.08), var(--panel));
+    }
+
+    .card-number {
+      color: var(--accent);
+      font-weight: 900;
+      font-size: 13px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 24px;
+    }
+
+    .card h3 {
+      font-size: 24px;
+      line-height: 1.15;
+      letter-spacing: -0.035em;
+      margin-bottom: 14px;
+    }
+
+    .card p {
+      color: var(--muted);
+      margin-bottom: 22px;
+    }
+
+    .card ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .card li {
+      padding: 8px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .proof {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      background: var(--line);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+
+    .metric {
+      background: var(--panel-2);
+      padding: 30px;
+    }
+
+    .metric strong {
+      display: block;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(36px, 5vw, 58px);
+      line-height: 1;
+      letter-spacing: -0.06em;
+      color: var(--accent);
+      margin-bottom: 10px;
+    }
+
+    .metric span {
+      color: var(--muted);
+    }
+
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 18px;
+    }
+
+    .step {
+      border-radius: var(--radius);
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.035);
+      padding: 32px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .step::after {
+      content: attr(data-step);
+      position: absolute;
+      right: 24px;
+      top: 14px;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 86px;
+      line-height: 1;
+      color: rgba(255, 255, 255, 0.045);
+      letter-spacing: -0.08em;
+    }
+
+    .step h3 {
+      font-size: 28px;
+      letter-spacing: -0.04em;
+      margin-bottom: 12px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .step p {
+      color: var(--muted);
+      margin-bottom: 0;
+      position: relative;
+      z-index: 1;
+    }
+
+    .faq {
+      display: grid;
+      gap: 12px;
+    }
+
+    details {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      padding: 20px 22px;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 800;
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+    }
+
+    summary::-webkit-details-marker {
+      display: none;
+    }
+
+    summary::after {
+      content: "+";
+      color: var(--accent);
+      font-size: 22px;
+      line-height: 1;
+    }
+
+    details[open] summary::after {
+      content: "−";
+    }
+
+    details p {
+      margin: 14px 0 0;
+      color: var(--muted);
+      max-width: 780px;
+    }
+
+    .closing {
+      margin: 54px 0 88px;
+      padding: clamp(32px, 6vw, 64px);
+      border-radius: 34px;
+      background:
+        linear-gradient(135deg, rgba(255, 107, 53, 0.18), rgba(255, 255, 255, 0.03)),
+        var(--panel);
+      border: 1px solid rgba(255, 107, 53, 0.28);
+      text-align: center;
+      box-shadow: var(--shadow);
+    }
+
+    .closing h2 {
+      margin-inline: auto;
+      margin-bottom: 18px;
+    }
+
+    .closing p {
+      color: var(--muted);
+      max-width: 660px;
+      margin: 0 auto 28px;
+      font-size: 18px;
+    }
+
+    footer {
+      padding: 28px 0 42px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+
+    @media (max-width: 860px) {
+      .hero,
+      .section-head,
+      .cards,
+      .proof,
+      .steps {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        padding-top: 52px;
+      }
+
+      .section-head {
+        align-items: start;
+      }
+
+      .hero-card {
+        order: -1;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .page {
+        width: min(100% - 28px, var(--max));
+      }
+
+      header {
+        padding: 20px 0;
+      }
+
+      .brand span {
+        max-width: 160px;
+        line-height: 1.1;
+      }
+
+      .nav-cta {
+        display: none;
+      }
+
+      .hero {
+        gap: 32px;
+      }
+
+      section {
+        padding: 50px 0;
+      }
+
+      .card,
+      .step,
+      .metric,
+      .hero-card {
+        padding: 22px;
+      }
+
+      .actions .button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header aria-label="Site header">
+      <a href="#top" class="brand" aria-label="Solo AI Ops home">
+        <span class="mark" aria-hidden="true"></span>
+        <span>Solo AI Ops</span>
+      </a>
+      <a class="nav-cta" href="#book">Book a consult</a>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div>
+          <div class="eyebrow">AI operations for lean teams</div>
+          <h1 id="hero-title">Turn scattered work into reliable AI-powered systems.</h1>
+          <p>I help founders and small teams audit messy workflows, build practical automations, and keep operations running without adding headcount.</p>
+          <div class="actions">
+            <a class="button primary" href="#book">Book your AI ops call</a>
+            <a class="button secondary" href="#services">See services</a>
+          </div>
+        </div>
+
+        <aside class="hero-card" aria-label="Operational snapshot">
+          <div class="dashboard">
+            <div class="dash-row">
+              <span>Workflow bottlenecks</span>
+              <strong>Mapped</strong>
+            </div>
+            <div class="dash-row">
+              <span>Manual handoffs</span>
+              <strong>Reduced</strong>
+            </div>
+            <div class="dash-row">
+              <span>AI agents & automations</span>
+              <strong>Documented</strong>
+            </div>
+            <div class="dash-row">
+              <span>Ops readiness</span>
+              <span class="pulse" aria-hidden="true"></span>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <section id="services" aria-labelledby="services-title">
+        <div class="section-head">
+          <h2 id="services-title">Focused services for operators who need leverage.</h2>
+          <p>Clear scopes, fast implementation, and systems your team can actually maintain.</p>
+        </div>
+
+        <div class="cards">
+          <article class="card">
+            <div>
+              <div class="card-number">Service 01</div>
+              <h3>AI Workflow Audit</h3>
+              <p>A structured review of your current tools, handoffs, repetitive tasks, and AI opportunities.</p>
+            </div>
+            <ul>
+              <li>Process map and automation shortlist</li>
+              <li>Risk, privacy, and data checks</li>
+              <li>Prioritized 30-day action plan</li>
+            </ul>
+          </article>
+
+          <article class="card">
+            <div>
+              <div class="card-number">Service 02</div>
+              <h3>Automation Build</h3>
+              <p>Done-for-you implementation of AI workflows that connect your existing stack and remove manual work.</p>
+            </div>
+            <ul>
+              <li>Prompted workflows and approval steps</li>
+              <li>CRM, email, docs, and task integrations</li>
+              <li>Testing, documentation, and handoff</li>
+            </ul>
+          </article>
+
+          <article class="card">
+            <div>
+              <div class="card-number">Service 03</div>
+              <h3>Monthly Retainer</h3>
+              <p>Ongoing AI operations support for teams that want continuous improvement without hiring internally.</p>
+            </div>
+            <ul>
+              <li>Weekly optimization and monitoring</li>
+              <li>New automations and team enablement</li>
+              <li>Priority support for broken workflows</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section aria-label="Proof metrics">
+        <div class="proof">
+          <div class="metric">
+            <strong>40%</strong>
+            <span>Typical reduction in repetitive admin after the first workflow sprint.</span>
+          </div>
+          <div class="metric">
+            <strong>10+</strong>
+            <span>Common tools connected across sales, support, recruiting, and internal ops.</span>
+          </div>
+          <div class="metric">
+            <strong>14d</strong>
+            <span>Average timeline to ship a production-ready automation from audit to handoff.</span>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="process-title">
+        <div class="section-head">
+          <h2 id="process-title">A simple path from chaos to operating rhythm.</h2>
+          <p>No bloated transformation program. Just the highest-leverage fixes first.</p>
+        </div>
+
+        <div class="steps">
+          <article class="step" data-step="01">
+            <h3>Diagnose the work</h3>
+            <p>We identify the tasks that drain time, create delays, or require too much context switching. You get a clear map of what to automate, delegate, or leave alone.</p>
+          </article>
+          <article class="step" data-step="02">
+            <h3>Build the system</h3>
+            <p>I design, implement, and document the workflow so your team can use it confidently. Every automation includes guardrails, ownership, and a maintenance plan.</p>
+          </article>
+        </div>
+      </section>
+
+      <section aria-labelledby="faq-title">
+        <div class="section-head">
+          <h2 id="faq-title">FAQ</h2>
+          <p>Short answers before we talk.</p>
+        </div>
+
+        <div class="faq">
+          <details>
+            <summary>Do we need to replace our current tools?</summary>
+            <p>Usually not. The goal is to improve the way your existing stack works together. I focus on practical integrations before recommending any new platform.</p>
+          </details>
+          <details>
+            <summary>What kinds of workflows are a good fit?</summary>
+            <p>Recurring workflows with clear inputs and outputs are best: lead routing, customer follow-up, internal reporting, recruiting coordination, support triage, content operations, and document generation.</p>
+          </details>
+          <details>
+            <summary>How do you handle quality and approvals?</summary>
+            <p>AI should not silently make important decisions. I build approval checkpoints, logging, fallback paths, and documentation so your team stays in control.</p>
+          </details>
+        </div>
+      </section>
+
+      <section id="book" class="closing" aria-labelledby="cta-title">
+        <h2 id="cta-title">Ready to make your operations lighter?</h2>
+        <p>Book a short consult. We will review your highest-friction workflow, identify quick wins, and decide whether an audit or build sprint is the right next step.</p>
+        <a class="button primary" href="/cdn-cgi/l/email-protection#741c1118181b34110c15190418115a171b194b0701161e11170049353d5146443b04110615001d1b1a07514644371b1a0701180015001d1b1a">Book a consultation</a>
+      </section>
+    </main>
+
+    <footer>
+      <span>© 2026 Solo AI Ops Consultant</span>
+      <span>AI workflow audits · Automation builds · Monthly ops support</span>
+    </footer>
+  </div></body>
+</html>

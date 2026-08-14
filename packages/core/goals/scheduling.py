@@ -138,6 +138,19 @@ def is_auto_measurement_source(source: object) -> bool:
     return True
 
 
+def measurement_source_requires_external_provider(source: object) -> bool:
+    """Return true only for sources backed by a credentialed integration.
+
+    ``workspace_internal`` is derived from Manor runtime evidence and manual
+    sources are user-entered; neither has credentials to connect, so they
+    must never count as declared external providers in readiness checks.
+    """
+    return (
+        is_auto_measurement_source(source)
+        and not is_workspace_internal_measurement_source(source)
+    )
+
+
 def should_install_measurement_schedule(goal: Goal) -> bool:
     return bool(
         getattr(goal, "status", None) == "active"

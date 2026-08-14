@@ -67,8 +67,8 @@ class APIVersion:
 
 META_GRAPH = APIVersion(
     name="Meta Graph API",
-    value="v22.0",
-    released=date(2025, 1, 21),
+    value="v25.0",
+    released=date(2026, 2, 18),
     eol_months=24,
     notes="https://developers.facebook.com/docs/graph-api/changelog",
 )

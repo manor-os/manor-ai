@@ -64,7 +64,7 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     # recovery intentional rather than an accidental side effect.
     "completed": {"pending", "in_progress", "on_hold", "cancelled"},
     "cancelled": {"pending", "scheduled", "in_progress"},
-    "failed": {"pending", "in_progress", "waiting_on_customer", "on_hold", "cancelled"},
+    "failed": {"pending", "in_progress", "waiting_on_customer", "on_hold", "cancelled", "completed"},
 }
 
 

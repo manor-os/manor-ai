@@ -59,7 +59,7 @@ def test_route_pricing_source_distinguishes_gateway_official_and_byok():
 async def test_resolve_official_model_route_prefers_vercel_gateway(monkeypatch):
     import packages.core.services.platform_model_provider_keys as provider_keys
 
-    async def fake_resolve(provider: str, *, reason: str = ""):
+    async def fake_resolve(provider: str, *, reason: str = "", sources=("db", "env")):
         assert provider == "vercel"
         return OfficialProviderCredential(
             provider="vercel",
@@ -82,7 +82,7 @@ async def test_resolve_official_model_route_prefers_vercel_gateway(monkeypatch):
 async def test_resolve_official_model_route_falls_back_to_openrouter(monkeypatch):
     import packages.core.services.platform_model_provider_keys as provider_keys
 
-    async def fake_resolve(provider: str, *, reason: str = ""):
+    async def fake_resolve(provider: str, *, reason: str = "", sources=("db", "env")):
         if provider == "vercel":
             return None
         assert provider == "openrouter"
@@ -107,7 +107,7 @@ async def test_resolve_official_model_route_falls_back_to_openrouter(monkeypatch
 async def test_resolve_official_model_route_survives_vercel_lookup_error(monkeypatch):
     import packages.core.services.platform_model_provider_keys as provider_keys
 
-    async def fake_resolve(provider: str, *, reason: str = ""):
+    async def fake_resolve(provider: str, *, reason: str = "", sources=("db", "env")):
         if provider == "vercel":
             raise RuntimeError("Vercel credential store unavailable")
         return OfficialProviderCredential(
@@ -124,3 +124,54 @@ async def test_resolve_official_model_route_survives_vercel_lookup_error(monkeyp
 
     assert route is not None
     assert route.provider == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_resolve_official_model_route_prefers_admin_db_source_over_env_source(
+    monkeypatch,
+):
+    """Admin DB credentials beat environment credentials across the route chain."""
+    import packages.core.services.platform_model_provider_keys as provider_keys
+
+    async def fake_resolve(provider: str, *, reason: str = "", sources=("db", "env")):
+        if provider == "vercel" and "env" in sources:
+            return OfficialProviderCredential(
+                provider="vercel",
+                api_key="vck_env_candidate_1234567890",
+                base_url="https://ai-gateway.vercel.sh/v1",
+                source="official",
+                source_detail="AI_GATEWAY_API_KEY",
+            )
+        if provider == "openrouter" and "db" in sources:
+            return OfficialProviderCredential(
+                provider="openrouter",
+                api_key="sk-or-db_candidate_1234567890",
+                base_url="https://db-openrouter.example/v1",
+                source="official",
+                source_detail="db",
+            )
+        return None
+
+    monkeypatch.setattr(provider_keys, "resolve_official_provider_credential", fake_resolve)
+
+    route = await resolve_official_model_route(
+        "anthropic/claude-sonnet-4.6",
+    )
+
+    assert route is not None
+    assert route.provider == "openrouter"
+    assert route.source_detail == "db"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_env_base_url_is_used_when_db_key_is_missing(monkeypatch):
+    import packages.core.services.platform_model_provider_keys as provider_keys
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env_key_1234567890")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://router.example/v1")
+
+    credential = await provider_keys.resolve_official_provider_credential("openrouter")
+
+    assert credential is not None
+    assert credential.source_detail == "OPENROUTER_API_KEY"
+    assert credential.base_url == "https://router.example/v1"

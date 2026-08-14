@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api";
+import type { IntegrationMCPServer } from "../../lib/api";
 import { NodeIcon, TYPE_META } from "./WorkflowCanvas";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
@@ -11,6 +12,7 @@ import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
 import MediaPreview from "./MediaPreview";
 import { extractMediaRefs } from "../../lib/workflowMedia";
+import { inferredWorkflowInputs, workflowStepOutputs } from "../../lib/workflowBindings";
 
 /* Node detail view — edit a node's config (prompt / model / params), like
    n8n's NDV. Renders type-appropriate fields; unknown types fall back to a
@@ -81,6 +83,26 @@ const SCHEMA: Record<string, Field[]> = {
   connector: [
     { key: "tool", label: "Tool / MCP operation", kind: "text", hint: "Resolved tool name (e.g. mcp__slack__post_message)." },
     { key: "args", label: "Arguments", kind: "json" },
+  ],
+  publication_receipt: [
+    {
+      key: "receipt",
+      label: "Publication receipt",
+      kind: "json",
+      hint: "Map the publisher output to platform, verification_status, external_id or published_url, published_at, evidence, attempts, and optional fallback_used.",
+    },
+    {
+      key: "payload",
+      label: "Published payload",
+      kind: "json",
+      hint: "Optional exact payload used for publishing. Manor stores only its SHA-256 fingerprint in the receipt.",
+    },
+    {
+      key: "require_verified",
+      label: "Require verified publication",
+      kind: "boolean",
+      hint: "On by default. The Workflow fails unless the publisher has observed the external postcondition.",
+    },
   ],
   image: [
     { key: "model", label: "Model", kind: "model", modelRole: "image", hint: "Image model from your catalog. Blank = the account default." },
@@ -186,6 +208,11 @@ const SCHEMA: Record<string, Field[]> = {
     { key: "wait_type", label: "Wait type", kind: "select", options: ["approval", "timer", "event"] },
     { key: "duration_seconds", label: "Duration (s)", kind: "number", hint: "For timer waits — ≤90s runs inline; longer waits pause and resume automatically." },
     { key: "message", label: "Message", kind: "text", hint: "Shown while approval / event waits are paused." },
+    { key: "response_variable", label: "Response variable", kind: "text", hint: "Stores the user's decision or response for downstream nodes." },
+    { key: "options", label: "Choices", kind: "json", hint: "Approval choices shown in the originating Chat, for example [\"approve\", \"revise\", \"cancel\"]." },
+    { key: "approval_values", label: "Approved choices", kind: "json", hint: "Choices that count as approval. Other choices can route to revision or cancellation branches." },
+    { key: "allow_always", label: "Allow permanent approval", kind: "boolean", hint: "Adds Always approve. Future matching operations skip this gate until the user revokes the saved approval." },
+    { key: "approval_action_key", label: "Approval action scope", kind: "text", hint: "Stable operation key shared with runtime approval, for example social_post.publish. Required for permanent approval." },
   ],
   notify: [
     { key: "channel", label: "Channel", kind: "text" },
@@ -200,6 +227,35 @@ const NO_CONFIG_TYPES = new Set(["trigger", "webhook", "end"]);
 
 function meta(t: string) {
   return TYPE_META[t] || { color: "#9b938c", label: t.toUpperCase() };
+}
+
+function parseConnectorTool(tool: unknown): { server: string; operation: string } {
+  const value = String(tool || "");
+  const parts = value.startsWith("mcp__") ? value.split("__") : [];
+  return {
+    server: parts[1] || "",
+    operation: parts.slice(2).join("__") || "",
+  };
+}
+
+function connectorArgumentLabel(key: string): string {
+  return key
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function connectorArgumentPlaceholder(schema: Record<string, any>): string {
+  if (schema.default !== undefined) return String(schema.default);
+  if (Array.isArray(schema.examples) && schema.examples.length) return String(schema.examples[0]);
+  if (schema.example !== undefined) return String(schema.example);
+  return schema.type === "string" ? "Value or {{input}}" : "";
+}
+
+function connectorArgumentIsMultiline(key: string, schema: Record<string, any>): boolean {
+  if (schema.format === "textarea") return true;
+  return /(body|content|description|html|markdown|message|prompt|query|text)$/i.test(key);
 }
 
 function StageOperationsSummary({ config }: { config: Record<string, any> }) {
@@ -283,6 +339,7 @@ export default function WorkflowNodeConfigPanel({
   const [rawRun, setRawRun] = useState(false); // Friendly (default) vs raw-JSON run view
   const [testInputValues, setTestInputValues] = useState<Record<string, string>>({});
   const [testInputErrors, setTestInputErrors] = useState<Record<string, string>>({});
+  const [testInputsOpen, setTestInputsOpen] = useState(!lastResult?.status);
   const [forId, setForId] = useState(step?.id);
   const resultRef = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
@@ -294,6 +351,13 @@ export default function WorkflowNodeConfigPanel({
   };
   // close the panel, then jump to a bound resource's page
   const goResource = (to: string) => { close(); navigate(to); };
+  const openReferencedWorkflow = (workflowId: string) => {
+    const returnTo = currentWorkflowId
+      ? `/flows?workflow=${encodeURIComponent(currentWorkflowId)}`
+      : "/flows";
+    close();
+    navigate(`/flows?workflow=${encodeURIComponent(workflowId)}`, { state: { returnTo } });
+  };
 
   // re-init when a different node opens
   if (step && step.id !== forId) {
@@ -307,14 +371,19 @@ export default function WorkflowNodeConfigPanel({
     setRawRun(false);
     setTestInputValues({});
     setTestInputErrors({});
+    setTestInputsOpen(!lastResult?.status);
   }
 
   const effectiveResult = liveResult || lastResult;
+  const parsedConnectorTool = parseConnectorTool(config.tool);
+  const connectorServer = parsedConnectorTool.server || String(config.__connector_server || "");
   useEffect(() => {
-    if (running || !effectiveResult?.status || !resultRef.current) return;
+    // Opening a node with historical output must start at Configuration. Only
+    // move to the result after the user runs a fresh test in this panel.
+    if (running || !liveResult?.status || !resultRef.current) return;
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     resultRef.current.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
-  }, [running, effectiveResult?.status, effectiveResult?.output, effectiveResult?.error]);
+  }, [running, liveResult?.status, liveResult?.output, liveResult?.error]);
 
   // Pickers refetch on open (staleTime 0) so newly-created agents / skills /
   // integrations / workspaces show up without a page reload.
@@ -338,11 +407,26 @@ export default function WorkflowNodeConfigPanel({
     enabled: step?.type === "agent",
     staleTime: 0,
   });
-  const { data: integrations = [] } = useQuery({
-    queryKey: ["integrations"],
-    queryFn: () => api.integrations.list(),
+  const {
+    data: integrationServers = [],
+    isLoading: integrationServersLoading,
+    isError: integrationServersError,
+  } = useQuery({
+    queryKey: ["integrations", "mcp-servers"],
+    queryFn: () => api.integrations.mcpServers(),
     enabled: step?.type === "connector",
     staleTime: 0,
+  });
+  const {
+    data: connectorCatalog,
+    isLoading: connectorCatalogLoading,
+    isError: connectorCatalogError,
+  } = useQuery({
+    queryKey: ["integrations", "operations", connectorServer],
+    queryFn: () => api.integrations.operations(connectorServer),
+    enabled: step?.type === "connector" && Boolean(connectorServer),
+    staleTime: 60_000,
+    retry: 1,
   });
   const { data: workspaces = [] } = useQuery({
     queryKey: ["workspaces"],
@@ -402,26 +486,38 @@ export default function WorkflowNodeConfigPanel({
       ? config.inputs
       : [];
   const entryOutputRows = workflowEntryOutputs(step.id, entryInputRows);
+  const inferredInputRows = inferredWorkflowInputs(config) as Binding[];
+  const effectiveInputRows: Binding[] = Array.isArray(config.inputs)
+    ? config.inputs as Binding[]
+    : inferredInputRows;
+  const hasBindingValueErrors = [config.inputs, config.outputs].some((rows) =>
+    Array.isArray(rows) && rows.some((row) => Boolean(row?.__valueError)),
+  );
   const promptInputNames = [...new Set(
-    (Array.isArray(config.inputs) ? config.inputs : [])
+    effectiveInputRows
       .map((item: any) => String(item?.key || item?.name || "").trim())
       .filter(Boolean),
   )];
-  const configuredTestInputs: Binding[] = (Array.isArray(config.inputs) ? config.inputs : [])
+  const configuredTestInputs: Binding[] = effectiveInputRows
     .filter((item: Binding) => String(item?.key || "").trim());
   const testInputValue = (input: Binding): string => {
     const key = String(input.key || "").trim();
     if (Object.prototype.hasOwnProperty.call(testInputValues, key)) return testInputValues[key];
+    // Prefer the current mapping resolved against the run's complete variable
+    // bag. Step-result input previews are intentionally size-limited and can
+    // therefore contain an ellipsis that is not valid JSON.
+    const mappedValue = resolveTestInputDefault(input.value, runVariables);
+    if (mappedValue !== undefined) return formatTestInputValue(mappedValue);
     const previousValue = lastResult?.inputs?.[key];
     if (previousValue !== undefined) return formatTestInputValue(previousValue);
-    return formatTestInputValue(resolveTestInputDefault(input.value, runVariables));
+    return "";
   };
 
-  // Strip transient raw-JSON buffers from the live config.
+  // Strip transient editor-only buffers from the live config.
   const cleanConfig = (): Record<string, any> => {
     const clean: Record<string, any> = {};
     for (const [k, v] of Object.entries(config)) {
-      if (k.startsWith("__raw_")) continue;
+      if (k.startsWith("__raw_") || k.startsWith("__connector_")) continue;
       clean[k] = (k === "inputs" || k === "outputs" || k === "run_inputs") && Array.isArray(v)
         ? v.map((row) => Object.fromEntries(
             Object.entries(row || {}).filter(([rowKey]) => !rowKey.startsWith("__")),
@@ -468,7 +564,10 @@ export default function WorkflowNodeConfigPanel({
     });
     setTestInputValues((current) => ({ ...testValues, ...current }));
     setTestInputErrors(errors);
-    if (Object.keys(errors).length) return;
+    if (Object.keys(errors).length) {
+      setTestInputsOpen(true);
+      return;
+    }
 
     setRunning(true);
     setLiveResult(null);
@@ -494,59 +593,41 @@ export default function WorkflowNodeConfigPanel({
     <Modal
       open={!!step}
       onClose={close}
-      title={`${m.label} node`}
+      title={name || `${m.label} node`}
+      className="workflow-node-dialog"
+      bodyClassName="workflow-node-dialog-body"
       maxWidth="960px"
       footer={
-        <div style={{ display: "flex", gap: 8, justifyContent: "space-between", alignItems: "center", width: "100%" }}>
+        <div className="workflow-node-dialog-actions">
           <Button
             variant="outline"
             onClick={runNode}
-            disabled={running || step.type === "stage" || !!rawErr || Object.keys(jsonErrs).length > 0}
+            disabled={running || step.type === "stage" || !!rawErr || hasBindingValueErrors || Object.keys(jsonErrs).length > 0}
           >
             {running ? "Testing…" : "Test node"}
           </Button>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div className="workflow-node-dialog-primary-actions">
             <Button variant="ghost" onClick={close}>Cancel</Button>
-            <Button onClick={save} disabled={!!rawErr || Object.keys(jsonErrs).length > 0}>Save</Button>
+            <Button onClick={save} disabled={!!rawErr || hasBindingValueErrors || Object.keys(jsonErrs).length > 0}>Save</Button>
           </div>
         </div>
       }
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <Field label="Name">
-          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Node name" />
-        </Field>
-
+      <div className="workflow-node-dialog-shell">
+        <div className="workflow-node-dialog-meta" aria-label="Node identity">
+          <span className="workflow-node-type-chip">{m.label}</span>
+          <code>{step.id}</code>
+        </div>
         <div className="workflow-node-config-layout">
-          <ExecutionResultPanel
-            resultRef={resultRef}
-            running={running}
-            result={effectiveResult}
-            isLive={!!liveResult}
-            raw={rawRun}
-            stepType={step.type}
-            onToggleRaw={() => setRawRun((value) => !value)}
-            testInputs={configuredTestInputs.map((input) => {
-              const key = String(input.key || "").trim();
-              return {
-                key,
-                type: input.type || "any",
-                source: String(input.value || ""),
-                value: testInputValue(input),
-                error: testInputErrors[key],
-                onChange: (value: string) => {
-                  setTestInputValues((current) => ({ ...current, [key]: value }));
-                  setTestInputErrors((current) => {
-                    if (!current[key]) return current;
-                    const next = { ...current };
-                    delete next[key];
-                    return next;
-                  });
-                },
-              };
-            })}
-          />
           <div className="workflow-node-config-fields">
+            <section className="workflow-node-section workflow-node-configuration-section">
+              <div className="workflow-node-section-heading">
+                <strong>Configuration</strong>
+                <span>What this node does when the Workflow reaches it.</span>
+              </div>
+              <Field label="Node name">
+                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Node name" />
+              </Field>
 
         {step.type === "unsupported" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: "9px 11px", borderRadius: 8, background: "rgba(168,162,158,0.12)" }}>
@@ -563,6 +644,18 @@ export default function WorkflowNodeConfigPanel({
           <StageOperationsSummary config={config} />
         ) : step.type === "agent" ? (
           <>
+            {config.service_key && (
+              <div className="workflow-service-binding" aria-label="Workspace agent binding">
+                <span className="workflow-service-binding-icon" aria-hidden="true">
+                  <NodeIcon type="agent" size={15} />
+                </span>
+                <span className="workflow-service-binding-copy">
+                  <strong>Workspace-bound agent</strong>
+                  <small>Resolved from the Workspace that starts this run.</small>
+                </span>
+                <code>{String(config.service_key)}</code>
+              </div>
+            )}
             <Field
               label="Run as agent"
               hint={(agents as unknown[]).length
@@ -668,33 +761,265 @@ export default function WorkflowNodeConfigPanel({
           </>
         ) : step.type === "connector" ? (
           (() => {
-            // Compose mcp__<server>__<operation> from an integration + operation.
             const tool = String(config.tool ?? "");
-            const parts = tool.startsWith("mcp__") ? tool.split("__") : [];
-            const server = parts[1] || "";
-            const operation = parts.slice(2).join("__") || "";
-            const setTool = (srv: string, op: string) =>
-              setKey("tool", srv ? `mcp__${srv}__${op}` : "");
-            const list = (integrations as any[]).map((i) => {
-              const key = i.server_key || i.provider || i.key || i.id;
-              return { value: String(key), label: String(i.name || i.display_name || key) };
+            const server = connectorServer;
+            const operation = parsedConnectorTool.operation;
+            const servers = integrationServers as IntegrationMCPServer[];
+            const selectableServers = servers.filter((item) => item.agent_can_use || item.server_key === server);
+            const serverInfo = servers.find((item) => item.server_key === server);
+            const serverOptions = [
+              ...selectableServers.map((item) => ({
+                value: item.server_key,
+                label: item.agent_can_use ? item.name : `${item.name} (not connected)`,
+              })),
+              ...(server && !servers.some((item) => item.server_key === server)
+                ? [{ value: server, label: `${connectorArgumentLabel(server)} (custom)` }]
+                : []),
+            ];
+            const operations = connectorCatalog?.server_key === server
+              ? connectorCatalog.operations
+              : [];
+            const selectedOperation = operations.find((item) => item.name === operation);
+            const resources = [...new Set(operations.map((item) => item.resource))].sort();
+            const hasResourceFilter = Object.prototype.hasOwnProperty.call(config, "__connector_resource");
+            const resourceFilter = hasResourceFilter
+              ? String(config.__connector_resource || "")
+              : selectedOperation?.resource || "";
+            const visibleOperations = resourceFilter
+              ? operations.filter((item) => item.resource === resourceFilter)
+              : operations;
+            const operationOptions = [
+              ...visibleOperations.map((item) => ({
+                value: item.name,
+                label: resourceFilter ? item.label : `${item.resource} · ${item.label}`,
+              })),
+              ...(operation && !visibleOperations.some((item) => item.name === operation)
+                ? [{ value: operation, label: `${connectorArgumentLabel(operation)} (custom)` }]
+                : []),
+            ];
+            const args = config.args && typeof config.args === "object" && !Array.isArray(config.args)
+              ? config.args as Record<string, any>
+              : {};
+            const accounts = [
+              ...(serverInfo?.connections || []).map((account) => ({
+                value: account.id,
+                label: `${account.display_name || `Account ${account.id.slice(-6)}`} · Personal${account.is_default ? " · Default" : ""}`,
+              })),
+              ...(serverInfo?.entity_accounts || []).map((account) => ({
+                value: account.id,
+                label: `${account.display_name || account.name || `Account ${account.id.slice(-6)}`} · Shared${account.is_default ? " · Default" : ""}`,
+              })),
+            ];
+            const selectedAccount = String(args.integration_account_id || "");
+            if (selectedAccount && !accounts.some((account) => account.value === selectedAccount)) {
+              accounts.push({ value: selectedAccount, label: `Unavailable account · ${selectedAccount.slice(-6)}` });
+            }
+
+            const clearArgumentErrors = () => setJsonErrs((current) => Object.fromEntries(
+              Object.entries(current).filter(([key]) => key !== "args" && !key.startsWith("args.")),
+            ));
+            const selectServer = (nextServer: string) => {
+              clearArgumentErrors();
+              setConfig((current) => {
+                const next = { ...current };
+                delete next.tool;
+                delete next.args;
+                delete next.__connector_resource;
+                if (nextServer) next.__connector_server = nextServer;
+                else delete next.__connector_server;
+                return next;
+              });
+            };
+            const selectOperation = (nextOperation: string) => {
+              clearArgumentErrors();
+              setConfig((current) => {
+                const previousArgs = current.args && typeof current.args === "object" && !Array.isArray(current.args)
+                  ? current.args as Record<string, any>
+                  : {};
+                const nextDefinition = operations.find((item) => item.name === nextOperation);
+                const allowed = new Set(Object.keys(nextDefinition?.input_schema?.properties || {}));
+                const nextArgs: Record<string, any> = {};
+                if (previousArgs.integration_account_id) {
+                  nextArgs.integration_account_id = previousArgs.integration_account_id;
+                }
+                if (!operations.length || !nextDefinition) {
+                  Object.assign(nextArgs, previousArgs);
+                } else {
+                  for (const [key, value] of Object.entries(previousArgs)) {
+                    if (allowed.has(key)) nextArgs[key] = value;
+                  }
+                }
+                return {
+                  ...current,
+                  __connector_server: server,
+                  tool: nextOperation ? `mcp__${server}__${nextOperation}` : undefined,
+                  args: Object.keys(nextArgs).length ? nextArgs : undefined,
+                };
+              });
+            };
+            const selectResource = (nextResource: string) => {
+              clearArgumentErrors();
+              setConfig((current) => {
+                const next: Record<string, any> = { ...current, __connector_resource: nextResource };
+                if (nextResource && selectedOperation && selectedOperation.resource !== nextResource) {
+                  delete next.tool;
+                  const accountId = args.integration_account_id;
+                  next.args = accountId ? { integration_account_id: accountId } : undefined;
+                }
+                return next;
+              });
+            };
+            const selectAccount = (accountId: string) => setConfig((current) => {
+              const previousArgs = current.args && typeof current.args === "object" && !Array.isArray(current.args)
+                ? current.args as Record<string, any>
+                : {};
+              const nextArgs = { ...previousArgs };
+              if (accountId) nextArgs.integration_account_id = accountId;
+              else delete nextArgs.integration_account_id;
+              return { ...current, args: Object.keys(nextArgs).length ? nextArgs : undefined };
             });
+            const setArgument = (key: string, value: any) => setConfig((current) => {
+              const previousArgs = current.args && typeof current.args === "object" && !Array.isArray(current.args)
+                ? current.args as Record<string, any>
+                : {};
+              const nextArgs = { ...previousArgs };
+              if (value === undefined || value === "") delete nextArgs[key];
+              else nextArgs[key] = value;
+              return { ...current, args: Object.keys(nextArgs).length ? nextArgs : undefined };
+            });
+            const properties = selectedOperation?.input_schema?.properties || {};
+            const required = new Set(selectedOperation?.input_schema?.required || []);
             return (
               <>
                 <Field label="Integration" hint="Resolved against this entity / workspace's connected accounts.">
                   <Select
                     value={server}
-                    onChange={(v) => setTool(v, operation)}
-                    placeholder={list.length ? "Select an integration…" : "No integrations connected"}
-                    options={list}
+                    onChange={selectServer}
+                    placeholder={integrationServersLoading
+                      ? "Loading integrations…"
+                      : serverOptions.length
+                        ? "Select an integration…"
+                        : "No integrations connected"}
+                    options={serverOptions}
+                    disabled={integrationServersLoading}
+                    filterable
+                    ariaLabel="Integration"
                   />
-                  <OpenLink label={list.length ? "Manage integrations" : "Connect an integration"} onClick={() => goResource("/integrations")} />
+                  {integrationServersError && (
+                    <span role="alert" className="workflow-connector-error">Connected integrations could not be loaded.</span>
+                  )}
+                  <OpenLink label={serverOptions.length ? "Manage integrations" : "Connect an integration"} onClick={() => goResource("/integrations")} />
                 </Field>
-                <Field label="Operation" hint="e.g. post_message, create_issue — composes mcp__<server>__<operation>.">
-                  <Input value={operation} onChange={(e) => setTool(server, e.target.value)} placeholder="operation" />
+                {accounts.length > 1 && (
+                  <Field label="Account" hint="Choose a connected account, or leave this on the provider default.">
+                    <Select
+                      value={selectedAccount}
+                      onChange={selectAccount}
+                      placeholder="Default account"
+                      options={[{ value: "", label: "Default account" }, ...accounts]}
+                      filterable
+                      ariaLabel="Integration account"
+                    />
+                  </Field>
+                )}
+                {server && resources.length > 1 && (
+                  <Field label="Resource" hint="Narrow the operation list to one kind of object.">
+                    <Select
+                      value={resourceFilter}
+                      onChange={selectResource}
+                      placeholder="All operations"
+                      options={[
+                        { value: "", label: "All operations" },
+                        ...resources.map((resource) => ({ value: resource, label: resource })),
+                      ]}
+                      ariaLabel="Integration resource"
+                    />
+                  </Field>
+                )}
+                <Field
+                  label="Operation"
+                  hint={selectedOperation?.description || "Choose the action this node performs."}
+                >
+                  {server && (connectorCatalogError || (!connectorCatalogLoading && operations.length === 0)) ? (
+                    <Input
+                      value={operation}
+                      onChange={(event) => selectOperation(event.target.value)}
+                      placeholder="e.g. send_message"
+                      ariaLabel="Integration operation"
+                    />
+                  ) : (
+                    <Select
+                      value={operation}
+                      onChange={selectOperation}
+                      placeholder={!server
+                        ? "Select an integration first"
+                        : connectorCatalogLoading
+                          ? "Loading operations…"
+                          : "Select an operation…"}
+                      options={operationOptions}
+                      disabled={!server || connectorCatalogLoading}
+                      filterable
+                      ariaLabel="Integration operation"
+                    />
+                  )}
+                  {server && connectorCatalogError && (
+                    <span role="alert" className="workflow-connector-error">The operation catalog could not be loaded. Enter the exact MCP operation name.</span>
+                  )}
+                  {server && !connectorCatalogLoading && !connectorCatalogError && operations.length === 0 && (
+                    <span className="workflow-connector-help">No discovered operations yet. Enter the exact MCP operation name.</span>
+                  )}
                 </Field>
-                {tool && <p className="mono" style={{ fontSize: 11, color: "var(--text-faint)", margin: 0 }}>{tool}</p>}
-                <JsonField fieldKey="args" label="Arguments" config={config} setConfig={setConfig} jsonErrs={jsonErrs} setJsonErrs={setJsonErrs} />
+                {selectedOperation?.effect !== "read" && selectedOperation && (
+                  <div
+                    className={`workflow-connector-effect is-${selectedOperation.effect}`}
+                    role={selectedOperation.effect === "destructive" ? "alert" : undefined}
+                  >
+                    <span aria-hidden="true" />
+                    {selectedOperation.effect === "destructive"
+                      ? "This operation can remove or irreversibly change external data."
+                      : "This operation changes data in the connected service."}
+                  </div>
+                )}
+                {Object.entries(properties).map(([key, property]) => (
+                  <ConnectorArgumentField
+                    key={`${operation}:${key}`}
+                    argumentKey={key}
+                    schema={property}
+                    required={required.has(key)}
+                    value={args[key]}
+                    onChange={(value) => setArgument(key, value)}
+                    onValidityChange={(error) => setJsonErrs((current) => {
+                      const next = { ...current };
+                      const errorKey = `args.${key}`;
+                      if (error) next[errorKey] = error;
+                      else delete next[errorKey];
+                      return next;
+                    })}
+                  />
+                ))}
+                {selectedOperation && Object.keys(properties).length === 0 && (
+                  <span className="workflow-connector-help">This operation does not require parameters.</span>
+                )}
+                <details className="workflow-connector-advanced">
+                  <summary>
+                    <span>
+                      <strong>Advanced</strong>
+                      <small>View or edit the exact JSON arguments.</small>
+                    </span>
+                  </summary>
+                  <div className="workflow-connector-advanced-content">
+                    {tool && <code className="workflow-connector-tool-name">{tool}</code>}
+                    <JsonField
+                      fieldKey="args"
+                      label="Arguments (JSON)"
+                      hint="Use this for nested values, expressions, or parameters not represented above."
+                      config={config}
+                      setConfig={setConfig}
+                      jsonErrs={jsonErrs}
+                      setJsonErrs={setJsonErrs}
+                    />
+                  </div>
+                </details>
               </>
             );
           })()
@@ -829,14 +1154,41 @@ export default function WorkflowNodeConfigPanel({
                   );
                 })()
               ) : f.kind === "workflow_ref" ? (
-                <Select
-                  value={String(config[f.key] ?? "")}
-                  onChange={(v) => setKey(f.key, v || undefined)}
-                  placeholder={allWorkflows.length ? "Select a workflow…" : "No other workflows"}
-                  options={(allWorkflows as { id: string; name: string }[])
-                    .filter((w) => w.id !== currentWorkflowId)
-                    .map((w) => ({ value: w.id, label: w.name }))}
-                />
+                <>
+                  <Select
+                    value={String(config[f.key] ?? "")}
+                    onChange={(v) => setKey(f.key, v || undefined)}
+                    placeholder={allWorkflows.length ? "Select a workflow…" : "No other workflows"}
+                    options={(allWorkflows as { id: string; name: string }[])
+                      .filter((w) => w.id !== currentWorkflowId)
+                      .map((w) => ({ value: w.id, label: w.name }))}
+                  />
+                  {config[f.key] && (
+                    <button
+                      type="button"
+                      className="workflow-reference-card"
+                      onClick={() => openReferencedWorkflow(String(config[f.key]))}
+                      aria-label={`Open ${
+                        (allWorkflows as { id: string; name: string }[])
+                          .find((workflow) => workflow.id === config[f.key])?.name || "referenced workflow"
+                      }`}
+                    >
+                      <span className="workflow-reference-card-icon" aria-hidden="true">
+                        <NodeIcon type="subworkflow" size={16} />
+                      </span>
+                      <span className="workflow-reference-card-copy">
+                        <strong>Open publishing workflow</strong>
+                        <small>{
+                          (allWorkflows as { id: string; name: string }[])
+                            .find((workflow) => workflow.id === config[f.key])?.name || String(config[f.key])
+                        }</small>
+                      </span>
+                      <svg aria-hidden="true" width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M9 18l6-6-6-6" />
+                      </svg>
+                    </button>
+                  )}
+                </>
               ) : (
                 <Input
                   value={String(config[f.key] ?? "")}
@@ -849,7 +1201,7 @@ export default function WorkflowNodeConfigPanel({
           </>
         ) : NO_CONFIG_TYPES.has(step.type) ? (
           <p style={{ fontSize: 12.5, color: "var(--text-faint)", margin: 0, lineHeight: 1.5 }}>
-            {step.type === "end" ? "Terminal node — ends this branch. No parameters." : "Entry node — starts the workflow. Triggering is set on the deployment."}
+            {step.type === "end" ? "Terminal node — map the Workflow result below." : "Entry node — starts the workflow. Triggering is set on the deployment."}
           </p>
         ) : step.type === "unsupported" ? null : (
           <Field label="Config (JSON)">
@@ -864,20 +1216,17 @@ export default function WorkflowNodeConfigPanel({
             {rawErr && <span style={{ fontSize: 12, color: "#d65f59" }}>{rawErr}</span>}
           </Field>
         )}
+            </section>
 
         {/* Data flow: define this step's named inputs (mapped from upstream
             values) and named outputs (fields of its result). The step's whole
             result is always auto-available as {{<id>}}. */}
-        {step.type !== "end" && step.type !== "unsupported" && step.type !== "stage" && (() => {
+        {step.type !== "unsupported" && step.type !== "stage" && (() => {
           const upstream = connectedUpstreamNodes(nodes || [], step.id);
-          const inputRows: Binding[] = Array.isArray(config.inputs) ? (config.inputs as Binding[]) : [];
-          const outputRows: Binding[] = Array.isArray(config.outputs)
-            ? (config.outputs as Binding[])
-            : isEntryNode
-              ? entryOutputRows
-            : config.output_var
-              ? [{ key: String(config.output_var), value: "" }]
-              : [];
+          const inputRows: Binding[] = effectiveInputRows;
+          const outputRows: Binding[] = isEntryNode
+            ? entryOutputRows
+            : workflowStepOutputs({ id: step.id, type: step.type, config }) as Binding[];
           const setInputs = (rows: Binding[]) => setKey("inputs", rows.length ? rows : undefined);
           const setRunInputs = (rows: WorkflowRunInputBinding[]) => setConfig((current) => {
             const previousRows = Array.isArray(current.run_inputs)
@@ -925,12 +1274,20 @@ export default function WorkflowNodeConfigPanel({
             return srcT && srcT !== "any" && srcT !== t ? `upstream is ${srcT}, this expects ${t}` : undefined;
           };
           return (
-            <div style={{ display: "flex", flexDirection: "column", gap: 14, paddingTop: 8, borderTop: "1px solid rgba(28,25,23,0.06)" }}>
+            <section className="workflow-node-section">
+              <div className="workflow-node-section-heading">
+                <strong>Data mapping</strong>
+                <span>Choose what enters this node and what it exposes downstream.</span>
+              </div>
               <FieldGroup
                 label="Inputs"
                 hint={isEntryNode
                   ? undefined
-                  : "Name the data this step needs, mapped from an upstream value. Pick a type to coerce + validate it. Reference an input as {{name}} in the fields above."}
+                  : step.type === "end"
+                    ? "Map input to the exact value this terminal branch returns as the Workflow result."
+                  : Array.isArray(config.inputs)
+                    ? "Name the data this step needs, mapped from an upstream value. Pick a type to coerce + validate it. Reference an input as {{name}} in the fields above."
+                    : "Automatically inferred from {{variables}} used by this node. Editing a row saves it as an explicit input mapping."}
               >
                 {isEntryNode ? (
                   <WorkflowRunInputRows rows={entryInputRows} onChange={setRunInputs} />
@@ -950,6 +1307,8 @@ export default function WorkflowNodeConfigPanel({
                 label="Outputs"
                 hint={isEntryNode
                   ? undefined
+                  : step.type === "end"
+                    ? `The completed Workflow result is available as {{${step.id}}}.`
                   : `This step's whole result is always available as {{${step.id}}}. Add named, typed outputs to expose specific fields downstream.`}
               >
                 <BindingRows
@@ -960,15 +1319,21 @@ export default function WorkflowNodeConfigPanel({
                   addLabel="Add output"
                 />
               </FieldGroup>
-            </div>
+            </section>
           );
         })()}
 
         {/* Node settings — n8n-style execution controls: error handling,
             retry, and a free-text note. These tune how the step runs. */}
         {step.type !== "trigger" && step.type !== "webhook" && step.type !== "unsupported" && step.type !== "stage" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8, borderTop: "1px solid rgba(28,25,23,0.06)" }}>
-            <span style={{ fontSize: 11, fontWeight: 500, letterSpacing: 0.2, color: "var(--text-faint)" }}>Settings</span>
+          <details className="workflow-node-settings">
+            <summary>
+              <span>
+                <strong>Run settings</strong>
+                <small>Error handling, cache, retries, and maintainer notes.</small>
+              </span>
+            </summary>
+            <div className="workflow-node-settings-content">
             <Field label="On error" hint="Stop the whole run, or skip this step and continue.">
               <Select
                 value={String(config.on_error ?? "stop")}
@@ -1015,10 +1380,42 @@ export default function WorkflowNodeConfigPanel({
                 rows={2}
               />
             </Field>
-          </div>
+            </div>
+          </details>
         )}
 
           </div>
+          <ExecutionResultPanel
+            key={step.id}
+            resultRef={resultRef}
+            running={running}
+            result={effectiveResult}
+            isLive={!!liveResult}
+            raw={rawRun}
+            stepType={step.type}
+            onToggleRaw={() => setRawRun((value) => !value)}
+            testInputsOpen={testInputsOpen}
+            onToggleTestInputs={() => setTestInputsOpen((value) => !value)}
+            testInputs={configuredTestInputs.map((input) => {
+              const key = String(input.key || "").trim();
+              return {
+                key,
+                type: input.type || "any",
+                source: formatTestInputSource(input.value),
+                value: testInputValue(input),
+                error: testInputErrors[key],
+                onChange: (value: string) => {
+                  setTestInputValues((current) => ({ ...current, [key]: value }));
+                  setTestInputErrors((current) => {
+                    if (!current[key]) return current;
+                    const next = { ...current };
+                    delete next[key];
+                    return next;
+                  });
+                },
+              };
+            })}
+          />
         </div>
 
       </div>
@@ -1034,6 +1431,8 @@ function ExecutionResultPanel({
   raw,
   stepType,
   onToggleRaw,
+  testInputsOpen,
+  onToggleTestInputs,
   testInputs,
 }: {
   resultRef: { current: HTMLDivElement | null };
@@ -1043,6 +1442,8 @@ function ExecutionResultPanel({
   raw: boolean;
   stepType: string;
   onToggleRaw: () => void;
+  testInputsOpen: boolean;
+  onToggleTestInputs: () => void;
   testInputs: TestInputField[];
 }) {
   const hasResult = !!result?.status;
@@ -1090,71 +1491,10 @@ function ExecutionResultPanel({
       role="region"
       aria-label="Execution result"
       className="workflow-node-execution-result"
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: 10,
-        padding: "16px",
-        borderRadius: "var(--radius-control)",
-        background: "var(--surface-muted)",
-        boxShadow: "var(--shadow-sm)",
-      }}
     >
-      {testInputs.length > 0 && (
-        <section className="workflow-node-test-inputs" aria-labelledby="workflow-node-test-inputs-title">
-          <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
-            <span id="workflow-node-test-inputs-title" style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>Test inputs</span>
-            <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>Not saved</span>
-          </div>
-          <p style={{ margin: 0, fontSize: 11.5, lineHeight: 1.45, color: "var(--text-muted)" }}>
-            Values are prefilled from the latest run when available. Edit them for this test.
-          </p>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {testInputs.map((input, index) => {
-              const multiline = input.type === "json" || input.value.includes("\n");
-              return (
-                <div key={`${input.key}-${index}`} style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                  <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
-                    <label style={{ minWidth: 0, fontSize: 11.5, fontWeight: 600, color: "var(--text-strong)", wordBreak: "break-word" }}>
-                      {input.key}
-                    </label>
-                    <span style={{ flexShrink: 0, fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--font-mono, monospace)" }}>{input.type}</span>
-                  </div>
-                  {multiline ? (
-                    <Textarea
-                      value={input.value}
-                      onChange={(event) => input.onChange(event.target.value)}
-                      rows={3}
-                      error={input.error}
-                      ariaLabel={`Test value for ${input.key}`}
-                    />
-                  ) : (
-                    <Input
-                      value={input.value}
-                      onChange={(event) => input.onChange(event.target.value)}
-                      type={input.type === "number" ? "number" : "text"}
-                      error={input.error}
-                      ariaLabel={`Test value for ${input.key}`}
-                      placeholder="Enter a test value"
-                    />
-                  )}
-                  {input.source && (
-                    <span title={input.source} style={{ overflow: "hidden", color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--font-mono, monospace)", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      Mapped from {input.source}
-                    </span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {testInputs.length > 0 && <div style={{ height: 1, background: "var(--border-subtle)" }} />}
-
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+      <div className="workflow-node-result-heading">
         <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>Execution result</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>Test & result</span>
           <span aria-live="polite" aria-atomic="true" style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, color: "var(--text-muted)" }}>
             <span
               aria-hidden="true"
@@ -1188,6 +1528,61 @@ function ExecutionResultPanel({
         )}
       </div>
 
+      {testInputs.length > 0 && (
+        <section className="workflow-node-test-inputs" aria-labelledby="workflow-node-test-inputs-title">
+          <button
+            type="button"
+            className="workflow-node-test-inputs-toggle"
+            aria-expanded={testInputsOpen}
+            onClick={onToggleTestInputs}
+          >
+            <span id="workflow-node-test-inputs-title">Test inputs</span>
+            <span>{testInputs.length} {testInputs.length === 1 ? "field" : "fields"} · not saved</span>
+          </button>
+          {testInputsOpen && (
+            <div className="workflow-node-test-inputs-content">
+              <p>Values are prefilled from the latest run when available. Edit them only for this test.</p>
+              <div className="workflow-node-test-input-list">
+                {testInputs.map((input, index) => {
+                  const multiline = input.type === "json" || input.value.includes("\n");
+                  return (
+                    <div key={`${input.key}-${index}`} className="workflow-node-test-input">
+                      <div className="workflow-node-test-input-label">
+                        <label>{input.key}</label>
+                        <span>{input.type}</span>
+                      </div>
+                      {multiline ? (
+                        <Textarea
+                          value={input.value}
+                          onChange={(event) => input.onChange(event.target.value)}
+                          rows={3}
+                          error={input.error}
+                          ariaLabel={`Test value for ${input.key}`}
+                        />
+                      ) : (
+                        <Input
+                          value={input.value}
+                          onChange={(event) => input.onChange(event.target.value)}
+                          type={input.type === "number" ? "number" : "text"}
+                          error={input.error}
+                          ariaLabel={`Test value for ${input.key}`}
+                          placeholder="Enter a test value"
+                        />
+                      )}
+                      {input.source && (
+                        <span className="workflow-node-test-input-source" title={input.source}>
+                          Mapped from {input.source}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
       {!running && !hasResult ? (
         <div className="workflow-node-result-empty">
           <span aria-hidden="true" style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 18, color: "var(--text-faint)" }}>{"{ }"}</span>
@@ -1210,10 +1605,10 @@ function ExecutionResultPanel({
             </p>
           )}
           {result.inputs && Object.keys(result.inputs).length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={subLabel}>Input — data this step received</span>
+            <details className="workflow-node-result-inputs">
+              <summary>Input · {Object.keys(result.inputs).length} fields</summary>
               <div style={contentStyle}><DataView data={result.inputs} /></div>
-            </div>
+            </details>
           )}
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             <span style={subLabel}>Result output</span>
@@ -1352,7 +1747,14 @@ type WorkflowNodeRef = {
   outputs?: { name: string; type?: string }[];
 };
 
-type Binding = { key?: string; value?: any; type?: string; __custom?: boolean };
+type Binding = {
+  key?: string;
+  value?: any;
+  type?: string;
+  __custom?: boolean;
+  __valueRaw?: string;
+  __valueError?: string;
+};
 type WorkflowRunInputBinding = Binding & {
   label?: string;
   required?: boolean;
@@ -1382,6 +1784,13 @@ function formatTestInputValue(value: any): string {
   } catch {
     return String(value);
   }
+}
+
+function formatTestInputSource(value: any): string {
+  if (Array.isArray(value) || (value && typeof value === "object")) {
+    return "structured JSON";
+  }
+  return String(value || "");
 }
 
 /** Resolve an exact upstream binding against the latest workflow variables for
@@ -1709,7 +2118,7 @@ function CodeInputTextarea({
 
 /** Parameter types — ComfyUI-style typed sockets / n8n typeOptions. ``any`` is
  *  the pass-through default; the rest coerce + validate at the data-flow layer. */
-const BINDING_TYPES = ["any", "text", "number", "boolean", "json", "image"];
+const BINDING_TYPES = ["any", "text", "number", "boolean", "json", "image", "video", "audio"];
 const CUSTOM_BINDING_VALUE = "__workflow_custom_binding__";
 
 function workflowEntryOutputType(type?: string): string {
@@ -1912,9 +2321,10 @@ function BindingRows({
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
       {rows.map((r, i) => {
         const warn = validate?.(r);
+        const structuredValue = Boolean(r.value && typeof r.value === "object");
         const selectedSource = valueOptions?.find((option) => option.value === r.value);
         const customMode = valueOptions !== undefined
-          && (!!r.__custom || (!!r.value && !selectedSource));
+          && (!!r.__custom || structuredValue || (!!r.value && !selectedSource));
         return (
           <div key={i} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
             <div className="workflow-binding-row">
@@ -1923,7 +2333,48 @@ function BindingRows({
               </div>
               <span className="workflow-binding-equals">=</span>
               <div className="workflow-binding-value">
-                {valueOptions === undefined ? (
+                {structuredValue ? (
+                  <div className="workflow-binding-structured-value">
+                    <Textarea
+                      value={r.__valueRaw ?? formatTestInputValue(r.value)}
+                      onChange={(event) => {
+                        const raw = event.target.value;
+                        try {
+                          update(i, {
+                            value: JSON.parse(raw),
+                            __custom: true,
+                            __valueRaw: undefined,
+                            __valueError: undefined,
+                          });
+                        } catch {
+                          update(i, {
+                            __custom: true,
+                            __valueRaw: raw,
+                            __valueError: "Enter valid JSON before saving.",
+                          });
+                        }
+                      }}
+                      rows={3}
+                      error={r.__valueError}
+                    />
+                    {valueOptions !== undefined && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => update(i, {
+                          value: "",
+                          __custom: false,
+                          __valueRaw: undefined,
+                          __valueError: undefined,
+                        })}
+                        title="Choose an upstream output"
+                        ariaLabel="Choose an upstream output"
+                      >
+                        Outputs
+                      </Button>
+                    )}
+                  </div>
+                ) : valueOptions === undefined ? (
                   <Input value={r.value ?? ""} onChange={(e) => update(i, { value: e.target.value })} placeholder={valuePlaceholder} />
                 ) : customMode ? (
                   <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -2042,6 +2493,158 @@ function FieldGroup({ label, hint, children }: { label: string; hint?: string; c
       {children}
       {hint && <span style={{ fontSize: 11, color: "var(--text-faint)", fontWeight: 400, lineHeight: 1.4 }}>{hint}</span>}
     </div>
+  );
+}
+
+function ConnectorArgumentField({
+  argumentKey,
+  schema,
+  required,
+  value,
+  onChange,
+  onValidityChange,
+}: {
+  argumentKey: string;
+  schema: Record<string, any>;
+  required: boolean;
+  value: any;
+  onChange: (value: any) => void;
+  onValidityChange: (error?: string) => void;
+}) {
+  const declaredType = Array.isArray(schema.type)
+    ? schema.type.find((item: unknown) => item !== "null")
+    : schema.type;
+  const type = String(declaredType || "string");
+  const label = `${connectorArgumentLabel(argumentKey)}${required ? " *" : ""}`;
+  const hintParts = [schema.description];
+  if (schema.default !== undefined) hintParts.push(`Default: ${String(schema.default)}`);
+  const hint = hintParts.filter(Boolean).join(" ");
+  const enumValues = Array.isArray(schema.enum) ? schema.enum : [];
+  const [rawJson, setRawJson] = useState(
+    value === undefined ? "" : JSON.stringify(value, null, 2),
+  );
+  const [jsonError, setJsonError] = useState("");
+
+  useEffect(() => {
+    if (!jsonError && (type === "object" || type === "array")) {
+      setRawJson(value === undefined ? "" : JSON.stringify(value, null, 2));
+    }
+  }, [value, type, jsonError]);
+
+  if (enumValues.length) {
+    const encodedValue = value === undefined ? "__unset__" : JSON.stringify(value);
+    const options = [
+      ...(!required || schema.default !== undefined
+        ? [{ value: "__unset__", label: schema.default !== undefined ? `Provider default (${String(schema.default)})` : "Not set" }]
+        : []),
+      ...enumValues.map((item: any) => ({ value: JSON.stringify(item), label: String(item) })),
+      ...(value !== undefined && !enumValues.some((item: any) => JSON.stringify(item) === encodedValue)
+        ? [{ value: encodedValue, label: `${String(value)} (custom)` }]
+        : []),
+    ];
+    return (
+      <Field label={label} hint={hint}>
+        <Select
+          value={encodedValue}
+          onChange={(encoded) => onChange(encoded === "__unset__" ? undefined : JSON.parse(encoded))}
+          options={options}
+          ariaLabel={label}
+        />
+      </Field>
+    );
+  }
+
+  if (type === "boolean") {
+    const boolValue = value === undefined ? "__unset__" : value ? "true" : "false";
+    return (
+      <Field label={label} hint={hint}>
+        <Select
+          value={boolValue}
+          onChange={(next) => onChange(next === "__unset__" ? undefined : next === "true")}
+          options={[
+            ...(!required || schema.default !== undefined
+              ? [{ value: "__unset__", label: schema.default !== undefined ? `Provider default (${String(schema.default)})` : "Not set" }]
+              : []),
+            { value: "true", label: "True" },
+            { value: "false", label: "False" },
+          ]}
+          ariaLabel={label}
+        />
+      </Field>
+    );
+  }
+
+  if (type === "object" || type === "array") {
+    return (
+      <Field label={label} hint={hint || `Enter a JSON ${type}.`}>
+        <Textarea
+          value={rawJson}
+          onChange={(event) => {
+            const text = event.target.value;
+            setRawJson(text);
+            if (!text.trim()) {
+              setJsonError("");
+              onValidityChange();
+              onChange(undefined);
+              return;
+            }
+            try {
+              const parsed = JSON.parse(text);
+              const validShape = type === "array"
+                ? Array.isArray(parsed)
+                : Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+              if (!validShape) throw new Error(`Expected a JSON ${type}`);
+              setJsonError("");
+              onValidityChange();
+              onChange(parsed);
+            } catch (error) {
+              const message = error instanceof Error && error.message.startsWith("Expected")
+                ? error.message
+                : "Invalid JSON";
+              setJsonError(message);
+              onValidityChange(message);
+            }
+          }}
+          rows={4}
+          ariaLabel={label}
+        />
+        {jsonError && <span role="alert" className="workflow-connector-error">{jsonError}</span>}
+      </Field>
+    );
+  }
+
+  const stringValue = value === undefined ? "" : String(value);
+  const changeScalar = (next: string) => {
+    if (next === "") {
+      onChange(undefined);
+      return;
+    }
+    if ((type === "number" || type === "integer") && !next.includes("{{")) {
+      const parsed = Number(next);
+      onChange(Number.isFinite(parsed) ? parsed : next);
+      return;
+    }
+    onChange(next);
+  };
+  return (
+    <Field label={label} hint={hint}>
+      {connectorArgumentIsMultiline(argumentKey, schema) ? (
+        <Textarea
+          value={stringValue}
+          onChange={(event) => changeScalar(event.target.value)}
+          placeholder={connectorArgumentPlaceholder(schema)}
+          rows={3}
+          ariaLabel={label}
+        />
+      ) : (
+        <Input
+          value={stringValue}
+          onChange={(event) => changeScalar(event.target.value)}
+          placeholder={connectorArgumentPlaceholder(schema)}
+          ariaLabel={label}
+        />
+      )}
+    </Field>
   );
 }
 

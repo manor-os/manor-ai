@@ -1364,6 +1364,7 @@ class RuntimePromptSkillToolSurface:
 
     declared_tool_names: tuple[str, ...]
     skill_tool_names: tuple[str, ...]
+    discoverable_tool_names: tuple[str, ...]
     tools: list[dict[str, Any]]
     allowed_tool_names: frozenset[str] | None = None
     harness: RuntimeHarness | None = None
@@ -1385,6 +1386,55 @@ def _prompt_skill_declared_tool_names(skill) -> tuple[str, ...]:
             if tool_name not in declared:
                 declared.append(tool_name)
     return tuple(declared)
+
+
+def _prompt_skill_discoverable_tool_names(
+    skill,
+    allowed_tool_names: Iterable[str] | None,
+    *,
+    runtime_envelope: RuntimeEnvelope | None = None,
+    registered_tool_names: Iterable[str] = (),
+) -> tuple[str, ...]:
+    config = getattr(skill, "config", None) or {}
+    if not isinstance(config, dict):
+        return ()
+    prefixes = tuple(
+        str(prefix).strip()
+        for prefix in (config.get("discoverable_tool_prefixes") or ())
+        if str(prefix or "").strip()
+    )
+    if not prefixes:
+        return ()
+    provider_keys = {
+        str(provider).strip()
+        for provider in (config.get("discoverable_provider_keys") or ())
+        if str(provider or "").strip()
+    }
+    declared = set(_prompt_skill_declared_tool_names(skill))
+    candidates = {
+        str(tool_name).strip()
+        for tool_name in registered_tool_names
+        if str(tool_name or "").strip()
+    }
+    profile = getattr(runtime_envelope, "profile", None)
+    if profile in {
+        RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
+        RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
+    }:
+        candidates &= set(_runtime_allowed_tool_name_set(allowed_tool_names) or ())
+    if provider_keys:
+        from packages.core.ai.runtime.tool_discovery import runtime_mcp_provider_from_tool_name
+
+        candidates = {
+            tool_name
+            for tool_name in candidates
+            if runtime_mcp_provider_from_tool_name(tool_name) in provider_keys
+        }
+    return tuple(sorted({
+        tool_name
+        for tool_name in candidates
+        if tool_name not in declared and tool_name.startswith(prefixes)
+    }))
 
 
 def _runtime_allowed_tool_name_set(
@@ -1442,16 +1492,25 @@ def _prompt_skill_runtime_envelope(
     *,
     allowed_tool_names: Iterable[str] | None,
     skill_tool_names: Iterable[str],
+    discovery_policy: dict[str, tuple[str, ...]] | None = None,
 ) -> RuntimeEnvelope | None:
     if runtime_envelope is None:
         return None
     effective_allowed = set(str(tool_name) for tool_name in (allowed_tool_names or ()) if str(tool_name or "").strip())
     if not effective_allowed:
         return runtime_envelope
-    effective_tools = set(runtime_envelope.tool_names or ())
-    effective_tools.update(skill_tool_names)
+    effective_tools = (
+        set(skill_tool_names)
+        if discovery_policy is not None
+        else set(runtime_envelope.tool_names or ()) | set(skill_tool_names)
+    )
     metadata = deepcopy(runtime_envelope.metadata)
     metadata.pop("chrome_runtime_contract_v1", None)
+    if discovery_policy is not None:
+        metadata["prompt_skill_tool_discovery"] = {
+            key: list(values)
+            for key, values in discovery_policy.items()
+        }
     return replace(
         runtime_envelope,
         tool_names=tuple(sorted(effective_tools)),
@@ -1490,6 +1549,7 @@ def runtime_prepare_prompt_skill_tool_surface(
     allowed_tool_names: Iterable[str] | None = None,
     runtime_envelope: RuntimeEnvelope | None = None,
     get_schemas_for_names: Callable[[list[str]], list[dict[str, Any]]] | None = None,
+    get_registered_tool_names: Callable[[], Iterable[str]] | None = None,
 ) -> RuntimePromptSkillToolSurface:
     """Prepare the schema-visible tool surface for a prompt skill.
 
@@ -1499,12 +1559,44 @@ def runtime_prepare_prompt_skill_tool_surface(
     """
 
     declared = _prompt_skill_declared_tool_names(skill)
-    allowed = _prompt_skill_effective_allowed_tools(
+    parent_allowed = _prompt_skill_effective_allowed_tools(
         declared,
         allowed_tool_names,
         runtime_envelope,
     )
-    skill_tool_names = tuple(tool_name for tool_name in declared if allowed is None or tool_name in allowed)
+    skill_tool_names = tuple(
+        tool_name
+        for tool_name in declared
+        if parent_allowed is None or tool_name in parent_allowed
+    )
+    if get_registered_tool_names is None:
+        from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
+
+        get_registered_tool_names = runtime_registered_tool_names
+    discoverable = _prompt_skill_discoverable_tool_names(
+        skill,
+        allowed_tool_names,
+        runtime_envelope=runtime_envelope,
+        registered_tool_names=get_registered_tool_names(),
+    )
+    config = getattr(skill, "config", None) or {}
+    discovery_policy = None
+    if discoverable or (isinstance(config, dict) and config.get("discoverable_tool_prefixes")):
+        discovery_policy = {
+            "provider_keys": tuple(
+                str(value).strip()
+                for value in (config.get("discoverable_provider_keys") or ())
+                if str(value or "").strip()
+            ),
+            "tool_prefixes": tuple(
+                str(value).strip()
+                for value in (config.get("discoverable_tool_prefixes") or ())
+                if str(value or "").strip()
+            ),
+        }
+        allowed = frozenset((*skill_tool_names, *discoverable))
+    else:
+        allowed = parent_allowed
     if get_schemas_for_names is None:
         from packages.core.ai.runtime.tool_registry import runtime_tool_schemas_for_names
 
@@ -1513,10 +1605,12 @@ def runtime_prepare_prompt_skill_tool_surface(
         runtime_envelope,
         allowed_tool_names=allowed,
         skill_tool_names=skill_tool_names,
+        discovery_policy=discovery_policy,
     )
     return RuntimePromptSkillToolSurface(
         declared_tool_names=declared,
         skill_tool_names=skill_tool_names,
+        discoverable_tool_names=discoverable,
         tools=list(get_schemas_for_names(list(skill_tool_names)) or []),
         allowed_tool_names=allowed,
         harness=RuntimeHarness(skill_envelope) if skill_envelope is not None else None,
@@ -1617,20 +1711,81 @@ def runtime_prompt_skill_registered_tool_executor(
 ) -> Callable[[str, Any], Awaitable[str]]:
     """Build the registered-tool executor used inside prompt-skill runs."""
 
+    stickman_timeline_ready = False
+
     async def _execute(tool_name: str, args: Any) -> str:
+        nonlocal stickman_timeline_ready
         guard = document_skill_media_guard(skill_slug, tool_name, args)
+        if guard is not None:
+            return guard
+
+        guard = runtime_stickman_workflow_artifact_guard(
+            skill_slug=skill_slug,
+            tool_name=tool_name,
+            args=args,
+            runtime_tool_context=runtime_tool_context,
+        )
         if guard is not None:
             return guard
 
         from packages.core.ai.runtime.tool_registry import runtime_execute_tool
 
         tool_args = dict(args) if isinstance(args, dict) else {}
+        tool_args = runtime_scope_stickman_workflow_artifact_args(
+            skill_slug=skill_slug,
+            tool_name=tool_name,
+            args=tool_args,
+            runtime_tool_context=runtime_tool_context,
+        )
         tool_args.update({
             key: value
             for key, value in dict(runtime_tool_context or {}).items()
             if key in RUNTIME_TOOL_CONTEXT_KEYS
         })
-        return await runtime_execute_tool(
+
+        run_prefix = _stickman_workflow_artifact_prefix(
+            skill_slug,
+            runtime_tool_context,
+        )
+        if (
+            str(tool_name or "").strip() == "generate_video"
+            and run_prefix is not None
+            and not stickman_timeline_ready
+        ):
+            prerequisite_args = {
+                "path": f"{run_prefix}/technical/narration-timeline.json",
+                "limit": 10000,
+                "max_chars": 200000,
+            }
+            prerequisite_args.update({
+                key: value
+                for key, value in dict(runtime_tool_context or {}).items()
+                if key in RUNTIME_TOOL_CONTEXT_KEYS
+            })
+            prerequisite_result = await runtime_execute_tool(
+                "read_file",
+                prerequisite_args,
+                entity_id=entity_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                active_user_message=active_user_message,
+                manual_skill_selected=manual_skill_selected,
+                tool_profile=tool_profile,
+                allowed_tool_names=allowed_tool_names,
+                runtime_envelope=runtime_envelope,
+            )
+            prerequisite_error = runtime_stickman_video_timeline_prerequisite_error(
+                run_prefix=run_prefix,
+                read_result=prerequisite_result,
+            )
+            if prerequisite_error is not None:
+                return prerequisite_error
+            stickman_timeline_ready = True
+
+        result = await runtime_execute_tool(
             tool_name,
             tool_args,
             entity_id=entity_id,
@@ -1645,8 +1800,337 @@ def runtime_prompt_skill_registered_tool_executor(
             allowed_tool_names=allowed_tool_names,
             runtime_envelope=runtime_envelope,
         )
+        if str(tool_name or "").strip() == "generate_image" and run_prefix is not None:
+            try:
+                image_payload = json.loads(result)
+            except (TypeError, ValueError):
+                image_payload = None
+            image_url = str(
+                image_payload.get("image_url") or image_payload.get("result_url") or ""
+            ).strip() if isinstance(image_payload, dict) else ""
+            reusable_person = bool(
+                isinstance(image_payload, dict)
+                and image_payload.get("reused_workspace_asset") is True
+                and str(image_payload.get("workspace_asset_key") or "").strip()
+                == "stickman_character"
+                and image_url
+            )
+            if reusable_person:
+                receipt_path = f"{run_prefix}/technical/person-reference-url.txt"
+                receipt_context = {
+                    key: value
+                    for key, value in dict(runtime_tool_context or {}).items()
+                    if key in RUNTIME_TOOL_CONTEXT_KEYS
+                }
+                write_args = {
+                    "path": receipt_path,
+                    "content": image_url,
+                    **receipt_context,
+                }
+                await runtime_execute_tool(
+                    "write_file",
+                    write_args,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    active_user_message=active_user_message,
+                    manual_skill_selected=manual_skill_selected,
+                    tool_profile=tool_profile,
+                    allowed_tool_names=allowed_tool_names,
+                    runtime_envelope=runtime_envelope,
+                )
+                read_result = await runtime_execute_tool(
+                    "read_file",
+                    {"path": receipt_path, "max_chars": 4096, **receipt_context},
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    active_user_message=active_user_message,
+                    manual_skill_selected=manual_skill_selected,
+                    tool_profile=tool_profile,
+                    allowed_tool_names=allowed_tool_names,
+                    runtime_envelope=runtime_envelope,
+                )
+                try:
+                    receipt_payload = json.loads(read_result)
+                except (TypeError, ValueError):
+                    receipt_payload = None
+                verified = bool(
+                    isinstance(receipt_payload, dict)
+                    and str(receipt_payload.get("content") or "").strip() == image_url
+                )
+                if not verified:
+                    return json.dumps(
+                        {
+                            "status": "blocked",
+                            "code": "workspace_identity_receipt_write_failed",
+                            "error": (
+                                "The reusable Workspace Stickman was resolved, but its "
+                                "run-scoped durable person-reference receipt could not be "
+                                "written and read back. Stop before paid media calls."
+                            ),
+                            "run_artifact_prefix": run_prefix,
+                            "required_path": receipt_path,
+                        },
+                        ensure_ascii=False,
+                    )
+                image_payload["durable_person_reference_path"] = receipt_path
+                image_payload["durable_person_reference_verified"] = True
+                result = json.dumps(image_payload, ensure_ascii=False)
+        return result
 
     return _execute
+
+
+def runtime_stickman_video_timeline_prerequisite_error(
+    *,
+    run_prefix: str,
+    read_result: str,
+) -> str | None:
+    """Require a non-empty measured narration timeline before paid video calls."""
+
+    reason = ""
+    try:
+        read_payload = json.loads(read_result)
+    except (TypeError, ValueError):
+        read_payload = None
+        reason = "the narration timeline receipt could not be read"
+
+    timeline_payload: Any = None
+    if isinstance(read_payload, dict):
+        if read_payload.get("error"):
+            reason = str(read_payload.get("error"))
+        else:
+            try:
+                timeline_payload = json.loads(str(read_payload.get("content") or ""))
+            except (TypeError, ValueError):
+                reason = "narration-timeline.json is not valid JSON"
+    elif not reason:
+        reason = "the narration timeline receipt was not structured JSON"
+
+    if isinstance(timeline_payload, dict):
+        cues = timeline_payload.get("cues") or timeline_payload.get("subtitle_cues")
+        audio_tracks = timeline_payload.get("audio_tracks")
+        if isinstance(cues, list) and cues and isinstance(audio_tracks, list) and audio_tracks:
+            return None
+        reason = "narration-timeline.json has no measured cues or audio tracks"
+
+    return json.dumps(
+        {
+            "status": "blocked",
+            "code": "stickman_narration_timeline_required",
+            "error": (
+                "generate_video is blocked until build_narration_timeline succeeds "
+                f"for {run_prefix}/technical/narration-timeline.json: {reason}. "
+                "Build the timeline from every normalized narration segment, then retry."
+            ),
+            "run_artifact_prefix": run_prefix,
+            "required_path": f"{run_prefix}/technical/narration-timeline.json",
+        },
+        ensure_ascii=False,
+    )
+
+
+_STICKMAN_WORKFLOW_SCOPED_SKILLS = frozenset(
+    {"stickman-video-creator", "stickman_video_creator"}
+)
+_STICKMAN_GENERATED_ARTIFACT_DIRS = frozenset(
+    {"audio", "final", "images", "qa", "subtitles", "technical", "video"}
+)
+_STICKMAN_PATH_ARGUMENTS = frozenset(
+    {
+        "audio_path",
+        "cues_name",
+        "directory",
+        "filename",
+        "input_path",
+        "manifest_name",
+        "media_path",
+        "name",
+        "output_dir",
+        "output_name",
+        "path",
+        "subtitle_path",
+        "timeline_name",
+        "transcript_path",
+    }
+)
+_STICKMAN_SIMPLE_OUTPUT_DIRS = {
+    "align_subtitles": "technical",
+    "build_narration_timeline": "technical",
+    "compose_video_timeline": "final",
+    "generate_image": "images",
+    "generate_video": "video",
+    "merge_videos": "video",
+    "normalize_audio_loudness": "audio/normalized",
+    "render_frame_samples": "qa",
+    "still_to_video": "video",
+    "write_file": "technical",
+}
+
+
+def _stickman_workflow_artifact_prefix(
+    skill_slug: str | None,
+    runtime_tool_context: Mapping[str, Any] | None,
+) -> str | None:
+    slug = str(skill_slug or "").strip().lower()
+    if slug not in _STICKMAN_WORKFLOW_SCOPED_SKILLS:
+        return None
+    context = dict(runtime_tool_context or {})
+    lineage_root = str(
+        context.get("_workflow_lineage_root_run_id_from_context")
+        or context.get("_workflow_run_id_from_context")
+        or ""
+    ).strip()
+    if not lineage_root:
+        return None
+    return f"runs/{lineage_root}"
+
+
+def _scope_stickman_artifact_path(
+    value: str,
+    *,
+    run_prefix: str,
+    simple_default_dir: str | None = None,
+) -> str:
+    original = str(value or "")
+    normalized = original.replace("\\", "/").strip()
+    if not normalized or "://" in normalized or normalized.startswith("data:"):
+        return original
+
+    run_root = run_prefix.split("/", 1)[1]
+    if normalized == run_prefix or normalized.startswith(f"{run_prefix}/"):
+        return normalized
+
+    # Keep an absolute Workspace prefix, but replace any caller-authored run
+    # slug with the durable Workflow lineage root.
+    run_marker = "/runs/"
+    if normalized.startswith("runs/"):
+        parts = normalized.split("/")
+        suffix = "/".join(parts[2:])
+        return run_prefix if not suffix else f"{run_prefix}/{suffix}"
+    if run_marker in normalized:
+        base, remainder = normalized.split(run_marker, 1)
+        suffix_parts = remainder.split("/")[1:]
+        suffix = "/".join(suffix_parts)
+        scoped = f"{base}/runs/{run_root}"
+        return scoped if not suffix else f"{scoped}/{suffix}"
+
+    # Legacy generated folders are never valid recovery sources for this
+    # Workflow. Transparently redirect them into the current durable run so a
+    # stale root-level final cannot satisfy QA or publication gates.
+    for artifact_dir in sorted(_STICKMAN_GENERATED_ARTIFACT_DIRS):
+        if normalized == artifact_dir or normalized.startswith(f"{artifact_dir}/"):
+            return f"{run_prefix}/{normalized}"
+        marker = f"/{artifact_dir}/"
+        if marker in normalized:
+            base, suffix = normalized.split(marker, 1)
+            return f"{base}/{run_prefix}/{artifact_dir}/{suffix}"
+
+    if "/" not in normalized and simple_default_dir:
+        return f"{run_prefix}/{simple_default_dir}/{normalized}"
+    return original
+
+
+def runtime_scope_stickman_workflow_artifact_args(
+    *,
+    skill_slug: str | None,
+    tool_name: str,
+    args: Mapping[str, Any],
+    runtime_tool_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Pin Stickman media artifacts to one retry-stable Workflow run.
+
+    The prompt still communicates the namespace to the model, while this
+    boundary makes path safety deterministic across context compaction and
+    retries. Workspace-owned identity assets and remote reference URLs remain
+    outside the run namespace.
+    """
+
+    run_prefix = _stickman_workflow_artifact_prefix(skill_slug, runtime_tool_context)
+    copied = deepcopy(dict(args))
+    if run_prefix is None:
+        return copied
+
+    default_dir = _STICKMAN_SIMPLE_OUTPUT_DIRS.get(str(tool_name or "").strip())
+    if tool_name == "generate_file":
+        kind = str(copied.get("kind") or "").strip().lower()
+        default_dir = "audio" if kind == "audio" else "technical"
+
+    def _visit(value: Any, key: str | None = None) -> Any:
+        if isinstance(value, dict):
+            return {item_key: _visit(item_value, item_key) for item_key, item_value in value.items()}
+        if isinstance(value, list):
+            return [_visit(item, key) for item in value]
+        if not isinstance(value, str):
+            return value
+        path_argument = bool(
+            key in _STICKMAN_PATH_ARGUMENTS
+            or str(key or "").endswith("_path")
+        )
+        if not path_argument:
+            return value
+        use_default = default_dir if key in {"filename", "name", "output_dir", "output_name", "path"} else None
+        return _scope_stickman_artifact_path(
+            value,
+            run_prefix=run_prefix,
+            simple_default_dir=use_default,
+        )
+
+    return _visit(copied)
+
+
+def runtime_stickman_workflow_artifact_guard(
+    *,
+    skill_slug: str | None,
+    tool_name: str,
+    args: Any,
+    runtime_tool_context: Mapping[str, Any] | None,
+) -> str | None:
+    """Reject unnamed paid media that would escape the durable run scope."""
+
+    run_prefix = _stickman_workflow_artifact_prefix(skill_slug, runtime_tool_context)
+    if run_prefix is None:
+        return None
+    values = dict(args) if isinstance(args, dict) else {}
+    normalized_tool = str(tool_name or "").strip()
+    is_narration = (
+        normalized_tool == "generate_file"
+        and str(values.get("kind") or "").strip().lower() == "audio"
+        and str(values.get("purpose") or "").strip().lower() == "narration"
+    )
+    requires_named_output = is_narration or normalized_tool == "generate_video"
+    if not requires_named_output:
+        return None
+    requested_name = str(
+        values.get("output_name")
+        or values.get("name")
+        or values.get("filename")
+        or ""
+    ).strip()
+    if requested_name:
+        return None
+    media_dir = "audio" if is_narration else "video"
+    return json.dumps(
+        {
+            "status": "blocked",
+            "code": "stickman_run_output_name_required",
+            "error": (
+                f"{normalized_tool} requires an explicit stable name inside "
+                f"{run_prefix}/{media_dir}. Retry this call with the manifest segment "
+                "or scene number in the filename; unnamed provider defaults are not "
+                "valid Stickman Workflow artifacts."
+            ),
+            "run_artifact_prefix": run_prefix,
+        },
+        ensure_ascii=False,
+    )
 
 
 def runtime_prompt_skill_bundle_tool_result(

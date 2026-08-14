@@ -48,6 +48,10 @@ async def get_current_user(
     if not claims:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
     request.state.auth_claims = claims
+    from packages.core.services.auth_context import set_current_mfa_verified
+    set_current_mfa_verified("mfa" in {
+        str(method).strip().lower() for method in claims.get("amr", [])
+    })
     request.state.impersonation = None
 
     user_id = claims.get("sub")
@@ -58,6 +62,9 @@ async def get_current_user(
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
+
+    if int(claims.get("token_version", -1)) != int(user.token_version or 0):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token has been revoked")
 
     if user.status != "active":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Account disabled")
@@ -158,6 +165,7 @@ def require_plan(resource: str):
                     "limit": result.limit,
                     "current": result.current,
                     "plan": result.plan,
+                    "resets_at": result.resets_at,
                     # Drives which unified limit reminder the UI shows.
                     "kind": _PLAN_LIMIT_KIND.get(resource, "generic"),
                 },

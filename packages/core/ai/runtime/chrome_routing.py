@@ -4,9 +4,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 from hashlib import sha256
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit
+
+from packages.core.ai.runtime.approval_classifier import classify_chrome_confirmation
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +54,7 @@ CHROME_MCP_TOOLS = frozenset({
     "mcp__chrome__close_tabs",
     "mcp__chrome__ping_tab",
     "mcp__chrome__read_page",
+    "mcp__chrome__resolve_target",
     "mcp__chrome__computer",
     "mcp__chrome__wait",
     "mcp__chrome__get_interactive_elements",
@@ -103,6 +108,60 @@ CHROME_LOCAL_BROWSER_DEFAULT_TOOLS = (
     "mcp__chrome__confirm_action",
 )
 
+
+def _chrome_knowledge_upload_source(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    path = unquote(urlsplit(text).path) if "://" in text else unquote(text)
+    if path.startswith("/api/v1/fs/"):
+        remainder = path.removeprefix("/api/v1/fs/").lstrip("/")
+        _entity_id, separator, knowledge_path = remainder.partition("/")
+        return knowledge_path.lstrip("/") if separator and knowledge_path else None
+    if path.startswith("/workspace/"):
+        return path.removeprefix("/workspace/").lstrip("/") or None
+    if path.startswith("Workspaces/"):
+        return path
+    return None
+
+
+def runtime_blocked_chrome_upload_knowledge_source(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> str | None:
+    """Require Knowledge assets to be localized before paired Chrome upload."""
+
+    if _canonical_chrome_tool_name(tool_name) != "mcp__chrome__upload":
+        return None
+
+    sources: list[str] = []
+    for key in ("files", "paths"):
+        raw_values = arguments.get(key)
+        values = raw_values if isinstance(raw_values, (list, tuple, set)) else [raw_values]
+        for value in values:
+            source = _chrome_knowledge_upload_source(value)
+            if source and source not in sources:
+                sources.append(source)
+    if not sources:
+        return None
+
+    return json.dumps(
+        {
+            "status": "blocked",
+            "reason": "chrome_knowledge_prepare_upload_required",
+            "blocked_tool": "mcp__chrome__upload",
+            "message": (
+                "Chrome upload accepts paired-machine local files only. Prepare each "
+                "Knowledge source first, then retry with the returned upload_files paths."
+            ),
+            "next_required_tool": "mcp__chrome_knowledge_local__prepare_upload",
+            "prepare_upload_sources": sources,
+        },
+        ensure_ascii=False,
+    )
+
 _URL_RE = re.compile(r"https?://[^\s`\"'）)]+", re.IGNORECASE)
 _CHROME_TERMS = (
     "chrome",
@@ -136,6 +195,15 @@ _CHROME_ACTION_TERMS = (
     "tab",
     "tabs",
     "screenshot",
+    "summarize",
+    "summary",
+    "current page",
+    "existing tab",
+    "logged-in",
+    "logged in",
+    "upload",
+    "download",
+    "record",
     "mouse",
     "打开",
     "访问",
@@ -151,6 +219,15 @@ _CHROME_ACTION_TERMS = (
     "截图",
     "鼠标",
     "移动",
+    "总结",
+    "汇总",
+    "当前页",
+    "当前页面",
+    "现有标签",
+    "登录状态",
+    "上传",
+    "下载",
+    "录制",
 )
 _CHROME_NODE_ACTION_TOOLS = frozenset({
     "mcp__chrome__click_element",
@@ -172,6 +249,11 @@ _CHROME_WORKFLOW_DOCUMENTATION_EXEMPT_TOOLS = _CHROME_WORKFLOW_SETUP_TOOLS | fro
 _CHROME_WORKFLOW_AFTER_FINALIZE_ALLOWED_TOOLS = _CHROME_WORKFLOW_SETUP_TOOLS | frozenset({
     "mcp__chrome__close_group_tabs",
     "mcp__chrome__get_group_state",
+})
+_CHROME_CONTROL_INTERRUPTION_ALLOWED_TOOLS = frozenset({
+    "mcp__chrome__status",
+    "mcp__chrome__get_group_state",
+    "mcp__chrome__finalize_tabs",
 })
 _CHROME_RECORDING_TOOLS = frozenset({
     "mcp__chrome__start_tab_recording",
@@ -444,11 +526,33 @@ def runtime_blocked_chrome_workflow_contract(
     canonical_tool = _canonical_chrome_tool_name(tool_name)
     if canonical_tool not in CHROME_MCP_TOOLS:
         return None
-    if active_user_message is not None and not detect_chrome_local_browser_route(active_user_message):
+    raw_state = (runtime_metadata or {}).get(_CHROME_RUNTIME_CONTRACT_STATE_KEY)
+    chrome_route = detect_chrome_local_browser_route(active_user_message)
+    if active_user_message is not None and not chrome_route and not isinstance(raw_state, dict):
         return None
     if runtime_metadata is None:
         return None
     state = _chrome_runtime_contract_state(runtime_metadata)
+    _ensure_chrome_control_epoch(
+        state=state,
+        arguments=arguments,
+        active_user_message=active_user_message,
+    )
+
+    blocked_interruption = _blocked_chrome_control_interruption(
+        canonical_tool=canonical_tool,
+        state=state,
+    )
+    if blocked_interruption is not None:
+        return blocked_interruption
+
+    if canonical_tool == "mcp__chrome__confirm_action":
+        blocked_confirmation = _blocked_chrome_confirmation_action(
+            arguments=arguments,
+            state=state,
+        )
+        if blocked_confirmation is not None:
+            return blocked_confirmation
 
     if canonical_tool == "mcp__chrome__finalize_tabs" and state.get("active_recording_id"):
         return json.dumps({
@@ -597,6 +701,22 @@ def runtime_record_chrome_tool_result(
         return
     state = _chrome_runtime_contract_state(runtime_metadata)
     payload = _parse_json_object(result)
+    if payload is not None and str(payload.get("status") or "").strip() == "interrupted":
+        result_epoch = str(
+            payload.get("control_epoch")
+            or payload.get("controlEpoch")
+            or (arguments or {}).get("control_epoch")
+            or (arguments or {}).get("controlEpoch")
+            or ""
+        ).strip()
+        current_epoch = str(state.get("control_epoch") or "").strip()
+        if result_epoch and result_epoch == current_epoch:
+            state["control_interruption"] = {
+                "reason": _chrome_control_interruption_reason(payload.get("reason")),
+                "group_id": str(payload.get("group_id") or payload.get("groupId") or "").strip(),
+                "control_epoch": result_epoch,
+            }
+        return
     if payload is not None and _workflow_scene_capture_context(arguments):
         _record_workflow_scene_capture_receipt(
             state,
@@ -631,10 +751,60 @@ def runtime_record_chrome_tool_result(
 
     if payload is None:
         return
+    if canonical_tool == "mcp__chrome__confirm_action":
+        if payload.get("ok") is True and str(payload.get("status") or "").strip() == "approved":
+            pending_confirmation = state.get("pending_chrome_confirmation")
+            approval_id = str(payload.get("approvalId") or payload.get("approval_id") or "").strip()
+            if (
+                isinstance(pending_confirmation, dict)
+                and approval_id
+                and approval_id == str(pending_confirmation.get("approval_id") or "").strip()
+            ):
+                state.pop("pending_chrome_confirmation", None)
+        return
+
+    status = str(payload.get("status") or "").strip()
+    if payload.get("approval_required") is True or status in {"approval_required", "handoff_required"}:
+        decision_arguments = dict(arguments or {})
+        for key in ("url", "target_label", "target_role", "data_summary", "label", "role"):
+            if payload.get(key) is not None:
+                decision_arguments[key] = payload[key]
+        decision = classify_chrome_confirmation(
+            canonical_tool,
+            decision_arguments,
+            initial_user_message=str(state.get("initial_user_message") or "").strip(),
+        )
+        approval_id = str(payload.get("approvalId") or payload.get("approval_id") or "").strip()
+        state["pending_chrome_confirmation"] = {
+            "approval_id": approval_id,
+            "tool_name": canonical_tool,
+            "confirmation_mode": decision.mode,
+            "policy_category": decision.policy_category,
+            "preapproved": decision.preapproved,
+            "destination": decision.destination,
+            "data_summary": decision.data_summary,
+            "action_signature": _chrome_action_signature(canonical_tool, arguments),
+        }
+        return
     if canonical_tool == "mcp__chrome__screenshot":
         _record_chrome_screenshot(state)
     elif canonical_tool == "mcp__chrome__wait":
         _record_chrome_wait(state)
+
+    event_receipt = payload.get("event_receipt")
+    if (
+        payload.get("action_executed") is True
+        and isinstance(event_receipt, dict)
+        and str(event_receipt.get("status") or "").strip() == "timeout"
+    ):
+        state.pop("pending_read_page_required_action", None)
+        state["pending_observation_after_action"] = {
+            "tool_name": canonical_tool,
+            "reason": "expected_event_timeout_after_execution",
+            "next_required_tool": "mcp__chrome__read_page",
+        }
+        state["post_action_read_credit"] = True
+        return
 
     reason = str(payload.get("reason") or "").strip()
     read_page_required = payload.get("read_page_required") is True or payload.get("readPageRequired") is True
@@ -675,6 +845,99 @@ def runtime_record_chrome_tool_result(
         "next_required_tool": "mcp__chrome__read_page",
     }
     state["post_action_read_credit"] = True
+
+
+def runtime_restore_chrome_confirmation_receipt(
+    *,
+    runtime_metadata: dict[str, Any] | None,
+    tool_name: str,
+    approval_id: Any,
+    confirmation_mode: Any,
+    policy_category: Any,
+    preapproved: Any,
+    arguments: dict[str, Any],
+    destination: Any = "",
+    data_summary: Any = "",
+) -> None:
+    """Restore a persisted Chrome approval receipt for a resumed runtime."""
+    canonical_tool = _canonical_chrome_tool_name(tool_name)
+    approval_id_text = str(approval_id or "").strip()
+    if (
+        runtime_metadata is None
+        or canonical_tool not in CHROME_MCP_TOOLS
+        or not approval_id_text
+    ):
+        return
+    state = _chrome_runtime_contract_state(runtime_metadata)
+    state["pending_chrome_confirmation"] = {
+        "approval_id": approval_id_text,
+        "tool_name": canonical_tool,
+        "confirmation_mode": str(confirmation_mode or "").strip(),
+        "policy_category": str(policy_category or "").strip(),
+        "preapproved": preapproved is True,
+        "destination": str(destination or "").strip(),
+        "data_summary": str(data_summary or "").strip(),
+        "action_signature": _chrome_action_signature(canonical_tool, arguments),
+    }
+
+
+def _blocked_chrome_confirmation_action(
+    *,
+    arguments: dict[str, Any],
+    state: dict[str, Any],
+) -> str | None:
+    pending = state.get("pending_chrome_confirmation")
+    if not isinstance(pending, dict):
+        return json.dumps({
+            "status": "blocked",
+            "reason": "chrome_confirmation_request_missing",
+            "blocked_tool": "mcp__chrome__confirm_action",
+            "message": "confirm_action requires the current approval_required receipt from a Chrome action.",
+            "next_required_tool": "mcp__chrome__read_page",
+        }, ensure_ascii=False)
+
+    expected_approval_id = str(pending.get("approval_id") or "").strip()
+    provided_approval_id = str(arguments.get("approvalId") or arguments.get("approval_id") or "").strip()
+    if not expected_approval_id or provided_approval_id != expected_approval_id:
+        return json.dumps({
+            "status": "blocked",
+            "reason": "chrome_confirmation_approval_mismatch",
+            "blocked_tool": "mcp__chrome__confirm_action",
+            "expected_approval_id": expected_approval_id or None,
+            "message": "confirm_action must use the exact pending Chrome approval id.",
+        }, ensure_ascii=False)
+
+    mode = str(pending.get("confirmation_mode") or "").strip()
+    category = str(pending.get("policy_category") or "").strip()
+    preapproved = pending.get("preapproved") is True
+    arguments["confirmation_mode"] = mode
+    arguments["policy_category"] = category
+    arguments["preapproved"] = preapproved
+    arguments["confirmation_action_signature"] = str(pending.get("action_signature") or "")
+
+    if mode == "handoff_required":
+        return json.dumps({
+            "status": "handoff_required",
+            "reason": "chrome_confirmation_handoff_required",
+            "blocked_tool": "mcp__chrome__confirm_action",
+            "confirmation_mode": mode,
+            "policy_category": category,
+            "action_executed": False,
+            "retryable": False,
+            "message": "This Chrome action is not supported for automated final submission. Hand control to the user.",
+        }, ensure_ascii=False)
+    if mode == "no_confirmation":
+        return json.dumps({
+            "status": "blocked",
+            "reason": "chrome_confirmation_contract_error",
+            "blocked_tool": "mcp__chrome__confirm_action",
+            "confirmation_mode": mode,
+            "policy_category": category,
+            "action_executed": False,
+            "retryable": False,
+            "message": "This Chrome action must not create an approval request.",
+        }, ensure_ascii=False)
+    return None
 
 
 def _record_chrome_candidate_summary(state: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -1247,6 +1510,81 @@ def _chrome_runtime_contract_state(runtime_metadata: dict[str, Any]) -> dict[str
     return replacement
 
 
+def _ensure_chrome_control_epoch(
+    *,
+    state: dict[str, Any],
+    arguments: dict[str, Any],
+    active_user_message: str | None,
+) -> str:
+    user_message = str(active_user_message or "").strip()
+    message_signature = (
+        sha256(user_message.encode("utf-8")).hexdigest()
+        if user_message
+        else ""
+    )
+    current_epoch = str(state.get("control_epoch") or "").strip()
+    previous_signature = str(state.get("control_user_message_signature") or "").strip()
+    starts_new_epoch = not current_epoch or bool(
+        message_signature
+        and previous_signature
+        and message_signature != previous_signature
+    )
+    if starts_new_epoch:
+        current_epoch = secrets.token_urlsafe(24)
+        state["control_epoch"] = current_epoch
+        state.pop("control_interruption", None)
+        if previous_signature and message_signature != previous_signature:
+            state.pop("finalized", None)
+    if message_signature:
+        state["control_user_message_signature"] = message_signature
+        state["initial_user_message"] = user_message
+    arguments["control_epoch"] = current_epoch
+    arguments.pop("controlEpoch", None)
+    return current_epoch
+
+
+def _blocked_chrome_control_interruption(
+    *,
+    canonical_tool: str,
+    state: dict[str, Any],
+) -> str | None:
+    interruption = state.get("control_interruption")
+    if not isinstance(interruption, dict):
+        return None
+    if canonical_tool in _CHROME_CONTROL_INTERRUPTION_ALLOWED_TOOLS:
+        return None
+    control_epoch = str(state.get("control_epoch") or "").strip()
+    interruption_epoch = str(interruption.get("control_epoch") or "").strip()
+    if not control_epoch or interruption_epoch != control_epoch:
+        return None
+    reason = _chrome_control_interruption_reason(interruption.get("reason"))
+    return json.dumps({
+        "status": "interrupted",
+        "reason": reason,
+        "action_executed": False,
+        "retryable": False,
+        "group_id": str(interruption.get("group_id") or "").strip(),
+        "control_epoch": control_epoch,
+        "message": _chrome_control_interruption_message(reason),
+    }, ensure_ascii=False)
+
+
+def _chrome_control_interruption_reason(value: Any) -> str:
+    reason = str(value or "").strip()
+    if reason in {"user_takeover", "extension_reload", "disconnected"}:
+        return reason
+    return "user_takeover"
+
+
+def _chrome_control_interruption_message(reason: str) -> str:
+    normalized = _chrome_control_interruption_reason(reason)
+    if normalized == "extension_reload":
+        return "Browser control stopped because the Manor Chrome extension reloaded."
+    if normalized == "disconnected":
+        return "Browser control stopped because the Manor Chrome extension disconnected."
+    return "Browser control stopped because the user took over Chrome."
+
+
 def _chrome_action_signature(tool_name: str, arguments: dict[str, Any]) -> str:
     significant = {
         key: arguments.get(key)
@@ -1266,6 +1604,8 @@ def _chrome_action_signature_ignored_key(key: str) -> bool:
     if key in {
         "approvalToken",
         "approval_token",
+        "control_epoch",
+        "controlEpoch",
         "turnId",
         "turn_id",
         "sessionId",

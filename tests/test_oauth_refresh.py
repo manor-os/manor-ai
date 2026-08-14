@@ -23,6 +23,7 @@ from sqlalchemy import select
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Integration
 from packages.core.models.user import OAuthAccount
+from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
 from packages.core.tasks import oauth_refresh as oauth_refresh_task
 from packages.core.tasks.oauth_refresh import (
     _refresh_integrations,
@@ -75,6 +76,15 @@ class _MockHttpxClient:
         return _mock_response(200, self._response_data)
 
 
+def _leased_tokens(account) -> dict[str, str]:
+    return lease_oauth_account_tokens(
+        account,
+        requester_id="test_oauth_refresh",
+        requester_kind="test",
+        reason="verify encrypted OAuth token rotation",
+    )
+
+
 # ── User-scope refresh ──────────────────────────────────────────────────────
 
 
@@ -117,7 +127,8 @@ async def test_user_token_near_expiry_is_refreshed(client: AsyncClient):
     assert n == 1
     async with dbmod.async_session() as db:
         row = (await db.execute(select(OAuthAccount).where(OAuthAccount.user_id == user_id))).scalar_one()
-    assert row.access_token == "NEW_TOKEN"
+    assert row.access_token is None
+    assert _leased_tokens(row)["access_token"] == "NEW_TOKEN"
     assert row.token_expires_at > now + timedelta(minutes=30)
 
 
@@ -213,8 +224,12 @@ async def test_rotated_refresh_token_persisted(client: AsyncClient):
 
     async with dbmod.async_session() as db:
         row = (await db.execute(select(OAuthAccount).where(OAuthAccount.user_id == user_id))).scalar_one()
-    assert row.access_token == "NEW"
-    assert row.refresh_token == "rt_NEW"
+    assert row.access_token is None
+    assert row.refresh_token is None
+    assert _leased_tokens(row) == {
+        "access_token": "NEW",
+        "refresh_token": "rt_NEW",
+    }
 
 
 @pytest.mark.asyncio

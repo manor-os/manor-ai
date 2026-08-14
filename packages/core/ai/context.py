@@ -78,6 +78,7 @@ async def build_agent_context(
     mode: str = "full",
     extra_system_prompt: Optional[str] = None,
     runtime_surface: ChatSurface | str = ChatSurface.SCHEDULED_AGENT_RUN,
+    runtime_metadata: Optional[dict] = None,
 ) -> AgentExecutionContext:
     """Build a complete execution context for any LLM call.
 
@@ -94,6 +95,8 @@ async def build_agent_context(
         model_role: Model tier — "primary", "worker", "image", etc.
         mode: Prompt detail — "full" (chat), "minimal" (quick), "task" (execution).
         extra_system_prompt: Appended to the resolved system prompt.
+        runtime_metadata: Task-owned metadata that nested tool calls must
+            inherit through the RuntimeEnvelope.
     """
     from packages.core.constants.agents import is_master_agent, MANOR_AGENT_ID
 
@@ -169,6 +172,7 @@ async def build_agent_context(
             thread_ref_id=runtime.thread_ref_id,
             message=active_user_message or "",
             legacy_path="ai.context.build_agent_context",
+            metadata=runtime_metadata,
         )
         assembled = await runtime_assemble_prompt_for_turn(
             db,
@@ -227,6 +231,7 @@ async def build_agent_context(
                 thread_ref_id=runtime.thread_ref_id,
                 message=active_user_message or "",
                 legacy_path="ai.context.build_agent_context.fallback",
+                metadata=runtime_metadata,
             )
             surface_result = runtime_prepare_agent_tool_surface_for_turn(
                 fallback_request,

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -54,6 +55,8 @@ from packages.core.constants.execution import (
     ExecutionPlanStatus,
     ExecutionStepStatus,
 )
+from packages.core.constants.approvals import HitlType
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.constants.supervisor import (
     SUPERVISOR_STEP_RETRY_FLAG,
     SUPERVISOR_VERDICT_LOG_TYPE,
@@ -65,6 +68,7 @@ from packages.core.constants.task_actors import TaskActor
 from packages.core.contracts.envelope import (
     StepResultStatus,
     normalize_step_result_status,
+    step_result_output_text,
 )
 from packages.core.database import async_session
 from packages.core.ai.runtime import (
@@ -87,6 +91,61 @@ logger = logging.getLogger(__name__)
 CYCLE_TICK_SECONDS = 2
 """How often run_plan re-enqueues itself while waiting on workers.
 Trade-off: lower → faster end-to-end, higher Celery load."""
+
+
+def _human_step_pending_action(params: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Route inline review steps through the typed governance HITL surface.
+
+    ``hitl_type`` describes what the person is doing; ``pending_action.kind``
+    describes which execution plane resumes. A Plan review is semantically the
+    same ``review`` HITL as a Workflow approval, but it resumes an execution
+    step, so its wire kind is ``governance_approval`` rather than
+    ``workflow_approval``.
+    """
+
+    values = params if isinstance(params, dict) else {}
+    explicit = values.get("pending_action")
+    if isinstance(explicit, dict) and explicit.get("kind"):
+        return dict(explicit)
+
+    review = values.get("review")
+    review_artifacts = values.get("review_artifacts")
+    if review_artifacts is None:
+        review_artifacts = values.get("artifacts_for_review")
+
+    if review is None and review_artifacts is None:
+        return None
+
+    if review_artifacts is None:
+        review_packet = review
+    elif isinstance(review, dict):
+        review_packet = dict(review)
+        review_packet.setdefault("artifacts", review_artifacts)
+    elif review is not None:
+        review_packet = {"content": review, "artifacts": review_artifacts}
+    else:
+        review_packet = {"artifacts": review_artifacts}
+
+    review_title = (
+        values.get("review_title") or values.get("title") or "Review required"
+    )
+    prompt = values.get("prompt") or values.get("question") or ""
+    return {
+        "kind": PendingActionKind.GOVERNANCE_APPROVAL.value,
+        "hitl_type": HitlType.REVIEW.value,
+        "title": review_title,
+        "review_title": review_title,
+        "prompt": prompt,
+        "action": values.get("action") or "content.review",
+        "tool": values.get("tool") or "plan",
+        "review": review_packet,
+        "payload": values.get("payload") or {
+            "diff": review_packet,
+            "why": prompt or f"{review_title} needs a human verdict.",
+        },
+        # A review is a verdict on this exact material, never a standing grant.
+        "options": values.get("options") or ["approve", "reject"],
+    }
 
 
 _PLAN_FINALIZABLE_TASK_STATUSES = {"pending", "in_progress", "waiting_on_customer"}
@@ -115,6 +174,7 @@ _ARTIFACT_RESULT_KEYS: dict[str, str] = {
     "result_url": "result",
     "url": "url",
     "fs_path": "file",
+    "mp4_fs_path": "video",
     "path": "file",
     "local_path": "file",
     "saved_to": "file",
@@ -205,7 +265,7 @@ _TEXT_ONLY_DELIVERABLE_TERMS = (
     "文字方案",
 )
 _EXPLICIT_FILE_DELIVERABLE_TERMS = (
-    "pdf", "docx", "pptx", "xlsx", "csv", "download", "attachment",
+    "pdf", "docx", "pptx", "xlsx", "csv", "mp4", "download", "attachment",
     "saved file", "file link", "file path", "export as", "save as",
     "as a file", "report file", "document file", "markdown file",
     "导出", "下载", "附件", "保存为", "保存到",
@@ -382,6 +442,20 @@ def _task_requires_artifact(task: Any | None) -> bool:
     return _text_explicitly_requests_artifact(text)
 
 
+def _required_artifact_extensions(task: Any | None) -> set[str]:
+    if task is None:
+        return set()
+    text = "\n".join(
+        [
+            str(getattr(task, "title", "") or ""),
+            str(getattr(task, "description", "") or ""),
+            _jsonish_text(getattr(task, "expected_output", None)),
+            _jsonish_text(getattr(task, "details", None)),
+        ]
+    ).lower()
+    return {".mp4"} if re.search(r"(?<![a-z0-9])\.?mp4(?![a-z0-9])", text) else set()
+
+
 def _artifact_refs_from_result(result: Any, *, step_key: str | None = None) -> list[dict]:
     if not isinstance(result, dict):
         return []
@@ -389,6 +463,13 @@ def _artifact_refs_from_result(result: Any, *, step_key: str | None = None) -> l
         return []
 
     refs: list[dict] = []
+
+    outputs = result.get("outputs")
+    if isinstance(outputs, dict):
+        nested_outputs = dict(outputs)
+        if isinstance(nested_outputs.get("files"), list):
+            nested_outputs["artifact_materialized"] = True
+        refs.extend(_artifact_refs_from_result(nested_outputs, step_key=step_key))
 
     def add_ref(
         ref_type: str,
@@ -434,7 +515,9 @@ def _artifact_refs_from_result(result: Any, *, step_key: str | None = None) -> l
                 )
                 break
 
-    for key in ("files", "artifacts", "documents", "images"):
+    # Canonical Knowledge refs go first so path-based duplicates collected
+    # from the producer payload cannot discard the enriched document_id.
+    for key in ("knowledge_artifacts", "files", "artifacts", "documents", "images"):
         values = result.get(key)
         if key in {"documents", "files"} and not _has_artifact_creation_signal(result):
             continue
@@ -465,63 +548,76 @@ def _artifact_refs_from_result(result: Any, *, step_key: str | None = None) -> l
                     )
                     break
 
+    # The default StepResult envelope keeps worker-specific output under
+    # ``outputs.data``. Promote that payload before applying the same artifact
+    # rules used for legacy root-level results, so paths such as
+    # ``mp4_fs_path`` remain usable by downstream steps and the supervisor.
+    outputs = result.get("outputs")
+    if isinstance(outputs, dict):
+        data = outputs.get("data")
+        if isinstance(data, dict):
+            refs.extend(_artifact_refs_from_result(data, step_key=step_key))
+        files = outputs.get("files")
+        if isinstance(files, list):
+            # ``outputs.files`` is an envelope-defined artifact slot, so it
+            # is creation evidence even when the worker did not add a legacy
+            # ``saved``/``generated`` flag.
+            refs.extend(_artifact_refs_from_result(
+                {"files": files, "generated": True},
+                step_key=step_key,
+            ))
+
     image_urls = result.get("image_urls")
     if isinstance(image_urls, list):
         for url in image_urls:
             add_ref("image", url, source_key="image_urls")
 
-    return _dedupe_artifact_refs(refs)
+    # Merge the raw filesystem alias into the canonical document reference.
+    # Keeping both produced two cards for one file and let the path-only copy
+    # bypass the fixed viewer/Markdown address contract.
+    return _dedupe_task_artifact_refs(_dedupe_artifact_refs(refs))
 
 
-def _step_result_summary(result: Any, *, limit: int = 500) -> str:
+def _step_result_summary(result: Any, *, limit: int = 4000) -> str:
     """Canonical text view of a step result.
 
     Owned here because the executor is the canonical write path; the
     read-time reconciler imports it so task output and replan context
     describe a result the same way.
     """
-    if not isinstance(result, dict):
-        return str(result or "")[:limit]
-    return str(result.get("text") or result.get("value") or result.get("summary") or "")[:limit]
+    return step_result_output_text(result, limit=limit)
 
 
 def _dedupe_artifact_refs(refs: list[dict]) -> list[dict]:
+    from packages.core.services.generated_file_refs import generated_file_ref_aliases
+
     seen: set[tuple[str, str, str]] = set()
     out: list[dict] = []
     for ref in refs:
-        identity = _artifact_ref_identity(ref)
-        key = (str(ref.get("step") or ""), str(ref.get("type") or ""), identity)
-        if key in seen:
+        step = str(ref.get("step") or "")
+        ref_type = str(ref.get("type") or "")
+        aliases = generated_file_ref_aliases(ref)
+        identities = aliases or {_artifact_ref_identity(ref)}
+        keys = {(step, ref_type, identity) for identity in identities}
+        if seen & keys:
             continue
-        seen.add(key)
+        seen.update(keys)
         out.append(ref)
     return out
 
 
 def _artifact_ref_identity(ref: dict) -> str:
-    return str(
-        ref.get("fs_path")
-        or ref.get("document_id")
-        or ref.get("url")
-        or ref.get("path")
-        or ref.get("file_url")
-        or ref.get("name")
-        or ref.get("filename")
-        or ref
-    )
+    from packages.core.services.generated_file_refs import generated_file_ref_aliases
+
+    aliases = generated_file_ref_aliases(ref)
+    return sorted(aliases)[0] if aliases else str(ref)
 
 
-def _dedupe_task_artifact_refs(refs: list[dict]) -> list[dict]:
+def _dedupe_task_artifact_refs(refs: list[dict], *, entity_id: str | None = None) -> list[dict]:
     """Task-level file lists should show each generated artifact once."""
-    seen: set[tuple[str, str]] = set()
-    out: list[dict] = []
-    for ref in refs:
-        key = (str(ref.get("type") or ""), _artifact_ref_identity(ref))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(ref)
-    return out
+    from packages.core.services.generated_file_refs import dedupe_generated_file_refs
+
+    return dedupe_generated_file_refs(refs, entity_id=entity_id)
 
 
 def _has_artifact_collection_payload(payload: dict[str, Any]) -> bool:
@@ -560,11 +656,34 @@ def _is_reference_only_payload(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _has_artifact_result(steps: list[ExecutionStep]) -> bool:
+def _artifact_ref_matches_extensions(ref: dict, extensions: set[str]) -> bool:
+    ref_type = str(ref.get("type") or "").strip().lower()
+    if ".mp4" in extensions and ref_type in {"mp4", "video/mp4"}:
+        return True
+    for key in ("name", "filename", "fs_path", "url", "path", "file_url"):
+        value = str(ref.get(key) or "").strip().lower()
+        path = value.split("?", 1)[0].split("#", 1)[0]
+        if any(path.endswith(extension) for extension in extensions):
+            return True
+    return False
+
+
+def _has_artifact_result(
+    steps: list[ExecutionStep],
+    *,
+    required_extensions: set[str] | None = None,
+) -> bool:
+    refs = [
+        ref
+        for step in steps
+        if step.step_status == ExecutionStepStatus.DONE
+        for ref in _artifact_refs_from_result(step.result, step_key=step.step_key)
+    ]
+    if not required_extensions:
+        return bool(refs)
     return any(
-        _artifact_refs_from_result(s.result, step_key=s.step_key)
-        for s in steps
-        if s.step_status == ExecutionStepStatus.DONE
+        _artifact_ref_matches_extensions(ref, required_extensions)
+        for ref in refs
     )
 
 
@@ -672,12 +791,18 @@ def _unmet_expects_issue(plan: ExecutionPlan, steps: list[ExecutionStep]) -> str
 def _missing_artifact_issue(task: Any | None, steps: list[ExecutionStep]) -> str | None:
     if not _task_requires_artifact(task):
         return None
-    if _has_artifact_result(steps):
+    required_extensions = _required_artifact_extensions(task)
+    if _has_artifact_result(steps, required_extensions=required_extensions):
         return None
+    format_requirement = ""
+    if required_extensions:
+        expected = ", ".join(sorted(required_extensions))
+        format_requirement = f" matching the required format ({expected})"
     if getattr(task, "workspace_id", None):
         return (
             "This workspace task needs a saved file/media/document deliverable, "
-            "but no saved file link or path was recorded. Replan and save the "
+            f"but no saved file link or path{format_requirement} was recorded. "
+            "Replan and save the "
             "deliverable under this workspace's default artifact folder, then "
             "return artifact evidence such as fs_path, document_id, file_url, "
             "image_url, video_url, or files. Do not ask the user for a save "
@@ -685,10 +810,46 @@ def _missing_artifact_issue(task: Any | None, steps: list[ExecutionStep]) -> str
         )
     return (
         "This task needs a saved file/media/document deliverable, but no "
-        "saved file link or path was recorded. Replan and save the deliverable "
+        f"saved file link or path{format_requirement} was recorded. Replan and save the deliverable "
         "to a user-visible file, then return artifact evidence such as fs_path, "
         "document_id, file_url, image_url, video_url, or files."
     )
+
+
+def _task_output_contract_issue(
+    task: Any | None,
+    steps: list[ExecutionStep],
+) -> str | None:
+    """Detect a plan that failed to bind its structured task deliverable.
+
+    Bound steps are already hard-validated at the dispatcher boundary.  This
+    deterministic supervisor gate covers plan-shape gaps (for example multiple
+    terminal agent steps, so no unique producer could be selected) instead of
+    asking the model supervisor to infer JSON Schema compliance from prose.
+    """
+    from packages.core.contracts.task_output import (
+        is_task_output_contract_schema,
+        task_expected_output_json_schema,
+    )
+
+    expected = task_expected_output_json_schema(getattr(task, "expected_output", None) if task is not None else None)
+    if expected is None:
+        return None
+
+    bound = [step for step in steps if is_task_output_contract_schema(step.expected_output_schema)]
+    if len(bound) != 1:
+        return (
+            "The task declares a structured expected_output, but the plan did not "
+            "bind it to exactly one terminal llm/subagent deliverable step. Replan "
+            "with one terminal structured-output step."
+        )
+    step = bound[0]
+    if step.step_status != ExecutionStepStatus.DONE:
+        return f"The structured deliverable step {step.step_key!r} did not complete."
+    outputs = step.result.get("outputs") if isinstance(step.result, dict) else None
+    if not isinstance(outputs, dict) or "data" not in outputs:
+        return f"The structured deliverable step {step.step_key!r} completed without outputs.data."
+    return None
 
 
 def _structured_status_value(value: Any) -> str:
@@ -746,6 +907,15 @@ def _structured_result_blocker(
         if declared is not None:
             if declared is StepResultStatus.SUCCEEDED:
                 continue
+            if (
+                declared is StepResultStatus.PARTIAL
+                and artifact_required
+                and _has_verified_artifact_payload(result)
+            ):
+                # A verified file with an unavailable optional receipt (for
+                # example a checksum tool) is still safe for a dependent
+                # upload step. Preserve blocking for ordinary partial output.
+                continue
             return f"step reported {key}={declared.value}"
         status = _structured_status_value(raw_status)
         if status in _STRUCTURED_BLOCKER_STATUSES:
@@ -768,6 +938,20 @@ def _structured_result_blocker(
             if issue:
                 return issue
     return None
+
+
+def _has_verified_artifact_payload(result: dict[str, Any]) -> bool:
+    """Whether an envelope carries a verified materialized artifact."""
+    payload: Any = result
+    outputs = result.get("outputs")
+    if isinstance(outputs, dict) and isinstance(outputs.get("data"), dict):
+        payload = outputs["data"]
+    if not isinstance(payload, dict):
+        return False
+    verification = str(payload.get("verification_status") or "").strip().lower()
+    if verification != "verified":
+        return False
+    return bool(_artifact_refs_from_result(payload))
 
 
 def _agent_summaries(steps: list[ExecutionStep], *, limit: int = 3) -> list[str]:
@@ -1027,6 +1211,21 @@ def _supervisor_result_preview(result: Any, *, max_chars: int = 1200) -> str:
     if result is None:
         return ""
     if isinstance(result, dict):
+        outputs = result.get("outputs")
+        if isinstance(outputs, dict):
+            output_text = outputs.get("text")
+            if isinstance(output_text, str) and output_text.strip():
+                return output_text.strip()[:max_chars]
+            if "data" in outputs:
+                # ``outputs.data`` is the canonical home of a task-authored
+                # structured deliverable.  Falling through to the envelope's
+                # short summary hides that payload from the supervisor and can
+                # turn a valid result into a retry/replan verdict.
+                data_preview = _jsonish_text(outputs.get("data")).strip()
+                if data_preview:
+                    summary = str(result.get("summary") or "").strip()
+                    parts = [part for part in (summary, data_preview) if part]
+                    return "\n".join(parts)[:max_chars]
         priority_keys = (
             "result_summary", "summary", "message", "text", "value",
             "content", "answer", "output", "result", "error", "errors",
@@ -1122,6 +1321,9 @@ class PlanExecutor:
                     await db.commit()
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, "completed")
+                if plan.status == ExecutionPlanStatus.REPLANNED:
+                    await db.commit()
+                    return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 if plan.status == ExecutionPlanStatus.RUNNING:
                     # The supervisor sent a step back for a re-run — the plan
                     # is live again, so nothing terminal gets announced here.
@@ -1155,6 +1357,9 @@ class PlanExecutor:
                     await db.commit()
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, "failed")
+                if plan.status == ExecutionPlanStatus.REPLANNED:
+                    await db.commit()
+                    return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 if plan.status == ExecutionPlanStatus.RUNNING:
                     # The supervisor sent a step back for a re-run — the plan
                     # is live again, so nothing terminal gets announced here.
@@ -1192,12 +1397,32 @@ class PlanExecutor:
                     self._mark_done(step, {"slept": seconds}, None)
 
                 elif step.kind == "human":
+                    # Review steps can bind directly to an upstream
+                    # deliverable (especially ``outputs.files``). Resolve the
+                    # binding before posting the HITL card so the UI receives
+                    # real document ids/paths, not a literal `${{ ... }}`.
+                    try:
+                        step.params = resolve_refs(step.params or {}, prior_results)
+                    except ReferenceError as exc:
+                        self._mark_failed(step, {
+                            "type": "ReferenceError", "message": str(exc),
+                        })
+                        chat_events.append({
+                            "kind": "step_failed", "step": step,
+                            "error": {"type": "ReferenceError", "message": str(exc)},
+                            "will_retry": False,
+                        })
+                        continue
                     if step.human_input_response is not None:
                         self._mark_done(step, step.human_input_response, None)
                         step.human_input_prompt = None
                     else:
                         self._mark_waiting_human(step, str((step.params or {}).get("prompt") or ""))
-                        chat_events.append({"kind": "step_needs_human", "step": step})
+                        chat_events.append({
+                            "kind": "step_needs_human",
+                            "step": step,
+                            "pending_action": _human_step_pending_action(step.params),
+                        })
                         # M9.2 — surface the wait as a HumanCommitment so the
                         # human-queue / consolidator can see the blocking input.
                         # Best-effort like the ledger adapters: never break the
@@ -1283,6 +1508,9 @@ class PlanExecutor:
                         await db.commit()
                         return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, terminal)
+                if plan.status == ExecutionPlanStatus.REPLANNED:
+                    await db.commit()
+                    return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 if plan.status == ExecutionPlanStatus.RUNNING:
                     # The supervisor sent a step back for a re-run — the plan
                     # is live again, so nothing terminal gets announced here.
@@ -1618,6 +1846,26 @@ class PlanExecutor:
             # Mark current plan as replanned (not failed)
             plan.status = ExecutionPlanStatus.REPLANNED.value
             plan.completed_at = datetime.now(timezone.utc)
+            # Replanning detaches the old plan from execution immediately.
+            # Expire its approval request and close the rendered card before
+            # the replacement plan is dispatched, otherwise the old Retry /
+            # Cancel card remains visible while the new plan is running.
+            try:
+                from packages.core.governance.approvals import resolve_origin_requests
+                from packages.core.governance.service import resolve_stale_hitl_cards
+
+                await resolve_origin_requests(
+                    db, plan_id=plan.id, reason="plan_replanned",
+                )
+                await resolve_stale_hitl_cards(
+                    db, plan_id=plan.id, reason="plan_replanned",
+                )
+            except Exception:
+                logger.warning(
+                    "approval-request cleanup on replan failed for %s",
+                    plan.id,
+                    exc_info=True,
+                )
             await db.flush()
 
             # Dispatch new planning cycle
@@ -1817,6 +2065,14 @@ class PlanExecutor:
                 source=SupervisorDecisionSource.GATE,
             )
 
+        task_output_issue = _task_output_contract_issue(task, steps)
+        if task_output_issue and plan_status == ExecutionPlanStatus.COMPLETED:
+            logger.info(
+                "Supervisor requested replan for plan %s task-output contract gap: %s",
+                plan.id,
+                task_output_issue,
+            )
+            return gate(SupervisorVerdict.NEEDS_REPLAN, task_output_issue)
         structured_issue = _structured_blocking_issue(task, steps)
         if structured_issue and plan_status == ExecutionPlanStatus.COMPLETED:
             logger.info(
@@ -2062,14 +2318,32 @@ class PlanExecutor:
                         "the named step could not be re-run (already retried once, or no longer present)",
                     )
 
-                # Every verdict says why — evidence from the model or the
-                # gate, plus what the code did with it.
+                # A model/gate replan verdict is produced inside finalization,
+                # after the normal pre-finalize failure/artifact checks.  It
+                # therefore must spend the real replan budget here instead of
+                # being treated as proof that the budget was already spent.
+                supervisor_replanned = False
                 note = ""
                 if decision.verdict is SupervisorVerdict.NEEDS_REPLAN:
-                    note = (
-                        "the replan budget for this task is exhausted, so the "
-                        "requested replan did not run and the task lands as failed"
+                    replan_steps = list((await db.execute(
+                        select(ExecutionStep).where(ExecutionStep.plan_id == plan.id)
+                        .order_by(ExecutionStep.created_at)
+                    )).scalars().all())
+                    supervisor_replanned = await PlanExecutor._maybe_replan(
+                        db,
+                        plan,
+                        replan_steps,
+                        reason="supervisor_review",
+                        issue=decision.evidence,
                     )
+                    note = (
+                        "a fresh plan was dispatched to address the supervisor's finding"
+                        if supervisor_replanned
+                        else "the requested replan could not be started, so the task lands as failed"
+                    )
+
+                # Every verdict says why — evidence from the model or the
+                # gate, plus what the code did with it.
                 await PlanExecutor._log_supervisor_verdict(db, task, plan, decision, note=note)
                 supervisor_decision = decision
 
@@ -2078,11 +2352,10 @@ class PlanExecutor:
                         task, "completed", db=db, config_versions=config_versions,
                     )
                 elif decision.verdict is SupervisorVerdict.NEEDS_REPLAN:
-                    # Replan was already attempted before _finalize.
-                    # If we're here, budget is exhausted → fall to failed.
-                    await apply_task_status_transition(
-                        task, "failed", db=db, config_versions=config_versions,
-                    )
+                    if not supervisor_replanned:
+                        await apply_task_status_transition(
+                            task, "failed", db=db, config_versions=config_versions,
+                        )
                 elif decision.verdict is SupervisorVerdict.NEEDS_HUMAN:
                     await apply_task_status_transition(
                         task, "waiting_on_customer", db=db,
@@ -2121,8 +2394,21 @@ class PlanExecutor:
                                 "artifact_required": bool(artifact_issue),
                                 "structured_blocker": bool(structured_issue),
                             })
+                        from packages.core.services.task_chat_hitl import ensure_task_recovery_hitl
+
+                        await ensure_task_recovery_hitl(
+                            db,
+                            task,
+                            plan_id=plan.id,
+                            prompt=message,
+                            issue=attention_issue,
+                        )
                     except Exception:
-                        pass
+                        logger.warning(
+                            "task %s: failed to project recovery HITL into workspace chat",
+                            task.id,
+                            exc_info=True,
+                        )
                 else:
                     # FAILED / CANCELLED / BLOCKED — the decision is a member
                     # of a closed enum, so there is no "unknown" branch left:
@@ -2143,6 +2429,12 @@ class PlanExecutor:
                 # Build step summaries with file/document references
                 step_summaries = []
                 all_files: list[dict] = []
+                structured_results: list[Any] = []
+                from packages.core.contracts.task_output import (
+                    is_task_output_contract_schema,
+                    task_output_payload,
+                )
+
                 for s in steps:
                     entry: dict = {
                         "key": s.step_key,
@@ -2150,17 +2442,12 @@ class PlanExecutor:
                         "status": s.step_status,
                     }
                     if s.result and isinstance(s.result, dict):
-                        entry["result_summary"] = str(
-                            s.result.get("text")
-                            or s.result.get("memo_text")
-                            or s.result.get("value")
-                            or s.result.get("summary")
-                            or s.result.get("result_summary")
-                            or s.result.get("message")
-                            or ""
-                        )[:500]
+                        entry["result_summary"] = _step_result_summary(s.result)
                         # Capture file/document references from step results
-                        refs = _artifact_refs_from_result(s.result, step_key=s.step_key)
+                        refs = _dedupe_task_artifact_refs(
+                            _artifact_refs_from_result(s.result, step_key=s.step_key),
+                            entity_id=plan.entity_id,
+                        )
                         if refs:
                             entry["files"] = refs
                             all_files.extend(refs)
@@ -2168,6 +2455,15 @@ class PlanExecutor:
                             entry["document_id"] = s.result["document_id"]
                         if s.result.get("fs_path"):
                             entry["fs_path"] = s.result["fs_path"]
+                        if is_task_output_contract_schema(s.expected_output_schema):
+                            outputs = s.result.get("outputs")
+                            if isinstance(outputs, dict) and "data" in outputs:
+                                payload = task_output_payload(
+                                    s.result,
+                                    s.expected_output_schema,
+                                )
+                                entry["data"] = payload
+                                structured_results.append(payload)
                     elif s.result:
                         entry["result_summary"] = str(s.result)[:500]
                     if s.error:
@@ -2181,8 +2477,19 @@ class PlanExecutor:
                     "plan_id": plan.id,
                     "plan_status": status,
                     "steps": step_summaries,
-                    "files": _dedupe_task_artifact_refs(all_files) if all_files else None,
+                    "files": _dedupe_task_artifact_refs(
+                        all_files,
+                        entity_id=plan.entity_id,
+                    ) if all_files else None,
                 }
+                if len(structured_results) == 1:
+                    # Preserve the exact machine-readable deliverable.  The
+                    # old aggregate kept only a 500-char summary and URLs,
+                    # which made a structurally correct worker result disappear
+                    # before downstream tasks or the UI could consume it.
+                    actual_output["result"] = structured_results[0]
+                elif structured_results:
+                    actual_output["results"] = structured_results
                 if supervisor_decision is not None:
                     actual_output["supervisor_verdict"] = supervisor_decision.verdict.value
                     actual_output["supervisor_evidence"] = supervisor_decision.evidence
@@ -2246,7 +2553,7 @@ class PlanExecutor:
                 if plan.started_at and plan.completed_at:
                     duration = (plan.completed_at - plan.started_at).total_seconds()
                 cost_usd = (plan.cost_tracking or {}).get("usd")
-                icon = "✓" if status == "completed" else "✗"
+                icon = "✓" if status == ExecutionPlanStatus.COMPLETED else "✗"
                 msg = f"{icon} Plan {status}"
                 if duration is not None:
                     msg += f" in {duration:.1f}s"
@@ -2276,20 +2583,53 @@ class PlanExecutor:
                 except Exception:
                     pass  # best-effort
 
-                # Post a human-readable summary of what the task produced
-                if status == "completed" and steps:
+                # Post a human-readable summary of what the task produced.
+                #
+                # The plan reaching ``completed`` is not the same claim as the
+                # TASK being done: a step can report done while saying, in its
+                # own text, that it delivered nothing. That is what the
+                # supervisor is for, and it had already ruled NEEDS_HUMAN on
+                # task 01KZ8A43NZSZCYNTD46A2G8C24 — in the same transaction,
+                # microseconds earlier — when this block posted "## Task
+                # Completed" over the top of it. The thread then said both
+                # "Task Completed" and "This task stopped before it finished".
+                #
+                # So the headline follows the supervisor's verdict, not the
+                # plan's mechanical status. The deliverables are still posted
+                # when a verdict withheld completion — the work that did happen
+                # is worth reading — but under a heading that does not contradict
+                # the card directly above it.
+                accepted = (
+                    supervisor_decision is None
+                    or supervisor_decision.verdict is SupervisorVerdict.COMPLETED
+                )
+                if status == ExecutionPlanStatus.COMPLETED and steps:
                     # Collect final deliverables from step results
                     deliverables = []
                     for s in steps:
                         if s.step_status == ExecutionStepStatus.DONE and s.result:
                             text = ""
                             if isinstance(s.result, dict):
-                                text = s.result.get("text") or s.result.get("value") or ""
+                                text = step_result_output_text(s.result)
+                                if is_task_output_contract_schema(s.expected_output_schema):
+                                    outputs = s.result.get("outputs")
+                                    if isinstance(outputs, dict) and "data" in outputs:
+                                        text = json.dumps(
+                                            outputs["data"],
+                                            ensure_ascii=False,
+                                            indent=2,
+                                            default=str,
+                                        )
                             if isinstance(text, str) and text.strip():
                                 step_label = getattr(s, "description", None) or s.step_key.replace("_", " ").title()
                                 deliverables.append(f"### {step_label}\n\n{text.strip()}")
                     if deliverables:
-                        summary = "## Task Completed\n\n" + "\n\n---\n\n".join(deliverables)
+                        heading = (
+                            "## Task Completed"
+                            if accepted
+                            else "## Work so far (not accepted as finished)"
+                        )
+                        summary = f"{heading}\n\n" + "\n\n---\n\n".join(deliverables)
                         try:
                             # The deliverables came from this task's agent;
                             # the executor only assembled them.
@@ -2341,6 +2681,26 @@ class PlanExecutor:
                     }
 
                 if task.status in TERMINAL_STATUSES:
+                    try:
+                        from packages.core.governance.approvals import resolve_origin_requests
+                        from packages.core.governance.service import resolve_stale_hitl_cards
+
+                        await resolve_origin_requests(
+                            db,
+                            task_id=task.id,
+                            reason="task_terminal",
+                        )
+                        await resolve_stale_hitl_cards(
+                            db,
+                            task_id=task.id,
+                            reason="task_terminal",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "task %s: HITL cleanup on terminal task status failed",
+                            task.id,
+                            exc_info=True,
+                        )
                     try:
                         from packages.core.services.workspace_operation_service import check_work_batch_completion
 
@@ -2448,6 +2808,7 @@ class PlanExecutor:
                     plan_id=plan_id, step_id=step.id, step_key=step.step_key,
                     prompt=evt.get("prompt") or step.human_input_prompt or "",
                     subscription_id=sub_id,
+                    pending_action=evt.get("pending_action"),
                 )
             elif evt["kind"] == "step_failed":
                 await chat_notify.notify_step_failed(

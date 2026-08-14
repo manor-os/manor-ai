@@ -12,26 +12,37 @@ import {
   useMemo,
   type MutableRefObject,
 } from "react";
-import { useQueryClient, useQuery } from "@tanstack/react-query";
+import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
 import { useLocation } from "react-router-dom";
-import { api } from "../lib/api";
+import { api, type GlobalChatFlowEntrypoint } from "../lib/api";
+import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
 import {
   type ChatMessage,
+  type ChatStreamSnapshot,
   type ToolCall,
   isInternalFilePermissionMessage,
+  isRedundantApprovalResolutionReceipt,
+  isTerminalStreamSnapshot,
+  mergeChatStreamSnapshot,
+  mergeResolvedWorkflowMessage,
+  streamSnapshotNeedsHistory,
   pendingHITLIds,
   hitlActionTranscriptText,
   parseToolCalls,
   useDebounced,
+  resolveGlobalWorkflowMessageAction,
 } from "../lib/chatStream";
-import { useChatStreamStore } from "../stores/chatStream";
+import { hasLocallyStreamedConversation, useChatStreamStore } from "../stores/chatStream";
 import { useAuthStore } from "../stores/auth";
+import { useToastStore } from "../stores/toast";
 import ChatMarkdown from "./ChatMarkdown";
+import WorkflowResultCard from "./WorkflowResultCard";
 import AssistantMessageBlocks from "./AssistantMessageBlocks";
 import FloatingPanel from "./FloatingPanel";
 import PanelHeader from "./chat/PanelHeader";
 import MessageRow from "./chat/MessageRow";
 import MessageBubble from "./chat/MessageBubble";
+import ChatTimestamp from "./chat/ChatTimestamp";
 import ChatMessageActions, {
   type ChatMessageFeedbackRating,
   displayContentForAssistantMessage,
@@ -39,9 +50,11 @@ import ChatMessageActions, {
 } from "./chat/ChatMessageActions";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import ManorAvatar from "./ui/ManorAvatar";
+import AgentActivityOrb, { inferAgentActivity } from "./ui/AgentActivityOrb";
 import UserAvatar from "./ui/UserAvatar";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
 import ApprovalActionBar from "./ui/ApprovalActionBar";
+import { chatMessageAnchorId } from "../lib/chatMessageAnchor";
 import { DEFAULT_APPROVAL_OPTIONS } from "../lib/approvalOptions";
 import SessionSwitcher from "./SessionSwitcher";
 import ToolCallList from "./ui/ToolCallList";
@@ -51,12 +64,23 @@ import ChatInputFooter, {
   createChatMessageAttachmentSnapshot,
   manualSkillLabel,
   stripManualSkillTokens,
+  stripWorkflowInvokeToken,
+  workflowInvokeMessage,
   type AttachedItem,
+  type ChatComposerSendContext,
   type ManualSkillItem,
   type MentionOption,
+  type WorkflowInvokeItem,
 } from "./ChatInputFooter";
+import WorkflowRunHost, {
+  buildWorkspaceWorkflowRunGroups,
+  workflowHostOwnedMessageIds,
+} from "./workflows/WorkflowRunHost";
 import { type ChatBoxMode } from "./ChatModeSelector";
 import ChatModeToolbar from "./ChatModeToolbar";
+import ChatModeTemplateGallery from "./ChatModeTemplateGallery";
+import { chatModeTemplateSamples } from "./EmbeddedChat";
+import { prepareTemplateRemix } from "./templateRemix";
 import {
   getDefaultChatModePayload,
   getChatModeInputPlaceholder,
@@ -93,6 +117,7 @@ import {
   type EditorLiveChatDetail,
 } from "../lib/editorLiveChat";
 import type { Agent, UserSummary } from "../lib/types";
+import { useChatAutoFollow } from "../lib/useChatAutoFollow";
 import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 
@@ -111,6 +136,21 @@ function toDisplayText(value: unknown): string {
 }
 
 type ChatRetryRequest = Omit<PendingChatRetry, "createdAt">;
+/* See EmbeddedChat: snapshots are the fast path, not a guaranteed one. */
+const FOLLOWED_RUN_SILENCE_MS = 45_000;
+/* A row can claim "streaming" forever if its API process was hard-killed (the
+ * sweeper only runs at startup). Cap the polls so a zombie row costs a bounded
+ * number of requests, not one every 45s for the life of the tab. */
+const FOLLOWED_RUN_MAX_POLLS = 20;
+
+/** Store-level truth — a component ref only knows this surface's session. */
+function isConversationStreamingNow(convId: string): boolean {
+  const state = useChatStreamStore.getState();
+  const key = state.getSessionKeyForConversation(convId);
+  return Boolean(key && state.sessions[key]?.streaming);
+}
+
+const GLOBAL_WORKFLOW_INVALIDATION_QUERY_KEYS = [["conversations"]] as const;
 
 function parseLiveEditStreamFrame(
   data: string,
@@ -1034,7 +1074,7 @@ function approvalPromptSignals(content: unknown) {
     lower,
   );
   const mentionsAction =
-    /删除|写入|修改|移动|覆盖|创建|生成|保存|delete|write|modify|move|overwrite|create|generate|save/.test(
+    /删除|写入|修改|移动|覆盖|创建|生成|保存|发布|发表|delete|write|modify|move|overwrite|create|generate|save|publish|publicat|post/.test(
       lower,
     );
   return mentionsApproval && mentionsAction;
@@ -1108,6 +1148,7 @@ function extractApprovalPaths(content: unknown) {
 /* ------------------------------------------------------------------ */
 
 export default function FloatingChat() {
+  const toast = useToastStore();
   const queryClient = useQueryClient();
   const location = useLocation();
   const currentUserId = useAuthStore((s) => s.user?.id);
@@ -1164,6 +1205,39 @@ export default function FloatingChat() {
   );
   const streaming = Boolean(currentSession?.streaming);
   const messages = currentSession?.messages || [];
+  /* A server-side turn this tab is following rather than streaming. Display
+   * only — `streaming` still means "this tab owns the connection". */
+  const [followedRunActive, setFollowedRunActive] = useState(false);
+  const [followedRunSilenceKey, setFollowedRunSilenceKey] = useState(0);
+  const lastSnapshotSeqRef = useRef<Record<string, number>>({});
+  const snapshotRefetchedRef = useRef<string | undefined>(undefined);
+  const followedRunPollsRef = useRef(0);
+  const lastAssistantMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant");
+  /* The meta path covers a reload that lands mid-turn: no snapshot has arrived
+   * yet, but the stored row already says the turn is running. Without it the
+   * watchdog can never arm and a lost terminal edge strands the checkpoint
+   * as if it were the final answer. */
+  const lastAssistantStreamStatus = (
+    lastAssistantMessage?.meta as Record<string, unknown> | null | undefined
+  )?.stream_status;
+  const remoteRunInFlight =
+    !streaming &&
+    (followedRunActive ||
+      lastAssistantStreamStatus === "streaming" ||
+      lastAssistantStreamStatus === "running");
+  const assistantWorking = streaming || remoteRunInFlight;
+  const activeAssistantMessage = useMemo(
+    () => assistantWorking
+      ? [...messages].reverse().find((message) => message.role === "assistant") || null
+      : null,
+    [messages, assistantWorking],
+  );
+  const activeAgentActivity = useMemo(
+    () => inferAgentActivity(activeAssistantMessage),
+    [activeAssistantMessage],
+  );
   const streamingConvId = currentSession?.convId;
   const [messageFeedback, setMessageFeedback] = useState<
     Record<string, ChatMessageFeedbackRating>
@@ -1198,6 +1272,67 @@ export default function FloatingChat() {
     },
     [setSessionMessages],
   );
+  const workflowRunGroups = useMemo(
+    () => buildWorkspaceWorkflowRunGroups(messages),
+    [messages],
+  );
+  const hostOwnedWorkflowMessageIds = useMemo(
+    () => workflowHostOwnedMessageIds(workflowRunGroups),
+    [workflowRunGroups],
+  );
+  const visibleWorkflowMessageEntries = useMemo(
+    () => messages.flatMap((message, index) => (
+      message.id && hostOwnedWorkflowMessageIds.has(message.id)
+        ? []
+        : [{ message, index }]
+    )),
+    [hostOwnedWorkflowMessageIds, messages],
+  );
+  const visibleWorkflowMessages = useMemo(
+    () => visibleWorkflowMessageEntries.map(({ message }) => message),
+    [visibleWorkflowMessageEntries],
+  );
+  const workflowMessageResolveMutation = useMutation({
+    mutationFn: ({
+      messageId,
+      choice,
+      note,
+      payload,
+      files,
+    }: {
+      messageId: string;
+      choice: string;
+      note?: string;
+      payload?: Record<string, unknown>;
+      files?: File[];
+    }) => resolveGlobalWorkflowMessageAction(
+      messageId,
+      choice,
+      note,
+      payload,
+      files,
+    ),
+    onSuccess: (resolved, { messageId }) => {
+      setMessages((current) => mergeResolvedWorkflowMessage(
+        current,
+        messageId,
+        resolved,
+      ));
+    },
+  });
+  const handleWorkflowMessageResolve = (
+    messageId: string,
+    choice: string,
+    note?: string,
+    payload?: Record<string, unknown>,
+    files?: File[],
+  ) => workflowMessageResolveMutation.mutateAsync({
+    messageId,
+    choice,
+    note,
+    payload,
+    files,
+  });
 
   const clearEditorLiveSession = useCallback(
     (deleteConversation = false) => {
@@ -1252,6 +1387,7 @@ export default function FloatingChat() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const attachMenuRef = useRef<HTMLDivElement>(null);
+  const { autoFollowRef, handleAutoFollowScroll } = useChatAutoFollow();
 
   const { data: workspaceUsers = [] } = useQuery({
     queryKey: ["floating-chat-mention-users"],
@@ -1261,6 +1397,23 @@ export default function FloatingChat() {
     queryKey: ["floating-chat-mention-agents"],
     queryFn: () => api.agents.list(),
   });
+  const { data: globalFlowEntrypoints = [] } = useQuery({
+    queryKey: ["global-chat-flow-entrypoints"],
+    queryFn: () => api.chat.listFlowEntrypoints(),
+  });
+  const workflowInvokeOptions = useMemo<WorkflowInvokeItem[]>(
+    () =>
+      globalFlowEntrypoints.map((entrypoint: GlobalChatFlowEntrypoint) => ({
+        bindingId: entrypoint.binding_id,
+        workflowId: entrypoint.workflow_id,
+        title: entrypoint.title,
+        description: [entrypoint.workspace_name, entrypoint.description]
+          .filter(Boolean)
+          .join(" · "),
+        placeholder: entrypoint.placeholder,
+      })),
+    [globalFlowEntrypoints],
+  );
 
   const mentionOptions = useMemo<MentionOption[]>(() => {
     const agentOptions = (allAgents as Agent[]).map((agent) => ({
@@ -1342,17 +1495,31 @@ export default function FloatingChat() {
     msgs
       .filter(
         (m: any) =>
-          !(m.role === "user" && isInternalFilePermissionMessage(m.content)),
+          !(m.role === "user" && isInternalFilePermissionMessage(m.content)) &&
+          !isRedundantApprovalResolutionReceipt(m),
       )
       .map((m: any) => ({
         id: m.id,
         conversation_id: m.conversation_id,
-        role: m.role as "user" | "assistant",
+        message_kind: m.message_kind,
+        refs: m.refs,
+        meta: m.meta,
+        pending_action: m.pending_action,
+        resolved_at: m.resolved_at,
+        resolution: m.resolution,
+        // Workflow progress and HITL rows are persisted as system messages.
+        // They belong to Manor, never to the signed-in user.
+        role: (m.role === "user" ? "user" : "assistant") as "user" | "assistant",
         content: toDisplayText(m.content),
         timestamp: m.created_at,
+        updated_at: m.updated_at,
         tool_calls: parseToolCalls(m.tool_calls),
         assistant_blocks: Array.isArray(m.assistant_blocks) ? m.assistant_blocks : undefined,
         hitl_requests: Array.isArray(m.hitl_requests) ? m.hitl_requests : undefined,
+        workflow_result:
+          m.workflow_result && typeof m.workflow_result === "object"
+            ? m.workflow_result
+            : undefined,
         attachments: Array.isArray(m.attachments) ? m.attachments : undefined,
         stop_reason: m.stop_reason,
         limit_detail: m.limit_detail,
@@ -1368,7 +1535,7 @@ export default function FloatingChat() {
 
   const handleOpenMessageReference = useCallback(
     async (refItem: ChatMessageDisplayReference) => {
-      const directUrl = refItem.previewUrl || refItem.url;
+      const directUrl = refItem.openUrl || refItem.previewUrl || refItem.url;
       if (directUrl) {
         window.open(directUrl, "_blank", "noopener,noreferrer");
         return;
@@ -1539,13 +1706,15 @@ export default function FloatingChat() {
     }
   }, [open, currentConvId, loadRecentMessages, setSessionMessages, streaming, streamingConvId]);
 
-  /* Auto-scroll — throttled during streaming to avoid queuing hundreds of scroll animations */
+  /* Auto-scroll — throttled during streaming to avoid queuing hundreds of scroll
+     animations, and only while the user hasn't scrolled away from the bottom. */
   const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (scrollTimerRef.current) return; // already scheduled
     scrollTimerRef.current = setTimeout(
       () => {
         scrollTimerRef.current = null;
+        if (!autoFollowRef.current) return;
         messagesEndRef.current?.scrollIntoView({
           behavior: "auto",
           block: "end",
@@ -1553,7 +1722,13 @@ export default function FloatingChat() {
       },
       streaming ? 240 : 0,
     );
-  }, [messages, streaming]);
+  }, [messages, streaming, autoFollowRef]);
+
+  /* Opening the panel or switching sessions is a user-initiated jump to the
+     latest message — resume following even if they had scrolled up before. */
+  useEffect(() => {
+    autoFollowRef.current = true;
+  }, [open, currentConvId, draftSessionKey, autoFollowRef]);
 
   useEffect(() => {
     if (!editorLiveSessionActive) return;
@@ -1616,6 +1791,117 @@ export default function FloatingChat() {
     window.addEventListener("manor:video-ready", handler);
     return () => window.removeEventListener("manor:video-ready", handler);
   }, [currentConvId, loadRecentMessages, setMessages]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (
+        detail?.conversation_id === currentConvId &&
+        !streamingRef.current
+      ) {
+        loadRecentMessages(detail.conversation_id)
+          .then((msgs) => setMessages(msgs))
+          .catch(() => {});
+      }
+    };
+    window.addEventListener("manor:conversation-message", handler);
+    return () => window.removeEventListener("manor:conversation-message", handler);
+  }, [currentConvId, loadRecentMessages, setMessages]);
+
+  /* Follow a turn this tab is not streaming — see EmbeddedChat for the full note. */
+  useEffect(() => {
+    if (!currentConvId) return;
+    const handler = (event: Event) => {
+      const snapshot = (event as CustomEvent).detail as ChatStreamSnapshot | undefined;
+      if (!snapshot || snapshot.conversation_id !== currentConvId) return;
+      const streamState = useChatStreamStore.getState();
+      const liveKey = streamState.getSessionKeyForConversation(currentConvId);
+      if (liveKey && streamState.sessions[liveKey]?.streaming) return;
+      if (hasLocallyStreamedConversation(currentConvId)) return;
+
+      const seqKey = snapshot.message_id || currentConvId;
+      const seq = typeof snapshot.seq === "number" ? snapshot.seq : 0;
+      if (seq && seq <= (lastSnapshotSeqRef.current[seqKey] || 0)) return;
+      lastSnapshotSeqRef.current[seqKey] = seq;
+
+      const known = liveKey ? streamState.sessions[liveKey]?.messages || [] : [];
+      const needsHistory = streamSnapshotNeedsHistory(known, snapshot);
+      setSessionMessages(currentConvId, (prev) =>
+        mergeChatStreamSnapshot(prev, snapshot),
+      );
+      const terminal = isTerminalStreamSnapshot(snapshot);
+      setFollowedRunActive(!terminal);
+      setFollowedRunSilenceKey((value) => value + 1);
+      followedRunPollsRef.current = 0;
+
+      // A snapshot projects the live turn only; the stored row is the authority
+      // for attachments and approval cards, which settle at the end.
+      const refetchKey = `${snapshot.message_id || ""}:${terminal ? "final" : "history"}`;
+      if ((terminal || needsHistory) && snapshotRefetchedRef.current !== refetchKey) {
+        snapshotRefetchedRef.current = refetchKey;
+        loadRecentMessages(currentConvId)
+          .then((msgs) => {
+            // Guard at resolution time: the user may have started their own
+            // turn during the fetch, and replacing the transcript then glues
+            // the next SSE token onto the previous reply.
+            if (isConversationStreamingNow(currentConvId)) return;
+            setSessionMessages(currentConvId, msgs);
+          })
+          .catch(() => {});
+      }
+    };
+    window.addEventListener("manor:chat-stream-snapshot", handler);
+    return () =>
+      window.removeEventListener("manor:chat-stream-snapshot", handler);
+  }, [currentConvId, loadRecentMessages, setSessionMessages]);
+
+  /* Nothing replays a snapshot lost to a socket reconnect — ask the API rather
+   * than spin forever over a reply that already finished. Gated on
+   * remoteRunInFlight so it arms straight from the stored row's stream_status
+   * after a reload, and disarms the moment this tab streams for itself. */
+  useEffect(() => {
+    if (!currentConvId || !remoteRunInFlight) return;
+    const timer = window.setTimeout(() => {
+      if (followedRunPollsRef.current >= FOLLOWED_RUN_MAX_POLLS) {
+        setFollowedRunActive(false);
+        return;
+      }
+      followedRunPollsRef.current += 1;
+      loadRecentMessages(currentConvId)
+        .then((msgs) => {
+          if (isConversationStreamingNow(currentConvId)) return;
+          setSessionMessages(currentConvId, msgs);
+          setFollowedRunActive(false);
+          // Re-arm: the refetched row may still claim to be streaming.
+          setFollowedRunSilenceKey((value) => value + 1);
+        })
+        .catch(() => {
+          // The poll failing is the offline case the watchdog exists for —
+          // keep trying at the same cadence rather than freezing mid-run.
+          setFollowedRunSilenceKey((value) => value + 1);
+        });
+    }, FOLLOWED_RUN_SILENCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [
+    currentConvId,
+    followedRunSilenceKey,
+    loadRecentMessages,
+    remoteRunInFlight,
+    setSessionMessages,
+  ]);
+
+  /* This tab streaming for itself ends any followed run: its own SSE is the
+   * authority now, and a stale "still working" flag would outlive the reply. */
+  useEffect(() => {
+    if (streaming) setFollowedRunActive(false);
+  }, [streaming]);
+
+  useEffect(() => {
+    setFollowedRunActive(false);
+    lastSnapshotSeqRef.current = {};
+    snapshotRefetchedRef.current = undefined;
+    followedRunPollsRef.current = 0;
+  }, [currentConvId]);
 
   /* Auto-resize textarea */
   useEffect(() => {
@@ -1885,13 +2171,25 @@ export default function FloatingChat() {
       textInput?: string,
       footerAttachments?: AttachedItem[],
       manualSkills: ManualSkillItem[] = [],
+      workflow?: WorkflowInvokeItem | null,
+      sendContext?: ChatComposerSendContext,
     ) => {
       const rawText = (
         typeof textInput === "string" ? textInput : input
       ).trim();
-      const text = stripManualSkillTokens(rawText, manualSkills);
+      const selectedWorkflow = workflow || null;
+      const effectiveManualSkills = selectedWorkflow ? [] : manualSkills;
+      const text = stripWorkflowInvokeToken(
+        stripManualSkillTokens(rawText, manualSkills),
+        selectedWorkflow,
+      );
       const attachmentSnapshot = footerAttachments || attachedFiles;
-      if (!text && attachmentSnapshot.length === 0 && manualSkills.length === 0)
+      if (
+        !text &&
+        attachmentSnapshot.length === 0 &&
+        effectiveManualSkills.length === 0 &&
+        !selectedWorkflow
+      )
         return;
       let sessionKey = currentSessionKeyRef.current;
       if (!sessionKey) {
@@ -1899,6 +2197,9 @@ export default function FloatingChat() {
         setDraftSessionKey(sessionKey);
       }
       if (useChatStreamStore.getState().sessions[sessionKey]?.streaming) return;
+
+      // Sending is an explicit jump back to the newest message.
+      autoFollowRef.current = true;
 
       // Stop voice if active — also drains the recorder so any in-flight
       // chunks transcribe before send (the user can edit the result
@@ -1920,6 +2221,7 @@ export default function FloatingChat() {
         type: mention.type,
         name: mention.name,
         subtitle: mention.subtitle,
+        avatarUrl: mention.avatarUrl,
       }));
       const mentionContext =
         peopleMentions.length > 0
@@ -1931,8 +2233,13 @@ export default function FloatingChat() {
       setMentionedAgentId(undefined);
       const sentAttachments = [...attachmentSnapshot];
       setAttachedFiles([]);
-      const requestChatMode =
-        !editorLiveSessionActive && chatMode !== "auto" ? chatMode : undefined;
+      const requestChatMode = selectedWorkflow
+        ? "flows"
+        : !editorLiveSessionActive && chatMode !== "auto"
+          ? chatMode
+          : undefined;
+      const requestChatModePayload =
+        !requestChatMode || selectedWorkflow ? undefined : chatModePayload;
 
       // Extract inline #[name](doc:id) refs in a single pass (used for both display and send)
       const inlineDocIds: string[] = [];
@@ -1943,11 +2250,16 @@ export default function FloatingChat() {
           return `#${name}`;
         },
       );
-      const displayContent = cleanText;
+      const displayContent = [
+        cleanText,
+        selectedWorkflow ? `[${t("nav.flows")}: ${selectedWorkflow.title}]` : "",
+      ].filter(Boolean).join("\n\n");
 
       const visibleRequest =
         `${cleanText}${mentionContext}`.trim() ||
-        "Use the manually selected skill with the current conversation context.";
+        (selectedWorkflow
+          ? workflowInvokeMessage(selectedWorkflow)
+          : "Use the manually selected skill with the current conversation context.");
       const liveEditDetail = editorLiveSessionActive
         ? editorLiveDetailRef.current
         : null;
@@ -2012,17 +2324,18 @@ export default function FloatingChat() {
           .map((a) => a.id!),
         ...inlineDocIds,
       ];
-      const retryRequest: ChatRetryRequest | undefined = !isLiveEdit
+      const retryRequest: ChatRetryRequest | undefined = !isLiveEdit && !selectedWorkflow
         ? {
             message: sendText,
             conversationId: currentConvId,
             documentIds: documentIds.length > 0 ? documentIds : undefined,
             agentId: mentionedAgentId,
+            localWorkerId: sendContext?.localWorkerId,
             chatMode: requestChatMode,
-            chatModePayload: requestChatMode ? chatModePayload : undefined,
+            chatModePayload: requestChatModePayload,
             manualSkillIds:
-              manualSkills.length > 0
-                ? manualSkills.map((skill) => skill.id)
+              effectiveManualSkills.length > 0
+                ? effectiveManualSkills.map((skill) => skill.id)
                 : undefined,
           }
         : undefined;
@@ -2087,35 +2400,47 @@ export default function FloatingChat() {
 
       await startStream(
         async () => {
-          const response = await api.chat.stream(sendText, currentConvId, {
-            files: localFiles.length > 0 ? localFiles : undefined,
-            documentIds: documentIds.length > 0 ? documentIds : undefined,
-            agentId: mentionedAgentId,
-            chatMode: requestChatMode,
-            chatModePayload: requestChatMode ? chatModePayload : undefined,
-            manualSkillIds:
-              manualSkills.length > 0
-                ? manualSkills.map((skill) => skill.id)
-                : undefined,
-            editorContext: isLiveEdit
-              ? {
-                  path: liveEditDetail?.sourcePath,
-                  sourcePath: liveEditDetail?.sourcePath,
-                  documentId: liveEditDetail?.documentId,
-                  documentName: liveEditDetail?.documentName,
-                  fileType: liveEditDetail?.fileType,
-                  mimeType: liveEditDetail?.mimeType,
-                  editorType: liveEditDetail?.editorType,
-                  supportsImageGeneration: Boolean(
-                    liveEditDetail?.supportsImageGeneration ||
-                    liveEditDetail?.applyGeneratedImage,
-                  ),
-                  currentDocumentContent:
-                    typeof liveEditContent === "string" ? liveEditContent : undefined,
-                }
-              : undefined,
-            ephemeral: isLiveEdit,
-          });
+          const response = selectedWorkflow
+            ? await api.chat.streamFlowEntrypoint(
+                selectedWorkflow.bindingId,
+                cleanText || workflowInvokeMessage(selectedWorkflow),
+                currentConvId,
+                {
+                  files: localFiles.length > 0 ? localFiles : undefined,
+                  documentIds: documentIds.length > 0 ? documentIds : undefined,
+                  localWorkerId: sendContext?.localWorkerId,
+                },
+              )
+            : await api.chat.stream(sendText, currentConvId, {
+                files: localFiles.length > 0 ? localFiles : undefined,
+                documentIds: documentIds.length > 0 ? documentIds : undefined,
+                agentId: mentionedAgentId,
+                localWorkerId: sendContext?.localWorkerId,
+                chatMode: requestChatMode,
+                chatModePayload: requestChatModePayload,
+                manualSkillIds:
+                  effectiveManualSkills.length > 0
+                    ? effectiveManualSkills.map((skill) => skill.id)
+                    : undefined,
+                editorContext: isLiveEdit
+                  ? {
+                      path: liveEditDetail?.sourcePath,
+                      sourcePath: liveEditDetail?.sourcePath,
+                      documentId: liveEditDetail?.documentId,
+                      documentName: liveEditDetail?.documentName,
+                      fileType: liveEditDetail?.fileType,
+                      mimeType: liveEditDetail?.mimeType,
+                      editorType: liveEditDetail?.editorType,
+                      supportsImageGeneration: Boolean(
+                        liveEditDetail?.supportsImageGeneration ||
+                        liveEditDetail?.applyGeneratedImage,
+                      ),
+                      currentDocumentContent:
+                        typeof liveEditContent === "string" ? liveEditContent : undefined,
+                    }
+                  : undefined,
+                ephemeral: isLiveEdit,
+              });
           if (!liveEditDetail?.applyContent) return response;
           return pipeEditorLiveEditStream(
             response,
@@ -2151,6 +2476,10 @@ export default function FloatingChat() {
         return;
       }
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // The agent may have created or changed Knowledge documents during this
+      // turn; without this, a mounted Knowledge page never learns about them
+      // (no polling, refetchOnWindowFocus off, 60s staleTime).
+      invalidateKnowledgeQueries(queryClient);
     },
     [
       input,
@@ -2175,15 +2504,13 @@ export default function FloatingChat() {
   const handleStopRequest = useCallback(() => {
     const convId = currentConvId || streamingConvId;
     const hitlIds = pendingHITLIds(messages);
-    stopStream(currentSessionKeyRef.current);
     if (convId) {
-      api.chat
-        .cancelPendingFileApprovals(convId, hitlIds)
-        .then(() =>
-          queryClient.invalidateQueries({ queryKey: ["conversations"] }),
-        )
-        .catch(() => {});
+      void api.chat.cancelPendingFileApprovals(convId, hitlIds).then(
+        () => queryClient.invalidateQueries({ queryKey: ["conversations"] }),
+        () => undefined,
+      );
     }
+    stopStream(currentSessionKeyRef.current);
   }, [currentConvId, streamingConvId, messages, stopStream, queryClient]);
 
   const handleCloseChat = useCallback(() => {
@@ -2242,6 +2569,7 @@ export default function FloatingChat() {
         api.chat.stream(pending.message, pending.conversationId, {
           documentIds: pending.documentIds,
           agentId: pending.agentId,
+          localWorkerId: pending.localWorkerId,
           workspaceId: pending.workspaceId,
           chatMode: pending.chatMode,
           chatModePayload: pending.chatModePayload,
@@ -2284,8 +2612,28 @@ export default function FloatingChat() {
   const handleSwitchSession = (convId: string) => {
     if (convId === currentConvId) return;
     if (editorLiveSessionActive) clearEditorLiveSession(true);
+    // A session that is still streaming owns its transcript: clearing it and
+    // reloading from the API would drop everything streamed so far and race
+    // the live writer, which only checkpoints to the DB every few seconds.
+    const streamState = useChatStreamStore.getState();
+    const liveKey = streamState.getSessionKeyForConversation(convId);
+    const isLiveConversation = Boolean(
+      liveKey && streamState.sessions[liveKey]?.streaming,
+    );
     setCurrentConvId(convId);
     setDraftSessionKey(undefined);
+    if (isLiveConversation) {
+      setAttachedFiles([]);
+      setComposerSeed(null);
+      setEditorSessionLabel(null);
+      setEditorLiveInfo(null);
+      editorLiveDetailRef.current = null;
+      editorLiveAppliedRef.current = { content: "" };
+      setSelectedMentions([]);
+      setMentionedAgentId(undefined);
+      setConversationLoading(false);
+      return;
+    }
     setSessionMessages(convId, []);
     setAttachedFiles([]);
     setComposerSeed(null);
@@ -2306,7 +2654,7 @@ export default function FloatingChat() {
 
   /* ---- HITL action handler ---- */
   const handleHITLAction = useCallback(
-    async (hitlId: string, action: string) => {
+    async (hitlId: string, action: string, review?: unknown) => {
       const markResolved = (items: ChatMessage[]) =>
         items.map((msg) => ({
           ...msg,
@@ -2317,7 +2665,11 @@ export default function FloatingChat() {
       const updatedMessages = markResolved(messages);
       setMessages(updatedMessages);
 
-      const hitlMessage = JSON.stringify({ hitl_id: hitlId, action });
+      const hitlMessage = JSON.stringify({
+        hitl_id: hitlId,
+        action,
+        ...(review !== undefined ? { payload: { review } } : {}),
+      });
       const now = new Date().toISOString();
       const msgsForHitl = [
         ...updatedMessages,
@@ -2500,18 +2852,6 @@ export default function FloatingChat() {
   );
 
   /* ---- Helpers ---- */
-  const formatTime = (ts?: string) => {
-    if (!ts) return "";
-    try {
-      return new Date(ts).toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-    } catch {
-      return "";
-    }
-  };
-
   const iconBtnStyle = (hoverColor: string): React.CSSProperties => ({
     width: 30,
     height: 30,
@@ -2635,22 +2975,15 @@ export default function FloatingChat() {
                 >
                   {editorSessionLabel}
                 </div>
-              ) : streaming ? (
+              ) : assistantWorking ? (
                 <div
                   style={{
                     display: "flex",
                     alignItems: "center",
-                    gap: 4,
                     marginTop: 1,
                   }}
                 >
-                  <span className="chat-typing-dots">
-                    <span />
-                    <span />
-                    <span />
-                  </span>
-                  <span style={{ fontSize: 10, color: "var(--text-faint, #78716c)" }}>
-                    {t("component.embedded_chat.replying")}</span>
+                  <AgentActivityOrb activity={activeAgentActivity} />
                 </div>
               ) : listening ? (
                 <div
@@ -2683,22 +3016,12 @@ export default function FloatingChat() {
               ) : (
                 <div
                   style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 4,
                     marginTop: 1,
+                    fontSize: 10,
+                    color: "var(--text-faint, #78716c)",
                   }}
                 >
-                  <span
-                    style={{
-                      width: 6,
-                      height: 6,
-                      borderRadius: "50%",
-                      background: "var(--accent, #4f9c84)",
-                      display: "inline-block",
-                    }}
-                  />
-                  <span style={{ fontSize: 10, color: "var(--text-faint, #78716c)" }}>{t("component.floating_chat.online")}</span>
+                  {t("page.app_layout.your_ai_chief_of_staff")}
                 </div>
               )}
           actions={
@@ -2754,6 +3077,7 @@ export default function FloatingChat() {
 
         {/* ── Messages ── */}
         <div
+          onScroll={handleAutoFollowScroll}
           style={{
             flex: 1,
             overflowY: "auto",
@@ -2856,7 +3180,7 @@ export default function FloatingChat() {
             </div>
           )}
 
-          {!showConversationSkeleton && messages.map((msg, i) => {
+          {!showConversationSkeleton && visibleWorkflowMessageEntries.map(({ message: msg, index: i }) => {
             const rawContent = toDisplayText(msg.content);
             const content = msg.role === "assistant"
               ? stripEditorLiveEditBlocks(rawContent)
@@ -2876,7 +3200,7 @@ export default function FloatingChat() {
               msg.role === "assistant"
                 ? displayContentForAssistantMessage(msg, rawBubbleContent)
                 : rawBubbleContent;
-            const isLatestStreaming = streaming && i === messages.length - 1;
+            const isLatestStreaming = assistantWorking && i === messages.length - 1;
             const suppressApprovalBubble =
               isApprovalBoilerplateContent(msg) && !isLatestStreaming;
             const showCreditLimitNotice =
@@ -2903,6 +3227,7 @@ export default function FloatingChat() {
             return (
               <MessageRow
                 key={i}
+                id={chatMessageAnchorId(msg.id, i)}
                 role={msg.role === "user" ? "user" : "other"}
                 avatar={msg.role === "assistant" ? <ManorAvatar size={26} /> : undefined}
               >
@@ -3010,6 +3335,7 @@ export default function FloatingChat() {
                     if (
                       hasAssistantBlocks &&
                       !canRetryFromContent &&
+                      !suppressApprovalBubble &&
                       !showCreditLimitNotice
                     ) {
                       return (
@@ -3021,16 +3347,20 @@ export default function FloatingChat() {
                             blocks={msg.assistant_blocks}
                             content={bubbleContent}
                             keyPrefix={i}
-                            streaming={streaming && i === messages.length - 1}
+                            streaming={assistantWorking && i === messages.length - 1}
+                          />
+                          <ChatMessageReferenceStrip
+                            references={parseUserMessageDisplay(msg).references}
+                            inlineFileCards
+                            returnTo={`${location.pathname}${location.search}${location.hash}`}
                           />
                         </MessageBubble>
                       );
                     }
-                    if (
-                      !bubbleContent ||
-                      suppressApprovalBubble ||
-                      showCreditLimitNotice
-                    ) return null;
+                    if (suppressApprovalBubble || showCreditLimitNotice)
+                      return null;
+                    // Attachment-only turns still need a bubble for the file card.
+                    if (!bubbleContent && (msg.attachments?.length ?? 0) === 0 && msg.role !== "user") return null;
                     const display = parseUserMessageDisplay({
                       ...msg,
                       content: bubbleContent,
@@ -3049,17 +3379,25 @@ export default function FloatingChat() {
                                 <ChatMarkdown content={cleanContent} isUser />
                               </CollapsibleSentMessage>
                             ) : (
-                              <ChatMarkdown
-                                content={cleanContent}
-                                isUser={false}
-                                streaming={
-                                  streaming &&
-                                  i === messages.length - 1 &&
-                                  msg.role === "assistant"
-                                }
-                              />
+                              <>
+                                <ChatMarkdown
+                                  content={cleanContent}
+                                  isUser={false}
+                                  streaming={
+                                    assistantWorking &&
+                                    i === messages.length - 1 &&
+                                    msg.role === "assistant"
+                                  }
+                                />
+                                {msg.workflow_result && (
+                                  <WorkflowResultCard
+                                    result={msg.workflow_result}
+                                    returnTo={`${location.pathname}${location.search}${location.hash}`}
+                                  />
+                                )}
+                              </>
                             )}
-                            {streaming &&
+                            {assistantWorking &&
                               i === messages.length - 1 &&
                               msg.role === "assistant" && (
                                 <span className="chat-streaming-cursor" />
@@ -3072,6 +3410,8 @@ export default function FloatingChat() {
                               references={references}
                               align={msg.role === "user" ? "right" : "left"}
                               onOpenReference={handleOpenMessageReference}
+                              inlineFileCards={msg.role === "assistant"}
+                              returnTo={`${location.pathname}${location.search}${location.hash}`}
                             />
                             <ChatMessageMetaChips
                               chips={chips}
@@ -3088,28 +3428,27 @@ export default function FloatingChat() {
                   {!content &&
                     visibleTools.length === 0 &&
                     !hasAssistantBlocks &&
-                    streaming &&
+                    assistantWorking &&
                     i === messages.length - 1 &&
                     msg.role === "assistant" && (
-                      <div
-                        style={{
-                          padding: "8px 12px",
-                          borderRadius: "14px 14px 14px 4px",
-                          background: "var(--modal-muted-bg, #f5f5f4)",
-                        }}
+                      <MessageBubble
+                        role="other"
+                        className="chat-bubble chat-bubble--bot chat-bubble--activity"
                       >
-                        <span className="chat-streaming-cursor" />
-                      </div>
+                        <AgentActivityOrb
+                          activity={inferAgentActivity(msg)}
+                          className="agent-activity-orb--message"
+                        />
+                      </MessageBubble>
                     )}
 
-                  <div
+                  {(!isLatestStreaming || Boolean(content) || visibleTools.length > 0 || hasAssistantBlocks) && (
+                    <div
                     className={`chat-message-meta-row ${
                       msg.role === "user" ? "chat-message-meta-row--user" : ""
                     } ${showMessageActions ? "chat-message-meta-row--actions" : ""}`}
                   >
-                    <span className="chat-timestamp">
-                      {formatTime(msg.timestamp)}
-                    </span>
+                    <ChatTimestamp timestamp={msg.timestamp} />
                     {showMessageActions && (
                       <span className="chat-message-meta-actions">
                         <ChatMessageActions
@@ -3146,7 +3485,8 @@ export default function FloatingChat() {
                         />
                       </span>
                     )}
-                  </div>
+                    </div>
+                  )}
               </MessageRow>
             );
           })}
@@ -3158,18 +3498,68 @@ export default function FloatingChat() {
             "floating" variant matches the 12 px padding and 100% width that
             .floating-chat-footer uses for its own composer. */}
         <ApprovalActionBar
-          messages={messages}
+          messages={visibleWorkflowMessages}
           disabled={streaming}
           onResolve={handleHITLAction}
           variant="floating"
+        />
+
+        <WorkflowRunHost
+          conversationId={currentConvId || streamingConvId}
+          groups={workflowRunGroups}
+          onResolveMessage={handleWorkflowMessageResolve}
+          resolveLoading={workflowMessageResolveMutation.isPending}
+          resolveError={workflowMessageResolveMutation.error}
+          resolveMessageId={workflowMessageResolveMutation.variables?.messageId || null}
+          invalidationQueryKeys={GLOBAL_WORKFLOW_INVALIDATION_QUERY_KEYS}
+          onRunChange={workflowMessageResolveMutation.reset}
         />
 
         <ChatInputFooter
           value={input}
           onChange={handleComposerChange}
           streaming={streaming}
-          onSend={handleSend}
+          onSend={(text, attachments, manualSkills, context) => {
+            void handleSend(text, attachments, manualSkills, null, context);
+          }}
+          onSendWorkflow={(text, attachments, manualSkills, workflow, context) => {
+            void handleSend(text, attachments, manualSkills, workflow, context);
+          }}
           onStop={handleStopRequest}
+          topSlot={
+            messages.length > 0 && !editorLiveSessionActive ? (
+                <ChatModeTemplateGallery
+                  mode={chatMode}
+                  disabled={streaming}
+                  samples={chatModeTemplateSamples(chatMode)}
+                  onSelect={async (sample) => {
+                    try {
+                      const remix = await prepareTemplateRemix(sample);
+                      setInput(remix.prompt);
+                      setComposerSeed(
+                        remix.attachments.length > 0
+                          ? {
+                              key: `artifact-template-${remix.attachments[0]?.id || Date.now()}-${Date.now()}`,
+                              attachments: remix.attachments,
+                            }
+                          : null,
+                      );
+                      toast.success(
+                        t("component.embedded_chat.template_ready").replace(
+                          "{name}", sample.title,
+                        ),
+                      );
+                      window.setTimeout(() => textareaRef.current?.focus(), 0);
+                    } catch (error) {
+                      toast.error(
+                        t("component.embedded_chat.template_create_failed"),
+                        error instanceof Error ? error.message : undefined,
+                      );
+                    }
+                  }}
+              />
+            ) : undefined
+          }
           placeholder={
             editorLiveSessionActive
               ? editorLivePlaceholder
@@ -3194,6 +3584,7 @@ export default function FloatingChat() {
             !editorLiveSessionActive && chatMode !== "auto"
           }
           mentions={mentionOptions}
+          workflows={editorLiveSessionActive ? [] : workflowInvokeOptions}
           selectedMentions={selectedMentions}
           onMentionSelect={handleMentionSelect}
           onMentionRemove={handleMentionRemove}

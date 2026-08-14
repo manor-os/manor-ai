@@ -4,6 +4,7 @@ interface TooltipProps {
   content: string;
   children: React.ReactNode;
   position?: "top" | "bottom" | "left" | "right";
+  className?: string;
 }
 
 const positionStyles: Record<string, React.CSSProperties> = {
@@ -16,23 +17,23 @@ const positionStyles: Record<string, React.CSSProperties> = {
 const arrowStyles: Record<string, React.CSSProperties> = {
   top: {
     bottom: -4, left: "50%", transform: "translateX(-50%) rotate(45deg)",
-    width: 8, height: 8, background: "#292524", position: "absolute",
+    width: 8, height: 8, background: "var(--ink)", position: "absolute",
   },
   bottom: {
     top: -4, left: "50%", transform: "translateX(-50%) rotate(45deg)",
-    width: 8, height: 8, background: "#292524", position: "absolute",
+    width: 8, height: 8, background: "var(--ink)", position: "absolute",
   },
   left: {
     right: -4, top: "50%", transform: "translateY(-50%) rotate(45deg)",
-    width: 8, height: 8, background: "#292524", position: "absolute",
+    width: 8, height: 8, background: "var(--ink)", position: "absolute",
   },
   right: {
     left: -4, top: "50%", transform: "translateY(-50%) rotate(45deg)",
-    width: 8, height: 8, background: "#292524", position: "absolute",
+    width: 8, height: 8, background: "var(--ink)", position: "absolute",
   },
 };
 
-export default function Tooltip({ content, children, position = "top" }: TooltipProps) {
+export default function Tooltip({ content, children, position = "top", className = "" }: TooltipProps) {
   const [visible, setVisible] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -45,26 +46,40 @@ export default function Tooltip({ content, children, position = "top" }: Tooltip
     setVisible(false);
   }
 
+  function showImmediately() {
+    clearTimeout(timerRef.current);
+    setVisible(true);
+  }
+
   return (
     <div
+      className={className}
       style={{ position: "relative", display: "inline-flex" }}
       onMouseEnter={show}
       onMouseLeave={hide}
+      onFocusCapture={showImmediately}
+      onBlurCapture={hide}
     >
       {children}
 
       {visible && (
         <div
+          role="tooltip"
           style={{
             position: "absolute",
             ...positionStyles[position],
-            background: "#292524",
-            color: "#fff",
+            width: "max-content",
+            maxWidth: 300,
+            background: "var(--ink)",
+            color: "var(--surface-panel)",
             fontSize: 12,
             fontWeight: 500,
-            padding: "5px 10px",
+            lineHeight: 1.45,
+            padding: "7px 10px",
             borderRadius: 8,
-            whiteSpace: "nowrap",
+            whiteSpace: "normal",
+            textAlign: "left",
+            boxShadow: "var(--shadow-md)",
             zIndex: 100,
             pointerEvents: "none",
             animation: "fade-in 0.15s ease",

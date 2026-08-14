@@ -5,7 +5,7 @@
  */
 import { useState, useEffect } from "react";
 import { useUpgradeStore } from "../stores/upgrade";
-import type { PlanLimitDetail } from "./api";
+import { api, normalizePlanLimitDetail, type PlanLimitDetail } from "./api";
 import { t } from "./i18n";
 
 /* ── Types ── */
@@ -116,9 +116,49 @@ export interface HITLRequest {
   content?: unknown;
   args_preview?: unknown;
   operation?: unknown;
+  review?: unknown;
+  review_title?: string;
+  workflow?: {
+    id?: string;
+    name?: string;
+    run_id?: string;
+    url?: string;
+  };
+  node?: { id?: string; name?: string; type?: string };
+  workflow_run_id?: string;
+  workflow_step_id?: string;
   options?: string[];
   resolved?: boolean;
   resolution?: string;
+}
+
+export interface ChatMessageRef {
+  type: string;
+  id: string;
+  title?: string;
+  name?: string;
+  [key: string]: unknown;
+}
+
+export interface ChatMessagePendingAction {
+  kind: string;
+  [key: string]: unknown;
+}
+
+export interface WorkflowResultReference {
+  workflow_id: string;
+  workflow_name: string;
+  run_id: string;
+  url?: string;
+  status?: string;
+  kind?: string;
+  title?: string | null;
+  summary?: string | null;
+  publication_summary?: {
+    count?: number;
+    verified?: number;
+    platforms?: string[];
+  } | null;
 }
 
 export interface ChatMessage {
@@ -130,6 +170,7 @@ export interface ChatMessage {
   assistant_blocks?: AssistantBlock[];
   sub_agent_events?: SubAgentEvent[];
   hitl_requests?: HITLRequest[];
+  workflow_result?: WorkflowResultReference;
   timestamp?: string;
   attachments?: {
     name: string;
@@ -138,8 +179,16 @@ export interface ChatMessage {
     fileType?: string;
     mimeType?: string;
     previewUrl?: string;
+    openUrl?: string;
+    fsPath?: string;
   }[];
-  mentions?: { id: string; type: "agent" | "user"; name: string; subtitle?: string }[];
+  mentions?: {
+    id: string;
+    type: "agent" | "user";
+    name: string;
+    subtitle?: string;
+    avatarUrl?: string | null;
+  }[];
   manualSkills?: { id: string; name: string; slug?: string }[];
   chatMode?: string;
   chatModePayload?: Record<string, unknown> | string;
@@ -156,6 +205,136 @@ export interface ChatMessage {
   stream_error?: boolean;
   stop_reason?: string;
   limit_detail?: PlanLimitDetail;
+  message_kind?: string | null;
+  refs?: ChatMessageRef[] | null;
+  meta?: Record<string, unknown> | null;
+  pending_action?: ChatMessagePendingAction | null;
+  resolved_at?: string | null;
+  resolution?: Record<string, unknown> | null;
+  updated_at?: string | null;
+}
+
+export function hasActivePersistedChatStream(messages: ChatMessage[]): boolean {
+  const latestAssistant = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant");
+  const status = latestAssistant?.meta?.stream_status;
+  return status === "running" || status === "streaming";
+}
+
+/**
+ * A chat run can outlive the browser's SSE connection. Keep visual running
+ * state separate from transport state so navigation or a reconnect does not
+ * make an active backend turn look complete.
+ */
+export function isChatRunActive(
+  messages: ChatMessage[],
+  transportStreaming: boolean,
+): boolean {
+  return transportStreaming || hasActivePersistedChatStream(messages);
+}
+
+/**
+ * In-progress reply pushed over the WebSocket for a turn this tab is not
+ * streaming (`chat_stream_snapshot`, published by chat_service).
+ *
+ * A personal conversation streams over the SSE body of the POST that started
+ * it, so a reloaded page has no connection to a turn that is still running.
+ * These carry the reply itself rather than a "go refetch" ping.
+ */
+export interface ChatStreamSnapshot {
+  conversation_id?: string;
+  message_id?: string;
+  seq?: number;
+  status?: string;
+  content?: string;
+  tool_calls?: unknown;
+  assistant_blocks?: unknown;
+}
+
+export function isTerminalStreamSnapshot(snapshot: ChatStreamSnapshot): boolean {
+  return snapshot.status !== "streaming";
+}
+
+/**
+ * Which row of a transcript a snapshot is describing, or -1 for none of them.
+ *
+ * The persisted id is the only trustworthy answer. "The last assistant row" is
+ * not: a turn started from another tab has an id this transcript has never
+ * seen, and treating it as the tail row overwrites the previous turn's finished
+ * answer — dragging that answer's attachments and approval card onto a reply
+ * that is still being written.
+ */
+function streamSnapshotTargetIndex(
+  messages: ChatMessage[],
+  snapshot: ChatStreamSnapshot,
+): number {
+  if (snapshot.message_id) {
+    const byId = messages.findIndex((message) => message.id === snapshot.message_id);
+    if (byId >= 0) return byId;
+  }
+  // No id match. Only a trailing assistant row that carries no id of its own can
+  // still be this turn — an optimistic placeholder, never a persisted reply.
+  const tailIndex = messages.length - 1;
+  const tail = messages[tailIndex];
+  return tail && tail.role === "assistant" && !tail.id ? tailIndex : -1;
+}
+
+/**
+ * Whether this snapshot describes a turn the transcript does not contain.
+ *
+ * True when a turn was started somewhere else: the reader is missing that
+ * turn's user message, so the transcript needs a reload rather than a merge.
+ */
+export function streamSnapshotNeedsHistory(
+  messages: ChatMessage[],
+  snapshot: ChatStreamSnapshot,
+): boolean {
+  return streamSnapshotTargetIndex(messages, snapshot) < 0;
+}
+
+/**
+ * Fold a snapshot into a transcript loaded from the API.
+ *
+ * The in-progress assistant row is normally already in that transcript — the
+ * history endpoint only hides a running placeholder once a newer finished reply
+ * exists — so this replaces in place. It appends only for a turn the transcript
+ * has never seen, where the alternative is destroying a finished reply.
+ *
+ * A snapshot is a projection of the live turn, not of the stored row: it has no
+ * attachments, hitl_requests, pending_action or message_kind. Those only settle
+ * when the turn ends, which is why callers refetch on a terminal snapshot
+ * instead of trusting it — see `isTerminalStreamSnapshot`.
+ */
+export function mergeChatStreamSnapshot(
+  messages: ChatMessage[],
+  snapshot: ChatStreamSnapshot,
+): ChatMessage[] {
+  const content = typeof snapshot.content === "string" ? snapshot.content : "";
+  const toolCalls = parseToolCalls(snapshot.tool_calls);
+  const blocks = Array.isArray(snapshot.assistant_blocks)
+    ? (snapshot.assistant_blocks as AssistantBlock[])
+    : undefined;
+
+  const targetIndex = streamSnapshotTargetIndex(messages, snapshot);
+  const previous = targetIndex >= 0 ? messages[targetIndex] : undefined;
+  const merged: ChatMessage = {
+    ...(previous || { role: "assistant" as const, content: "" }),
+    role: "assistant",
+    id: snapshot.message_id || previous?.id,
+    content,
+    tool_calls: toolCalls || previous?.tool_calls,
+    assistant_blocks: blocks || previous?.assistant_blocks,
+    meta: {
+      ...(previous?.meta || {}),
+      stream_status: isTerminalStreamSnapshot(snapshot) ? undefined : "streaming",
+    },
+  };
+
+  if (targetIndex < 0) return [...messages, merged];
+  const updated = [...messages];
+  updated[targetIndex] = merged;
+  return updated;
 }
 
 export function mergeSubAgentEvents(
@@ -229,9 +408,42 @@ export interface StreamProcessResult {
 }
 
 const INTERNAL_FILE_PERMISSION_RE = /^\[File permission(?:\s+[^\]]*)?\]$/i;
+const APPROVAL_RESOLUTION_RECEIPT_RE =
+  /^[✓✗]\s*(?:Approved|Rejected|Cancelled|Resolved)(?:\s+—[\s\S]*)?$/i;
 
 export function isInternalFilePermissionMessage(content: unknown): boolean {
   return typeof content === "string" && INTERNAL_FILE_PERMISSION_RE.test(content.trim());
+}
+
+/**
+ * Historical personal-Chat approvals may contain both a resolved HITL card
+ * and the Workspace Chat service's linked system receipt. The card is the
+ * durable audit surface; rendering the receipt as another assistant bubble
+ * repeats the same status without adding information.
+ */
+export function isRedundantApprovalResolutionReceipt(message: {
+  role?: unknown;
+  content?: unknown;
+  message_kind?: unknown;
+  refs?: unknown;
+}): boolean {
+  if (message.role !== "system" || message.message_kind !== "system") return false;
+  if (
+    typeof message.content !== "string" ||
+    !APPROVAL_RESOLUTION_RECEIPT_RE.test(message.content.trim())
+  ) {
+    return false;
+  }
+  return (
+    Array.isArray(message.refs) &&
+    message.refs.some(
+      (ref) =>
+        ref != null &&
+        typeof ref === "object" &&
+        (ref as Record<string, unknown>).type === "message" &&
+        Boolean((ref as Record<string, unknown>).id),
+    )
+  );
 }
 
 export function pendingHITLIds(messages: ChatMessage[]): string[] {
@@ -243,6 +455,61 @@ export function pendingHITLIds(messages: ChatMessage[]): string[] {
   );
 }
 
+export function mergeResolvedWorkflowMessage(
+  messages: ChatMessage[],
+  messageId: string,
+  resolvedValue: unknown,
+): ChatMessage[] {
+  const resolved = resolvedValue && typeof resolvedValue === "object"
+    ? resolvedValue as Partial<ChatMessage>
+    : {};
+  return messages.map((message) => (
+    message.id === messageId
+      ? {
+          ...message,
+          message_kind: resolved.message_kind ?? message.message_kind,
+          refs: resolved.refs ?? message.refs,
+          meta: resolved.meta ?? message.meta,
+          pending_action: Object.prototype.hasOwnProperty.call(
+            resolved,
+            "pending_action",
+          )
+            ? resolved.pending_action
+            : message.pending_action,
+          resolved_at: resolved.resolved_at || new Date().toISOString(),
+          resolution: resolved.resolution ?? message.resolution,
+          updated_at: resolved.updated_at ?? message.updated_at,
+        }
+      : message
+  ));
+}
+
+export async function resolveGlobalWorkflowMessageAction(
+  messageId: string,
+  choice: string,
+  note?: string,
+  payload?: Record<string, unknown>,
+  files?: File[],
+) {
+  const uploadedAttachments = files?.length
+    ? await Promise.all(files.map(async (file) => {
+        const document = await api.documents.upload(file);
+        if (!document?.id) throw new Error(`Failed to upload ${file.name}`);
+        return { name: file.name, id: document.id, type: "knowledge" };
+      }))
+    : [];
+  const existingAttachments = Array.isArray(payload?.attachments)
+    ? payload.attachments
+    : [];
+  const resolvedPayload = uploadedAttachments.length > 0
+    ? {
+        ...(payload || {}),
+        attachments: [...existingAttachments, ...uploadedAttachments],
+      }
+    : payload;
+  return api.chat.resolveAction(messageId, choice, note, resolvedPayload);
+}
+
 export function hitlActionTranscriptText(action: string): string {
   const normalized = String(action || "").trim().toLowerCase();
   if (normalized === "approve" || normalized === "always_approve") {
@@ -250,6 +517,12 @@ export function hitlActionTranscriptText(action: string): string {
   }
   if (normalized === "reject") {
     return "Rejected the requested action.";
+  }
+  if (normalized === "revise") {
+    return "Requested revisions to the Workflow output.";
+  }
+  if (normalized === "cancel") {
+    return "Cancelled the Workflow action.";
   }
   return "Responded to the approval request.";
 }
@@ -277,6 +550,12 @@ function normalizeMessageAttachments(value: unknown): ChatMessage["attachments"]
       fileType: item.fileType == null ? undefined : String(item.fileType),
       mimeType: item.mimeType == null ? undefined : String(item.mimeType),
       previewUrl: item.previewUrl == null ? undefined : String(item.previewUrl),
+      openUrl: item.openUrl == null
+        ? (item.open_url == null ? undefined : String(item.open_url))
+        : String(item.openUrl),
+      fsPath: item.fsPath == null
+        ? (item.fs_path == null ? undefined : String(item.fs_path))
+        : String(item.fsPath),
     }))
     .filter((item) => item.name);
   return attachments.length ? attachments : undefined;
@@ -316,6 +595,31 @@ export function inferToolStatus(result: unknown): ToolCall["status"] {
   return "success";
 }
 
+export function settlePendingAssistantToolCalls(
+  messages: ChatMessage[],
+  status: ToolCall["status"],
+): ChatMessage[] {
+  const updated = [...messages];
+  const last = updated[updated.length - 1];
+  if (!last || last.role !== "assistant" || !last.tool_calls?.length) {
+    return messages;
+  }
+  let changed = false;
+  const tool_calls = last.tool_calls.map((tool) => {
+    const toolStatus = tool.status || (tool.result ? "success" : "pending");
+    if (toolStatus !== "pending") return tool;
+    changed = true;
+    return {
+      ...tool,
+      status,
+      activeChild: undefined,
+    };
+  });
+  if (!changed) return messages;
+  updated[updated.length - 1] = { ...last, tool_calls };
+  return updated;
+}
+
 export function markAssistantProcessBlocksSummarizing(blocks: AssistantBlock[] | undefined): AssistantBlock[] | undefined {
   if (!Array.isArray(blocks) || blocks.length === 0) return blocks;
   let changed = false;
@@ -344,27 +648,50 @@ export function markAssistantProcessBlocksSummarizing(blocks: AssistantBlock[] |
   return changed ? next : blocks;
 }
 
+export function markAssistantProcessBlocksStopped(blocks: AssistantBlock[] | undefined): AssistantBlock[] | undefined {
+  if (!Array.isArray(blocks) || blocks.length === 0) return blocks;
+  let changed = false;
+  const next = blocks.map((block) => {
+    if (block.type !== "process") return block;
+    const steps = (block.steps || []).map((step) => {
+      const status = step.status === "running" || step.status === "pending" ? "error" : step.status;
+      if (status !== step.status) changed = true;
+      return status === step.status ? step : { ...step, status };
+    });
+    if (
+      block.status === "error" &&
+      block.default_collapsed === true &&
+      steps === block.steps
+    ) {
+      return block;
+    }
+    changed = true;
+    return {
+      ...block,
+      status: "error",
+      default_collapsed: true,
+      steps,
+    };
+  });
+  return changed ? next : blocks;
+}
+
+export function settlePendingAssistantProcess(messages: ChatMessage[]): ChatMessage[] {
+  const withSettledTools = settlePendingAssistantToolCalls(messages, "error");
+  const updated = [...withSettledTools];
+  const last = updated[updated.length - 1];
+  if (!last || last.role !== "assistant" || !last.assistant_blocks?.length) {
+    return withSettledTools;
+  }
+  const assistant_blocks = markAssistantProcessBlocksStopped(last.assistant_blocks);
+  if (assistant_blocks === last.assistant_blocks) return withSettledTools;
+  updated[updated.length - 1] = { ...last, assistant_blocks };
+  return updated;
+}
+
 export function formatPersistedStreamErrorMessage(message: unknown): string {
   const detail = normalizeToolResult(message)?.trim() || t("lib.chat_stream.unknown_error");
   return t("lib.chat_stream.request_failed_with_detail").replace("{detail}", detail);
-}
-
-function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitDetail {
-  if (detail && typeof detail === "object") {
-    const d = detail as Record<string, unknown>;
-    return {
-      message: String(d.message || fallback),
-      limit: typeof d.limit === "number" ? d.limit : null,
-      current: typeof d.current === "number" ? d.current : null,
-      plan: String(d.plan || "current"),
-    };
-  }
-  return {
-    message: typeof detail === "string" && detail ? detail : fallback,
-    limit: null,
-    current: null,
-    plan: "current",
-  };
 }
 
 function formatCreditLimitMessage(detail: PlanLimitDetail): string {
@@ -955,7 +1282,18 @@ export async function processSSEStream(
               return updated;
             });
           }
-          continue;
+          // stream_end is the protocol terminal event. Some deployments keep
+          // the HTTP response open briefly after it, so waiting for EOF leaves
+          // the composer disabled despite a completed assistant turn.
+          flushPendingToolStarts();
+          setMessages((prev) => settlePendingAssistantToolCalls(
+            prev,
+            stopReason ? "error" : "success",
+          ));
+          markSummaryStarted();
+          void reader.cancel();
+          await waitForTypewriterIdle();
+          return result;
         }
 
         const token = normalizeToolResult(parsed.text_delta ?? parsed.token ?? parsed.content) || "";

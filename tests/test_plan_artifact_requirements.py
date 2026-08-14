@@ -108,6 +108,59 @@ def test_explicit_file_deliverable_still_requires_artifact_with_plain_text_summa
     assert "saved file link or path" in issue
 
 
+def test_mp4_deliverable_rejects_script_packet_artifact() -> None:
+    task = _task(
+        "Create and verify today's stickman MP4",
+        description="Produce the final video and return daily-stickman-video.mp4.",
+        details={"requires_artifact": True, "artifact_type": "video"},
+    )
+    steps = [
+        _step(
+            {
+                "status": "succeeded",
+                "outputs": {
+                    "files": [
+                        {
+                            "name": "stickman-script-packet.md",
+                            "path": "workspace/artifacts/stickman-script-packet.md",
+                        }
+                    ]
+                },
+            }
+        )
+    ]
+
+    issue = executor._missing_artifact_issue(task, steps)
+
+    assert issue is not None
+    assert ".mp4" in issue
+
+
+def test_mp4_deliverable_accepts_mp4_artifact() -> None:
+    task = _task(
+        "Create and verify today's stickman MP4",
+        description="Produce the final video and return daily-stickman-video.mp4.",
+        details={"requires_artifact": True, "artifact_type": "video"},
+    )
+    steps = [
+        _step(
+            {
+                "status": "succeeded",
+                "outputs": {
+                    "files": [
+                        {
+                            "name": "daily-stickman-video.mp4",
+                            "path": "workspace/artifacts/daily-stickman-video.mp4",
+                        }
+                    ]
+                },
+            }
+        )
+    ]
+
+    assert executor._missing_artifact_issue(task, steps) is None
+
+
 def test_office_file_deliverable_still_requires_artifact() -> None:
     task = _task(
         "Create investor slides",
@@ -174,8 +227,77 @@ def test_artifact_refs_detect_common_aliases() -> None:
     )
 
     sources = {ref.get("source") for ref in refs}
-    assert {"artifact_url", "download_url", "file_path"} <= sources
+    assert {"artifact_url", "file_path"} <= sources
+    assert "download_url" not in sources
     assert any(ref.get("fs_path") == "Workspaces/Demo/reports/final.pdf" for ref in refs)
+
+
+def test_artifact_refs_detect_canonical_envelope_output_files() -> None:
+    refs = executor._artifact_refs_from_result(
+        {
+            "status": "succeeded",
+            "summary": "Rendered and verified the final MP4.",
+            "outputs": {
+                "files": [
+                    {
+                        "name": "daily-stickman.mp4",
+                        "path": "Faceless Stickman Studio/final/daily-stickman.mp4",
+                    }
+                ]
+            },
+        },
+        step_key="create_verified_video",
+    )
+
+    assert refs == [
+        {
+            "type": "file",
+            "step": "create_verified_video",
+            "source": "path",
+            "fs_path": "Faceless Stickman Studio/final/daily-stickman.mp4",
+            "open_url": "Faceless Stickman Studio/final/daily-stickman.mp4",
+        }
+    ]
+
+
+def test_artifact_refs_detect_envelope_outputs_data_payload() -> None:
+    refs = executor._artifact_refs_from_result(
+        {
+            "status": "partial",
+            "summary": "Rendered and verified the final video.",
+            "outputs": {
+                "data": {
+                    "mp4_fs_path": "Workspaces/Demo/final/daily-stickman-video.mp4",
+                    "verification_status": "verified",
+                    "duration_seconds": 44.29,
+                },
+            },
+        },
+        step_key="produce_video",
+    )
+
+    assert any(ref.get("fs_path", "").endswith("daily-stickman-video.mp4") for ref in refs)
+
+
+def test_verified_artifact_allows_partial_envelope_to_continue() -> None:
+    task = _task(
+        "Produce and upload a verified MP4",
+        description="Create the final video file for upload.",
+    )
+    result = {
+        "status": "partial",
+        "summary": "Checksum was unavailable, but the MP4 was verified.",
+        "outputs": {
+            "data": {
+                "mp4_fs_path": "Workspaces/Demo/final/daily-stickman-video.mp4",
+                "verification_status": "verified",
+                "duration_seconds": 44.29,
+            },
+        },
+    }
+
+    assert executor._structured_result_blocker(result, artifact_required=True) is None
+    assert executor._missing_artifact_issue(task, [_step(result)]) is None
 
 
 def test_task_artifact_refs_dedupe_same_file_across_sources() -> None:
@@ -201,7 +323,41 @@ def test_task_artifact_refs_dedupe_same_file_across_sources() -> None:
         },
     ]
 
-    assert executor._dedupe_task_artifact_refs(refs) == [refs[0]]
+    assert executor._dedupe_task_artifact_refs(refs) == [
+        {
+            **refs[0],
+            "name": "draft-pack.md",
+            "open_url": "workspace/social/draft-pack.md",
+        }
+    ]
+
+
+def test_task_artifact_refs_merge_document_and_filesystem_aliases() -> None:
+    refs = [
+        {
+            "type": "file",
+            "fs_path": "Workspaces/Launch/report.md",
+        },
+        {
+            "type": "document",
+            "document_id": "doc_report",
+            "url": "/api/v1/fs/entity/Workspaces/Launch/report.md",
+            "name": "report.md",
+        },
+    ]
+
+    assert executor._dedupe_task_artifact_refs(refs, entity_id="entity") == [
+        {
+            "type": "file",
+            "fs_path": "Workspaces/Launch/report.md",
+            "open_url": "/viewer/doc_report",
+            "document_id": "doc_report",
+            "url": "/api/v1/fs/entity/Workspaces/Launch/report.md",
+            "name": "report.md",
+            "viewer_url": "/viewer/doc_report",
+            "markdown_link": "[report.md](/viewer/doc_report)",
+        }
+    ]
 
 
 def test_artifact_refs_ignore_reference_documents() -> None:
@@ -381,6 +537,7 @@ def test_succeeded_step_context_surfaces_generated_files() -> None:
             "source": "fs_path",
             "name": "script.md",
             "fs_path": "workspace/artifacts/script.md",
+            "open_url": "workspace/artifacts/script.md",
         }
     ]
 

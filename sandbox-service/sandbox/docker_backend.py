@@ -21,6 +21,8 @@ import subprocess
 import time
 from typing import Optional
 
+from config import config as app_config
+
 from .models import ContainerConfig, ExecResponse, SandboxStatus, SkillManifest
 
 logger = logging.getLogger(__name__)
@@ -92,7 +94,7 @@ def _config_hash(cfg: ContainerConfig, skill_dir: str) -> str:
     """Deterministic hash of container config + skill directory for staleness check."""
     payload = (
         f"{cfg.image}|{cfg.network}|{cfg.memory}|{cfg.cpus}|{cfg.pids_limit}"
-        f"|{cfg.read_only_root}|{cfg.workdir}|{skill_dir}"
+        f"|{cfg.read_only_root}|{cfg.workdir}|{cfg.workdir_tmpfs_size}|{skill_dir}"
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
@@ -126,7 +128,18 @@ class DockerSandbox:
     def expires_at(self) -> float | None:
         if self.status in (SandboxStatus.DESTROYED, SandboxStatus.DESTROYING):
             return None
-        return self.last_used_at + self.config.exec_timeout if self.last_used_at else None
+        return (
+            self.last_used_at + app_config.IDLE_TIMEOUT_SECONDS
+            if self.last_used_at
+            else None
+        )
+
+    def touch(self) -> None:
+        """Refresh the idle lease without executing untrusted project code."""
+
+        if self.status in (SandboxStatus.DESTROYED, SandboxStatus.DESTROYING):
+            raise RuntimeError(f"Sandbox is not running (status={self.status.value})")
+        self.last_used_at = time.time()
 
     def is_active(self) -> bool:
         return self.status in (SandboxStatus.CREATING, SandboxStatus.INSTALLING, SandboxStatus.EXECUTING, SandboxStatus.DESTROYING)
@@ -299,7 +312,12 @@ class DockerSandbox:
             args.extend(["--tmpfs", t])
         # Skill workdir as tmpfs so writes work with read-only root.
         # mode=1777 ensures any user (including non-root sandbox user) can write.
-        args.extend(["--tmpfs", f"{cfg.workdir}:exec,size=256m,mode=1777"])
+        args.extend(
+            [
+                "--tmpfs",
+                f"{cfg.workdir}:exec,size={cfg.workdir_tmpfs_size},mode=1777",
+            ]
+        )
         # pip cache needs /root writable (root user installs).
         args.extend(["--tmpfs", "/root:exec,size=128m"])
         # npm / sandbox user home: npm cache, .npm config, node_modules etc.
@@ -335,25 +353,34 @@ class DockerSandbox:
         args.extend([cfg.image, "sleep", "infinity"])
         return args
 
-    async def _inject_files(self, skill: SkillManifest) -> None:
+    async def _inject_files(
+        self,
+        skill: SkillManifest,
+        *,
+        clear_existing: bool = True,
+    ) -> None:
         """
         Copy skill directory contents into the container.
 
-        Clears the existing workdir first so sandbox reuse does not leak old skill files.
+        Clear the existing workdir when a different skill is loaded so sandbox
+        reuse does not leak files across skills.  A same-skill reload overlays
+        the packaged files instead, preserving session-owned directories such
+        as ``/skill/projects`` so a later chat turn can continue the project.
         """
 
         def _tar_inject() -> None:
             import os
             entries = os.listdir(skill.skill_dir)
-            _run_docker(
-                [
-                    "docker", "exec",
-                    self.container_name,
-                    "sh", "-c",
-                    f"find {shlex.quote(self.config.workdir)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +",
-                ],
-                allow_failure=True,
-            )
+            if clear_existing:
+                _run_docker(
+                    [
+                        "docker", "exec",
+                        self.container_name,
+                        "sh", "-c",
+                        f"find {shlex.quote(self.config.workdir)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +",
+                    ],
+                    allow_failure=True,
+                )
             if not entries:
                 return
             tar_create = subprocess.Popen(
@@ -442,8 +469,12 @@ class DockerSandbox:
                 new_skill = SkillScanner().scan(tmp_dir)
                 new_skill = new_skill.model_copy(update={"name": skill_name, "skill_dir": tmp_dir})
 
+                same_skill = self.skill is not None and self.skill.name == skill_name
                 self.status = SandboxStatus.RUNNING
-                await self._inject_files(new_skill)
+                await self._inject_files(
+                    new_skill,
+                    clear_existing=not same_skill,
+                )
 
                 if auto_install and (new_skill.requirements_txt or new_skill.package_json):
                     self.status = SandboxStatus.INSTALLING

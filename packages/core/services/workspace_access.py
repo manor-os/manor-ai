@@ -126,13 +126,19 @@ async def user_can_control_workspace_run(
     entity_role: str | None = None,
 ) -> bool:
     """Return whether a user may mutate an existing Workflow Run."""
-    if user_id and str(getattr(run, "started_by", "") or "") == str(user_id):
-        return True
     if is_entity_admin_role(entity_role):
         return True
     workspace_id = str(getattr(run, "workspace_id", "") or "")
     if not workspace_id:
         return False
+    if user_id and str(getattr(run, "started_by", "") or "") == str(user_id):
+        return await user_can_read_workspace_id(
+            db,
+            workspace_id=workspace_id,
+            entity_id=str(getattr(run, "entity_id", "") or ""),
+            user_id=user_id,
+            role=entity_role,
+        )
     return await user_can_write_workspace_artifacts(
         db,
         workspace_id=workspace_id,

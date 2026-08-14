@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 
@@ -31,6 +32,7 @@ from .models import (
     FileWriteResponse,
     LoadSkillResponse,
     SandboxInfo,
+    SandboxStatus,
     SkillContextResponse,
     SkillManifest,
     SkillRunResponse,
@@ -117,16 +119,15 @@ class SkillRunner:
             await self._prune_idle()
             if len(self._sandboxes) >= app_config.MAX_SANDBOXES:
                 raise RuntimeError(
-                    f"Max sandbox limit reached ({app_config.MAX_SANDBOXES}). "
-                    "Destroy idle sandboxes first."
+                    f"Max sandbox limit reached ({app_config.MAX_SANDBOXES}). Destroy idle sandboxes first."
                 )
 
         # Sanitize env vars
         safe_env, blocked = sanitize_env_vars(env, allowed_sensitive_keys)
 
-        # Resolve config. Overrides are partial by design: the API caller can
-        # add bind mounts without replacing service-owned defaults such as
-        # image, memory, workdir, or timeouts.
+        # Resolve config. Overrides are partial by design so trusted Manor
+        # adapters can request bounded resource profiles or bind mounts while
+        # inheriting every unspecified service-owned default.
         cfg = self._resolve_config(config_overrides)
 
         # Create sandbox
@@ -184,12 +185,36 @@ class SkillRunner:
                 full_path.parent.mkdir(parents=True, exist_ok=True)
                 full_path.write_text(content, encoding="utf-8")
 
-            return await self.create_sandbox(
-                skill_dir=tmp_dir,
-                env=env,
-                allowed_sensitive_keys=allowed_sensitive_keys,
-                config_overrides=config_overrides,
-                auto_install=auto_install,
+            # ``create_sandbox`` scans the temporary directory and would use
+            # that random directory name (for example ``sbx-pptx-abcd``) as
+            # the skill identity.  Preserve the caller-provided identity so a
+            # later ``load-skill`` call can correctly recognize a same-skill
+            # continuation and avoid clearing session-owned project files.
+            skill = self._scanner.scan(tmp_dir).model_copy(
+                update={"name": skill_name, "skill_dir": tmp_dir},
+            )
+
+            safe_env, blocked = sanitize_env_vars(env, allowed_sensitive_keys)
+            cfg = self._resolve_config(config_overrides)
+            sandbox_id = str(uuid.uuid4())[:12]
+            sandbox = DockerSandbox(sandbox_id, cfg)
+
+            try:
+                await sandbox.setup(skill, safe_env, auto_install=auto_install)
+            except Exception:
+                await sandbox.destroy()
+                raise
+
+            self._sandboxes[sandbox_id] = sandbox
+            self._fs_bridges[sandbox_id] = FsBridge(sandbox)
+
+            return CreateSandboxResponse(
+                sandbox_id=sandbox_id,
+                container_name=sandbox.container_name,
+                status=sandbox.status,
+                skill=skill,
+                workdir=cfg.workdir,
+                env_blocked=blocked,
             )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -332,12 +357,14 @@ class SkillRunner:
 
         for cmd in commands:
             result = await self.exec_command(sandbox_id, cmd)
-            steps.append(SkillRunStepResult(
-                command=cmd,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.exit_code,
-            ))
+            steps.append(
+                SkillRunStepResult(
+                    command=cmd,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    exit_code=result.exit_code,
+                )
+            )
             if result.exit_code != 0:
                 all_ok = False
                 break
@@ -389,18 +416,20 @@ class SkillRunner:
         """List all active sandboxes."""
         result: list[SandboxInfo] = []
         for sid, sbx in self._sandboxes.items():
-            result.append(SandboxInfo(
-                sandbox_id=sid,
-                container_name=sbx.container_name,
-                status=sbx.status,
-                skill_name=sbx.skill.name if sbx.skill else "unknown",
-                workdir=sbx.config.workdir,
-                created_at=sbx.created_at,
-                last_used_at=sbx.last_used_at,
-                config=sbx.config,
-                active_command=sbx.active_command,
-                expires_at=sbx.expires_at,
-            ))
+            result.append(
+                SandboxInfo(
+                    sandbox_id=sid,
+                    container_name=sbx.container_name,
+                    status=sbx.status,
+                    skill_name=sbx.skill.name if sbx.skill else "unknown",
+                    workdir=sbx.config.workdir,
+                    created_at=sbx.created_at,
+                    last_used_at=sbx.last_used_at,
+                    config=sbx.config,
+                    active_command=sbx.active_command,
+                    expires_at=sbx.expires_at,
+                )
+            )
         return result
 
     def get_sandbox_status(self, sandbox_id: str) -> SandboxInfo:
@@ -417,6 +446,13 @@ class SkillRunner:
             active_command=sbx.active_command,
             expires_at=sbx.expires_at,
         )
+
+    def touch_sandbox(self, sandbox_id: str) -> SandboxInfo:
+        """Refresh a session lease and return its current status."""
+
+        sandbox = self._get_sandbox(sandbox_id)
+        sandbox.touch()
+        return self.get_sandbox_status(sandbox_id)
 
     # ── internal helpers ──
 
@@ -447,20 +483,18 @@ class SkillRunner:
 
     @staticmethod
     def _validate_config(cfg: ContainerConfig) -> None:
+        if not re.fullmatch(r"[1-9][0-9]*[kKmMgG]", cfg.workdir_tmpfs_size):
+            raise SecurityError("workdir_tmpfs_size must be a positive Docker size such as 256m or 2g.")
         for volume in cfg.volumes or []:
             parts = volume.split(":")
             if len(parts) not in (2, 3):
-                raise SecurityError(
-                    "Volume mounts must use 'host_path:container_path[:mode]' syntax."
-                )
+                raise SecurityError("Volume mounts must use 'host_path:container_path[:mode]' syntax.")
             host_path, container_path = parts[0], parts[1]
             mode = parts[2] if len(parts) == 3 else ""
             validate_host_path(host_path)
             validate_container_path(container_path)
             if mode and mode not in {"ro", "rw"}:
-                raise SecurityError(
-                    f"Unsupported volume mode '{mode}'. Use 'ro' or 'rw'."
-                )
+                raise SecurityError(f"Unsupported volume mode '{mode}'. Use 'ro' or 'rw'.")
 
     def _default_config(self) -> ContainerConfig:
         return ContainerConfig(
@@ -497,12 +531,18 @@ class SkillRunner:
         return []
 
     async def _prune_idle(self) -> None:
-        """Remove sandboxes that have been idle beyond the threshold."""
+        """Remove ready sandboxes that have been idle beyond the threshold.
+
+        An executing/installing sandbox may run longer than the idle timeout.
+        Its command lifecycle refreshes ``last_used_at`` on completion, so the
+        pruner must never queue destruction merely because a long command has
+        been running for more than the configured idle window.
+        """
         now = time.time()
         to_remove: list[str] = []
         for sid, sbx in self._sandboxes.items():
             idle = now - sbx.last_used_at
-            if idle > app_config.IDLE_TIMEOUT_SECONDS:
+            if sbx.status == SandboxStatus.READY and idle > app_config.IDLE_TIMEOUT_SECONDS:
                 to_remove.append(sid)
         for sid in to_remove:
             logger.info("Pruning idle sandbox %s", sid)

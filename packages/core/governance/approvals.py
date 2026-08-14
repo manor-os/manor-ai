@@ -139,6 +139,9 @@ def dedup_key_for(subject: ApprovalSubject, origin: ApprovalOrigin) -> str:
             origin.context.get("pending_kind") or PendingActionKind.HUMAN_INPUT.value
         )
         return f"lease:{origin.lease_id}:{pending_kind}"
+    if origin.kind == ApprovalOriginKind.TASK and origin.task_id:
+        action = subject.action_key or subject.resource_kind or "action"
+        return f"task:{origin.task_id}:{action}"
     if origin.kind == ApprovalOriginKind.OPERATION:
         op_id = str(origin.context.get("draft_id") or origin.message_id or "")
         return f"op:{op_id}"
@@ -177,6 +180,8 @@ async def resolve_approval(
     reason: Optional[str] = None,
     intrinsic_rule: Optional[str] = None,
     intrinsic_reason: Optional[str] = None,
+    intrinsic_high_risk_approved: bool = False,
+    policy_hitl_preauthorized: bool = False,
     hitl_type: str = HitlType.AUTHORIZE.value,
     payload: Optional[dict] = None,
 ) -> ApprovalDecision:
@@ -186,6 +191,15 @@ async def resolve_approval(
     intrinsic (non-policy) trigger — e.g. the runtime guard's
     ``direct_chat_baseline``. Without them, step-plane ``step.*`` names are
     synthesized.
+
+    ``intrinsic_high_risk_approved`` suppresses only the synthetic step-level
+    high-risk prompt when an upstream governance action already approved this
+    exact operation. Policy HITL/deny decisions and explicit
+    ``requires_approval`` flags still apply.
+
+    ``policy_hitl_preauthorized`` satisfies an approval-only policy prompt for
+    the exact operation. Hard policy blocks and explicit step approval remain
+    authoritative.
 
     ``hitl_type``/``payload`` let a caller that knows something this function
     cannot — e.g. the dispatcher gate, which knows the step already failed and
@@ -225,10 +239,17 @@ async def resolve_approval(
         bool(decision.allowed and decision.matched_rule)
         and subject.resource_kind != "platform"
     )
+    policy_hitl_needs_human = bool(
+        decision.pause_for_hitl and not policy_hitl_preauthorized
+    )
     needs_human = bool(
-        decision.pause_for_hitl
+        policy_hitl_needs_human
         or subject.requires_approval
-        or (subject.risk_level == _HIGH and origin.kind == ApprovalOriginKind.STEP)
+        or (
+            subject.risk_level == _HIGH
+            and origin.kind == ApprovalOriginKind.STEP
+            and not intrinsic_high_risk_approved
+        )
     )
     if not needs_human:
         return ApprovalDecision("allow", decision.reason, decision.matched_rule)
@@ -240,7 +261,7 @@ async def resolve_approval(
     # report and the dispatcher tests key off ("step.*" ⇒ intrinsic step
     # approval, any other rule ⇒ a governance policy pause).
     subj = subject.action_key or subject.capability_id or subject.resource_kind or "action"
-    if decision.pause_for_hitl and decision.matched_rule:
+    if policy_hitl_needs_human and decision.matched_rule:
         hitl_rule, hitl_reason = decision.matched_rule, decision.reason
     elif intrinsic_rule:
         hitl_rule = intrinsic_rule

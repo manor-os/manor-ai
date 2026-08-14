@@ -50,6 +50,7 @@ class ArtifactResult(Shape):
             "properties": {
                 "files": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "required": ["name", "fs_path"],

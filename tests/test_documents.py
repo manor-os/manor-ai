@@ -109,6 +109,71 @@ async def test_browse_documents_returns_root_direct_folders_and_files(client: As
 
 
 @pytest.mark.asyncio
+async def test_indexing_status_poll_is_minimal_and_visibility_scoped(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import update
+
+    from packages.core.models.document import Document
+
+    owner_headers = await _auth(client, "docstatusowner")
+    owner_upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=owner_headers,
+        files={"file": ("owner.md", b"# Owner", "text/markdown")},
+    )
+    assert owner_upload.status_code == 201, owner_upload.text
+    owner_document_id = owner_upload.json()["id"]
+
+    other_headers = await _auth(client, "docstatusother")
+    other_upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=other_headers,
+        files={"file": ("other.md", b"# Other", "text/markdown")},
+    )
+    assert other_upload.status_code == 201, other_upload.text
+    other_document_id = other_upload.json()["id"]
+
+    await db_session.execute(
+        update(Document)
+        .where(Document.id == owner_document_id)
+        .values(
+            vector_status="processing",
+            metadata_={
+                "indexing": {
+                    "run_id": "status-run",
+                    "step": "embedding",
+                    "current_chunk": 7,
+                    "total_chunks": 20,
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/v1/documents/indexing-status",
+        params=[("ids", owner_document_id), ("ids", other_document_id)],
+        headers=owner_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {
+            "id": owner_document_id,
+            "vector_status": "processing",
+            "indexing_progress": {
+                "run_id": "status-run",
+                "step": "embedding",
+                "current_chunk": 7,
+                "total_chunks": 20,
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_browse_documents_returns_folder_direct_folders_and_files(client: AsyncClient):
     headers = await _auth(client, "docbrowsefolder")
     parent_resp = await client.post(
@@ -432,6 +497,7 @@ async def test_move_document_to_folder_moves_filesystem_payload(client: AsyncCli
 async def test_upload_rejects_when_cloud_filesystem_unavailable(client: AsyncClient, tmp_path):
     from packages.core.config import get_settings
 
+    headers = await _auth(client, "docfsdown")
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
     old_root = settings.MANOR_FS_ROOT
@@ -440,7 +506,6 @@ async def test_upload_rejects_when_cloud_filesystem_unavailable(client: AsyncCli
     settings.MANOR_FS_ROOT = str(tmp_path)
     settings.DEPLOYMENT_MODE = "cloud"
     try:
-        headers = await _auth(client, "docfsdown")
         resp = await client.post(
             "/api/v1/documents/upload",
             headers=headers,
@@ -459,7 +524,7 @@ async def test_upload_rejects_when_cloud_filesystem_unavailable(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_list_documents_keeps_missing_filesystem_payload_visible(db_session, tmp_path):
+async def test_list_documents_keeps_missing_filesystem_payload_visible_without_stat(db_session, tmp_path):
     from packages.core.config import get_settings
     from packages.core.models.document import Document
     from packages.core.services.document_access import list_visible_documents
@@ -503,7 +568,10 @@ async def test_list_documents_keeps_missing_filesystem_payload_visible(db_sessio
         stored = await db_session.get(Document, doc_id)
         assert stored is not None
         assert stored.is_trashed is False
-        assert stored.metadata_["file_integrity"]["status"] == "missing"
+        # A listing is a DB-only projection. The periodic integrity repair
+        # records missing files; browse/search must not stat or mutate every
+        # visible document on the request path.
+        assert "file_integrity" not in (stored.metadata_ or {})
         assert stored.vector_status == "ready"
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
@@ -649,6 +717,157 @@ async def test_failed_placeholder_without_payload_is_hidden_from_knowledge(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_aggregation_pass_skips_filesystem_stats(tmp_path, monkeypatch):
+    """stat_files=False must not touch the filesystem and must not hide
+    fs_path rows — folder counts and storage totals only need visibility,
+    and fs_path rows are always visible regardless of stat outcome."""
+    from packages.core.models.document import VectorStatus
+    from packages.core.services import document_access
+
+    class FakeDb:
+        async def flush(self):
+            raise AssertionError("aggregation pass should not mutate documents")
+
+    doc = SimpleNamespace(
+        id="doc_1",
+        entity_id="ent_1",
+        fs_path="docs/never-written.md",  # file does not exist
+        file_url=None,
+        metadata_={},
+        vector_status=VectorStatus.READY,
+        is_trashed=False,
+        trashed_at=None,
+    )
+    (tmp_path / "ent_1").mkdir()
+    monkeypatch.setattr(
+        "packages.core.config.get_settings",
+        lambda: SimpleNamespace(MANOR_FS_ENABLED=True, MANOR_FS_ROOT=str(tmp_path)),
+    )
+    stat_calls = {"count": 0}
+    real_isfile = document_access.os.path.isfile
+
+    def _counting_isfile(path):
+        stat_calls["count"] += 1
+        return real_isfile(path)
+
+    monkeypatch.setattr(document_access.os.path, "isfile", _counting_isfile)
+
+    visible = await document_access._filter_readable_local_documents(
+        FakeDb(), [doc], stat_files=False,
+    )
+
+    assert visible == [doc]
+    assert stat_calls["count"] == 0
+    assert "file_integrity" not in doc.metadata_
+
+
+@pytest.mark.asyncio
+async def test_local_stat_results_are_cached_across_listings(tmp_path, monkeypatch):
+    """A second listing within the TTL reuses the cached stat instead of
+    re-hitting the (network) filesystem."""
+    from packages.core.models.document import VectorStatus
+    from packages.core.services import document_access
+
+    class FakeDb:
+        async def flush(self):
+            return None
+
+    (tmp_path / "ent_1" / "docs").mkdir(parents=True)
+    (tmp_path / "ent_1" / "docs" / "report.md").write_text("hi")
+
+    def _make_doc():
+        return SimpleNamespace(
+            id="doc_1",
+            entity_id="ent_1",
+            fs_path="docs/report.md",
+            file_url=None,
+            metadata_={},
+            vector_status=VectorStatus.READY,
+            is_trashed=False,
+            trashed_at=None,
+        )
+
+    monkeypatch.setattr(
+        "packages.core.config.get_settings",
+        lambda: SimpleNamespace(MANOR_FS_ENABLED=True, MANOR_FS_ROOT=str(tmp_path)),
+    )
+    document_access._clear_local_stat_cache()
+    stat_calls = {"count": 0}
+    real_isfile = document_access.os.path.isfile
+
+    def _counting_isfile(path):
+        stat_calls["count"] += 1
+        return real_isfile(path)
+
+    monkeypatch.setattr(document_access.os.path, "isfile", _counting_isfile)
+
+    visible = await document_access._filter_readable_local_documents(FakeDb(), [_make_doc()])
+    assert len(visible) == 1
+    first_pass_calls = stat_calls["count"]
+    assert first_pass_calls >= 1
+
+    visible = await document_access._filter_readable_local_documents(FakeDb(), [_make_doc()])
+    assert len(visible) == 1
+    assert stat_calls["count"] == first_pass_calls  # served from cache
+
+    # After the cache is dropped a stale entry cannot mask a deleted file.
+    document_access._clear_local_stat_cache()
+    (tmp_path / "ent_1" / "docs" / "report.md").unlink()
+    doc = _make_doc()
+    visible = await document_access._filter_readable_local_documents(FakeDb(), [doc])
+    assert len(visible) == 1
+    assert doc.metadata_["file_integrity"]["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_visible_document_listing_never_stats_the_filesystem(monkeypatch):
+    """Knowledge browse/search must remain a DB-only read path.
+
+    File existence is checked by open/download operations and the periodic
+    integrity repair task, not once per visible row on every listing.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from packages.core.models.document import VectorStatus
+    from packages.core.services import document_access, document_service
+
+    document = SimpleNamespace(
+        id="doc_1",
+        entity_id="ent_1",
+        fs_path="docs/report.md",
+        file_url=None,
+        metadata_={},
+        vector_status=VectorStatus.READY,
+        is_trashed=False,
+        trashed_at=None,
+    )
+    monkeypatch.setattr(
+        document_service,
+        "list_documents",
+        AsyncMock(return_value=([document], 1)),
+    )
+    stat_local_documents = AsyncMock(
+        side_effect=AssertionError("Knowledge listing must not stat the filesystem")
+    )
+    monkeypatch.setattr(
+        document_access,
+        "_stat_local_documents",
+        stat_local_documents,
+    )
+
+    documents, total = await document_access.list_visible_documents(
+        SimpleNamespace(),
+        "ent_1",
+        user_id=None,
+    )
+
+    assert documents == [document]
+    assert total == 1
+    stat_local_documents.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_generating_placeholder_stays_visible_while_file_is_pending(tmp_path, monkeypatch):
     from packages.core.models.document import VectorStatus
     from packages.core.services import document_access
@@ -760,6 +979,36 @@ async def test_create_blank_pptx_document_downloads_real_powerpoint(client: Asyn
         assert download.content.startswith(b"PK")
         with zipfile.ZipFile(io.BytesIO(download.content)) as zf:
             assert "ppt/presentation.xml" in zf.namelist()
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
+async def test_downloading_legacy_ppt_never_rebuilds_or_overwrites_original(client: AsyncClient, tmp_path):
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    old_root = settings.MANOR_FS_ROOT
+    old_enabled = settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        headers = await _auth(client, "legacy_ppt_download_user")
+        legacy_bytes = bytes.fromhex("d0cf11e0a1b11ae1") + b"legacy-powerpoint-binary-payload"
+        upload = await client.post(
+            "/api/v1/documents/upload",
+            headers=headers,
+            files={"file": ("legacy-deck.ppt", legacy_bytes, "application/vnd.ms-powerpoint")},
+        )
+        assert upload.status_code == 201, upload.text
+
+        download = await client.get(
+            f"/api/v1/documents/{upload.json()['id']}/download",
+            headers=headers,
+        )
+        assert download.status_code == 200, download.text
+        assert download.content == legacy_bytes
     finally:
         settings.MANOR_FS_ROOT = old_root
         settings.MANOR_FS_ENABLED = old_enabled
@@ -880,6 +1129,91 @@ async def test_document_thumbnail_uses_file_type_when_name_has_no_extension(
 
 
 @pytest.mark.asyncio
+async def test_document_content_uses_authorized_redis_hot_cache(client: AsyncClient, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from apps.api.routers import documents as documents_router
+
+    headers = await _auth(client, "content_hot_cache_user")
+    upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("cached.md", b"filesystem content", "text/markdown")},
+    )
+    assert upload.status_code == 201, upload.text
+
+    cache_get = AsyncMock(return_value="redis content")
+    filesystem_get = AsyncMock(side_effect=AssertionError("Redis hit must bypass filesystem content read"))
+    monkeypatch.setattr(documents_router, "get_cached_document_text", cache_get)
+    monkeypatch.setattr(documents_router, "get_document_content", filesystem_get)
+
+    response = await client.get(
+        f"/api/v1/documents/{upload.json()['id']}/content",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"content": "redis content"}
+    assert response.headers["x-knowledge-cache"] == "redis-hit"
+    filesystem_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_document_thumbnail_uses_authorized_redis_hot_cache(client: AsyncClient, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from apps.api.routers import documents as documents_router
+    from packages.core.services.knowledge_hot_cache import CachedKnowledgeBlob
+
+    headers = await _auth(client, "thumbnail_hot_cache_user")
+    upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={
+            "file": (
+                "cached.png",
+                b"\x89PNG\r\n\x1a\noriginal image should not be read",
+                "image/png",
+            )
+        },
+    )
+    assert upload.status_code == 201, upload.text
+
+    cache_get = AsyncMock(
+        return_value=CachedKnowledgeBlob(data=b"redis jpeg", media_type="image/jpeg")
+    )
+    monkeypatch.setattr(documents_router, "get_cached_document_blob", cache_get)
+
+    response = await client.get(
+        f"/api/v1/documents/{upload.json()['id']}/thumbnail",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.content == b"redis jpeg"
+    assert response.headers["x-knowledge-cache"] == "redis-hit"
+
+
+@pytest.mark.asyncio
+async def test_generate_image_thumbnail_is_bounded_jpeg(tmp_path):
+    from PIL import Image
+
+    from apps.api.routers.documents import _generate_image_thumbnail
+
+    source = tmp_path / "source.png"
+    target = tmp_path / "thumbnail.jpg"
+    Image.new("RGBA", (1600, 900), (30, 80, 120, 128)).save(source)
+
+    await _generate_image_thumbnail(str(source), str(target))
+
+    assert target.is_file()
+    with Image.open(target) as thumbnail:
+        assert thumbnail.format == "JPEG"
+        assert thumbnail.width <= 640
+        assert thumbnail.height <= 640
+
+
+@pytest.mark.asyncio
 async def test_search_documents(client: AsyncClient):
     headers = await _auth(client)
     await client.post(
@@ -926,7 +1260,9 @@ async def test_document_groups(client: AsyncClient):
 
     # Upload a document
     upload = await client.post(
-        "/api/v1/documents/upload", headers=headers, files={"file": ("contract.pdf", b"pdf", "application/pdf")}
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("contract.pdf", b"%PDF-1.4\ncontract", "application/pdf")},
     )
     doc_id = upload.json()["id"]
 

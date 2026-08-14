@@ -119,6 +119,8 @@ async def transcribe_blob(
 
     api_key = ""
     base_url = ""
+    use_vercel_transcription = False
+    vercel_auth_method = "api-key"
     requested_base_url = str(user_base_url or "").strip().rstrip("/")
     if requested_base_url and not str(user_api_key or "").strip():
         raise WhisperError("A custom STT base URL requires a matching user API key.")
@@ -214,7 +216,11 @@ async def transcribe_blob(
 
     # Default model if still empty
     if not model:
-        model = "openai/gpt-4o-audio-preview" if use_chat_api else "whisper-1"
+        model = (
+            "openai/whisper-1"
+            if use_vercel_transcription
+            else ("openai/gpt-4o-audio-preview" if use_chat_api else "whisper-1")
+        )
         reported_model = model
 
     if not api_key:
@@ -228,6 +234,56 @@ async def transcribe_blob(
             "Measured subtitle alignment requires a timestamp-capable STT model; "
             "the selected chat-audio route needs the canonical transcript to return "
             "reference-aligned segment timestamps."
+        )
+
+    if use_vercel_transcription:
+        from packages.core.services.vercel_ai_gateway import vercel_gateway_post
+
+        try:
+            payload = await vercel_gateway_post(
+                api_key=api_key,
+                base_url=base_url,
+                model=reported_model or model,
+                protocol="transcription",
+                payload={
+                    "audio": base64.b64encode(blob).decode("ascii"),
+                    "mediaType": mime or "audio/webm",
+                },
+                auth_method=vercel_auth_method,
+                timeout=120.0,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Vercel transcription request failed: %s", exc)
+            raise WhisperError(f"Transcription provider unreachable: {exc}") from exc
+        except Exception as exc:
+            logger.warning("Vercel transcription failed: %s", exc)
+            raise WhisperError(str(exc)) from exc
+
+        text = str(payload.get("text") or "").strip()
+        raw_segments = payload.get("segments") or []
+        segments = [
+            {
+                "start": float(segment.get("startSecond") or 0.0),
+                "end": float(segment.get("endSecond") or 0.0),
+                "text": str(segment.get("text") or "").strip(),
+            }
+            for segment in raw_segments
+            if isinstance(segment, dict)
+        ]
+        duration = float(payload.get("durationInSeconds") or 0.0)
+        if duration <= 0 and segments:
+            duration = max(float(segment["end"]) for segment in segments)
+        if duration <= 0:
+            duration = max(1.0, len(blob) / 4096)
+        if require_timestamps and not segments:
+            raise WhisperTimestampError(
+                "The selected Vercel transcription model did not return segment timestamps."
+            )
+        return WhisperResult(
+            text=text,
+            duration_seconds=duration,
+            model=reported_model or model,
+            segments=segments or None,
         )
 
     if use_chat_api:
@@ -277,6 +333,7 @@ async def transcribe_blob(
         }
         if require_timestamps:
             chat_body["temperature"] = 0
+            chat_body["top_p"] = 1
             chat_body["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -346,9 +403,19 @@ async def transcribe_blob(
 
     # Standard Whisper path: multipart file upload to /audio/transcriptions
     files = {"file": (filename or "audio.webm", blob, mime or "audio/webm")}
+    current_openai_transcribe_models = {
+        "gpt-4o-transcribe",
+        "gpt-4o-mini-transcribe",
+    }
+    uses_json_only_transcription = model in current_openai_transcribe_models
+    if require_timestamps and uses_json_only_transcription:
+        raise WhisperTimestampError(
+            f"{reported_model or model} does not provide segment timestamps. "
+            "Choose OpenAI Whisper or Groq Whisper for measured subtitle alignment."
+        )
     data: dict = {
         "model": model,
-        "response_format": "verbose_json",
+        "response_format": "json" if uses_json_only_transcription else "verbose_json",
     }
     if require_timestamps:
         data["timestamp_granularities[]"] = ["word", "segment"]

@@ -364,6 +364,87 @@ def test_planner_keeps_explicit_saved_report_file_write_step(monkeypatch):
     assert plan.steps[-1].requires_approval is False
 
 
+def test_planner_keeps_mp4_production_when_task_also_requests_plain_text(monkeypatch):
+    from packages.core.ai.runtime import RuntimePlannerChatTurnResult
+    from packages.core.plans import planner
+
+    async def fake_runtime_execute_planner_chat_turn(**kwargs):
+        return RuntimePlannerChatTurnResult(
+            content="""
+            {
+              "steps": [
+                {
+                  "key": "generate_script_storyboard_packet",
+                  "kind": "subagent",
+                  "service_key": "stickman.production",
+                  "params": {"prompt": "Create the script and storyboard packet."}
+                },
+                {
+                  "key": "produce_and_verify_mp4",
+                  "kind": "subagent",
+                  "service_key": "stickman.production",
+                  "capability_id": "file.write",
+                  "params": {
+                    "prompt": "Produce and verify daily-stickman-video.mp4, save the file, and return its file_url and fs_path."
+                  },
+                  "depends_on": ["generate_script_storyboard_packet"]
+                }
+              ]
+            }
+            """,
+            tool_calls=[],
+            usage={"prompt_tokens": 9},
+        )
+
+    monkeypatch.setattr(
+        planner,
+        "runtime_execute_planner_chat_turn",
+        fake_runtime_execute_planner_chat_turn,
+    )
+
+    ctx = planner._Context(
+        workspace=None,
+        subscriptions=[
+            SimpleNamespace(
+                service_key="stickman.production",
+                id="sub_1",
+                agent_id="agent_1",
+            )
+        ],
+        agents_by_id={
+            "agent_1": SimpleNamespace(
+                id="agent_1",
+                name="Stickman Producer",
+                system_prompt="",
+            )
+        },
+        allowed_service_keys={"stickman.production"},
+        provider_actions={},
+    )
+    task = SimpleNamespace(
+        title="Create and verify today's daily-stickman-video.mp4",
+        description=(
+            "Produce the finished video file and return its Knowledge path. "
+            "Also report the verification status as plain text in workspace chat."
+        ),
+        details={"artifact": "verified MP4 video artifact"},
+        input_contract=None,
+        expected_output={
+            "type": "object",
+            "properties": {"video_file": {"type": "string"}},
+        },
+        owner_service_key="stickman.production",
+        delegate_service_keys=[],
+    )
+
+    plan = asyncio.run(planner._generate_plan(task, ctx))
+
+    assert [step.key for step in plan.steps] == [
+        "generate_script_storyboard_packet",
+        "produce_and_verify_mp4",
+    ]
+
+
 def test_planner_clears_hard_approval_for_generated_pdf(monkeypatch):
     from packages.core.ai.runtime import RuntimePlannerChatTurnResult
     from packages.core.plans import planner
@@ -425,6 +506,74 @@ def test_planner_clears_hard_approval_for_generated_pdf(monkeypatch):
     assert [step.key for step in plan.steps] == ["research_block_context", "generate_brochure_pdf"]
     assert plan.steps[-1].capability_id == "file.write"
     assert plan.steps[-1].requires_approval is False
+
+
+def test_planner_clears_high_risk_for_internal_mp4_production(monkeypatch):
+    from packages.core.ai.runtime import RuntimePlannerChatTurnResult
+    from packages.core.plans import planner
+
+    async def fake_runtime_execute_planner_chat_turn(**kwargs):
+        return RuntimePlannerChatTurnResult(
+            content="""
+            {
+              "steps": [
+                {
+                  "key": "produce_verified_stickman_mp4",
+                  "kind": "subagent",
+                  "service_key": "stickman.production",
+                  "params": {
+                    "prompt": "Produce one finished, verified Stickman video MP4 and save daily-stickman-video.mp4."
+                  },
+                  "risk_level": "high",
+                  "description": "Generate and verify the final MP4 deliverable as a stable, publishable artifact."
+                }
+              ]
+            }
+            """,
+            tool_calls=[],
+            usage={"prompt_tokens": 9},
+        )
+
+    monkeypatch.setattr(
+        planner,
+        "runtime_execute_planner_chat_turn",
+        fake_runtime_execute_planner_chat_turn,
+    )
+
+    ctx = planner._Context(
+        workspace=None,
+        subscriptions=[
+            SimpleNamespace(
+                service_key="stickman.production",
+                id="sub_1",
+                agent_id="agent_1",
+            )
+        ],
+        agents_by_id={
+            "agent_1": SimpleNamespace(
+                id="agent_1",
+                name="Stickman Producer",
+                system_prompt="",
+            )
+        },
+        allowed_service_keys={"stickman.production"},
+        provider_actions={},
+    )
+    task = SimpleNamespace(
+        title="Create and verify today's daily-stickman-video.mp4",
+        description="Produce the verified MP4 file and return its workspace artifact path.",
+        details={},
+        input_contract=None,
+        expected_output=None,
+        owner_service_key="stickman.production",
+        delegate_service_keys=[],
+    )
+
+    plan = asyncio.run(planner._generate_plan(task, ctx))
+
+    assert [step.key for step in plan.steps] == ["produce_verified_stickman_mp4"]
+    assert plan.steps[0].risk_level == "low"
+    assert plan.steps[0].requires_approval is False
 
 
 def test_planner_clears_hard_approval_for_action_steps(monkeypatch):

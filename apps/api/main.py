@@ -17,6 +17,7 @@ import logging
 import re
 import sys
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,11 +31,17 @@ _SENSITIVE_QUERY_RE = re.compile(
     r"[^&\s\"']+",
     re.IGNORECASE,
 )
+_SENSITIVE_LOG_VALUE_RE = re.compile(
+    r"(?i)\b(verification[_ -]?code|password[_ -]?reset[_ -]?token|"
+    r"access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|api[_ -]?key)"
+    r"(\s*(?:for\s+[^\s:]+)?\s*[:=]\s*)([^\s,;&\"']+)"
+)
 
 
 def redact_sensitive_log_text(value: str) -> str:
-    """Remove query-string credentials before log records reach handlers."""
-    return _SENSITIVE_QUERY_RE.sub(r"\1<redacted>", value)
+    """Remove credentials and verification material before log emission."""
+    redacted = _SENSITIVE_QUERY_RE.sub(r"\1<redacted>", value)
+    return _SENSITIVE_LOG_VALUE_RE.sub(r"\1\2<redacted>", redacted)
 
 
 class SensitiveQueryStringFilter(logging.Filter):
@@ -63,6 +70,9 @@ def install_sensitive_log_filter() -> None:
         target = logging.getLogger(logger_name)
         if not any(isinstance(existing, SensitiveQueryStringFilter) for existing in target.filters):
             target.addFilter(sensitive_filter)
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(existing, SensitiveQueryStringFilter) for existing in handler.filters):
+            handler.addFilter(sensitive_filter)
 
 
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -73,12 +83,49 @@ logging.basicConfig(
     stream=sys.stderr,
     force=True,  # override any prior basicConfig from library imports
 )
-install_sensitive_log_filter()
 # Quiet noisy third-party loggers
 for _quiet in ("httpx", "httpcore", "hpack", "urllib3", "sqlalchemy.engine"):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
+install_sensitive_log_filter()
 
 logger = logging.getLogger(__name__)
+
+
+def _cors_allowed_origins() -> list[str]:
+    configured = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    cloud_mode = os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud"
+    origins = (
+        [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+        if configured.strip()
+        else (
+            [(os.getenv("APP_URL") or "https://app.manorai.xyz").strip().rstrip("/")]
+            if cloud_mode
+            else [
+        "http://localhost:18080",
+        "http://localhost:5173",
+        "http://127.0.0.1:18080",
+        "http://127.0.0.1:5173",
+            ]
+        )
+    )
+    normalized = sorted(set(origins))
+    for origin in normalized:
+        parsed = urlsplit(origin)
+        if (
+            origin in {"*", "null"}
+            or "*" in origin
+            or not parsed.scheme
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError(f"Invalid CORS origin: {origin!r}")
+        if cloud_mode and parsed.scheme != "https":
+            raise RuntimeError("Cloud CORS origins must use HTTPS")
+    return normalized
 
 
 @asynccontextmanager
@@ -89,17 +136,17 @@ async def lifespan(app: FastAPI):
     # Refuse to run with the built-in JWT signing key: it is published in the
     # source, so anyone could forge tokens for any user. Hard-fail in cloud;
     # warn loudly in self-hosted/OSS mode (local dev may not set it yet).
-    from packages.core.config import INSECURE_DEFAULT_JWT_SECRET, get_settings
+    from packages.core.config import get_settings, is_insecure_jwt_secret
     _settings = get_settings()
-    if _settings.JWT_SECRET_KEY == INSECURE_DEFAULT_JWT_SECRET:
+    if is_insecure_jwt_secret(_settings.JWT_SECRET_KEY):
         if _settings.DEPLOYMENT_MODE.strip().lower() == "cloud":
             raise RuntimeError(
-                "JWT_SECRET_KEY is the insecure built-in default; refusing to "
-                "start in cloud mode. Set JWT_SECRET_KEY to a strong random value."
+                "JWT_SECRET_KEY is empty, too short, or a shipped placeholder; "
+                "refusing to start in cloud mode. Set at least 32 random bytes."
             )
         logger.warning(
-            "SECURITY: JWT_SECRET_KEY is the built-in default — tokens are "
-            "forgeable. Set JWT_SECRET_KEY to a strong random value before "
+            "SECURITY: JWT_SECRET_KEY is empty, too short, or a shipped "
+            "placeholder — tokens are forgeable. Set at least 32 random bytes before "
             "exposing this instance."
         )
 
@@ -486,13 +533,14 @@ tags_metadata = [
 
 
 def create_app() -> FastAPI:
+    cloud_mode = os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud"
     app = FastAPI(
         title="Manor AI",
         description="The AI operating system for autonomous enterprise management",
         version="0.1.0",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
-        openapi_url="/api/openapi.json",
+        docs_url=None if cloud_mode else "/api/docs",
+        redoc_url=None if cloud_mode else "/api/redoc",
+        openapi_url=None if cloud_mode else "/api/openapi.json",
         openapi_tags=tags_metadata,
         lifespan=lifespan,
     )
@@ -500,10 +548,20 @@ def create_app() -> FastAPI:
     # CORS
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_cors_allowed_origins(),
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Accept",
+            "Authorization",
+            "Content-Type",
+            "Range",
+            "X-Language",
+            "X-Portal-Token",
+            "X-Request-ID",
+            "X-Silent-Error",
+        ],
+        expose_headers=["Content-Disposition", "Content-Length", "X-Request-ID"],
     )
 
     # Production middleware (request ID, logging, rate limiting, error handling)
@@ -543,7 +601,7 @@ def create_app() -> FastAPI:
         })
 
     # ── Core routers (always loaded) ──
-    from apps.api.routers import auth, health, entities, workspaces, workspace_drafts, tasks, chat, messages, agents, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support
+    from apps.api.routers import auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, messages, agents, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support, sites
     from apps.api.routers.channels import wechat as wechat_channel
     from apps.api.routers.channels import twilio as twilio_channel
     from apps.api.routers.channels import whatsapp as whatsapp_channel
@@ -555,6 +613,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(entities.router)
     app.include_router(workspaces.router)
+    app.include_router(workspace_stats.router)
     app.include_router(workspace_drafts.router)
     app.include_router(nango_oauth.router)
     app.include_router(nango_webhooks.router)
@@ -571,6 +630,8 @@ def create_app() -> FastAPI:
     app.include_router(document_permissions.public_router)  # /api/v1/shared-doc/{token} — unauth
     app.include_router(folder_permissions.router)            # /api/v1/folders/{id}/properties, /grants, /shares
     app.include_router(folder_permissions.public_router)     # /api/v1/shared-folder/{token} — unauth viewer
+    app.include_router(sites.router)                         # /api/v1/sites — publish + domain management
+    app.include_router(sites.public_router)                  # /api/v1/site-host, /api/v1/sites/tls-check — unauth
     app.include_router(integrations.router)
     app.include_router(notifications.router)
     app.include_router(admin.router)

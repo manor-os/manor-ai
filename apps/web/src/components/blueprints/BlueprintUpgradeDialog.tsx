@@ -38,9 +38,14 @@ export default function BlueprintUpgradeDialog({
   workspaceName,
 }: BlueprintUpgradeDialogProps) {
   const queryClient = useQueryClient();
-  const [applied, setApplied] = useState<{ updated: number; kept: number } | null>(null);
+  const [applied, setApplied] = useState<{
+    updated: number;
+    kept: number;
+    canRevert: boolean;
+    versionOnly: boolean;
+  } | null>(null);
 
-  const { data: plan, isLoading } = useQuery({
+  const { data: plan, isLoading, isError, error } = useQuery({
     queryKey: ["blueprint-upgrade-plan", workspaceId],
     queryFn: () => api.workspaces.blueprintUpgradePlan(workspaceId),
     enabled: open,
@@ -55,7 +60,12 @@ export default function BlueprintUpgradeDialog({
   const applyMutation = useMutation({
     mutationFn: () => api.workspaces.applyBlueprintUpgrade(workspaceId),
     onSuccess: (result) => {
-      setApplied({ updated: result.updated.length, kept: result.kept_yours.length });
+      setApplied({
+        updated: result.updated.length,
+        kept: result.kept_yours.length,
+        canRevert: result.can_revert,
+        versionOnly: result.updated.length === 0 && result.kept_yours.length === 0,
+      });
       invalidate();
     },
   });
@@ -72,6 +82,10 @@ export default function BlueprintUpgradeDialog({
   const items = plan?.items ?? [];
   const toUpdate = items.filter((item) => item.action === "update");
   const keptYours = items.filter((item) => item.action === "keep_yours");
+  const missing = items.filter((item) => item.action === "missing");
+  const visibleItems = items.filter((item) => item.action !== "unchanged");
+  const versionOnlySync = items.length > 0 && visibleItems.length === 0;
+  const canApply = toUpdate.length > 0 || versionOnlySync;
   const busy = applyMutation.isPending || revertMutation.isPending;
 
   return (
@@ -82,21 +96,41 @@ export default function BlueprintUpgradeDialog({
     >
       {isLoading ? (
         <LoadingSpinner />
+      ) : isError ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <p style={{ fontSize: 13, color: "#b42318", lineHeight: 1.6, margin: 0 }}>
+            {t("page.blueprints.upgrade_load_failed")}
+          </p>
+          {error instanceof Error && error.message ? (
+            <p style={{ fontSize: 11.5, color: "#78716c", lineHeight: 1.5, margin: 0 }}>
+              {error.message}
+            </p>
+          ) : null}
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <button onClick={onClose} style={secondaryButton}>
+              {t("action.close")}
+            </button>
+          </div>
+        </div>
       ) : applied ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <p style={{ fontSize: 13, color: "#44403c", lineHeight: 1.6, margin: 0 }}>
-            {t("page.blueprints.upgrade_done")
-              .replace("{updated}", String(applied.updated))
-              .replace("{kept}", String(applied.kept))}
+            {applied.versionOnly
+              ? t("page.blueprints.upgrade_version_confirmed")
+              : t("page.blueprints.upgrade_done")
+                .replace("{updated}", String(applied.updated))
+                .replace("{kept}", String(applied.kept))}
           </p>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-            <button
-              onClick={() => revertMutation.mutate()}
-              disabled={busy}
-              style={secondaryButton}
-            >
-              {t("page.blueprints.upgrade_revert")}
-            </button>
+            {applied.canRevert && (
+              <button
+                onClick={() => revertMutation.mutate()}
+                disabled={busy}
+                style={secondaryButton}
+              >
+                {t("page.blueprints.upgrade_revert")}
+              </button>
+            )}
             <button onClick={onClose} disabled={busy} style={primaryButton}>
               {t("action.done")}
             </button>
@@ -108,11 +142,13 @@ export default function BlueprintUpgradeDialog({
             <p style={{ fontSize: 13, color: "#78716c", margin: 0 }}>
               {t("page.blueprints.upgrade_nothing")}
             </p>
+          ) : versionOnlySync ? (
+            <p style={{ fontSize: 13, color: "#57534e", lineHeight: 1.6, margin: 0 }}>
+              {t("page.blueprints.upgrade_already_matches")}
+            </p>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {items
-                .filter((item) => item.action === "update" || item.action === "keep_yours")
-                .map((item) => {
+              {visibleItems.map((item) => {
                   const tone = ACTION_TONE[item.action] || ACTION_TONE.unchanged;
                   return (
                     <div
@@ -182,16 +218,26 @@ export default function BlueprintUpgradeDialog({
             </p>
           )}
 
+          {missing.length > 0 && (
+            <p style={{ fontSize: 12, color: "#78716c", lineHeight: 1.55, margin: 0 }}>
+              {t("page.blueprints.upgrade_missing_items").replace("{count}", String(missing.length))}
+            </p>
+          )}
+
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
             <button onClick={onClose} disabled={busy} style={secondaryButton}>
               {t("action.cancel")}
             </button>
             <button
               onClick={() => applyMutation.mutate()}
-              disabled={busy || toUpdate.length === 0}
-              style={{ ...primaryButton, opacity: toUpdate.length === 0 ? 0.5 : 1 }}
+              disabled={busy || !canApply}
+              style={{ ...primaryButton, opacity: canApply ? 1 : 0.5 }}
             >
-              {t("page.blueprints.upgrade_confirm").replace("{count}", String(toUpdate.length))}
+              {versionOnlySync
+                ? t("page.blueprints.upgrade_confirm_current")
+                : canApply
+                  ? t("page.blueprints.upgrade_confirm").replace("{count}", String(toUpdate.length))
+                  : t("page.blueprints.upgrade_no_automatic_updates")}
             </button>
           </div>
         </div>

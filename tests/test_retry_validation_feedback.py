@@ -91,3 +91,68 @@ async def test_exec_llm_prompt_unchanged_on_first_attempt(monkeypatch):
     await internal._exec_llm({"params": {"prompt": "Write the post."}})
 
     assert captured["prompt"] == "Write the post."
+
+
+def test_human_guidance_note_renders_answer_and_author():
+    from packages.core.workers.internal import _human_guidance_note
+
+    note = _human_guidance_note({
+        "human_input_response": {
+            "choice": "retry",
+            "note": "use the landing page screenshot",
+            "user": "Calvin",
+        },
+    })
+    assert note is not None
+    assert note.startswith("[Operator guidance]")
+    assert "Calvin" in note
+    assert "use the landing page screenshot" in note
+
+    # Retry endpoints store the text under "response" instead of "note".
+    legacy = _human_guidance_note({
+        "human_input_response": {"response": "post to the company account"},
+    })
+    assert legacy is not None
+    assert "post to the company account" in legacy
+
+
+def test_human_guidance_note_absent_without_answer_text():
+    from packages.core.workers.internal import _human_guidance_note
+
+    assert _human_guidance_note(None) is None
+    assert _human_guidance_note({}) is None
+    assert _human_guidance_note({"human_input_response": None}) is None
+    assert _human_guidance_note({"human_input_response": {"choice": "retry"}}) is None
+
+
+@pytest.mark.asyncio
+async def test_exec_llm_prepends_human_guidance_on_resumed_step(monkeypatch):
+    """A guidance note typed at retry time must reach the retried model —
+    previously human_input_response was copied into params but never
+    rendered, so 'retry with guidance' re-ran the identical prompt."""
+    import packages.core.workers.internal as internal
+
+    captured: dict = {}
+
+    async def fake_llm_step(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(content="ok", usage={})
+
+    monkeypatch.setattr(
+        internal, "runtime_execute_internal_worker_llm_step", fake_llm_step
+    )
+
+    await internal._exec_llm({
+        "params": {
+            "prompt": "Publish the post.",
+            "human_input_response": {
+                "choice": "retry",
+                "note": "use the landing page screenshot",
+                "user": "Calvin",
+            },
+        },
+    })
+
+    assert captured["prompt"].startswith("[Operator guidance]")
+    assert "use the landing page screenshot" in captured["prompt"]
+    assert captured["prompt"].endswith("Publish the post.")

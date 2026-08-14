@@ -15,6 +15,7 @@ from packages.core.ai.runtime import (
     runtime_update_goal_value_action,
     runtime_workspace_add_knowledge_documents_action,
     runtime_workspace_add_rule_action,
+    runtime_workspace_answer_task_blocker_action,
     runtime_workspace_create_knowledge_folder_action,
     runtime_workspace_create_task_action,
     runtime_workspace_delegate_service_action,
@@ -81,7 +82,8 @@ WORKSPACE_LIST_KNOWLEDGE_SCHEMA = {
         "description": (
             "List workspace Knowledge Nets and attached documents. "
             "Use before changing workspace knowledge when the user refers to a "
-            "net or document by name."
+            "net or document by name. Returned documents include markdown_link; "
+            "copy it verbatim when mentioning a file."
         ),
         "parameters": {
             "type": "object",
@@ -270,7 +272,10 @@ WORKSPACE_CREATE_TASK_SCHEMA = {
                     "items": {"type": "object"},
                     "description": (
                         "Task-only guardrails. Each rule may include description, "
-                        "rule_type, action_patterns, severity, and rule_key."
+                        "rule_type, action_patterns, severity, and rule_key. Target "
+                        "the actual constrained action: use external_message.send for "
+                        "message-content rules; use workspace.task.create only when "
+                        "the user explicitly forbids creating nested tasks from this task."
                     ),
                 },
                 "knowledge_query": {
@@ -597,6 +602,48 @@ WORKSPACE_RESOLVE_HITL_SCHEMA = {
                 },
             },
             "required": ["action"],
+        },
+    },
+}
+
+
+ANSWER_TASK_BLOCKER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "answer_task_blocker",
+        "description": (
+            "Route the user's answer to an open task blocker back to the paused "
+            "task. Use the Open Task Blockers context to pick the request_id when "
+            "the user's latest message answers, confirms, or declines one of them. "
+            "The original task resumes with its own tools — never re-delegate the "
+            "same goal instead of answering the blocker. Not for login walls "
+            "(those need the card's sign-in flow) or unrelated chat."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "request_id": {
+                    "type": "string",
+                    "description": "The blocker's request_id from Open Task Blockers.",
+                },
+                "answer": {
+                    "type": "string",
+                    "description": "The user's answer, restated faithfully (free-form blockers).",
+                },
+                "answers": {
+                    "type": "object",
+                    "description": "Structured answers keyed by the blocker's question fields (form blockers).",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "true only when the user explicitly confirmed a destructive action.",
+                },
+                "refuse": {
+                    "type": "boolean",
+                    "description": "true when the user declines — cancels the blocked step.",
+                },
+            },
+            "required": ["request_id"],
         },
     },
 }
@@ -1021,6 +1068,22 @@ async def _workspace_update_goal_value_handler(
     )
 
 
+async def _answer_task_blocker_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    return await runtime_workspace_answer_task_blocker_action(
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        params=dict(kwargs),
+    )
+
+
 def get_tools():
     return [
         (WORKSPACE_AGENT_SCHEMA, _workspace_agent_handler),
@@ -1033,6 +1096,7 @@ def get_tools():
         (WORKSPACE_UPDATE_KNOWLEDGE_POLICY_SCHEMA, _workspace_update_knowledge_policy_handler),
         (WORKSPACE_OPERATION_SCHEMA, _workspace_operation_handler),
         (WORKSPACE_RESOLVE_HITL_SCHEMA, _workspace_resolve_hitl_handler),
+        (ANSWER_TASK_BLOCKER_SCHEMA, _answer_task_blocker_handler),
         (WORKSPACE_ADD_RULE_SCHEMA, _workspace_add_rule_handler),
         (WORKSPACE_REQUEST_STRATEGIST_REVIEW_SCHEMA, _workspace_request_strategist_review_handler),
     ]

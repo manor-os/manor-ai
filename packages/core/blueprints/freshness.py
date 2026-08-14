@@ -196,16 +196,29 @@ def blueprint_freshness(
         return BlueprintFreshness.NOT_FROM_BLUEPRINT
 
     # Version first: it is what publishing moves, and it survives a payload
-    # the reader cannot fetch. The fingerprint remains only for installs made
-    # before versions were recorded — no live blueprint needs it now that the
-    # platform's own are published rows like everyone else's.
+    # the reader cannot fetch. When the versions are equal, still compare the
+    # fingerprints when both are available. This repairs an install whose
+    # published version and content ever drifted apart (for example during a
+    # seed/import race) instead of permanently calling different content
+    # current just because the version strings happen to match.
     installed_version = record.get(BLUEPRINT_VERSION_KEY)
     if installed_version is not None and current_version is not None:
-        return (
-            BlueprintFreshness.CURRENT
-            if parse_content_version(installed_version) >= parse_content_version(current_version)
-            else BlueprintFreshness.UPDATE_AVAILABLE
-        )
+        installed_parts = parse_content_version(installed_version)
+        current_parts = parse_content_version(current_version)
+        if installed_parts < current_parts:
+            return BlueprintFreshness.UPDATE_AVAILABLE
+        if installed_parts > current_parts:
+            return BlueprintFreshness.CURRENT
+
+        installed_fingerprint = str(record.get(CONTENT_FINGERPRINT_KEY) or "").strip()
+        current_fingerprint = blueprint_content_fingerprint(current_payload)
+        if (
+            installed_fingerprint
+            and current_fingerprint
+            and installed_fingerprint != current_fingerprint
+        ):
+            return BlueprintFreshness.UPDATE_AVAILABLE
+        return BlueprintFreshness.CURRENT
 
     installed = str(record.get(CONTENT_FINGERPRINT_KEY) or "").strip()
     if not installed:

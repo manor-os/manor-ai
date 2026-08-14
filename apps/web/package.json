@@ -13,27 +13,31 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource-variable/manrope": "^5.3.0",
+    "@fontsource-variable/space-grotesk": "^5.3.0",
     "@novnc/novnc": "^1.6.0",
     "@tanstack/react-query": "^5.60.0",
     "@xyflow/react": "^12.11.2",
     "chart.js": "^4.5.1",
     "clsx": "^2.1.0",
+    "dompurify": "^3.4.13",
+    "image-size": "file:vendor/image-size",
     "jszip": "^3.10.1",
     "mammoth": "^1.12.0",
     "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "^5.6.205",
-    "phaser": "^3.80.1",
+    "pdfjs-dist": "^6.2.108",
     "pptxgenjs": "^4.0.1",
     "pptxviewjs": "^1.1.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
-    "react-router-dom": "^7.0.0",
+    "react-router-dom": "^7.18.2",
     "react-syntax-highlighter": "^16.1.1",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "simple-icons": "^16.23.0",
     "tailwind-merge": "^2.6.0",
+    "thinking-orbs": "0.2.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zustand": "^5.0.0"
   },
@@ -48,5 +52,10 @@
     "tailwindcss": "^3.4.0",
     "typescript": "^5.6.0",
     "vite": "^6.0.0"
+  },
+  "overrides": {
+    "pptxgenjs": {
+      "image-size": "$image-size"
+    }
   }
 }

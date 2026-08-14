@@ -75,6 +75,14 @@ class KnownFlag:
 
 KNOWN_FLAGS: tuple[KnownFlag, ...] = (
     KnownFlag(
+        key="flows_preview_access",
+        description=(
+            "Allows selected accounts to use Flows while the feature is still "
+            "shown as Coming Soon to other users."
+        ),
+        default_enabled=False,
+    ),
+    KnownFlag(
         key="require_invitation_code",
         description=(
             "On: public registration rejects signups without a valid invite "

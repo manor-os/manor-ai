@@ -46,6 +46,10 @@ request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "100"))
 _RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "").lower() in ("1", "true", "yes")
 DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "oss")
+_HSTS_MAX_AGE = max(0, int(os.getenv("HSTS_MAX_AGE_SECONDS", "31536000")))
+_HSTS_INCLUDE_SUBDOMAINS = os.getenv(
+    "HSTS_INCLUDE_SUBDOMAINS", "false",
+).strip().lower() in {"1", "true", "yes", "on"}
 _HEALTH_PATHS = {"/health", "/health/"}
 
 # Streaming endpoints — BaseHTTPMiddleware buffers StreamingResponse bodies,
@@ -74,6 +78,34 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers["X-Request-ID"] = rid
         response.headers["X-API-Version"] = "0.1.0"
+        return response
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Apply a conservative browser baseline to API responses."""
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        if not request.url.path.startswith(("/api/docs", "/api/redoc", "/api/openapi.json")):
+            response.headers.setdefault(
+                "Content-Security-Policy",
+                "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            )
+        if DEPLOYMENT_MODE.strip().lower() == "cloud":
+            hsts_value = f"max-age={_HSTS_MAX_AGE}"
+            if _HSTS_INCLUDE_SUBDOMAINS:
+                hsts_value += "; includeSubDomains"
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                hsts_value,
+            )
         return response
 
 
@@ -412,6 +444,7 @@ def setup_middleware(app: FastAPI) -> None:
 
     # Middleware — added in reverse execution order
     app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(LocaleMiddleware)
     app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(RateLimitMiddleware)

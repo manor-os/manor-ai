@@ -125,8 +125,9 @@ def runtime_set_suppressed_billing_context(
     workspace_id: str | None = None,
     conversation_id: str | None = None,
     source: str = RUNTIME_CHAT_SOURCE,
+    durable_per_call: bool = False,
 ) -> RuntimeBillingContextHandle:
-    """Bind a suppressing billing context for runtimes that aggregate usage themselves."""
+    """Bind a suppressing billing context for callers with custom billing."""
 
     from packages.core.ai.llm_client import LLMBillingContext, _billing_ctx_var
 
@@ -138,6 +139,7 @@ def runtime_set_suppressed_billing_context(
         conversation_id=conversation_id,
         source=source,
         suppress=True,
+        durable_per_call=durable_per_call,
     )
     return RuntimeBillingContextHandle(
         context=context,

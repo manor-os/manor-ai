@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useUpgradeStore } from "../stores/upgrade";
@@ -1760,8 +1760,8 @@ function WorkspacePickerContent({ doc, workspaces, onSelect }: { doc: any; works
 const DOCUMENT_POLL_INTERVAL_MS = 5_000;
 const DOCUMENT_QUEUED_POLL_INTERVAL_MS = 15_000;
 
-function documentListPollInterval(value: unknown): number | false {
-  const docs = Array.isArray((value as any)?.items) ? (value as any).items : [];
+function documentStatusPollInterval(value: unknown): number | false {
+  const docs = Array.isArray(value) ? value : [];
   const inProgressDocs = docs.filter((d: any) => isVectorInProgress(String(d?.vector_status || "")));
   if (inProgressDocs.length === 0) return false;
   return inProgressDocs.some((d: any) => d.vector_status === VectorStatus.PROCESSING || d.vector_status === VectorStatus.GENERATING)
@@ -1940,6 +1940,10 @@ export default function Knowledge() {
   const searchTerm = search.trim();
   const isSearching = searchTerm.length > 0;
 
+  const documentBrowseCacheKey = useMemo(
+    () => ["documents-browse", searchTerm, currentFolderId, selectedWorkspaceId, librarySection],
+    [currentFolderId, librarySection, searchTerm, selectedWorkspaceId],
+  );
   const { data, isLoading } = useQuery({
     queryKey: ["documents-browse", searchTerm, currentFolderId, selectedWorkspaceId, librarySection],
     queryFn: () => api.documents.browse(getKnowledgeBrowseParams({
@@ -1949,8 +1953,49 @@ export default function Knowledge() {
       selectedWorkspaceId,
     })),
     staleTime: 60_000,
-    refetchInterval: (query) => documentListPollInterval(query.state.data),
+    // Keep the previous folder's listing on screen while the next folder
+    // loads — navigation swaps content in place instead of flashing empty.
+    placeholderData: keepPreviousData,
+    // Global default disables focus refetch; knowledge changes out-of-band
+    // (agents, other users, editors in other tabs), so re-check on focus.
+    refetchOnWindowFocus: true,
   });
+
+  const inProgressDocumentIds = useMemo(
+    () => ((data?.items || []) as Document[])
+      .filter((document) => isVectorInProgress(String(document.vector_status || "")))
+      .map((document) => document.id),
+    [data?.items],
+  );
+  const { data: indexingStatuses = [] } = useQuery({
+    queryKey: ["document-indexing-status", inProgressDocumentIds],
+    queryFn: () => api.documents.indexingStatuses(inProgressDocumentIds),
+    enabled: inProgressDocumentIds.length > 0,
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchInterval: (query) => (
+      query.state.data === undefined
+        ? DOCUMENT_POLL_INTERVAL_MS
+        : documentStatusPollInterval(query.state.data)
+    ),
+  });
+
+  useEffect(() => {
+    if (indexingStatuses.length === 0) return;
+    const statusesById = new Map(indexingStatuses.map((status) => [status.id, status]));
+    queryClient.setQueryData(documentBrowseCacheKey, (current: any) => {
+      if (!current) return current;
+      const mergeStatuses = (documents: any[] | undefined) => documents?.map((document) => {
+        const status = statusesById.get(document.id);
+        return status ? { ...document, ...status } : document;
+      });
+      return {
+        ...current,
+        items: mergeStatuses(current.items) || current.items,
+        documents: mergeStatuses(current.documents) || current.documents,
+      };
+    });
+  }, [documentBrowseCacheKey, indexingStatuses, queryClient]);
 
   const { data: workspaces = [] } = useQuery({
     queryKey: ["workspaces"],
@@ -1962,6 +2007,7 @@ export default function Knowledge() {
     queryKey: ["folder-tree"],
     queryFn: () => api.folders.tree(),
     staleTime: 60_000,
+    refetchOnWindowFocus: true,
   });
   const invalidateDocumentBrowse = useCallback(() => {
     return queryClient.invalidateQueries({ queryKey: ["documents-browse"] });

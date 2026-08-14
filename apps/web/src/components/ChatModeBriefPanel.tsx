@@ -12,9 +12,11 @@ import {
   type ChatBoxMode,
 } from "./ChatModeSelector";
 import { t } from "../lib/i18n";
+import { VideoGenerationMode } from "../lib/types";
 
 export type ChatModePayload = {
   task?: string;
+  generation_mode?: VideoGenerationMode;
   aspect_ratio?: string;
   clip_duration_seconds?: number;
   audio_policy?: string;
@@ -93,6 +95,23 @@ function coerceVideoResolution(value?: string) {
   return match?.value || "720p";
 }
 
+export function coerceVideoGenerationMode(value?: string) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/-/g, "_");
+  if (["native", "motion", "coded_motion", "code_motion"].includes(normalized)) {
+    return VideoGenerationMode.NATIVE_MOTION;
+  }
+  if (["ai", "model", "generated", "ai_generated"].includes(normalized)) {
+    return VideoGenerationMode.AI_VIDEO;
+  }
+  if (normalized === VideoGenerationMode.NATIVE_MOTION) {
+    return VideoGenerationMode.NATIVE_MOTION;
+  }
+  if (normalized === VideoGenerationMode.AI_VIDEO) {
+    return VideoGenerationMode.AI_VIDEO;
+  }
+  return VideoGenerationMode.AUTO;
+}
+
 const MODE_DEFAULT_PAYLOADS: Partial<Record<ChatBoxMode, ChatModePayload>> = {
   image: {
     task: "generate",
@@ -103,6 +122,7 @@ const MODE_DEFAULT_PAYLOADS: Partial<Record<ChatBoxMode, ChatModePayload>> = {
     model: "image_5_lite",
   },
   video: {
+    generation_mode: VideoGenerationMode.AUTO,
     output_type: "single_clip",
     aspect_ratio: "16:9",
     resolution: "720p",
@@ -121,6 +141,11 @@ const MODE_DEFAULT_PAYLOADS: Partial<Record<ChatBoxMode, ChatModePayload>> = {
   document: {
     task: "draft",
     format: "structured_doc",
+    source_policy: "use_references",
+  },
+  pdf: {
+    task: "create",
+    format: "polished_pdf",
     source_policy: "use_references",
   },
   slides: {
@@ -145,6 +170,7 @@ const MODE_DEFAULT_PAYLOADS: Partial<Record<ChatBoxMode, ChatModePayload>> = {
     format: "brief",
     source_policy: "web_and_references",
   },
+  flows: {},
 };
 
 export function getDefaultChatModePayload(mode: ChatBoxMode): ChatModePayload {
@@ -156,6 +182,13 @@ export function getChatModeInputPlaceholder(
   payload?: ChatModePayload,
 ): string {
   if (mode === "video") {
+    const generationMode = coerceVideoGenerationMode(payload?.generation_mode);
+    if (generationMode === VideoGenerationMode.NATIVE_MOTION) {
+      return t("component.chat_mode.video_placeholder_native_motion");
+    }
+    if (generationMode === VideoGenerationMode.AI_VIDEO) {
+      return t("component.chat_mode.video_placeholder_ai_video");
+    }
     const referencePolicy =
       payload?.reference_policy ||
       MODE_DEFAULT_PAYLOADS.video?.reference_policy ||
@@ -188,6 +221,7 @@ function coerceVideoPayload(payload: ChatModePayload): ChatModePayload {
         : true;
   const next = {
     ...payload,
+    generation_mode: coerceVideoGenerationMode(payload.generation_mode),
     clip_duration_seconds: coerceVideoDuration(payload.clip_duration_seconds),
     aspect_ratio: coerceVideoAspectRatio(payload.aspect_ratio),
     resolution: coerceVideoResolution(payload.resolution),
@@ -320,6 +354,19 @@ export default function ChatModeBriefPanel({
           <IconPlay size={15} />
           <span>{t("component.chat_mode.brief_video_title")}</span>
         </div>
+        <SegmentGroup
+          label={t("component.chat_mode.brief_generation")}
+          value={payload.generation_mode}
+          disabled={disabled}
+          onChange={(generation_mode) =>
+            update({ generation_mode: coerceVideoGenerationMode(generation_mode) })
+          }
+          options={[
+            { value: VideoGenerationMode.AUTO, label: t("component.chat_mode.generation_auto_short") },
+            { value: VideoGenerationMode.NATIVE_MOTION, label: t("component.chat_mode.generation_native_short") },
+            { value: VideoGenerationMode.AI_VIDEO, label: t("component.chat_mode.generation_ai_short") },
+          ]}
+        />
         <SegmentGroup
           label={t("component.chat_mode.brief_output")}
           value={payload.output_type}
@@ -467,7 +514,7 @@ export default function ChatModeBriefPanel({
   return (
     <div className="chat-mode-brief chat-mode-brief--compact">
       <div className="chat-mode-brief-header">
-        {mode === "document" || mode === "slides" || mode === "sheet" ? (
+        {mode === "document" || mode === "pdf" || mode === "slides" || mode === "sheet" ? (
           <IconDocument size={15} />
         ) : (
           <IconSparkles size={15} />

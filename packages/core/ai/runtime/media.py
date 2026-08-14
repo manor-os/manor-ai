@@ -125,6 +125,20 @@ async def runtime_resolve_video_recovery_credentials(
 
     catalog_provider = _catalog_provider(model)
     provider_hint = str(stored_provider or "").lower()
+    if provider_hint == "vercel":
+        from packages.core.services.model_gateway import resolve_gateway_credential
+
+        credential = await resolve_gateway_credential(
+            "vercel",
+            reason="media.video.vercel_gateway_recovery_key",
+        )
+        return RuntimeMediaCredentials(
+            api_key=credential.api_key if credential else "",
+            provider="vercel",
+            catalog_provider=catalog_provider,
+            base_url_override=credential.base_url if credential else "",
+            is_byok=False,
+        )
     api_key, base_url_override, is_byok = await _resolve_user_media_credentials(
         user_id,
         entity_id,
@@ -169,6 +183,7 @@ async def runtime_resolve_video_generation_credentials(
     model: str,
     stored_adapter_name: str,
     openrouter_adapter_name: str,
+    vercel_adapter_name: str = "vercel_gateway",
 ) -> RuntimeMediaCredentials:
     """Resolve provider credentials for a stored video generation job."""
 
@@ -181,6 +196,20 @@ async def runtime_resolve_video_generation_credentials(
 
     catalog_provider = _catalog_provider(model)
     adapter_name = str(stored_adapter_name or "").strip()
+    if adapter_name == vercel_adapter_name:
+        from packages.core.services.model_gateway import resolve_gateway_credential
+
+        credential = await resolve_gateway_credential(
+            "vercel",
+            reason="media.video.vercel_gateway_key",
+        )
+        return RuntimeMediaCredentials(
+            api_key=credential.api_key if credential else "",
+            provider="vercel",
+            catalog_provider=catalog_provider,
+            base_url_override=credential.base_url if credential else "",
+            is_byok=False,
+        )
     api_key, base_url_override, is_byok = await _resolve_user_media_credentials(
         user_id,
         entity_id,
@@ -190,7 +219,7 @@ async def runtime_resolve_video_generation_credentials(
         if not api_key.startswith("sk-or-"):
             api_key, _openrouter_base_url = await _platform_native_media_credential_async("openrouter")
             is_byok = False
-        base_url_override = ""
+            base_url_override = _openrouter_base_url
     else:
         if not is_byok and catalog_provider in {"bytedance", "kwaivgi"}:
             native_key, native_base_url = await _platform_native_media_credential_async(catalog_provider)

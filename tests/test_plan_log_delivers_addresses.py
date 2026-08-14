@@ -25,8 +25,11 @@ import re
 import pytest
 
 from packages.core.workspace_chat.notifiers import (
+    _artifacts_as_attachments,
     _format_artifact,
     _render_dag,
+    _render_plan_completion_summary,
+    _render_step_completion_summary,
     extract_artifacts_for_chat,
 )
 
@@ -82,6 +85,53 @@ def test_genuinely_different_files_both_survive():
         ]}
     )
     assert len([a for a in found if a["kind"] == "file"]) == 2
+
+
+def test_a_knowledge_document_replaces_its_raw_filesystem_reference():
+    found = extract_artifacts_for_chat(
+        {
+            "fs_path": "Workspaces/W/final/report.md",
+            "document_id": "01KYNERQ91YH35G3V7FA1M0J8F",
+            "viewer_url": "/viewer/01KYNERQ91YH35G3V7FA1M0J8F",
+        }
+    )
+
+    assert found == [{
+        "kind": "document",
+        "value": "01KYNERQ91YH35G3V7FA1M0J8F",
+        "name": "report.md",
+    }]
+
+
+def test_canonical_knowledge_artifacts_are_discovered():
+    found = extract_artifacts_for_chat({
+        "knowledge_artifacts": [{
+            "name": "report.md",
+            "fs_path": "Workspaces/W/final/report.md",
+            "document_id": "01KYNERQ91YH35G3V7FA1M0J8F",
+        }]
+    })
+
+    assert found[0]["kind"] == "document"
+    assert found[0]["value"] == "01KYNERQ91YH35G3V7FA1M0J8F"
+
+
+def test_multiple_knowledge_artifacts_hide_their_raw_path_duplicates():
+    found = extract_artifacts_for_chat({
+        "files": [
+            {"name": "one.md", "fs_path": "Workspaces/W/one.md"},
+            {"name": "two.md", "fs_path": "Workspaces/W/two.md"},
+        ],
+        "knowledge_artifacts": [
+            {"name": "one.md", "document_id": "doc_one", "fs_path": "Workspaces/W/one.md"},
+            {"name": "two.md", "document_id": "doc_two", "fs_path": "Workspaces/W/two.md"},
+        ],
+    })
+
+    assert [(item["kind"], item["value"]) for item in found] == [
+        ("document", "doc_one"),
+        ("document", "doc_two"),
+    ]
 
 
 # ── The line is an address ────────────────────────────────────────────
@@ -145,6 +195,64 @@ def test_the_rendered_plan_log_carries_openable_files():
     rendered = _render_dag([_step(artifacts)], entity_id=ENTITY)
     assert rendered.count("File:") == 1, f"still duplicated:\n{rendered}"
     assert f"/api/v1/fs/{ENTITY}/" in rendered
+
+
+def test_completion_summaries_carry_openable_file_addresses():
+    artifacts = [
+        {
+            "kind": "file",
+            "value": "Workspaces/W/final/clip.mp4",
+            "name": "clip.mp4",
+        }
+    ]
+    step_summary = _render_step_completion_summary(
+        label="Render final clip",
+        agent_part="",
+        time_part="",
+        summary="Rendered the final video.",
+        artifacts=artifacts,
+        max_summary_chars=1000,
+        entity_id=ENTITY,
+    )
+    plan_summary = _render_plan_completion_summary(
+        plan_id="plan_1",
+        task_title="Render final clip",
+        duration_seconds=12,
+        cost_usd=None,
+        steps=[_step(artifacts)],
+        entity_id=ENTITY,
+    )
+
+    assert f"/api/v1/fs/{ENTITY}/Workspaces/W/final/clip.mp4" in step_summary
+    assert f"/api/v1/fs/{ENTITY}/Workspaces/W/final/clip.mp4" in plan_summary
+
+
+def test_completed_artifacts_share_the_structured_chat_attachment_contract():
+    attachments = _artifacts_as_attachments(
+        [
+            {
+                "kind": "file",
+                "value": "Workspaces/W/final/clip.mp4",
+                "name": "clip.mp4",
+            },
+            {
+                "kind": "document",
+                "value": "01KYNERQ91YH35G3V7FA1M0J8F",
+                "name": "clip.mp4",
+            },
+        ],
+        entity_id=ENTITY,
+    )
+
+    assert attachments == [
+        {
+            "name": "clip.mp4",
+            "type": "knowledge",
+            "fileType": "mp4",
+            "previewUrl": f"/api/v1/fs/{ENTITY}/Workspaces/W/final/clip.mp4",
+            "id": "01KYNERQ91YH35G3V7FA1M0J8F",
+        }
+    ]
 
 
 def test_the_renderer_still_works_without_an_entity():

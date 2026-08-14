@@ -47,6 +47,16 @@ from packages.core.services.version_service import (
 )
 from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.document_ai_draft import generate_document_ai_draft_content
+from packages.core.services.knowledge_hot_cache import (
+    cache_document_blob,
+    cache_document_blob_from_path,
+    cache_document_text,
+    get_cached_document_blob,
+    get_cached_document_text,
+)
+from packages.core.services.stickman_topic_ledger import (
+    topic_ledger_workspace_id_for_document,
+)
 from packages.core.ai.runtime import runtime_text_completion_platform_configured
 from apps.api.deps import get_current_user, require_plan
 from packages.core.models.permission import Capability
@@ -78,6 +88,7 @@ class DocumentResponse(BaseModel):
     created_by: str | None = None
     folder_id: str | None = None
     created_at: str | None = None
+    updated_at: str | None = None
     # ── Permission-v1 fields (see docs/PERMISSIONS_DESIGN_ZH.md §13) ─────
     visibility: str | None = None
     classification: str | None = None
@@ -102,6 +113,14 @@ class DocumentListResponse(BaseModel):
     # before the user hits a 402. ``storage_limit_mb`` is null when unlimited.
     storage_used_mb: float | None = None
     storage_limit_mb: float | None = None
+
+
+class DocumentIndexingStatusResponse(BaseModel):
+    """Small polling payload for Knowledge indexing progress."""
+
+    id: str
+    vector_status: str
+    indexing_progress: dict | None = None
 
 
 class DocumentGroupResponse(BaseModel):
@@ -172,6 +191,10 @@ def _doc_resp(
     display_path: str | None = None,
 ) -> DocumentResponse:
     meta = d.metadata_ if hasattr(d, "metadata_") else None
+    # Mutation handlers may return an ORM instance after a commit, where
+    # ``updated_at`` is expired. Reading through ``__dict__`` avoids triggering
+    # async lazy-loading while still exposing the value for fully loaded rows.
+    loaded_updated_at = getattr(d, "__dict__", {}).get("updated_at")
     indexing = meta.get("indexing") if isinstance(meta, dict) else None
     artifact_meta = meta.get("artifact") if isinstance(meta, dict) else None
     generation_meta = meta.get("generation") if isinstance(meta, dict) else None
@@ -185,6 +208,7 @@ def _doc_resp(
         indexing_progress=indexing,
         created_by=d.created_by, folder_id=d.folder_id,
         created_at=d.created_at.isoformat() if d.created_at else None,
+        updated_at=loaded_updated_at.isoformat() if loaded_updated_at else None,
         # ── Permission-v1 fields ─────────────────────────────────────────
         visibility=getattr(d, "visibility", None),
         classification=getattr(d, "classification", None),
@@ -378,12 +402,32 @@ def _safe_file_extension(raw_ext: str | None, default: str = "md") -> str:
 
 _VIDEO_THUMB_EXTENSIONS = {"mp4", "webm", "ogg", "mov", "avi", "mkv"}
 _VIDEO_THUMB_MIME_PREFIXES = ("video/",)
+_IMAGE_THUMB_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"}
+_AUDIO_STREAM_EXTENSIONS = {"mp3", "wav", "ogg", "aac", "flac", "m4a", "wma"}
 
 
 def _is_video_document(doc) -> bool:
     ext = (getattr(doc, "file_type", None) or os.path.splitext(getattr(doc, "name", "") or "")[1].lstrip(".")).lower()
     mime = (getattr(doc, "mime_type", None) or "").lower()
     return ext in _VIDEO_THUMB_EXTENSIONS or any(mime.startswith(prefix) for prefix in _VIDEO_THUMB_MIME_PREFIXES)
+
+
+def _is_image_document(doc) -> bool:
+    ext = (getattr(doc, "file_type", None) or os.path.splitext(getattr(doc, "name", "") or "")[1].lstrip(".")).lower()
+    mime = (getattr(doc, "mime_type", None) or "").lower()
+    return ext in _IMAGE_THUMB_EXTENSIONS or mime.startswith("image/") and mime != "image/svg+xml"
+
+
+def _download_is_hot_cacheable(doc) -> bool:
+    """Keep byte-range media on FileResponse/streaming paths."""
+    ext = (getattr(doc, "file_type", None) or os.path.splitext(getattr(doc, "name", "") or "")[1].lstrip(".")).lower()
+    mime = (getattr(doc, "mime_type", None) or "").lower()
+    return not (
+        ext in _VIDEO_THUMB_EXTENSIONS
+        or ext in _AUDIO_STREAM_EXTENSIONS
+        or mime.startswith("video/")
+        or mime.startswith("audio/")
+    )
 
 
 def _document_ext(doc) -> str:
@@ -406,7 +450,10 @@ def _is_docx_document(doc) -> bool:
 
 async def _repair_pptx_file_if_needed(doc, full_path: str, db: AsyncSession) -> None:
     """Convert legacy empty/text .pptx placeholders into real PPTX files."""
-    if not _is_pptx_document(doc) or not full_path:
+    # Never run the placeholder repair over legacy OLE .ppt or proprietary
+    # .dps files. They are valid non-ZIP presentations and replacing them with
+    # a generated PPTX would destroy the user's original binary document.
+    if _document_ext(doc) != "pptx" or not full_path:
         return
 
     should_repair = False
@@ -876,6 +923,18 @@ async def upload_document(
                     if file_size > max_bytes:
                         raise HTTPException(413, f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB")
                     await f.write(chunk)
+            from packages.core.services.upload_security import (
+                UploadSecurityError,
+                inspect_upload_path,
+            )
+            try:
+                mime_type = await inspect_upload_path(
+                    tmp_path,
+                    filename=filename,
+                    declared_content_type=file.content_type,
+                )
+            except UploadSecurityError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from exc
             fs_path = await _copy_document_file_atomic(
                 user.entity_id,
                 rel_target,
@@ -894,6 +953,15 @@ async def upload_document(
         file_size = len(content)
         if file_size > max_bytes:
             raise HTTPException(413, f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB")
+        from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+        try:
+            mime_type = await inspect_upload_content(
+                content,
+                filename=filename,
+                declared_content_type=file.content_type,
+            )
+        except UploadSecurityError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
 
     ext = os.path.splitext(filename)[1].lstrip(".") if "." in filename else None
     if settings.MANOR_FS_ENABLED and fs_path:
@@ -1957,14 +2025,25 @@ async def replace_document_file_endpoint(
             raise HTTPException(413, f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB")
         chunks.append(chunk)
 
+    content = b"".join(chunks)
+    from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+    try:
+        trusted_mime_type = await inspect_upload_content(
+            content,
+            filename=file.filename or existing_doc.name,
+            declared_content_type=file.content_type,
+        )
+    except UploadSecurityError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
     try:
         doc = await save_document_file(
             db,
             doc_id,
             user.entity_id,
-            b"".join(chunks),
+            content,
             filename=file.filename,
-            mime_type=file.content_type,
+            mime_type=trusted_mime_type,
             created_by=(user.display_name or user.email),
         )
     except ValueError as exc:
@@ -1985,6 +2064,7 @@ async def replace_document_file_endpoint(
 @router.get("/{doc_id}/content")
 async def get_document_content_endpoint(
     doc_id: str,
+    response: Response,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1998,9 +2078,24 @@ async def get_document_content_endpoint(
     )
     if not doc:
         raise HTTPException(404, "Document not found")
+    is_live_topic_ledger = topic_ledger_workspace_id_for_document(doc) is not None
+    cached_content = (
+        await get_cached_document_text(doc)
+        if not is_live_topic_ledger
+        else None
+    )
+    if cached_content is not None:
+        response.headers["X-Knowledge-Cache"] = "redis-hit"
+        return {"content": cached_content}
     content = await get_document_content(db, doc_id, user.entity_id)
     if content is None:
         raise HTTPException(404, "Document not found or no content")
+    cached = (
+        await cache_document_text(doc, content)
+        if not is_live_topic_ledger
+        else False
+    )
+    response.headers["X-Knowledge-Cache"] = "miss-stored" if cached else "miss-bypass"
     return {"content": content}
 
 
@@ -2095,6 +2190,50 @@ async def _document_first_page_thumbnail(doc, entity_id: str) -> FileResponse:
     )
 
 
+async def _generate_image_thumbnail(source_path: str, target_path: str) -> None:
+    """Create a bounded JPEG preview without sending the source image."""
+
+    def _render() -> None:
+        from PIL import Image, ImageOps
+
+        temp_path = f"{target_path}.tmp"
+        with Image.open(source_path) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.thumbnail((640, 640))
+            if image.mode not in {"RGB", "L"}:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            elif image.mode == "L":
+                image = image.convert("RGB")
+            image.save(temp_path, format="JPEG", quality=82, optimize=True)
+        os.replace(temp_path, target_path)
+
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    try:
+        await asyncio.to_thread(_render)
+    except Exception:
+        temp_path = f"{target_path}.tmp"
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
+
+async def _cache_thumbnail_file_response(doc, response: FileResponse) -> FileResponse:
+    stored = await cache_document_blob_from_path(
+        doc,
+        "thumbnail",
+        str(response.path),
+        media_type="image/jpeg",
+    )
+    response.headers["X-Knowledge-Cache"] = "miss-stored" if stored else "miss-bypass"
+    return response
+
+
 @router.get("/{doc_id}/thumbnail")
 async def document_thumbnail(
     doc_id: str,
@@ -2110,9 +2249,46 @@ async def document_thumbnail(
     )
     if not doc:
         raise HTTPException(404, "Document not found")
+    cached_thumbnail = await get_cached_document_blob(doc, "thumbnail")
+    if cached_thumbnail is not None:
+        return Response(
+            content=cached_thumbnail.data,
+            media_type=cached_thumbnail.media_type,
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "X-Knowledge-Cache": "redis-hit",
+                "X-Thumbnail-Cache": "redis-hit",
+            },
+        )
+
+    if _is_image_document(doc):
+        source_path = _document_full_path(doc, user.entity_id)
+        if not source_path or not os.path.isfile(source_path):
+            raise HTTPException(404, "Image file is not available for thumbnail generation")
+        thumb_path = _thumbnail_cache_path(user.entity_id, doc.id)
+        source_mtime = os.path.getmtime(source_path)
+        disk_hit = (
+            os.path.isfile(thumb_path)
+            and os.path.getsize(thumb_path) > 0
+            and os.path.getmtime(thumb_path) >= source_mtime
+        )
+        if not disk_hit:
+            await _generate_image_thumbnail(source_path, thumb_path)
+        image_response = FileResponse(
+            path=thumb_path,
+            media_type="image/jpeg",
+            filename=f"{os.path.splitext(doc.name)[0] or doc.id}-thumbnail.jpg",
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "X-Thumbnail-Cache": "disk-hit" if disk_hit else "generated",
+            },
+        )
+        return await _cache_thumbnail_file_response(doc, image_response)
+
     if not _is_video_document(doc):
-        # Non-video: render a first-page thumbnail for PDFs and office files.
-        return await _document_first_page_thumbnail(doc, user.entity_id)
+        # PDFs and office files use the renderer's content-addressed disk cache.
+        first_page = await _document_first_page_thumbnail(doc, user.entity_id)
+        return await _cache_thumbnail_file_response(doc, first_page)
 
     source_path = _document_full_path(doc, user.entity_id)
     thumb_path = _thumbnail_cache_path(user.entity_id, doc.id)
@@ -2148,7 +2324,7 @@ async def document_thumbnail(
                 except OSError:
                     pass
 
-    return FileResponse(
+    video_response = FileResponse(
         path=thumb_path,
         media_type="image/jpeg",
         filename=f"{os.path.splitext(doc.name)[0] or doc.id}-thumbnail.jpg",
@@ -2157,6 +2333,7 @@ async def document_thumbnail(
             "X-Thumbnail-Cache": "hit" if cache_hit else "miss",
         },
     )
+    return await _cache_thumbnail_file_response(doc, video_response)
 
 
 @router.get("/{doc_id}/download")
@@ -2175,22 +2352,54 @@ async def download_document(
     if not doc:
         raise HTTPException(404, "Document not found")
 
+    is_live_topic_ledger = topic_ledger_workspace_id_for_document(doc) is not None
+    hot_cacheable_download = (
+        _download_is_hot_cacheable(doc) and not is_live_topic_ledger
+    )
+    cached_download = (
+        await get_cached_document_blob(doc, "download")
+        if hot_cacheable_download
+        else None
+    )
+    if cached_download is not None:
+        encoded_name = urllib.parse.quote(doc.name or "download")
+        return Response(
+            content=cached_download.data,
+            media_type=cached_download.media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+                "Cache-Control": "private, max-age=300",
+                "X-Knowledge-Cache": "redis-hit",
+            },
+        )
+
     # Try filesystem first
-    if doc.fs_path:
+    if doc.fs_path and not is_live_topic_ledger:
         full_path = _document_full_path(doc, user.entity_id)
         if full_path and _is_pptx_document(doc):
             await _repair_pptx_file_if_needed(doc, full_path, db)
         if full_path and os.path.isfile(full_path):
             if _mark_document_file_available(doc, source="filesystem"):
                 await db.commit()
+            cached = (
+                await cache_document_blob_from_path(
+                    doc,
+                    "download",
+                    full_path,
+                    media_type=doc.mime_type or "application/octet-stream",
+                )
+                if hot_cacheable_download
+                else False
+            )
             return FileResponse(
                 path=full_path,
                 media_type=doc.mime_type or "application/octet-stream",
                 filename=doc.name,
+                headers={"X-Knowledge-Cache": "miss-stored" if cached else "miss-bypass"},
             )
 
     # Fallback to file_url (e.g. S3 / external storage)
-    if doc.file_url:
+    if doc.file_url and not is_live_topic_ledger:
         return await _remote_document_stream_response(
             doc.file_url,
             filename=doc.name,
@@ -2213,10 +2422,14 @@ async def download_document(
         doc.mime_type = DOCX_MIME
         await db.flush()
         await db.commit()
+        cached = await cache_document_blob(doc, "download", file_bytes, media_type=DOCX_MIME)
         return Response(
             content=file_bytes,
             media_type=DOCX_MIME,
-            headers={"Content-Disposition": f'attachment; filename="{doc.name}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{doc.name}"',
+                "X-Knowledge-Cache": "miss-stored" if cached else "miss-bypass",
+            },
         )
 
     if _is_pptx_document(doc):
@@ -2227,18 +2440,36 @@ async def download_document(
         doc.mime_type = PPTX_MIME
         await db.flush()
         await db.commit()
+        cached = await cache_document_blob(doc, "download", file_bytes, media_type=PPTX_MIME)
         return Response(
             content=file_bytes,
             media_type=PPTX_MIME,
-            headers={"Content-Disposition": f'attachment; filename="{doc.name}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{doc.name}"',
+                "X-Knowledge-Cache": "miss-stored" if cached else "miss-bypass",
+            },
         )
 
     # Fallback: serve content from DB (text-based documents created via API)
     if content:
+        content_bytes = content.encode("utf-8")
+        cached = (
+            await cache_document_blob(
+                doc,
+                "download",
+                content_bytes,
+                media_type=doc.mime_type or "text/plain",
+            )
+            if hot_cacheable_download
+            else False
+        )
         return Response(
-            content=content.encode("utf-8"),
+            content=content_bytes,
             media_type=doc.mime_type or "text/plain",
-            headers={"Content-Disposition": f'attachment; filename="{doc.name}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{doc.name}"',
+                "X-Knowledge-Cache": "miss-stored" if cached else "miss-bypass",
+            },
         )
 
     raise HTTPException(404, "No file available for this document")
@@ -2716,6 +2947,46 @@ async def browse_documents(
         storage_used_mb=gate.current,
         storage_limit_mb=gate.limit,
     )
+
+
+@router.get("/indexing-status", response_model=list[DocumentIndexingStatusResponse])
+async def document_indexing_statuses(
+    ids: list[str] | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return only mutable indexing fields for visible documents.
+
+    Knowledge uses this endpoint while a small set of documents is pending or
+    processing. It avoids rebuilding and transferring the full folder browse
+    payload every five seconds.
+    """
+
+    document_ids = list(dict.fromkeys(ids or []))
+    if len(document_ids) > 100:
+        raise HTTPException(422, "At most 100 document IDs may be polled")
+
+    statuses: list[DocumentIndexingStatusResponse] = []
+    for document_id in document_ids:
+        document = await get_visible_document(
+            db,
+            document_id,
+            user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        )
+        if document is None:
+            continue
+        metadata = document.metadata_ if isinstance(document.metadata_, dict) else {}
+        indexing = metadata.get("indexing")
+        statuses.append(
+            DocumentIndexingStatusResponse(
+                id=document.id,
+                vector_status=document.vector_status,
+                indexing_progress=indexing if isinstance(indexing, dict) else None,
+            )
+        )
+    return statuses
 
 
 @router.get("/folder-tree", response_model=list[FolderResponse])

@@ -36,7 +36,7 @@ import {
   looksLikeViewerRouteReference,
 } from "../lib/chatRouteReferences";
 import { stripEditorLiveEditBlocks } from "../lib/editorLiveChat";
-import { decodeFileReferenceHref, isOpenableFileReference, linkifyFileReferencesInMarkdown, looksLikeFileReference } from "../lib/fileReferences";
+import { decodeFileReferenceHref, isOpenableFileReference, linkifyFileReferencesInMarkdown } from "../lib/fileReferences";
 
 
 SyntaxHighlighter.registerLanguage("tsx", tsx);
@@ -296,10 +296,9 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
                 />
               );
             }
-            // A card promises that clicking opens the file, so the link must
-            // carry an address. `looksLikeFileReference(label)` used to be
-            // enough: any link text ending in a known extension produced a
-            // card, whether or not anything could resolve it.
+            // A file card is only rendered when the Markdown target carries a
+            // destination. Knowledge references use /viewer/<document_id>;
+            // a filename-shaped label alone is never treated as clickable.
             if (
               enableFileCards &&
               (

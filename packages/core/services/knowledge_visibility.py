@@ -13,8 +13,16 @@ HIDDEN_PREFIXES: tuple[str, ...] = (
     "tmp/",
     "temp/",
     "avatars/",
-    # Runtime input / task storage. These are not final user-facing outputs.
+    # Runtime INPUT storage: reference frames and other material handed to a
+    # provider. Genuinely not user-facing.
     "uploads/",
+    # Entity-ROOT task scratch. Matched as a prefix only (see the loop at the
+    # end of is_user_visible_path) — never as a mid-path segment, or the
+    # canonical workspace artifact path
+    # Workspaces/_by_id/<folder>/tasks/<task>/videos/<file> would be caught by
+    # it, which is exactly what cost a produced 16.5 MB MP4 its Document row.
+    # It also bounds what knowledge URL signing will hand to browser tools, so
+    # the root prefix has to keep blocking.
     "tasks/",
     "$sandbox_output/",
     "$sandbox-output/",
@@ -31,6 +39,38 @@ HIDDEN_PREFIXES: tuple[str, ...] = (
     "svg_final_flattext/",
     "svg-flat/",
 )
+
+# Names that mean "internal" wherever they appear, at any depth: build caches,
+# scratch dirs, sandbox spill.
+#
+# The rest of HIDDEN_PREFIXES is position-dependent — ``tasks/`` and
+# ``uploads/`` name entity-ROOT storage areas, and matching those names at any
+# depth is what made every workspace task artifact invisible: the canonical
+# artifact path is
+# ``Workspaces/_by_id/<workspace>/tasks/<task>/videos/<file>.mp4``, whose
+# ``tasks`` segment collided with the root-level rule. Knowledge sync refused
+# to register the file, so a produced MP4 existed on disk with no Document row
+# — and the chat's file card, finding nothing to open, dropped the user on an
+# empty Knowledge page. STORAGE_ONLY_PREFIXES below says these paths are meant
+# to sync (they are projected through Document.folder_id); only their physical
+# folders stay out of the tree.
+ANYWHERE_HIDDEN_DIR_NAMES: frozenset[str] = frozenset({
+    ".ai",
+    ".cache",
+    "tmp",
+    "temp",
+    "__pycache__",
+    "$sandbox_output",
+    "$sandbox-output",
+    "$SANDBOX_OUTPUT_DIR",
+    "sandbox_output",
+    "sandbox-output",
+    "svg_output",
+    "svg_final",
+    "svg_output_flattext",
+    "svg_final_flattext",
+    "svg-flat",
+})
 
 # Final media artifacts may live under these physical filesystem folders.
 # The files can be visible as Documents, but the storage folders themselves
@@ -69,8 +109,7 @@ def is_user_visible_path(path: str) -> bool:
         return False
     if any(part.startswith(".") for part in parts):
         return False
-    hidden_dir_names = {prefix.rstrip("/") for prefix in HIDDEN_PREFIXES}
-    if any(part in hidden_dir_names for part in parts):
+    if any(part in ANYWHERE_HIDDEN_DIR_NAMES for part in parts):
         return False
     if any(part in SYSTEM_FILES or part in SYSTEM_DIRS for part in parts):
         return False

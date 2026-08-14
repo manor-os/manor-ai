@@ -108,8 +108,13 @@ async def plan_task(
         plan = await _generate_plan(task, context)
     _enforce_allowlists(plan, context)
 
-    gaps = plan_contract_gaps(plan.topo_order())
-    if gaps:
+    gaps = plan_contract_gaps(
+        plan.topo_order(),
+        task_expected_output=getattr(task, "expected_output", None),
+        require_explicit_agent_outputs=True,
+    )
+    required_step_errors = _required_plan_step_errors(task, plan)
+    if gaps or required_step_errors:
         # Re-plan once, feeding the gaps back to the Planner via task.details
         # (the prompt dumps Details JSON, so _replan_context reaches the LLM).
         # MERGE into any existing _replan_context — a runtime replan
@@ -118,10 +123,13 @@ async def plan_task(
         # and the minimal-replan guidance depend on; don't clobber them.
         existing_ctx = (task.details or {}).get("_replan_context")
         replan_ctx = dict(existing_ctx) if isinstance(existing_ctx, dict) else {}
-        replan_ctx.setdefault("reason", "contract_gaps")
-        replan_ctx["contract_gaps"] = "; ".join(
-            f"{g.step_key}: {g.detail}" for g in gaps
-        )
+        replan_ctx.setdefault("reason", "contract_gaps" if gaps else "required_plan_steps")
+        if gaps:
+            replan_ctx["contract_gaps"] = "; ".join(
+                f"{g.step_key}: {g.detail}" for g in gaps
+            )
+        if required_step_errors:
+            replan_ctx["required_plan_step_errors"] = required_step_errors
         task.details = {**(task.details or {}), "_replan_context": replan_ctx}
         async with runtime_planner_llm_billing_context(
             entity_id=task.entity_id,
@@ -129,8 +137,18 @@ async def plan_task(
         ):
             plan = await _generate_plan(task, context)
         _enforce_allowlists(plan, context)
-        gaps = plan_contract_gaps(plan.topo_order())
-        if gaps:
+        gaps = plan_contract_gaps(
+            plan.topo_order(),
+            task_expected_output=getattr(task, "expected_output", None),
+            require_explicit_agent_outputs=True,
+        )
+        required_step_errors = _required_plan_step_errors(task, plan)
+        if gaps or required_step_errors:
+            if required_step_errors and not gaps:
+                raise PlannerError(
+                    "required plan steps were not satisfied: "
+                    + "; ".join(required_step_errors)
+                )
             raise PlanContractError(gaps)
 
     return await create_plan_from_dag(
@@ -563,6 +581,7 @@ _TEXT_REPORT_DELIVERABLE_TERMS = (
 )
 _EXPLICIT_SAVED_ARTIFACT_TERMS = (
     ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt", ".md",
+    "mp4", "video file", "video artifact",
     "saved file", "file link", "file path", "report file", "text file",
     "document file", "markdown file", "as a file", "download", "attachment",
     "save as", "export as",
@@ -572,6 +591,7 @@ _EXPLICIT_SAVED_ARTIFACT_TERMS = (
 
 def _normalize_plan_for_task(task: Task, plan: Plan) -> Plan:
     """Normalize planner overreach before materializing executable steps."""
+    plan = _normalize_internal_agent_high_risk_steps(plan)
     plan = _normalize_planner_hard_approval_steps(plan)
     if not _task_requests_text_report_only(task):
         return plan
@@ -593,6 +613,114 @@ def _normalize_plan_for_task(task: Task, plan: Plan) -> Plan:
     try:
         normalized.metadata.normalized_removed_steps = sorted(removable_keys)
         normalized.metadata.normalization_reason = "unrequested_text_report_file_write"
+    except Exception:
+        pass
+    return normalized
+
+
+def _required_plan_step_errors(task: Task, plan: Plan) -> list[str]:
+    """Return violations of an explicit task-level ExecutionPlan contract."""
+    from packages.core.plans.refs import extract_step_refs
+
+    details = task.details if isinstance(task.details, dict) else {}
+    required_steps = details.get("required_plan_steps")
+    if not isinstance(required_steps, list):
+        return []
+
+    by_key = {step.key: step for step in plan.steps}
+    errors: list[str] = []
+    for raw in required_steps:
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("key") or "").strip()
+        if not key:
+            continue
+        step = by_key.get(key)
+        if step is None:
+            errors.append(f"missing required step {key!r}")
+            continue
+        for field in ("kind", "service_key"):
+            expected = str(raw.get(field) or "").strip()
+            if expected and str(getattr(step, field, None) or "").strip() != expected:
+                errors.append(
+                    f"required step {key!r} must have {field}={expected!r}"
+                )
+        expected_output_shape = str(raw.get("output_shape") or "").strip()
+        if expected_output_shape and str(getattr(step, "output_shape", None) or "").strip() != expected_output_shape:
+            errors.append(
+                f"required step {key!r} must have output_shape={expected_output_shape!r}"
+            )
+        expected_expects = raw.get("expects")
+        if isinstance(expected_expects, list):
+            actual_expects = [str(value).strip() for value in (getattr(step, "expects", None) or []) if str(value).strip()]
+            if actual_expects != [str(value).strip() for value in expected_expects if str(value).strip()]:
+                errors.append(
+                    f"required step {key!r} must declare expects={expected_expects!r}"
+                )
+        expected_dependencies = raw.get("depends_on")
+        if isinstance(expected_dependencies, list):
+            missing_dependencies = [
+                str(value) for value in expected_dependencies
+                if str(value) and str(value) not in step.depends_on
+            ]
+            if missing_dependencies:
+                errors.append(
+                    f"required step {key!r} must depend on {missing_dependencies!r}"
+                )
+        prompt = str((step.params or {}).get("prompt") or "")
+        for value in raw.get("prompt_substrings") or []:
+            required_text = str(value).strip()
+            if required_text and required_text.lower() not in prompt.lower():
+                errors.append(
+                    f"required step {key!r} prompt must mention {required_text!r}"
+                )
+        required_refs = raw.get("required_refs")
+        if isinstance(required_refs, list):
+            referenced_steps = {step_key for step_key, _field in extract_step_refs(step.params)}
+            for required_ref in required_refs:
+                producer_key = str(required_ref or "").strip()
+                if producer_key and producer_key not in referenced_steps:
+                    errors.append(
+                        f"required step {key!r} must reference required step {producer_key!r}"
+                    )
+        required_ref_fields = raw.get("required_ref_fields")
+        if isinstance(required_ref_fields, dict):
+            refs_by_step: dict[str, set[str | None]] = {}
+            for ref_step, ref_field in extract_step_refs(step.params):
+                refs_by_step.setdefault(ref_step, set()).add(ref_field)
+            for producer_key, fields in required_ref_fields.items():
+                expected_fields = [str(value).strip() for value in (fields or []) if str(value).strip()]
+                actual_fields = refs_by_step.get(str(producer_key), set())
+                if not any(field in actual_fields for field in expected_fields):
+                    field_label = expected_fields[0] if len(expected_fields) == 1 else str(expected_fields)
+                    errors.append(
+                        f"required step {key!r} must reference {producer_key}.{field_label}"
+                    )
+    return errors
+
+
+def _normalize_internal_agent_high_risk_steps(plan: Plan) -> Plan:
+    """Keep external-risk classification on concrete runtime actions."""
+    changed: list[str] = []
+    steps: list[PlanStep] = []
+    for step in plan.steps:
+        if (
+            step.kind in {"llm", "subagent"}
+            and step.risk_level == "high"
+            and not step.action_key
+            and not step.capability_id
+        ):
+            steps.append(step.model_copy(update={"risk_level": "low"}))
+            changed.append(step.key)
+        else:
+            steps.append(step)
+    if not changed:
+        return plan
+    normalized = Plan(steps=steps, metadata=plan.metadata)
+    try:
+        existing = list(getattr(normalized.metadata, "normalized_removed_internal_high_risk", []) or [])
+        normalized.metadata.normalized_removed_internal_high_risk = existing + changed
+        normalized.metadata.normalization_reason = "planner_internal_agent_risk_policy_owned"
     except Exception:
         pass
     return normalized
@@ -757,29 +885,37 @@ def _fallback_plan(task: Task, ctx: _Context) -> Plan:
     if not primary_service:
         # No services at all — emit a single human step so the user
         # sees something instead of nothing.
-        return Plan(steps=[
-            PlanStep(
-                key="manual_only",
-                kind="human",
-                params={"prompt": f"No services configured to plan task: {task.title}"},
-                description="Manual fallback (no service_key available).",
-            )
-        ])
+        return Plan(
+            steps=[
+                PlanStep(
+                    key="manual_only",
+                    kind="human",
+                    params={"prompt": f"No services configured to plan task: {task.title}"},
+                    description="Manual fallback (no service_key available).",
+                )
+            ]
+        )
     task_prompt = runtime_planner_task_prompt(task)
-    return Plan(steps=[
-        PlanStep(
-            key="think",
-            kind="llm",
-            service_key=primary_service,
-            params={"prompt": f"Think out loud about how to do this task:\n\n{task_prompt}"},
-            description="Reason about the task.",
-        ),
-        PlanStep(
-            key="summarize",
-            kind="llm",
-            service_key=primary_service,
-            params={"prompt": "Summarise the conclusion and any runtime requirements used in 3 bullet points: ${{ steps.think.result.text }}"},
-            depends_on=["think"],
-            description="Summarise into a concrete plan.",
-        ),
-    ])
+    return Plan(
+        steps=[
+            PlanStep(
+                key="think",
+                kind="llm",
+                service_key=primary_service,
+                output_shape="TextResult",
+                params={"prompt": f"Think out loud about how to do this task:\n\n{task_prompt}"},
+                description="Reason about the task.",
+            ),
+            PlanStep(
+                key="summarize",
+                kind="llm",
+                service_key=primary_service,
+                output_shape="TextResult",
+                params={
+                    "prompt": "Summarise the conclusion and any runtime requirements used in 3 bullet points: ${{ steps.think.result.text }}"
+                },
+                depends_on=["think"],
+                description="Summarise into a concrete plan.",
+            ),
+        ]
+    )

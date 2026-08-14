@@ -17,6 +17,17 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+
+
+def _leased_tokens(account) -> dict[str, str]:
+    return lease_oauth_account_tokens(
+        account,
+        requester_id="test_oauth_flow",
+        requester_kind="test",
+        reason="verify encrypted OAuth token persistence",
+    )
+
 
 async def _register_owner(client: AsyncClient, username: str) -> tuple[dict, str, str]:
     resp = await client.post(
@@ -133,6 +144,131 @@ async def test_oauth_start_tiktok_uses_client_key(client: AsyncClient, monkeypat
     assert "video.publish" in url
 
 
+@pytest.mark.asyncio
+async def test_oauth_start_facebook_uses_reviewed_scopes_only(
+    client: AsyncClient, monkeypatch
+):
+    """Facebook Login must request exactly the permissions backed by tools and
+    omit Google/PKCE parameters that are not part of Meta's server-side flow."""
+    from urllib.parse import parse_qs, urlparse
+
+    headers, _, _ = await _register_owner(client, "oauth_facebook")
+    monkeypatch.setenv("FACEBOOK_CLIENT_ID", "fb_cid")
+    monkeypatch.setenv("FACEBOOK_CLIENT_SECRET", "fb_csec")
+    monkeypatch.setenv("APP_URL", "https://app.manorai.xyz")
+
+    resp = await client.get(
+        "/api/v1/integrations/oauth/facebook/start",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    query = parse_qs(urlparse(data["authorize_url"]).query)
+    assert query["client_id"] == ["fb_cid"]
+    assert query["redirect_uri"] == [
+        "https://app.manorai.xyz/api/v1/integrations/oauth/facebook/callback"
+    ]
+    assert set(query["scope"][0].split(",")) == {
+        "public_profile",
+        "pages_show_list",
+        "pages_read_engagement",
+        "pages_manage_posts",
+        "pages_manage_engagement",
+        "pages_messaging",
+        "pages_manage_metadata",
+        "read_insights",
+        "instagram_basic",
+        "instagram_content_publish",
+        "instagram_manage_comments",
+        "instagram_manage_insights",
+    }
+    for unsupported in (
+        "email",
+        "access_type",
+        "prompt",
+        "code_challenge",
+        "code_challenge_method",
+    ):
+        assert unsupported not in query
+
+
+@pytest.mark.asyncio
+async def test_facebook_callback_exchanges_for_long_lived_token(
+    client: AsyncClient, monkeypatch
+):
+    """The callback persists Meta's long-lived token, never the one-hour token."""
+    headers, user_id, _ = await _register_owner(client, "oauth_facebook_callback")
+    monkeypatch.setenv("FACEBOOK_CLIENT_ID", "fb_cid")
+    monkeypatch.setenv("FACEBOOK_CLIENT_SECRET", "fb_csec")
+    monkeypatch.setenv("APP_URL", "https://app.manorai.xyz")
+
+    start = await client.get(
+        "/api/v1/integrations/oauth/facebook/start",
+        headers=headers,
+    )
+    state = start.json()["state"]
+    calls: list[dict] = []
+
+    class _MockResp:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _MockClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, _url, *, params=None, headers=None):
+            calls.append(dict(params or {}))
+            if (params or {}).get("grant_type") == "fb_exchange_token":
+                return _MockResp({
+                    "access_token": "fb-long-lived",
+                    "token_type": "bearer",
+                    "expires_in": 5_184_000,
+                })
+            if (params or {}).get("fields") == "id,name":
+                return _MockResp({"id": "fb-user-1", "name": "Meta Tester"})
+            return _MockResp({
+                "access_token": "fb-short-lived",
+                "token_type": "bearer",
+                "expires_in": 3_600,
+            })
+
+    with patch("httpx.AsyncClient", lambda *args, **kwargs: _MockClient()):
+        resp = await client.get(
+            f"/api/v1/integrations/oauth/facebook/callback?code=abc&state={state}",
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 302
+    assert any(call.get("fb_exchange_token") == "fb-short-lived" for call in calls)
+
+    import packages.core.database as dbmod
+    from packages.core.models.user import OAuthAccount
+
+    async with dbmod.async_session() as db:
+        row = (
+            await db.execute(
+                select(OAuthAccount).where(
+                    OAuthAccount.user_id == user_id,
+                    OAuthAccount.provider == "facebook",
+                )
+            )
+        ).scalar_one()
+    assert row.access_token is None
+    assert _leased_tokens(row)["access_token"] == "fb-long-lived"
+    assert row.provider_user_id == "fb-user-1"
+    assert row.token_expires_at is not None
+
+
 def test_apply_authorize_param_conventions_google_select_account():
     """Google providers upgrade ``prompt`` to ``select_account consent`` so a
     second connect lets the user pick a different Google account, while
@@ -165,6 +301,58 @@ def test_apply_authorize_param_conventions_google_select_account():
         out = apply_authorize_param_conventions(SimpleNamespace(server_key=key), dict(base))
         assert out["prompt"] == "consent"
         assert "select_account" not in out["prompt"]
+
+
+def test_google_oauth_scopes_are_exactly_the_reviewed_minimum_set():
+    """Keep the runtime manifest byte-for-byte aligned with the Google Cloud
+    Data Access screen. Alias scopes such as ``email`` / ``profile`` and
+    redundant broader scopes have caused verification discrepancies before.
+    """
+    from packages.core.services.oauth_provider_config import _PROVIDER_OAUTH_META
+
+    identity = {
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    }
+    expected = {
+        "gmail": identity | {
+            "https://www.googleapis.com/auth/gmail.modify",
+        },
+        "google_calendar": identity | {
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+            "https://www.googleapis.com/auth/calendar.events.freebusy",
+        },
+        "google_drive": identity | {
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.readonly",
+        },
+        "youtube": identity | {
+            "https://www.googleapis.com/auth/youtube.force-ssl",
+        },
+    }
+
+    for provider, scopes in expected.items():
+        assert set(_PROVIDER_OAUTH_META[provider]["scopes"].split()) == scopes
+
+
+def test_google_mcp_catalog_scopes_match_runtime_service_scopes():
+    from packages.core.services.mcp_seed import _MCP_CATALOG
+    from packages.core.services.oauth_provider_config import _PROVIDER_OAUTH_META
+
+    identity = {
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    }
+    catalog = {
+        row[0]: set((row[6] or "").split(",")) - {""}
+        for row in _MCP_CATALOG
+    }
+    for provider in ("gmail", "google_calendar", "google_drive", "youtube"):
+        runtime_service_scopes = set(_PROVIDER_OAUTH_META[provider]["scopes"].split()) - identity
+        assert catalog[provider] == runtime_service_scopes
 
 
 @pytest.mark.asyncio
@@ -361,8 +549,12 @@ async def test_callback_exchanges_code_and_stores_token(client: AsyncClient, mon
                 )
             )
         ).scalar_one()
-    assert row.access_token == "xoxb-new-token"
-    assert row.refresh_token == "rt-new"
+    assert row.access_token is None
+    assert row.refresh_token is None
+    assert _leased_tokens(row) == {
+        "access_token": "xoxb-new-token",
+        "refresh_token": "rt-new",
+    }
     assert row.token_expires_at is not None
 
 
@@ -444,8 +636,12 @@ async def test_callback_clears_stale_failed_health_on_reconnect(client: AsyncCli
                 )
             )
         ).scalar_one()
-    assert row.access_token == "xoxb-reconnected-token"
-    assert row.refresh_token == "rt-reconnected"
+    assert row.access_token is None
+    assert row.refresh_token is None
+    assert _leased_tokens(row) == {
+        "access_token": "xoxb-reconnected-token",
+        "refresh_token": "rt-reconnected",
+    }
     assert "last_health_check" not in row.profile
     assert "oauth_refresh" not in row.profile
 
@@ -519,7 +715,11 @@ async def test_oauth_callback_keeps_multiple_external_accounts(
         )).scalars().all())
 
     assert {row.provider_user_id for row in rows} == {"U-FIRST", "U-SECOND"}
-    assert {row.access_token for row in rows} == {"token-first", "token-second"}
+    assert all(row.access_token is None for row in rows)
+    assert {_leased_tokens(row)["access_token"] for row in rows} == {
+        "token-first",
+        "token-second",
+    }
     assert sum(bool((row.profile or {}).get("is_default")) for row in rows) == 1
 
 

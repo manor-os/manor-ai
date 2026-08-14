@@ -22,7 +22,7 @@ export default function FloatingPanel({
   children: ReactNode;
   /** Stack order. Chat uses 1001; layer others above it if both can show. */
   zIndex?: number;
-  /** Shared default size for all floating panels — override only if needed. */
+  /** Shared maximum width for all floating panels — override only if needed. */
   width?: number;
   height?: number;
   ariaLabel?: string;
@@ -39,10 +39,10 @@ export default function FloatingPanel({
         bottom: 24,
         right: 24,
         zIndex,
-        width,
+        width: "calc(100% - 48px)",
         height,
         maxHeight: "calc(100vh - 48px)",
-        maxWidth: "calc(100vw - 48px)",
+        maxWidth: width,
         borderRadius: 20,
         background: "var(--modal-bg)",
         backdropFilter: "blur(24px)",

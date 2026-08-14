@@ -76,9 +76,10 @@ class Task(Base, TimestampMixin):
     # task creation; Planner is bound by it.
     delegate_service_keys: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
 
-    # Soft I/O contracts (JSON Schema) — Strategist→Planner chain uses
-    # these to propagate one task's actual_output into the next task's
-    # params. Optional; pure manual tasks leave them null.
+    # Task I/O contracts (JSON Schema) — input_contract supports task chaining;
+    # a structural expected_output is also hard-bound to the unique terminal
+    # llm/subagent step before execution. Optional; pure manual tasks leave
+    # them null.
     input_contract: Mapped[Optional[dict]] = mapped_column(JSONB)
     expected_output: Mapped[Optional[dict]] = mapped_column(JSONB)
     actual_output: Mapped[Optional[dict]] = mapped_column(JSONB)

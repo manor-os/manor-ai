@@ -10,6 +10,7 @@ export interface WorkflowInputSchema {
   const?: unknown;
   default?: unknown;
   properties?: Record<string, WorkflowInputSchema>;
+  additionalProperties?: boolean | WorkflowInputSchema;
   required?: string[];
   items?: WorkflowInputSchema;
   minItems?: number;
@@ -118,10 +119,13 @@ export function workflowSchemaDraft(schema: WorkflowInputSchema, supplied: unkno
   const schemaType = workflowSchemaType(schema);
   if (schemaType === "object") {
     const sourceRecord = asRecord(source) || {};
-    return Object.fromEntries(Object.entries(schema.properties || {}).map(([key, child]) => [
+    const declared = Object.fromEntries(Object.entries(schema.properties || {}).map(([key, child]) => [
       key,
       workflowSchemaDraft(child, sourceRecord[key]),
     ]));
+    return schema.additionalProperties === false
+      ? declared
+      : { ...sourceRecord, ...declared };
   }
   if (schemaType === "array") {
     if (workflowSchemaType(schema.items) === "string") {
@@ -240,7 +244,9 @@ export function parseWorkflowSchemaDraft(
   if (schemaType === "object") {
     const draftRecord = asRecord(draft) || {};
     const requiredKeys = new Set(schema.required || []);
-    const parsed: Record<string, unknown> = {};
+    const parsed: Record<string, unknown> = schema.additionalProperties === false
+      ? {}
+      : { ...draftRecord };
     for (const [key, child] of Object.entries(schema.properties || {})) {
       const childValue = parseWorkflowSchemaDraft(
         child,

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -19,6 +21,8 @@ from urllib.parse import unquote, urlparse
 from sqlalchemy import select
 
 from packages.core.models.media_job import MediaJobStatus
+from packages.core.models.base import generate_ulid
+from packages.core.services.audio_conversion import ffmpeg_audio_codec_args
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,9 @@ AUDIO_TIMELINE_TYPES = {
 TERMINAL_JOB_STATUSES = MediaJobStatus.terminal()
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 MAX_WAIT_SECONDS = 900.0
+NARRATION_MIN_TEMPO_FACTOR = 0.75
+NARRATION_MAX_TEMPO_FACTOR = 1.5
+NARRATION_MAX_BLOCK_TEMPO_RELATIVE_SPREAD = 0.03
 
 
 WAIT_MEDIA_JOBS_SCHEMA = {
@@ -395,6 +402,182 @@ ALIGN_SUBTITLES_SCHEMA = {
 }
 
 
+BUILD_NARRATION_TIMELINE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "build_narration_timeline",
+        "description": (
+            "Build durable subtitle cues and audio-track offsets from caption-sized "
+            "TTS audio segments measured with ffprobe and FFmpeg silence detection. "
+            "Each segment must preserve provenance for its exact spoken text. Omit "
+            "text to derive it directly from the audio receipt and avoid retyping drift."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "transcript_path": {
+                    "type": "string",
+                    "description": "Canonical narration text file.",
+                },
+                "segments": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "audio_path": {"type": "string"},
+                            "text": {
+                                "type": "string",
+                                "description": (
+                                    "Optional exact TTS prompt. Prefer omitting it so the "
+                                    "Harness derives text from the audio receipt."
+                                ),
+                            },
+                            "start_seconds": {
+                                "type": "number",
+                                "minimum": 0,
+                                "description": (
+                                    "Optional absolute timeline start. Use it on the first "
+                                    "segment of a fixed visual block; omitted segments follow "
+                                    "the previous measured segment without a gap."
+                                ),
+                            },
+                        },
+                        "required": ["audio_path"],
+                        "additionalProperties": False,
+                    },
+                    "description": (
+                        "Ordered normalized TTS audio segments. The Harness derives omitted "
+                        "text from each segment's immutable TTS provenance."
+                    ),
+                },
+                "require_normalized_segments": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Require every audio_path to be a normalize_audio_loudness output "
+                        "with a positive target_duration_seconds receipt. Keep true for "
+                        "production narration so a compacted agent cannot silently mix raw TTS."
+                    ),
+                },
+                "block_durations_seconds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "number", "minimum": 0.25, "maximum": 60},
+                    "description": (
+                        "Ordered visual-block durations. When supplied, the Harness "
+                        "requires one explicit segment start at every cumulative block "
+                        "boundary and verifies measured narration occupancy per block."
+                    ),
+                },
+                "minimum_block_fill_ratio": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 1,
+                    "default": 0.72,
+                },
+                "maximum_block_fill_ratio": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 1,
+                    "default": 0.9,
+                },
+                "manifest_name": {
+                    "type": "string",
+                    "description": "Narration manifest output path or filename.",
+                },
+                "timeline_name": {
+                    "type": "string",
+                    "description": "Narration timeline JSON output path or filename.",
+                },
+                "cues_name": {
+                    "type": "string",
+                    "description": "Subtitle cue JSON output path or filename.",
+                },
+                "silence_noise_db": {
+                    "type": "number",
+                    "minimum": -80,
+                    "maximum": -20,
+                    "default": -50,
+                },
+                "minimum_silence_seconds": {
+                    "type": "number",
+                    "minimum": 0.05,
+                    "maximum": 2,
+                    "default": 0.1,
+                },
+                "padding_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 0.25,
+                    "default": 0.08,
+                },
+            },
+            "required": ["transcript_path", "segments"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+PREPARE_NARRATION_TIMELINE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "prepare_narration_timeline",
+        "description": (
+            "Deterministically prepare a complete fixed-block narration timeline from "
+            "an immutable segment manifest and its stable source TTS files. The Harness "
+            "measures every source clip, applies one shared natural tempo factor per "
+            "visual block, normalizes loudness, and builds verified cues in one call."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "transcript_path": {"type": "string"},
+                "segment_manifest_path": {"type": "string"},
+                "source_audio_directory": {"type": "string"},
+                "normalized_output_directory": {"type": "string"},
+                "block_durations_seconds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "number", "minimum": 0.25, "maximum": 60},
+                },
+                "occupancy_ratio": {
+                    "type": "number",
+                    "minimum": 0.72,
+                    "maximum": 0.9,
+                    "default": 0.84,
+                },
+                "minimum_block_fill_ratio": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 1,
+                    "default": 0.72,
+                },
+                "maximum_block_fill_ratio": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 1,
+                    "default": 0.9,
+                },
+                "manifest_name": {"type": "string"},
+                "timeline_name": {"type": "string"},
+                "cues_name": {"type": "string"},
+            },
+            "required": [
+                "transcript_path",
+                "segment_manifest_path",
+                "source_audio_directory",
+                "normalized_output_directory",
+                "block_durations_seconds",
+                "timeline_name",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 NORMALIZE_AUDIO_LOUDNESS_SCHEMA = {
     "type": "function",
     "function": {
@@ -408,6 +591,16 @@ NORMALIZE_AUDIO_LOUDNESS_SCHEMA = {
                 "target_lufs": {"type": "number", "default": -16},
                 "true_peak": {"type": "number", "default": -1.5},
                 "lra": {"type": "number", "default": 11},
+                "target_duration_seconds": {
+                    "type": "number",
+                    "minimum": 0.25,
+                    "maximum": 3600,
+                    "description": (
+                        "Optional exact output duration. The tool deterministically applies "
+                        "FFmpeg tempo adjustment before loudness normalization while preserving "
+                        "the narrator profile. Use this to fit locked narration into a fixed block."
+                    ),
+                },
                 "output_format": {"type": "string", "enum": ["wav", "mp3", "m4a", "flac"], "default": "wav"},
             },
             "required": ["input_path", "output_name"],
@@ -1167,6 +1360,7 @@ async def _align_subtitles_handler(
 
         transcript = ""
         transcript_matches = None
+        alignment_texts: list[str] = []
         if transcript_path:
             transcript_rel = _workspace_media_reference(
                 transcript_path,
@@ -1181,6 +1375,7 @@ async def _align_subtitles_handler(
                     "Subtitle cue text must match the canonical narration transcript verbatim.",
                     code="subtitle_transcript_mismatch",
                 )
+            alignment_texts = [cue.text for cue in cues]
 
         audio_duration = None
         audio_transcript_matches = None
@@ -1191,14 +1386,97 @@ async def _align_subtitles_handler(
             "missing_sentence_indexes": [],
             "measured_timestamps": False,
             "transcription_model": None,
+            "alignment_unit": "subtitle_cue" if alignment_texts else None,
             "sentence_timestamps": [],
             "scene_coverage": _scene_alignment_coverage(
                 [timeline, *cue_payloads],
-                _canonical_sentences(transcript),
+                alignment_texts,
                 cues,
-                list(range(1, len(_canonical_sentences(transcript)) + 1)),
+                list(range(1, len(alignment_texts) + 1)),
             ),
         }
+        if (
+            transcript
+            and not audio_path
+            and _subtitle_cues_have_measured_timing(cues)
+        ):
+            sentences = alignment_texts
+            measured_segments = [
+                {
+                    "start": cue.start,
+                    "end": cue.end,
+                    "text": cue.text,
+                    "timing_source": cue.timing_source or "existing_measured_cues",
+                }
+                for cue in cues
+            ]
+            try:
+                measured_sentence_cues, semantic_metrics = _align_sentences_to_segments(
+                    sentences,
+                    measured_segments,
+                )
+            except SubtitleWordTimestampsRequiredError as exc:
+                return _json_blocked(
+                    str(exc),
+                    code="subtitle_word_timestamps_required",
+                    transcription_model="tts_segment_provenance",
+                )
+            scene_coverage = _scene_alignment_coverage(
+                [timeline, *cue_payloads],
+                sentences,
+                measured_sentence_cues,
+                semantic_metrics["aligned_sentence_indexes"],
+            )
+            alignment_metrics = {
+                **semantic_metrics,
+                "measured_timestamps": True,
+                "transcription_model": "tts_segment_provenance",
+                "alignment_unit": "subtitle_cue",
+                "sentence_timestamps": [
+                    {
+                        "sentence_index": sentence_index,
+                        "start": round(cue.start, 3),
+                        "end": round(cue.end, 3),
+                        "timing_source": cue.timing_source,
+                    }
+                    for sentence_index, cue in zip(
+                        semantic_metrics["aligned_sentence_indexes"],
+                        measured_sentence_cues,
+                        strict=True,
+                    )
+                ],
+                "scene_coverage": scene_coverage,
+            }
+            if (
+                semantic_metrics["similarity"] < 0.90
+                or semantic_metrics["coverage"] < 0.95
+            ):
+                return _json_blocked(
+                    "Measured narration could not be aligned to at least 95% of the "
+                    "canonical sentences with 0.90 similarity.",
+                    code="subtitle_semantic_alignment_failed",
+                    alignment_metrics=alignment_metrics,
+                )
+            if scene_coverage["missing_interval_scene_ids"]:
+                missing_intervals = scene_coverage["missing_interval_scene_ids"]
+                missing = ", ".join(missing_intervals)
+                return _json_blocked(
+                    "Measured scene coverage requires a stable start/end interval "
+                    f"for every declared scene. Missing interval for scene(s): {missing}.",
+                    code="subtitle_scene_interval_missing",
+                    missing_interval_scene_ids=missing_intervals,
+                    scene_coverage=scene_coverage,
+                    alignment_metrics=alignment_metrics,
+                )
+            if scene_coverage["missing_scene_ids"]:
+                missing = ", ".join(scene_coverage["missing_scene_ids"])
+                return _json_blocked(
+                    f"Measured narration did not align a sentence to scene(s): {missing}.",
+                    code="subtitle_scene_alignment_incomplete",
+                    missing_scene_ids=scene_coverage["missing_scene_ids"],
+                    scene_coverage=scene_coverage,
+                    alignment_metrics=alignment_metrics,
+                )
         if audio_path:
             if not ffprobe:
                 return _json_error("ffprobe is required to align subtitles to narration audio")
@@ -1231,7 +1509,7 @@ async def _align_subtitles_handler(
                         code="subtitle_audio_transcript_unverified",
                     )
             if transcript:
-                sentences = _canonical_sentences(transcript)
+                sentences = alignment_texts
                 if _subtitle_cues_have_measured_timing(cues):
                     measured_segments = [
                         {
@@ -1316,6 +1594,7 @@ async def _align_subtitles_handler(
                     **semantic_metrics,
                     "measured_timestamps": True,
                     "transcription_model": transcription_model or None,
+                    "alignment_unit": "subtitle_cue",
                     "sentence_timestamps": [
                         {
                             "sentence_index": sentence_index,
@@ -1483,6 +1762,888 @@ async def _align_subtitles_handler(
         return _json_error(str(exc), code="align_subtitles_failed")
 
 
+def _narration_segment_cue_bounds(
+    *,
+    duration_seconds: float,
+    leading_silence_seconds: float,
+    trailing_silence_seconds: float,
+    padding_seconds: float,
+) -> tuple[float, float]:
+    """Return safe cue bounds inside a decoded, isolated TTS segment."""
+    duration = max(0.0, float(duration_seconds))
+    leading = max(0.0, min(duration, float(leading_silence_seconds)))
+    trailing = max(0.0, min(duration - leading, float(trailing_silence_seconds)))
+    padding = max(0.0, float(padding_seconds))
+    speech_start = leading
+    speech_end = max(speech_start, duration - trailing)
+    if speech_end <= speech_start:
+        return speech_start, speech_end
+    return max(0.0, speech_start - padding), min(duration, speech_end + padding)
+
+
+def _narrator_profile_audio_output_name(output_name: str, voice: str) -> str:
+    """Place normalized task narration beside its source voice segments."""
+    voice_slug = re.sub(r"[^a-z0-9]+", "-", str(voice or "").strip().lower()).strip("-")
+    if not voice_slug:
+        raise ValueError("Narrator profile voice must produce a non-empty storage folder name.")
+    normalized = str(output_name or "").replace("\\", "/").strip("/")
+    filename = normalized.rsplit("/", 1)[-1].strip()
+    if not filename:
+        raise ValueError("Normalized narration output name must include a filename.")
+    if normalized.startswith("runs/") and "/" in normalized:
+        parent = normalized.rsplit("/", 1)[0]
+        if parent.rsplit("/", 1)[-1].strip().lower() == voice_slug:
+            return normalized
+        return f"{parent}/{voice_slug}/{filename}"
+    return f"audio/{voice_slug}/{filename}"
+
+
+async def _build_narration_timeline_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    transcript_path: str = "",
+    segments: list[dict[str, Any]] | None = None,
+    manifest_name: str = "",
+    timeline_name: str = "",
+    cues_name: str = "",
+    silence_noise_db: float = -50.0,
+    minimum_silence_seconds: float = 0.1,
+    padding_seconds: float = 0.08,
+    require_normalized_segments: bool = True,
+    block_durations_seconds: list[float] | None = None,
+    minimum_block_fill_ratio: float = 0.72,
+    maximum_block_fill_ratio: float = 0.9,
+    workspace_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    **_: Any,
+) -> str:
+    """Build subtitle timing from isolated, provenance-verified TTS segments."""
+    if not entity_id:
+        return _json_error("entity_id is required")
+    if not str(transcript_path or "").strip():
+        return _json_error("transcript_path is required")
+    if not isinstance(segments, list) or not segments:
+        return _json_error("segments must contain at least one narration segment")
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg:
+        return _json_error("ffmpeg is required", code="ffmpeg_missing")
+    if not ffprobe:
+        return _json_error("ffprobe is required", code="ffprobe_missing")
+
+    try:
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        transcript_rel = _workspace_media_reference(
+            transcript_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        transcript_abs = _resolve_entity_file(entity_root, transcript_rel)
+        transcript = Path(transcript_abs).read_text(encoding="utf-8")
+        if not _canonical_subtitle_text(transcript):
+            return _json_error("Canonical narration transcript must not be empty")
+
+        prepared: list[dict[str, Any]] = []
+        for index, item in enumerate(segments, start=1):
+            if not isinstance(item, dict):
+                return _json_error(
+                    f"segments[{index}] must be an object",
+                    code="narration_segment_invalid",
+                )
+            raw_audio_path = str(item.get("audio_path") or "").strip()
+            if not raw_audio_path:
+                return _json_error(
+                    f"segments[{index}] requires audio_path",
+                    code="narration_segment_invalid",
+                )
+            audio_rel = _workspace_media_reference(
+                raw_audio_path,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+            normalization_tempo_factor: float | None = None
+            if require_normalized_segments:
+                normalization = await _audio_normalization_provenance(
+                    entity_id=entity_id,
+                    audio_rel_path=audio_rel,
+                )
+                target_duration = (
+                    normalization.get("target_duration_seconds")
+                    if isinstance(normalization, dict)
+                    else None
+                )
+                if (
+                    not isinstance(normalization, dict)
+                    or normalization.get("operation") != "normalize_audio_loudness"
+                    or not isinstance(target_duration, (int, float))
+                    or isinstance(target_duration, bool)
+                    or target_duration <= 0
+                ):
+                    return _json_error(
+                        (
+                            f"Narration segment {index} must be a loudness-normalized "
+                            "audio receipt with target_duration_seconds."
+                        ),
+                        code="narration_segment_not_normalized",
+                    )
+                tempo_factor = normalization.get("tempo_factor")
+                if isinstance(tempo_factor, (int, float)) and not isinstance(
+                    tempo_factor, bool
+                ):
+                    normalization_tempo_factor = float(tempo_factor)
+                if (
+                    isinstance(normalization.get("narration_profile"), dict)
+                    and isinstance(tempo_factor, (int, float))
+                    and not isinstance(tempo_factor, bool)
+                    and not (
+                        NARRATION_MIN_TEMPO_FACTOR
+                        <= float(tempo_factor)
+                        <= NARRATION_MAX_TEMPO_FACTOR
+                    )
+                ):
+                    return _json_error(
+                        (
+                            f"Narration segment {index} tempo factor {float(tempo_factor):.3f} "
+                            "would sound unnaturally slow or fast. Re-normalize from the "
+                            "original TTS receipt with a duration allocated proportionally "
+                            "within its visual block."
+                        ),
+                        code="narration_segment_tempo_out_of_range",
+                    )
+            text = str(item.get("text") or "").strip()
+            if not text:
+                provenance = await _audio_prompt_provenance(
+                    entity_id=entity_id,
+                    audio_rel_path=audio_rel,
+                )
+                if provenance is None:
+                    return _json_error(
+                        f"Narration segment {index} has no verifiable generation provenance.",
+                        code="narration_segment_provenance_unverified",
+                    )
+                text = provenance[0]
+            raw_start = item.get("start_seconds")
+            start_seconds = None
+            if raw_start is not None:
+                try:
+                    start_seconds = float(raw_start)
+                except (TypeError, ValueError):
+                    return _json_error(
+                        f"segments[{index}].start_seconds must be a non-negative number",
+                        code="narration_segment_start_invalid",
+                    )
+                if not math.isfinite(start_seconds) or start_seconds < 0:
+                    return _json_error(
+                        f"segments[{index}].start_seconds must be a non-negative number",
+                        code="narration_segment_start_invalid",
+                    )
+            prepared.append(
+                {
+                    "index": index,
+                    "text": text,
+                    "audio_rel": _normalize_user_path(audio_rel),
+                    "audio_abs": _resolve_entity_file(entity_root, audio_rel),
+                    "start_seconds": start_seconds,
+                    "tempo_factor": normalization_tempo_factor,
+                }
+            )
+
+        joined_text = "".join(item["text"] for item in prepared)
+        if _canonical_subtitle_text(joined_text) != _canonical_subtitle_text(transcript):
+            return _json_error(
+                "Ordered narration segment text must equal the canonical transcript.",
+                code="narration_segment_transcript_mismatch",
+            )
+
+        noise = _clamp_float(silence_noise_db, -80.0, -20.0, -50.0)
+        silence_minimum = _clamp_float(minimum_silence_seconds, 0.05, 2.0, 0.1)
+        padding = _clamp_float(padding_seconds, 0.0, 0.25, 0.08)
+        offset = 0.0
+        cue_payloads: list[dict[str, Any]] = []
+        track_payloads: list[dict[str, Any]] = []
+        segment_payloads: list[dict[str, Any]] = []
+        narrator_profile: dict[str, str | int] | None = None
+        narrator_profile_missing = False
+
+        for item in prepared:
+            requested_start = item["start_seconds"]
+            if requested_start is not None:
+                if requested_start + 0.001 < offset:
+                    return _json_error(
+                        f"Narration segment {item['index']} overlaps the preceding segment.",
+                        code="narration_segment_overlap",
+                    )
+                offset = requested_start
+            match = await _audio_prompt_matches_transcript(
+                entity_id=entity_id,
+                audio_rel_path=item["audio_rel"],
+                transcript=item["text"],
+            )
+            if match is False:
+                provenance = await _audio_prompt_provenance(
+                    entity_id=entity_id,
+                    audio_rel_path=item["audio_rel"],
+                )
+                return _json(
+                    {
+                        "status": "error",
+                        "code": "narration_segment_provenance_mismatch",
+                        "error": (
+                            f"Narration segment {item['index']} was generated from different text."
+                        ),
+                        "segment_index": item["index"],
+                        "provided_text": item["text"],
+                        "receipt_text": provenance[0] if provenance else None,
+                        "audio_path": item["audio_rel"],
+                    }
+                )
+            if match is None:
+                return _json_error(
+                    f"Narration segment {item['index']} has no verifiable generation provenance.",
+                    code="narration_segment_provenance_unverified",
+                )
+
+            segment_profile = await _audio_narrator_profile(
+                entity_id=entity_id,
+                audio_rel_path=item["audio_rel"],
+            )
+            if segment_profile is None:
+                narrator_profile_missing = True
+                if narrator_profile is not None:
+                    return _json_error(
+                        "Narration segments must use the same task narrator profile.",
+                        code="narration_segment_profile_mismatch",
+                    )
+            else:
+                if narrator_profile_missing or (
+                    narrator_profile is not None and segment_profile != narrator_profile
+                ):
+                    return _json_error(
+                        "Narration segments must use the same task narrator profile.",
+                        code="narration_segment_profile_mismatch",
+                    )
+                narrator_profile = segment_profile
+
+            _assert_audio_path(item["audio_abs"])
+            media_info = await _probe_media(ffprobe, item["audio_abs"])
+            duration = float(media_info.get("duration_seconds") or 0.0)
+            if duration <= 0:
+                return _json_error(
+                    f"Narration segment {item['index']} has no measurable duration.",
+                    code="narration_segment_duration_unavailable",
+                )
+            _stdout, silence_stderr = await _run_process(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-nostats",
+                    "-i",
+                    item["audio_abs"],
+                    "-map",
+                    "0:a:0",
+                    "-af",
+                    f"silencedetect=noise={noise:.1f}dB:d={silence_minimum:.3f}",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                timeout_seconds=max(120.0, duration * 2.0 + 30.0),
+            )
+            silence = _parse_silence_intervals(silence_stderr, duration_seconds=duration)
+            local_start, local_end = _narration_segment_cue_bounds(
+                duration_seconds=duration,
+                leading_silence_seconds=silence["leading_silence_seconds"],
+                trailing_silence_seconds=silence["trailing_silence_seconds"],
+                padding_seconds=padding,
+            )
+            if local_end - local_start < 0.05:
+                return _json_error(
+                    f"Narration segment {item['index']} has no detectable speech.",
+                    code="narration_segment_silent",
+                )
+
+            cue = {
+                "type": "narration",
+                "text": item["text"],
+                "start": round(offset + local_start, 3),
+                "end": round(offset + local_end, 3),
+                "measured": True,
+                "timing_source": "measured_tts_segment_audio",
+            }
+            track = {
+                "id": f"narration-{item['index']:03d}",
+                "type": "narration",
+                "path": item["audio_rel"],
+                "start": round(offset, 3),
+                "end": round(offset + duration, 3),
+            }
+            cue_payloads.append(cue)
+            track_payloads.append(track)
+            segment_payloads.append(
+                {
+                    "index": item["index"],
+                    "text": item["text"],
+                    "text_sha256": hashlib.sha256(
+                        _canonical_subtitle_text(item["text"]).encode("utf-8")
+                    ).hexdigest(),
+                    "audio_path": item["audio_rel"],
+                    "duration_seconds": round(duration, 3),
+                    "start_seconds": round(offset, 3),
+                    "leading_silence_seconds": silence["leading_silence_seconds"],
+                    "trailing_silence_seconds": silence["trailing_silence_seconds"],
+                    "cue_start": cue["start"],
+                    "cue_end": cue["end"],
+                    "narration_profile": segment_profile,
+                }
+            )
+            offset += duration
+
+        total_duration = round(offset, 3)
+        block_fill_ratios: list[float] = []
+        if block_durations_seconds is not None:
+            if not isinstance(block_durations_seconds, list) or not block_durations_seconds:
+                return _json_error(
+                    "block_durations_seconds must contain at least one positive duration.",
+                    code="narration_block_plan_invalid",
+                )
+            block_durations: list[float] = []
+            for index, value in enumerate(block_durations_seconds, start=1):
+                duration = _coerce_float(value, 0.0)
+                if not math.isfinite(duration) or not 0.25 <= duration <= 60:
+                    return _json_error(
+                        f"block_durations_seconds[{index}] must be between 0.25 and 60.",
+                        code="narration_block_plan_invalid",
+                    )
+                block_durations.append(duration)
+            minimum_fill = _clamp_float(minimum_block_fill_ratio, 0.1, 1.0, 0.72)
+            maximum_fill = _clamp_float(maximum_block_fill_ratio, 0.1, 1.0, 0.9)
+            if minimum_fill > maximum_fill:
+                return _json_error(
+                    "minimum_block_fill_ratio cannot exceed maximum_block_fill_ratio.",
+                    code="narration_block_plan_invalid",
+                )
+            block_start = 0.0
+            for block_index, block_duration in enumerate(block_durations, start=1):
+                block_end = block_start + block_duration
+                matching = [
+                    (prepared_item, segment)
+                    for prepared_item, segment in zip(prepared, segment_payloads, strict=True)
+                    if block_start - 0.001
+                    <= float(segment["start_seconds"])
+                    < block_end - 0.001
+                ]
+                explicit_starts = [
+                    item
+                    for item in prepared
+                    if item["start_seconds"] is not None
+                    and abs(float(item["start_seconds"]) - block_start) <= 0.001
+                ]
+                if len(explicit_starts) != 1 or not matching:
+                    return _json_error(
+                        (
+                            f"Narration block {block_index} requires exactly one explicit "
+                            f"first-segment start at {block_start:.3f}s."
+                        ),
+                        code="narration_block_boundary_missing",
+                    )
+                if any(float(segment["start_seconds"]) + float(segment["duration_seconds"]) > block_end + 0.001 for _, segment in matching):
+                    return _json_error(
+                        f"Narration block {block_index} crosses its {block_end:.3f}s boundary.",
+                        code="narration_block_boundary_crossed",
+                    )
+                block_tempo_factors = [
+                    float(prepared_item["tempo_factor"])
+                    for prepared_item, _segment in matching
+                    if prepared_item["tempo_factor"] is not None
+                ]
+                if len(block_tempo_factors) > 1:
+                    slowest = min(block_tempo_factors)
+                    fastest = max(block_tempo_factors)
+                    relative_spread = (fastest - slowest) / slowest
+                    if relative_spread > NARRATION_MAX_BLOCK_TEMPO_RELATIVE_SPREAD:
+                        return _json_error(
+                            (
+                                f"Narration block {block_index} uses inconsistent tempo "
+                                f"factors {slowest:.3f}-{fastest:.3f}. Allocate every clause "
+                                "from its measured source TTS duration using one shared "
+                                "block-level tempo factor."
+                            ),
+                            code="narration_block_tempo_inconsistent",
+                        )
+                cue_end = max(float(segment["cue_end"]) for _, segment in matching)
+                fill_ratio = (cue_end - block_start) / block_duration
+                block_fill_ratios.append(round(fill_ratio, 4))
+                if not minimum_fill <= fill_ratio <= maximum_fill:
+                    return _json_error(
+                        (
+                            f"Narration block {block_index} measured fill ratio "
+                            f"{fill_ratio:.3f}; expected {minimum_fill:.3f}-{maximum_fill:.3f}. "
+                            "Reallocate the frozen clauses proportionally within this block "
+                            "and normalize again from the original TTS receipts."
+                        ),
+                        code="narration_block_fill_out_of_range",
+                    )
+                block_start = block_end
+            if any(float(segment["start_seconds"]) >= block_start - 0.001 for segment in segment_payloads):
+                return _json_error(
+                    "Narration contains a segment outside the declared visual blocks.",
+                    code="narration_block_plan_mismatch",
+                )
+        manifest = {
+            "version": 1,
+            "timing_source": "measured_tts_segment_audio",
+            "transcript_path": _normalize_user_path(transcript_rel),
+            "transcript_sha256": hashlib.sha256(
+                _canonical_subtitle_text(transcript).encode("utf-8")
+            ).hexdigest(),
+            "total_duration_seconds": total_duration,
+            "segments": segment_payloads,
+            "audio_tracks": track_payloads,
+            "block_durations_seconds": block_durations_seconds,
+            "block_fill_ratios": block_fill_ratios,
+        }
+        if narrator_profile is not None:
+            manifest["narration_profile"] = narrator_profile
+        timeline = {
+            "duration_seconds": total_duration,
+            "audio_tracks": track_payloads,
+            "subtitle_cues": cue_payloads,
+            "block_durations_seconds": block_durations_seconds,
+            "block_fill_ratios": block_fill_ratios,
+            "alignment_metrics": {
+                "similarity": 1.0,
+                "coverage": 1.0,
+                "measured_timestamps": True,
+                "transcription_model": "tts_segment_provenance",
+                "timing_sources": ["measured_tts_segment_audio"],
+            },
+        }
+        if narrator_profile is not None:
+            timeline["narration_profile"] = narrator_profile
+        cue_document = {"cues": cue_payloads}
+        outputs = [
+            (manifest_name or "technical/narration-manifest.json", "narration-manifest", manifest),
+            (timeline_name or "timeline/narration-timeline.json", "narration-timeline", timeline),
+            (cues_name or "subtitles/subtitle-cues.json", "subtitle-cues", cue_document),
+        ]
+        artifact_outputs: dict[str, dict[str, str | None]] = {}
+        for output_name, fallback, payload in outputs:
+            target = await _build_media_target(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                output_name=output_name,
+                ext=".json",
+                fallback=fallback,
+                default_dir=WorkspaceArtifactDir.ARTIFACTS.value,
+            )
+            if not target.abs_dir or not target.abs_path:
+                raise ValueError(f"Could not resolve {fallback} output path")
+            os.makedirs(target.abs_dir, exist_ok=True)
+            data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            target_abs_path = entity_fs.write_entity_file_atomic(
+                entity_id,
+                target.rel_path,
+                data,
+                expected_size=len(data),
+                allow_empty=False,
+            )
+            document_id = await _register_file_artifact(
+                entity_id=entity_id,
+                user_id=user_id,
+                filename=target.filename,
+                rel_path=target.rel_path,
+                file_size=os.path.getsize(target_abs_path),
+                file_type="json",
+                mime_type="application/json",
+                workspace_id=workspace_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                tool_name="build_narration_timeline",
+                artifact_role="intermediate",
+                generation={
+                    "operation": "build_narration_timeline",
+                    "transcript_path": _normalize_user_path(transcript_rel),
+                    "segment_count": len(segment_payloads),
+                    "total_duration_seconds": total_duration,
+                    "timing_source": "measured_tts_segment_audio",
+                    "narration_profile": narrator_profile,
+                },
+            )
+            await _bind_artifact_to_workspace(
+                entity_id=entity_id,
+                document_id=document_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                tool_name="build_narration_timeline",
+            )
+            artifact_outputs[fallback] = {
+                "document_id": document_id,
+                "fs_path": _normalize_user_path(target.rel_path),
+                "name": target.filename,
+            }
+
+        return _json(
+            {
+                "kind": "narration_timeline",
+                "status": "completed",
+                "timing_source": "measured_tts_segment_audio",
+                "total_duration_seconds": total_duration,
+                "cue_count": len(cue_payloads),
+                "audio_tracks": track_payloads,
+                "block_durations_seconds": block_durations_seconds,
+                "block_fill_ratios": block_fill_ratios,
+                "narration_profile": narrator_profile,
+                "manifest": artifact_outputs["narration-manifest"],
+                "timeline": artifact_outputs["narration-timeline"],
+                "cues": artifact_outputs["subtitle-cues"],
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("build_narration_timeline failed")
+        return _json_error(str(exc), code="build_narration_timeline_failed")
+
+
+async def _prepare_narration_timeline_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    transcript_path: str = "",
+    segment_manifest_path: str = "",
+    source_audio_directory: str = "",
+    normalized_output_directory: str = "",
+    block_durations_seconds: list[float] | None = None,
+    occupancy_ratio: float = 0.84,
+    minimum_block_fill_ratio: float = 0.72,
+    maximum_block_fill_ratio: float = 0.9,
+    manifest_name: str = "",
+    timeline_name: str = "",
+    cues_name: str = "",
+    workspace_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    **_: Any,
+) -> str:
+    """Normalize immutable TTS receipts per block and build their timeline."""
+    if not entity_id:
+        return _json_error("entity_id is required")
+    required_paths = {
+        "transcript_path": transcript_path,
+        "segment_manifest_path": segment_manifest_path,
+        "source_audio_directory": source_audio_directory,
+        "normalized_output_directory": normalized_output_directory,
+        "timeline_name": timeline_name,
+    }
+    missing = [key for key, value in required_paths.items() if not str(value or "").strip()]
+    if missing:
+        return _json_error(f"{', '.join(missing)} required")
+    if not isinstance(block_durations_seconds, list) or not block_durations_seconds:
+        return _json_error(
+            "block_durations_seconds must contain at least one positive duration.",
+            code="narration_block_plan_invalid",
+        )
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return _json_error("ffprobe is required", code="ffprobe_missing")
+
+    try:
+        from packages.core.services import entity_fs
+
+        entity_root = entity_fs.get_entity_root(entity_id)
+        workspace_base_dir = await _workspace_media_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        transcript_rel = _workspace_media_reference(
+            transcript_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        segment_manifest_rel = _workspace_media_reference(
+            segment_manifest_path,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        source_dir_rel = _workspace_media_reference(
+            source_audio_directory,
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+        )
+        transcript = Path(_resolve_entity_file(entity_root, transcript_rel)).read_text(
+            encoding="utf-8"
+        )
+        segment_manifest = json.loads(
+            Path(_resolve_entity_file(entity_root, segment_manifest_rel)).read_text(
+                encoding="utf-8"
+            )
+        )
+        if not isinstance(segment_manifest, list) or not segment_manifest:
+            return _json_error(
+                "segment_manifest_path must contain a non-empty JSON array.",
+                code="narration_segment_manifest_invalid",
+            )
+
+        ordered_blocks: list[str] = []
+        prepared_sources: list[dict[str, Any]] = []
+        source_dir_abs = Path(_resolve_entity_dir(entity_root, source_dir_rel))
+        narrator_profile: dict[str, str | int] | None = None
+        for index, item in enumerate(segment_manifest, start=1):
+            if not isinstance(item, dict):
+                return _json_error(
+                    f"Narration manifest item {index} must be an object.",
+                    code="narration_segment_manifest_invalid",
+                )
+            expected_id = f"S{index:03d}"
+            filename_style_id = f"SEGMENT-{index:03d}"
+            segment_id = str(item.get("segment_id") or "").strip().upper()
+            block_id = str(item.get("block_id") or "").strip().upper()
+            text = str(item.get("text") or "").strip()
+            if segment_id not in {expected_id, filename_style_id} or not block_id or not text:
+                return _json_error(
+                    (
+                        f"Narration manifest item {index} must contain segment_id={expected_id} "
+                        f"or segment_id=segment-{index:03d}, "
+                        "a block_id, and non-empty text."
+                    ),
+                    code="narration_segment_manifest_invalid",
+                )
+            if block_id not in ordered_blocks:
+                ordered_blocks.append(block_id)
+            elif ordered_blocks[-1] != block_id:
+                return _json_error(
+                    f"Narration block {block_id} is not contiguous in the manifest.",
+                    code="narration_segment_manifest_invalid",
+                )
+            expected_stem = f"segment-{index:03d}"
+            supported_source_suffixes = {".wav", ".mp3", ".m4a", ".flac"}
+            candidates = [
+                path
+                for path in source_dir_abs.rglob(f"{expected_stem}.*")
+                if path.stem.lower() == expected_stem
+                and path.suffix.lower() in supported_source_suffixes
+                and "normalized" not in {part.lower() for part in path.parts}
+            ]
+            if len(candidates) != 1:
+                return _json_error(
+                    (
+                        f"Expected exactly one base source receipt for {expected_id} named "
+                        f"{expected_stem}.wav, .mp3, .m4a, or .flac; found {len(candidates)}."
+                    ),
+                    code="narration_source_receipt_count_mismatch",
+                )
+            source_abs = candidates[0]
+            source_rel = _normalize_user_path(os.path.relpath(source_abs, entity_root))
+            if not await _audio_prompt_matches_transcript(
+                entity_id=entity_id,
+                audio_rel_path=source_rel,
+                transcript=text,
+            ):
+                return _json_error(
+                    f"Source receipt {expected_id} does not match its immutable manifest text.",
+                    code="narration_segment_provenance_mismatch",
+                )
+            profile = await _audio_narrator_profile(
+                entity_id=entity_id,
+                audio_rel_path=source_rel,
+            )
+            if profile is None or (narrator_profile is not None and profile != narrator_profile):
+                return _json_error(
+                    "Every source narration segment must use one identical narrator profile.",
+                    code="narration_segment_profile_mismatch",
+                )
+            narrator_profile = profile
+            source_info = await _probe_media(ffprobe, str(source_abs))
+            source_duration = float(source_info.get("duration_seconds") or 0.0)
+            if source_duration <= 0:
+                return _json_error(
+                    f"Source receipt {expected_id} has no measurable duration.",
+                    code="narration_segment_duration_unavailable",
+                )
+            prepared_sources.append(
+                {
+                    "index": index,
+                    "segment_id": expected_id,
+                    "block_id": block_id,
+                    "text": text,
+                    "source_rel": source_rel,
+                    "source_duration": source_duration,
+                }
+            )
+
+        if _canonical_subtitle_text(" ".join(item["text"] for item in prepared_sources)) != _canonical_subtitle_text(transcript):
+            return _json_error(
+                "Narration manifest text must equal the canonical transcript.",
+                code="narration_segment_transcript_mismatch",
+            )
+        if len(ordered_blocks) != len(block_durations_seconds):
+            return _json_error(
+                (
+                    f"Narration manifest has {len(ordered_blocks)} blocks but "
+                    f"block_durations_seconds has {len(block_durations_seconds)} entries."
+                ),
+                code="narration_block_plan_mismatch",
+            )
+
+        occupancy = _clamp_float(occupancy_ratio, 0.72, 0.9, 0.84)
+        minimum_fill = _clamp_float(minimum_block_fill_ratio, 0.1, 1.0, 0.72)
+        maximum_fill = _clamp_float(maximum_block_fill_ratio, 0.1, 1.0, 0.9)
+        if minimum_fill > maximum_fill:
+            return _json_error(
+                "minimum_block_fill_ratio cannot exceed maximum_block_fill_ratio.",
+                code="narration_block_plan_invalid",
+            )
+        block_starts: dict[str, float] = {}
+        block_tempo_factors: dict[str, float] = {}
+        block_occupancy_ratios: dict[str, float] = {}
+        cumulative_start = 0.0
+        for block_id, raw_duration in zip(
+            ordered_blocks, block_durations_seconds, strict=True
+        ):
+            block_duration = _coerce_float(raw_duration, 0.0)
+            if not math.isfinite(block_duration) or not 0.25 <= block_duration <= 60:
+                return _json_error(
+                    f"Invalid duration for narration block {block_id}.",
+                    code="narration_block_plan_invalid",
+                )
+            block_starts[block_id] = cumulative_start
+            cumulative_start += block_duration
+            source_total = sum(
+                item["source_duration"]
+                for item in prepared_sources
+                if item["block_id"] == block_id
+            )
+            natural_occupancy_min = source_total / (
+                block_duration * NARRATION_MAX_TEMPO_FACTOR
+            )
+            natural_occupancy_max = source_total / (
+                block_duration * NARRATION_MIN_TEMPO_FACTOR
+            )
+            allowed_occupancy_min = max(minimum_fill, natural_occupancy_min)
+            allowed_occupancy_max = min(maximum_fill, natural_occupancy_max)
+            if allowed_occupancy_min > allowed_occupancy_max:
+                requested_tempo_factor = source_total / (block_duration * occupancy)
+                return _json_blocked(
+                    (
+                        f"Narration block {block_id} requires tempo factor "
+                        f"{requested_tempo_factor:.3f} at preferred occupancy {occupancy:.3f}, "
+                        "and no accepted block occupancy can keep both "
+                        f"fill {minimum_fill:.2f}-{maximum_fill:.2f} and tempo "
+                        f"{NARRATION_MIN_TEMPO_FACTOR:.2f}-{NARRATION_MAX_TEMPO_FACTOR:.2f}."
+                    ),
+                    code="narration_block_tempo_out_of_range",
+                    block_id=block_id,
+                    tempo_factor=round(requested_tempo_factor, 6),
+                )
+            block_occupancy = min(
+                max(occupancy, allowed_occupancy_min),
+                allowed_occupancy_max,
+            )
+            tempo_factor = source_total / (block_duration * block_occupancy)
+            block_occupancy_ratios[block_id] = block_occupancy
+            block_tempo_factors[block_id] = tempo_factor
+
+        normalized_segments: list[dict[str, Any]] = []
+        first_in_block: set[str] = set()
+        normalized_paths: list[str] = []
+        output_dir = str(normalized_output_directory).replace("\\", "/").strip("/")
+        for item in prepared_sources:
+            tempo_factor = block_tempo_factors[item["block_id"]]
+            target_duration = item["source_duration"] / tempo_factor
+            normalized_result = json.loads(
+                await _normalize_audio_loudness_handler(
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    input_path=item["source_rel"],
+                    output_name=f"{output_dir}/segment-{item['index']:03d}.wav",
+                    target_lufs=-16,
+                    true_peak=-1,
+                    lra=11,
+                    target_duration_seconds=target_duration,
+                    output_format="wav",
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                )
+            )
+            if normalized_result.get("status") != "completed":
+                return _json_error(
+                    normalized_result.get("error") or "Narration normalization failed.",
+                    code=str(normalized_result.get("code") or "narration_normalization_failed"),
+                )
+            normalized_path = str(normalized_result.get("fs_path") or "").strip()
+            if not normalized_path:
+                return _json_error(
+                    f"Narration normalization returned no fs_path for {item['segment_id']}.",
+                    code="narration_normalization_failed",
+                )
+            segment = {"audio_path": normalized_path}
+            if item["block_id"] not in first_in_block:
+                segment["start_seconds"] = block_starts[item["block_id"]]
+                first_in_block.add(item["block_id"])
+            normalized_segments.append(segment)
+            normalized_paths.append(normalized_path)
+
+        timeline_result = json.loads(
+            await _build_narration_timeline_handler(
+                entity_id=entity_id,
+                user_id=user_id,
+                transcript_path=transcript_rel,
+                segments=normalized_segments,
+                manifest_name=manifest_name,
+                timeline_name=timeline_name,
+                cues_name=cues_name,
+                require_normalized_segments=True,
+                block_durations_seconds=block_durations_seconds,
+                minimum_block_fill_ratio=minimum_block_fill_ratio,
+                maximum_block_fill_ratio=maximum_block_fill_ratio,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+            )
+        )
+        if timeline_result.get("status") != "completed":
+            return _json(timeline_result)
+        timeline_result.update(
+            preparation_mode="measured_source_duration_per_block",
+            source_segment_count=len(prepared_sources),
+            normalized_segment_count=len(normalized_paths),
+            normalized_audio_paths=normalized_paths,
+            block_tempo_factors={
+                block_id: round(value, 6)
+                for block_id, value in block_tempo_factors.items()
+            },
+            block_occupancy_ratios={
+                block_id: round(value, 6)
+                for block_id, value in block_occupancy_ratios.items()
+            },
+            occupancy_ratio=occupancy,
+        )
+        return _json(timeline_result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("prepare_narration_timeline failed")
+        return _json_error(str(exc), code="prepare_narration_timeline_failed")
+
+
 async def _normalize_audio_loudness_handler(
     *,
     entity_id: str = "",
@@ -1492,6 +2653,7 @@ async def _normalize_audio_loudness_handler(
     target_lufs: float = -16.0,
     true_peak: float = -1.5,
     lra: float = 11.0,
+    target_duration_seconds: float | None = None,
     output_format: str = "wav",
     workspace_id: str | None = None,
     task_id: str | None = None,
@@ -1507,8 +2669,12 @@ async def _normalize_audio_loudness_handler(
         return _json_error("output_name is required")
 
     ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return _json_error("ffmpeg is required for loudness normalization", code="ffmpeg_missing")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        return _json_error(
+            "ffmpeg and ffprobe are required for loudness normalization",
+            code="ffmpeg_missing",
+        )
 
     try:
         from packages.core.services import entity_fs
@@ -1526,6 +2692,15 @@ async def _normalize_audio_loudness_handler(
         )
         input_abs = _resolve_entity_file(entity_root, rel_input)
         _assert_audio_path(input_abs)
+        narration_profile = await _audio_narrator_profile(
+            entity_id=entity_id,
+            audio_rel_path=_normalize_user_path(rel_input),
+        )
+        if narration_profile is not None:
+            output_name = _narrator_profile_audio_output_name(
+                output_name,
+                str(narration_profile["voice"]),
+            )
         fmt = str(output_format or "wav").strip().lower()
         if fmt not in {"wav", "mp3", "m4a", "flac"}:
             fmt = "wav"
@@ -1548,6 +2723,40 @@ async def _normalize_audio_loudness_handler(
             "true_peak": true_peak,
             "lra": lra,
         }
+        source_info = await _probe_media(ffprobe, input_abs)
+        source_duration = float(source_info.get("duration_seconds") or 0.0)
+        requested_duration = _coerce_float(target_duration_seconds, 0.0)
+        if requested_duration and not 0.25 <= requested_duration <= 3600:
+            raise ValueError("target_duration_seconds must be between 0.25 and 3600")
+        tempo_factor = (
+            source_duration / requested_duration
+            if requested_duration > 0 and source_duration > 0
+            else 1.0
+        )
+        if (
+            narration_profile is not None
+            and requested_duration > 0
+            and not NARRATION_MIN_TEMPO_FACTOR
+            <= tempo_factor
+            <= NARRATION_MAX_TEMPO_FACTOR
+        ):
+            return _json_blocked(
+                (
+                    f"Narration tempo factor {tempo_factor:.3f} is outside the natural "
+                    f"range {NARRATION_MIN_TEMPO_FACTOR:.2f}-{NARRATION_MAX_TEMPO_FACTOR:.2f}. "
+                    "Allocate this frozen clause from its measured source TTS duration using "
+                    "one shared tempo factor for the visual block, then retry from the "
+                    "original TTS receipt."
+                ),
+                code="narration_tempo_out_of_range",
+                source_duration_seconds=round(source_duration, 3),
+                target_duration_seconds=round(requested_duration, 3),
+                tempo_factor=round(tempo_factor, 6),
+            )
+        filters: list[str] = []
+        if abs(tempo_factor - 1.0) > 0.001:
+            filters.append(_atempo_filter(tempo_factor))
+        filters.append(_loudnorm_filter(config))
         args = [
             ffmpeg,
             "-y",
@@ -1555,7 +2764,7 @@ async def _normalize_audio_loudness_handler(
             input_abs,
             "-vn",
             "-af",
-            _loudnorm_filter(config),
+            ",".join(filters),
             "-ar",
             "48000",
             "-ac",
@@ -1565,6 +2774,20 @@ async def _normalize_audio_loudness_handler(
         args.append(target.abs_path)
         await _run_process(args, timeout_seconds=300.0)
 
+        generation = {
+            "operation": "normalize_audio_loudness",
+            "input_path": _normalize_user_path(rel_input),
+            "target_lufs": _loudness_target_lufs(target_lufs),
+            "true_peak": _loudness_true_peak(true_peak),
+            "lra": _loudness_lra(lra),
+            "format": fmt,
+            "source_duration_seconds": round(source_duration, 3),
+            "target_duration_seconds": round(requested_duration, 3) if requested_duration else None,
+            "tempo_factor": round(tempo_factor, 6),
+        }
+        if narration_profile is not None:
+            generation["voice"] = narration_profile["voice"]
+            generation["narration_profile"] = narration_profile
         document_id = await _register_file_artifact(
             entity_id=entity_id,
             user_id=user_id,
@@ -1579,14 +2802,7 @@ async def _normalize_audio_loudness_handler(
             conversation_id=conversation_id,
             tool_name="normalize_audio_loudness",
             artifact_role="audio",
-            generation={
-                "operation": "normalize_audio_loudness",
-                "input_path": _normalize_user_path(rel_input),
-                "target_lufs": _loudness_target_lufs(target_lufs),
-                "true_peak": _loudness_true_peak(true_peak),
-                "lra": _loudness_lra(lra),
-                "format": fmt,
-            },
+            generation=generation,
         )
         await _bind_artifact_to_workspace(
             entity_id=entity_id,
@@ -1599,8 +2815,7 @@ async def _normalize_audio_loudness_handler(
             tool_name="normalize_audio_loudness",
         )
 
-        return _json(
-            {
+        payload: dict[str, Any] = {
                 "kind": "audio",
                 "status": "completed",
                 "document_id": document_id,
@@ -1613,8 +2828,14 @@ async def _normalize_audio_loudness_handler(
                 "target_lufs": _loudness_target_lufs(target_lufs),
                 "true_peak": _loudness_true_peak(true_peak),
                 "lra": _loudness_lra(lra),
-            }
-        )
+                "source_duration_seconds": round(source_duration, 3),
+                "target_duration_seconds": round(requested_duration, 3) if requested_duration else None,
+                "tempo_factor": round(tempo_factor, 6),
+        }
+        if narration_profile is not None:
+            payload["voice"] = narration_profile["voice"]
+            payload["narration_profile"] = narration_profile
+        return _json(payload)
     except Exception as exc:  # noqa: BLE001
         logger.exception("normalize_audio_loudness failed")
         return _json_error(str(exc), code="normalize_audio_loudness_failed")
@@ -4495,6 +5716,22 @@ async def _audio_prompt_matches_transcript(
     transcript: str,
 ) -> bool | None:
     """Follow normalized-audio provenance to compare its TTS prompt when available."""
+    provenance = await _audio_prompt_provenance(
+        entity_id=entity_id,
+        audio_rel_path=audio_rel_path,
+    )
+    if provenance is None:
+        return None
+    prompt, _source_path = provenance
+    return _canonical_subtitle_text(prompt) == _canonical_subtitle_text(transcript)
+
+
+async def _audio_prompt_provenance(
+    *,
+    entity_id: str,
+    audio_rel_path: str,
+) -> tuple[str, str] | None:
+    """Return the immutable TTS prompt and source path behind normalized audio."""
     from sqlalchemy import select
 
     from packages.core.database import async_session
@@ -4525,7 +5762,102 @@ async def _audio_prompt_matches_transcript(
             generation = generation if isinstance(generation, dict) else {}
             prompt = generation.get("prompt")
             if isinstance(prompt, str) and prompt.strip():
-                return _canonical_subtitle_text(prompt) == _canonical_subtitle_text(transcript)
+                return prompt.strip(), current_path
+            source_path = generation.get("input_path") or generation.get("source_path")
+            if not isinstance(source_path, str) or not source_path.strip():
+                return None
+            current_path = _rel_path_from_reference(source_path, entity_id) or source_path
+    return None
+
+
+async def _audio_normalization_provenance(
+    *,
+    entity_id: str,
+    audio_rel_path: str,
+) -> dict[str, Any] | None:
+    """Return the normalization receipt attached to this exact audio artifact."""
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.document import Document
+
+    current_path = _rel_path_from_reference(audio_rel_path, entity_id) or audio_rel_path
+    async with async_session() as db:
+        document = (
+            await db.execute(
+                select(Document)
+                .where(
+                    Document.entity_id == entity_id,
+                    Document.fs_path == str(current_path or "").strip(),
+                    Document.is_trashed == False,  # noqa: E712
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if document is None:
+        return None
+    generation = (document.metadata_ or {}).get("generation")
+    return generation if isinstance(generation, dict) else None
+
+
+def _validate_narrator_profile(value: object) -> dict[str, str | int]:
+    if not isinstance(value, dict):
+        raise ValueError("Narrator profile receipt must be an object.")
+    version = value.get("version")
+    provider = str(value.get("provider") or "").strip().lower()
+    model = str(value.get("model") or "").strip()
+    voice = str(value.get("voice") or "").strip()
+    voice_instructions = str(value.get("voice_instructions") or "").strip()
+    if version != 1 or not provider or not model or not voice or voice.lower() == "random":
+        raise ValueError("Narrator profile receipt must contain one concrete model and voice.")
+    if model.split("/", 1)[0].strip().lower() != provider:
+        raise ValueError("Narrator profile provider does not match its model.")
+    return {
+        "version": 1,
+        "provider": provider,
+        "model": model,
+        "voice": voice,
+        "voice_instructions": voice_instructions,
+    }
+
+
+async def _audio_narrator_profile(
+    *,
+    entity_id: str,
+    audio_rel_path: str,
+) -> dict[str, str | int] | None:
+    """Follow normalized-audio provenance to recover its task narrator profile."""
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.document import Document
+
+    current_path = _rel_path_from_reference(audio_rel_path, entity_id) or audio_rel_path
+    seen: set[str] = set()
+    async with async_session() as db:
+        for _depth in range(3):
+            current_path = str(current_path or "").strip()
+            if not current_path or current_path in seen:
+                return None
+            seen.add(current_path)
+            document = (
+                await db.execute(
+                    select(Document)
+                    .where(
+                        Document.entity_id == entity_id,
+                        Document.fs_path == current_path,
+                        Document.is_trashed == False,  # noqa: E712
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if document is None:
+                return None
+            generation = (document.metadata_ or {}).get("generation")
+            generation = generation if isinstance(generation, dict) else {}
+            profile = generation.get("narration_profile")
+            if profile is not None:
+                return _validate_narrator_profile(profile)
             source_path = generation.get("input_path") or generation.get("source_path")
             if not isinstance(source_path, str) or not source_path.strip():
                 return None
@@ -5282,6 +6614,205 @@ def _loudnorm_filter(config: dict[str, Any]) -> str:
     )
 
 
+def _loudnorm_measurement(stderr: str) -> dict[str, float]:
+    required = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    for match in reversed(re.findall(r"\{\s*\"input_i\".*?\}", stderr or "", re.DOTALL)):
+        try:
+            payload = json.loads(match)
+            return {key: float(payload[key]) for key in required}
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    raise ValueError("FFmpeg loudnorm analysis did not return a complete measurement")
+
+
+async def _apply_two_pass_loudnorm(
+    *,
+    ffmpeg: str,
+    input_path: str,
+    config: dict[str, Any],
+    total_duration: float,
+) -> None:
+    """Normalize a composed MP4 deterministically without re-encoding video."""
+    if not config.get("enabled"):
+        return
+    target_i = _loudness_target_lufs(config.get("target_lufs"))
+    target_tp = _loudness_true_peak(config.get("true_peak"))
+    target_lra = _loudness_lra(config.get("lra"))
+    analysis_filter = (
+        f"loudnorm=I={target_i:.1f}:TP={target_tp:.1f}:LRA={target_lra:.1f}:"
+        "print_format=json"
+    )
+    _stdout, stderr = await _run_process(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            input_path,
+            "-vn",
+            "-af",
+            analysis_filter,
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout_seconds=max(180.0, (total_duration or 60.0) * 4.0 + 120.0),
+    )
+    measured = _loudnorm_measurement(stderr)
+    correction_filter = (
+        f"loudnorm=I={target_i:.1f}:TP={target_tp:.1f}:LRA={target_lra:.1f}:"
+        f"measured_I={measured['input_i']:.3f}:"
+        f"measured_TP={measured['input_tp']:.3f}:"
+        f"measured_LRA={measured['input_lra']:.3f}:"
+        f"measured_thresh={measured['input_thresh']:.3f}:"
+        f"offset={measured['target_offset']:.3f}:linear=true:print_format=summary"
+    )
+    temp_path = f"{input_path}.loudnorm-{generate_ulid()}.mp4"
+    try:
+        await _run_process(
+            [
+                ffmpeg,
+                "-y",
+                "-i",
+                input_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-c:v",
+                "copy",
+                "-af",
+                correction_filter,
+                "-c:a",
+                "aac",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-t",
+                f"{total_duration:.3f}",
+                "-movflags",
+                "+faststart",
+                temp_path,
+            ],
+            timeout_seconds=max(180.0, (total_duration or 60.0) * 4.0 + 120.0),
+        )
+        os.replace(temp_path, input_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    # AAC encoding can introduce inter-sample overshoot after loudnorm has
+    # already limited the decoded PCM stream. Measure the encoded result and
+    # apply the smallest deterministic attenuation needed to keep the final
+    # file at or below the requested true-peak ceiling.
+    await _enforce_encoded_true_peak(
+        ffmpeg=ffmpeg,
+        input_path=input_path,
+        target_true_peak=target_tp,
+        total_duration=total_duration,
+    )
+
+
+async def _measure_encoded_true_peak(
+    *,
+    ffmpeg: str,
+    input_path: str,
+    total_duration: float,
+) -> float:
+    _stdout, stderr = await _run_process(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            input_path,
+            "-map",
+            "0:a:0",
+            "-af",
+            "ebur128=peak=true:framelog=verbose",
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout_seconds=max(120.0, (total_duration or 60.0) * 2.0 + 30.0),
+    )
+    measured = _parse_ebur128(stderr).get("true_peak_dbfs")
+    if measured is None:
+        raise ValueError("FFmpeg ebur128 analysis did not return an encoded true-peak value")
+    return float(measured)
+
+
+async def _enforce_encoded_true_peak(
+    *,
+    ffmpeg: str,
+    input_path: str,
+    target_true_peak: float,
+    total_duration: float,
+    max_attempts: int = 2,
+) -> None:
+    """Cap post-AAC true peak while preserving the already-normalized mix."""
+    target = _loudness_true_peak(target_true_peak)
+    measured = await _measure_encoded_true_peak(
+        ffmpeg=ffmpeg,
+        input_path=input_path,
+        total_duration=total_duration,
+    )
+    for _attempt in range(max(1, int(max_attempts))):
+        if measured <= target:
+            return
+
+        # One tenth of a decibel of safety headroom absorbs measurement
+        # rounding and the small overshoot introduced by the next AAC encode.
+        attenuation_db = target - measured - 0.1
+        temp_path = f"{input_path}.true-peak-{generate_ulid()}.mp4"
+        try:
+            await _run_process(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    input_path,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0",
+                    "-c:v",
+                    "copy",
+                    "-af",
+                    f"volume={attenuation_db:.3f}dB",
+                    "-c:a",
+                    "aac",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-t",
+                    f"{total_duration:.3f}",
+                    "-movflags",
+                    "+faststart",
+                    temp_path,
+                ],
+                timeout_seconds=max(180.0, (total_duration or 60.0) * 4.0 + 120.0),
+            )
+            os.replace(temp_path, input_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        measured = await _measure_encoded_true_peak(
+            ffmpeg=ffmpeg,
+            input_path=input_path,
+            total_duration=total_duration,
+        )
+
+    if measured > target:
+        raise ValueError(
+            "Encoded true peak remains above the requested ceiling after correction: "
+            f"measured {measured:.1f} dBFS, maximum {target:.1f} dBFS"
+        )
+
+
 def _loudness_target_lufs(value: Any) -> float:
     return _clamp_float(value, -24.0, -6.0, -16.0)
 
@@ -5402,9 +6933,6 @@ async def _compose_video_file(
         )
         if total_duration > 0:
             mix_chain += f",atrim=0:{total_duration:.3f},asetpts=PTS-STARTPTS"
-        loudnorm = _loudnorm_filter(loudness_config)
-        if loudnorm:
-            mix_chain += f",{loudnorm}"
         filter_parts.append(mix_chain + "[aout]")
     else:
         output_audio_label = "aout"
@@ -5443,12 +6971,20 @@ async def _compose_video_file(
             "48000",
             "-ac",
             "2",
+            "-t",
+            f"{total_duration:.3f}",
             "-movflags",
             "+faststart",
             target.abs_path,
         ]
     )
     await _run_process(args, timeout_seconds=max(180.0, (total_duration or 60.0) * 8.0 + 120.0))
+    await _apply_two_pass_loudnorm(
+        ffmpeg=ffmpeg,
+        input_path=target.abs_path,
+        config=loudness_config,
+        total_duration=total_duration,
+    )
     return target.abs_path, target.rel_path, target.filename
 
 
@@ -5944,6 +7480,8 @@ async def _normalize_clip(
             "48000",
             "-ac",
             "2",
+            "-t",
+            f"{output_span:.3f}",
             "-shortest",
             output_path,
         ]
@@ -5975,6 +7513,8 @@ async def _normalize_clip(
             "48000",
             "-ac",
             "2",
+            "-t",
+            f"{output_span:.3f}",
             "-shortest",
             output_path,
         ]
@@ -6332,13 +7872,7 @@ def _audio_mime(fmt: str) -> str:
 
 
 def _audio_codec_args(fmt: str) -> list[str]:
-    if fmt == "mp3":
-        return ["-c:a", "libmp3lame", "-b:a", "192k"]
-    if fmt == "m4a":
-        return ["-c:a", "aac", "-b:a", "192k"]
-    if fmt == "flac":
-        return ["-c:a", "flac"]
-    return ["-c:a", "pcm_s16le"]
+    return ffmpeg_audio_codec_args(fmt)
 
 
 def _is_video_document(doc: Any) -> bool:
@@ -6389,6 +7923,8 @@ def get_tools():
         (WAIT_MEDIA_JOBS_SCHEMA, _wait_media_jobs_handler),
         (MERGE_VIDEOS_SCHEMA, _merge_videos_handler),
         (ALIGN_SUBTITLES_SCHEMA, _align_subtitles_handler),
+        (BUILD_NARRATION_TIMELINE_SCHEMA, _build_narration_timeline_handler),
+        (PREPARE_NARRATION_TIMELINE_SCHEMA, _prepare_narration_timeline_handler),
         (NORMALIZE_AUDIO_LOUDNESS_SCHEMA, _normalize_audio_loudness_handler),
         (COMPOSE_VIDEO_TIMELINE_SCHEMA, _compose_video_timeline_handler),
         (PROBE_MEDIA_SCHEMA, _probe_media_handler),

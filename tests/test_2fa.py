@@ -1,19 +1,21 @@
 """E2E tests: two-factor authentication (TOTP)."""
 
+import jwt
 import pytest
 from httpx import AsyncClient
 
+from auth_helpers import register_user_and_get_token
 from packages.core.services.totp_service import generate_totp_code
 
 
 async def _register_and_token(client: AsyncClient) -> str:
     """Register tfauser and return JWT token."""
-    resp = await client.post(
-        "/api/v1/auth/register",
+    resp = await register_user_and_get_token(
+        client,
         json={
             "username": "tfauser",
             "email": "tfa@example.com",
-            "password": "securepass123",
+            "password": "TestPassword123!",
             "entity_name": "TFA Corp",
         },
     )
@@ -60,6 +62,12 @@ async def test_verify_and_enable(client: AsyncClient):
     assert data["enabled"] is True
     assert "backup_codes" in data
     assert len(data["backup_codes"]) == 8
+    assert data["access_token"]
+    claims = jwt.decode(
+        data["access_token"],
+        options={"verify_signature": False, "verify_aud": False},
+    )
+    assert claims["amr"] == ["mfa"]
 
 
 @pytest.mark.asyncio
@@ -82,7 +90,7 @@ async def test_login_requires_2fa(client: AsyncClient):
         "/api/v1/auth/login",
         json={
             "username": "tfauser",
-            "password": "securepass123",
+            "password": "TestPassword123!",
         },
     )
     assert resp.status_code == 200, resp.text
@@ -114,7 +122,7 @@ async def test_login_with_2fa(client: AsyncClient):
         "/api/v1/auth/login",
         json={
             "username": "tfauser",
-            "password": "securepass123",
+            "password": "TestPassword123!",
             "totp_code": login_code,
         },
     )
@@ -162,7 +170,7 @@ async def test_disable_2fa(client: AsyncClient):
         "/api/v1/auth/login",
         json={
             "username": "tfauser",
-            "password": "securepass123",
+            "password": "TestPassword123!",
         },
     )
     assert resp.status_code == 200

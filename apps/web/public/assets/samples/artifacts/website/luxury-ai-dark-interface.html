@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aurelia AI — Luxury Neural Interface</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:ital,wght@1,600;1,700;1,800&display=swap" rel="stylesheet">
+  <style data-manor-preview-src="styles.css">
+:root {
+  --bg: #0a0a0a;
+  --gold-base: #a78b71;
+  --gold-light: #c9b8a0;
+  --gold-hover: #e8d5b7;
+  --white: #ffffff;
+  --white-90: rgba(255,255,255,.9);
+  --white-70: rgba(255,255,255,.7);
+  --white-55: rgba(255,255,255,.55);
+  --white-40: rgba(255,255,255,.4);
+  --white-18: rgba(255,255,255,.18);
+  --white-10: rgba(255,255,255,.1);
+  --white-08: rgba(255,255,255,.08);
+  --white-03: rgba(255,255,255,.03);
+  --glass-bg: rgba(255,255,255,.03);
+  --glass-border: rgba(255,255,255,.1);
+  --ease: cubic-bezier(.4,0,.2,1);
+  --glow: 0 0 100px rgba(167,139,113,.2);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--white);
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  overflow-x: hidden;
+}
+body::selection { background: var(--gold-base); color: #050505; }
+
+.bg-dots {
+  position: fixed;
+  inset: 0;
+  z-index: -4;
+  background-image: radial-gradient(circle, rgba(255,255,255,.08) 1px, transparent 1.2px);
+  background-size: 32px 32px;
+  background-position: center top;
+}
+.ambient {
+  position: fixed;
+  width: 48vw;
+  height: 48vw;
+  border-radius: 50%;
+  pointer-events: none;
+  filter: blur(80px);
+  opacity: .52;
+  z-index: -3;
+}
+.ambient-one { top: -18vw; left: 20vw; background: rgba(167,139,113,.18); }
+.ambient-two { right: -20vw; top: 42vh; background: rgba(201,184,160,.09); }
+
+img { display: block; max-width: 100%; }
+a { color: inherit; text-decoration: none; }
+button, input { font: inherit; }
+
+.glass {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.container { width: min(1180px, calc(100% - 48px)); margin-inline: auto; }
+.section { padding: 120px 0; }
+.logo {
+  font-family: "Playfair Display", serif;
+  font-size: 28px;
+  font-weight: 800;
+  font-style: italic;
+  letter-spacing: -.03em;
+}
+.eyebrow, .label {
+  color: var(--gold-light);
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .26em;
+}
+
+.navbar {
+  position: fixed;
+  z-index: 50;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(1180px, calc(100% - 32px));
+  height: 68px;
+  padding: 0 clamp(24px, 4vw, 48px);
+  border-radius: 999px;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+}
+.nav-links { display: flex; gap: 34px; justify-content: center; }
+.nav-links a {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .22em;
+  color: var(--white-55);
+  transition: color .35s var(--ease);
+}
+.nav-links a:hover { color: var(--gold-hover); }
+.trial-btn {
+  justify-self: end;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 42px;
+  padding: 0 20px;
+  border-radius: 999px;
+  color: #050505;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  transition: transform .35s var(--ease), background .35s var(--ease);
+}
+.trial-btn:hover { transform: translateY(-2px); background: var(--gold-hover); }
+
+.hero { padding-top: 170px; }
+.hero-copy { position: relative; z-index: 3; text-align: center; }
+.hero h1 {
+  max-width: 1050px;
+  margin: 18px auto 22px;
+  font-family: "Playfair Display", serif;
+  font-style: italic;
+  font-size: clamp(2.5rem, 8vw, 6rem);
+  line-height: .92;
+  font-weight: 700;
+  letter-spacing: -.055em;
+}
+.hero h1 span { color: var(--gold-base); }
+.hero-subtitle {
+  width: min(660px, 100%);
+  margin: 0 auto;
+  color: var(--white-55);
+  font-size: 17px;
+  line-height: 1.75;
+  font-weight: 300;
+}
+.cta-row { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+.btn {
+  min-height: 50px;
+  padding: 0 24px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform .35s var(--ease), border-color .35s var(--ease), color .35s var(--ease), background .35s var(--ease), box-shadow .35s var(--ease);
+}
+.btn:hover { transform: translateY(-2px); }
+.btn-solid { background: #fff; color: #050505; border: 1px solid #fff; }
+.btn-solid:hover { background: var(--gold-hover); border-color: var(--gold-hover); }
+.btn-outline { border: 1px solid var(--white-18); color: #fff; background: rgba(255,255,255,.02); }
+.btn-outline:hover { border-color: var(--gold-light); color: var(--gold-hover); box-shadow: 0 0 34px rgba(167,139,113,.16); }
+
+.neural-stage {
+  position: relative;
+  height: 720px;
+  margin-top: 70px;
+}
+.connection-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  opacity: .9;
+}
+.node-line {
+  fill: none;
+  stroke: url(#nodeGradient);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  opacity: .55;
+  animation: pulsing-branch 3.8s var(--ease) infinite alternate;
+}
+.node-line.dashed {
+  stroke-dasharray: 5 15;
+  animation: pulsing-branch 3.8s var(--ease) infinite alternate, flow 12s linear infinite;
+}
+.node-line.faint { opacity: .3; }
+
+.central-node {
+  position: absolute;
+  z-index: 5;
+  left: 50%;
+  top: 50%;
+  width: min(640px, 62vw);
+  aspect-ratio: 16 / 9;
+  transform: translate(-50%, -50%);
+  border-radius: 48px;
+  box-shadow: var(--glow);
+  overflow: hidden;
+  transition: transform .6s var(--ease), box-shadow .6s var(--ease), border-color .6s var(--ease);
+}
+.central-node:hover { border-color: rgba(201,184,160,.28); box-shadow: 0 0 120px rgba(167,139,113,.28); }
+.central-glow {
+  position: absolute;
+  inset: -40%;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(201,184,160,.22), transparent 30%),
+    conic-gradient(from 180deg, transparent, rgba(167,139,113,.14), transparent, rgba(232,213,183,.1), transparent);
+  animation: rotateGlow 18s linear infinite;
+}
+.live-pill {
+  position: absolute;
+  z-index: 2;
+  top: 24px;
+  left: 24px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  animation: breathe 2.2s var(--ease) infinite;
+}
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 18px rgba(74,222,128,.8);
+  animation: pulseDot 1.4s var(--ease) infinite;
+}
+.live-pill strong { color: #4ade80; font-size: 8px; letter-spacing: .2em; }
+.live-pill span:last-child { color: #fff; font-size: 12px; }
+.node-orb {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+}
+.node-orb span {
+  position: absolute;
+  width: 160px;
+  height: 160px;
+  border-radius: 50%;
+  border: 1px solid rgba(201,184,160,.26);
+  box-shadow: inset 0 0 40px rgba(167,139,113,.12), 0 0 40px rgba(167,139,113,.14);
+}
+.node-orb span:nth-child(2) { width: 230px; height: 230px; opacity: .65; }
+.node-orb span:nth-child(3) { width: 310px; height: 310px; opacity: .32; }
+.node-panel {
+  position: absolute;
+  z-index: 2;
+  left: 34px;
+  right: 34px;
+  bottom: 30px;
+}
+.node-panel h2 {
+  margin: 10px 0 18px;
+  font-family: "Playfair Display", serif;
+  font-style: italic;
+  font-size: clamp(32px, 4vw, 54px);
+  line-height: 1;
+}
+.meter { height: 4px; border-radius: 999px; background: rgba(255,255,255,.08); overflow: hidden; }
+.meter i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--gold-base), var(--gold-hover)); box-shadow: 0 0 22px rgba(167,139,113,.7); }
+.node-stats { display: flex; gap: 22px; margin-top: 16px; flex-wrap: wrap; }
+.node-stats span { color: var(--white-55); font-size: 12px; }
+.node-stats b { color: #fff; font-weight: 700; }
+
+.satellite-card {
+  position: absolute;
+  z-index: 6;
+  width: clamp(220px, 24vw, 340px);
+  border-radius: 24px;
+  padding: 12px;
+  box-shadow: 0 20px 80px rgba(0,0,0,.35);
+  transition: transform .7s var(--ease), border-color .7s var(--ease), box-shadow .7s var(--ease);
+}
+.satellite-card:hover { transform: scale(1.05); border-color: rgba(232,213,183,.35); box-shadow: 0 0 60px rgba(167,139,113,.3); }
+.satellite-card img {
+  width: 100%;
+  aspect-ratio: 1.55;
+  object-fit: cover;
+  border-radius: 20px;
+  filter: grayscale(1);
+  transition: filter .7s var(--ease), transform .7s var(--ease);
+}
+.satellite-card:hover img { filter: grayscale(0); transform: scale(1.015); }
+.satellite-card div { padding: 14px 6px 4px; }
+.satellite-card span { color: var(--gold-light); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .24em; }
+.satellite-card p { margin: 8px 0 0; color: var(--white-90); font-size: 14px; line-height: 1.4; }
+.card-a { top: 40px; left: 0; }
+.card-b { top: 18px; right: 0; }
+.card-c { bottom: 28px; left: 0; }
+.card-d { bottom: 18px; right: 0; }
+
+.section-heading { text-align: center; margin-bottom: 52px; }
+.section-heading h2 {
+  width: min(780px, 100%);
+  margin: 18px auto 0;
+  font-family: "Playfair Display", serif;
+  font-style: italic;
+  font-size: clamp(2.4rem, 5vw, 4.8rem);
+  line-height: .98;
+  letter-spacing: -.04em;
+}
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 18px;
+}
+.feature-card {
+  min-height: 280px;
+  border-radius: 28px;
+  padding: 28px;
+  transition: transform .45s var(--ease), border-color .45s var(--ease), background .45s var(--ease);
+}
+.feature-card:hover { transform: translateY(-8px); border-color: rgba(232,213,183,.32); background: rgba(255,255,255,.045); }
+.icon-box {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  color: var(--gold-hover);
+  background: rgba(167,139,113,.1);
+  border: 1px solid rgba(167,139,113,.18);
+  font-size: 22px;
+  transition: transform .45s var(--ease);
+}
+.feature-card:hover .icon-box { transform: scale(1.1); }
+.feature-card h3 { margin: 34px 0 12px; font-family: Inter, sans-serif; font-size: 20px; font-weight: 700; font-style: normal; letter-spacing: -.02em; }
+.feature-card p { margin: 0; color: rgba(156,163,175,.95); font-size: 14px; line-height: 1.75; }
+
+.billing-toggle {
+  width: max-content;
+  margin: 30px auto 0;
+  display: flex;
+  padding: 5px;
+  border-radius: 999px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--white-10);
+  backdrop-filter: blur(10px);
+}
+.billing-toggle button {
+  border: 0;
+  min-width: 98px;
+  height: 38px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--white-55);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .35s var(--ease), color .35s var(--ease);
+}
+.billing-toggle button.active { background: #fff; color: #050505; }
+.pricing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; align-items: stretch; }
+.price-card {
+  position: relative;
+  border-radius: 32px;
+  padding: 38px;
+  display: flex;
+  min-height: 510px;
+  flex-direction: column;
+  transition: transform .45s var(--ease), border-color .45s var(--ease), box-shadow .45s var(--ease);
+}
+.price-card:hover { transform: translateY(-8px); border-color: rgba(232,213,183,.3); }
+.price-card-pro { border-color: rgba(167,139,113,.4); box-shadow: 0 0 90px rgba(167,139,113,.12); transform: translateY(-14px); }
+.popular-badge {
+  position: absolute;
+  top: -15px;
+  left: 50%;
+  transform: translateX(-50%);
+  height: 30px;
+  padding: 0 18px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: var(--gold-base);
+  color: #050505;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+}
+.price-card h3 { margin: 26px 0 16px; font-family: Inter, sans-serif; font-style: normal; font-size: 48px; letter-spacing: -.05em; }
+.price-card small { color: var(--white-40); font-size: 14px; letter-spacing: 0; margin-left: 5px; }
+.price-card p:not(.label) { color: var(--white-55); line-height: 1.7; margin: 0 0 26px; }
+.price-card ul { list-style: none; padding: 0; margin: 0 0 34px; display: grid; gap: 14px; color: var(--white-70); font-size: 14px; }
+.price-card li::before { content: "✦"; color: var(--gold-light); margin-right: 10px; }
+.price-card .btn { margin-top: auto; }
+
+.team-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; }
+.team-card {
+  position: relative;
+  overflow: hidden;
+  border-radius: 36px;
+  padding: 14px;
+}
+.team-card img {
+  width: 100%;
+  aspect-ratio: 4 / 5;
+  object-fit: cover;
+  border-radius: 28px;
+  filter: grayscale(1);
+  transition: filter .7s var(--ease), transform .7s var(--ease);
+}
+.team-card:hover img { filter: grayscale(0); transform: scale(1.025); }
+.team-caption {
+  position: absolute;
+  left: 38px;
+  right: 38px;
+  bottom: 36px;
+  padding: 24px;
+  border-radius: 24px;
+  background: rgba(10,10,10,.42);
+  border: 1px solid rgba(255,255,255,.1);
+  backdrop-filter: blur(10px);
+}
+.team-caption h3 {
+  margin: 0;
+  font-family: "Playfair Display", serif;
+  font-style: italic;
+  font-size: clamp(32px, 4vw, 58px);
+  letter-spacing: -.05em;
+}
+.team-caption p {
+  margin: 10px 0 0;
+  color: var(--gold-light);
+  font-size: 11px;
+  font-weight: 300;
+  text-transform: uppercase;
+  letter-spacing: .34em;
+}
+
+.footer { padding-bottom: 56px; border-top: 1px solid rgba(255,255,255,.07); }
+.footer-grid { display: grid; grid-template-columns: 1.6fr repeat(3, .75fr) 1.2fr; gap: 36px; }
+.footer p { color: var(--white-55); line-height: 1.7; font-size: 14px; }
+.footer h4 { margin: 0 0 18px; color: var(--gold-light); font-size: 11px; text-transform: uppercase; letter-spacing: .25em; }
+.footer a:not(.logo) { display: block; color: var(--white-55); font-size: 14px; margin: 12px 0; transition: color .35s var(--ease); }
+.footer a:hover { color: var(--gold-hover); }
+.social-row { display: flex; gap: 10px; margin-top: 24px; }
+.social-row a {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: grid !important;
+  place-items: center;
+  margin: 0 !important;
+  border: 1px solid var(--white-10);
+  background: rgba(255,255,255,.02);
+}
+.digest-form {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  padding: 5px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--white-10);
+  backdrop-filter: blur(10px);
+}
+.digest-form input {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #fff;
+  padding-left: 14px;
+  font-size: 13px;
+}
+.digest-form input::placeholder { color: var(--white-40); }
+.digest-form button {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 0;
+  background: #fff;
+  color: #050505;
+  cursor: pointer;
+  transition: background .35s var(--ease), transform .35s var(--ease);
+}
+.digest-form button:hover { background: var(--gold-hover); transform: rotate(-35deg); }
+
+.reveal { opacity: 0; transform: translateY(34px); transition: opacity 1s cubic-bezier(.19,1,.22,1), transform 1s cubic-bezier(.19,1,.22,1); }
+.reveal.visible { opacity: 1; transform: translateY(0); }
+
+@keyframes pulsing-branch { from { opacity: .4; } to { opacity: .7; } }
+@keyframes flow { to { stroke-dashoffset: -120; } }
+@keyframes rotateGlow { to { transform: rotate(360deg); } }
+@keyframes breathe { 0%, 100% { transform: scale(1); box-shadow: 0 0 0 rgba(167,139,113,0); } 50% { transform: scale(1.025); box-shadow: 0 0 30px rgba(167,139,113,.16); } }
+@keyframes pulseDot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.72); } }
+
+@media (max-width: 980px) {
+  .navbar { grid-template-columns: 1fr auto; }
+  .nav-links { display: none; }
+  .features-grid, .pricing-grid, .team-grid, .footer-grid { grid-template-columns: 1fr; }
+  .price-card-pro { transform: none; }
+  .neural-stage { height: 860px; }
+  .central-node { width: min(680px, 92vw); }
+  .connection-svg { opacity: .45; }
+  .card-a { top: 0; left: 0; }
+  .card-b { top: 110px; right: 0; }
+  .card-c { bottom: 120px; left: 0; }
+  .card-d { bottom: 0; right: 0; }
+}
+@media (max-width: 640px) {
+  .container { width: min(100% - 28px, 1180px); }
+  .section { padding: 84px 0; }
+  .hero { padding-top: 130px; }
+  .trial-btn { display: none; }
+  .navbar { width: calc(100% - 20px); height: 62px; display: flex; justify-content: center; }
+  .neural-stage { height: auto; display: grid; gap: 14px; padding-top: 20px; }
+  .connection-svg { display: none; }
+  .central-node, .satellite-card { position: relative; inset: auto; left: auto; top: auto; right: auto; bottom: auto; width: 100%; transform: none !important; }
+  .central-node { order: -1; min-height: 340px; }
+  .satellite-card:hover { transform: scale(1.01) !important; }
+  .node-stats { gap: 12px; }
+  .team-caption { left: 24px; right: 24px; bottom: 24px; }
+}
+
+</style>
+</head>
+<body>
+  <div class="bg-dots" aria-hidden="true"></div>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+
+  <header class="navbar glass">
+    <a class="logo" href="#">Aurelia</a>
+    <nav class="nav-links" aria-label="Primary navigation">
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#team">Studio</a>
+      <a href="#footer">Digest</a>
+    </nav>
+    <a class="trial-btn" href="#pricing">Start Free Trial</a>
+  </header>
+
+  <main>
+    <section class="hero section" id="home">
+      <div class="container hero-copy reveal">
+        <p class="eyebrow">Neural creative operating system</p>
+        <h1>Design with <span>intelligence</span>. Orchestrate with <span>taste</span>.</h1>
+        <p class="hero-subtitle">A premium AI workspace for teams building high-fidelity campaigns, cinematic content, and intelligent creative systems.</p>
+        <div class="cta-row">
+          <a class="btn btn-outline" href="#features">Explore Platform</a>
+          <a class="btn btn-solid" href="#pricing">Start Free Trial</a>
+        </div>
+      </div>
+
+      <div class="neural-stage container reveal" id="neuralStage">
+        <svg class="connection-svg" viewBox="0 0 1200 720" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <linearGradient id="nodeGradient" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="10%" stop-color="#a78b71" />
+              <stop offset="90%" stop-color="#c9b8a0" />
+            </linearGradient>
+          </defs>
+          <path class="node-line" d="M600 360 C430 210, 320 160, 155 118" />
+          <path class="node-line dashed" d="M600 360 C770 205, 875 150, 1045 105" />
+          <path class="node-line" d="M600 360 C390 405, 300 510, 150 595" />
+          <path class="node-line dashed" d="M600 360 C805 425, 885 525, 1048 595" />
+          <path class="node-line faint" d="M600 360 C520 275, 470 225, 410 180" />
+          <path class="node-line faint dashed" d="M600 360 C680 277, 730 232, 805 178" />
+        </svg>
+
+        <article class="satellite-card card-a glass" data-depth="-18">
+          <img src="https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=900&q=85" alt="Luxury creative workspace" />
+          <div>
+            <span>Creative Studio</span>
+            <p>Autonomous concept boards</p>
+          </div>
+        </article>
+
+        <article class="satellite-card card-b glass" data-depth="16">
+          <img src="https://images.unsplash.com/photo-1551434678-e076c223a692?auto=format&fit=crop&w=900&q=85" alt="Team reviewing digital product" />
+          <div>
+            <span>Signal Layer</span>
+            <p>Realtime collaboration intelligence</p>
+          </div>
+        </article>
+
+        <article class="central-node glass" data-depth="8">
+          <div class="central-glow"></div>
+          <div class="live-pill glass">
+            <span class="live-dot"></span>
+            <strong>LIVE</strong>
+            <span>Model orchestration active</span>
+          </div>
+          <div class="node-orb">
+            <span></span><span></span><span></span>
+          </div>
+          <div class="node-panel">
+            <p class="label">Inference Mesh</p>
+            <h2>72 active agents</h2>
+            <div class="meter"><i style="width:82%"></i></div>
+            <div class="node-stats">
+              <span>Latency <b>18ms</b></span>
+              <span>Quality <b>98.4%</b></span>
+              <span>Spend <b>-21%</b></span>
+            </div>
+          </div>
+        </article>
+
+        <article class="satellite-card card-c glass" data-depth="-12">
+          <img src="https://images.unsplash.com/photo-1518005020951-eccb494ad742?auto=format&fit=crop&w=900&q=85" alt="Architectural bronze geometric detail" />
+          <div>
+            <span>Motion Engine</span>
+            <p>Cinematic asset expansion</p>
+          </div>
+        </article>
+
+        <article class="satellite-card card-d glass" data-depth="20">
+          <img src="https://images.unsplash.com/photo-1519608487953-e999c86e7455?auto=format&fit=crop&w=900&q=85" alt="Dark city skyline at night" />
+          <div>
+            <span>Brand Memory</span>
+            <p>Gold-standard taste alignment</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="features">
+      <div class="container section-heading reveal">
+        <p class="eyebrow">Capabilities</p>
+        <h2>Precision tools for elevated output.</h2>
+      </div>
+      <div class="container features-grid">
+        <article class="feature-card glass reveal">
+          <div class="icon-box">✦</div>
+          <h3>Neural Routing</h3>
+          <p>Route every prompt to the right specialist model with intelligent fallback, scoring, and quality gates.</p>
+        </article>
+        <article class="feature-card glass reveal">
+          <div class="icon-box">◐</div>
+          <h3>Brand Memory</h3>
+          <p>Keep tone, visual rules, campaign history, and executive preferences available across every workflow.</p>
+        </article>
+        <article class="feature-card glass reveal">
+          <div class="icon-box">⌁</div>
+          <h3>Creative Graph</h3>
+          <p>Connect briefs, references, assets, approvals, and performance signals into one navigable intelligence layer.</p>
+        </article>
+        <article class="feature-card glass reveal">
+          <div class="icon-box">✧</div>
+          <h3>Secure Atelier</h3>
+          <p>Private workspaces, permissioned memory, and audit trails designed for high-stakes creative organizations.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section pricing-section" id="pricing">
+      <div class="container section-heading reveal">
+        <p class="eyebrow">Pricing</p>
+        <h2>Choose your creative operating tier.</h2>
+        <div class="billing-toggle" role="group" aria-label="Billing period">
+          <button class="active" data-billing="monthly">Monthly</button>
+          <button data-billing="annual">Annual</button>
+        </div>
+      </div>
+      <div class="container pricing-grid">
+        <article class="price-card glass reveal">
+          <p class="label">Starter</p>
+          <h3><span data-monthly="$29" data-annual="$24">$29</span><small>/mo</small></h3>
+          <p>For solo creators building premium AI workflows.</p>
+          <ul>
+            <li>5 connected workspaces</li>
+            <li>Basic brand memory</li>
+            <li>100 orchestration runs</li>
+          </ul>
+          <a class="btn btn-outline" href="#">Begin</a>
+        </article>
+        <article class="price-card price-card-pro glass reveal">
+          <div class="popular-badge">Most Popular</div>
+          <p class="label">Pro</p>
+          <h3><span data-monthly="$99" data-annual="$79">$99</span><small>/mo</small></h3>
+          <p>For teams producing high-volume creative systems.</p>
+          <ul>
+            <li>Unlimited creative graph</li>
+            <li>Advanced routing policies</li>
+            <li>1,500 orchestration runs</li>
+          </ul>
+          <a class="btn btn-solid" href="#">Start Trial</a>
+        </article>
+        <article class="price-card glass reveal">
+          <p class="label">Maison</p>
+          <h3><span data-monthly="$299" data-annual="$249">$299</span><small>/mo</small></h3>
+          <p>For organizations needing secure AI operations.</p>
+          <ul>
+            <li>Custom model governance</li>
+            <li>Dedicated success partner</li>
+            <li>Enterprise audit controls</li>
+          </ul>
+          <a class="btn btn-outline" href="#">Contact</a>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="team">
+      <div class="container section-heading reveal">
+        <p class="eyebrow">Studio Council</p>
+        <h2>Human taste, augmented by intelligence.</h2>
+      </div>
+      <div class="container team-grid">
+        <article class="team-card glass reveal">
+          <img src="https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=900&q=85" alt="Portrait of Isabella Voss" />
+          <div class="team-caption">
+            <h3>Isabella Voss</h3>
+            <p>Creative Systems Director</p>
+          </div>
+        </article>
+        <article class="team-card glass reveal">
+          <img src="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=900&q=85" alt="Portrait of Marcus Vale" />
+          <div class="team-caption">
+            <h3>Marcus Vale</h3>
+            <p>Principal AI Architect</p>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer section" id="footer">
+    <div class="container footer-grid">
+      <div class="footer-brand">
+        <a class="logo" href="#">Aurelia</a>
+        <p>Luxury AI infrastructure for creative teams with uncompromising taste.</p>
+        <div class="social-row">
+          <a href="#" aria-label="X">𝕏</a>
+          <a href="#" aria-label="Instagram">◎</a>
+          <a href="#" aria-label="LinkedIn">in</a>
+        </div>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <a href="#">Orchestration</a>
+        <a href="#">Memory</a>
+        <a href="#">Governance</a>
+      </div>
+      <div>
+        <h4>Studio</h4>
+        <a href="#">Workflows</a>
+        <a href="#">Templates</a>
+        <a href="#">Agents</a>
+      </div>
+      <div>
+        <h4>Company</h4>
+        <a href="#">About</a>
+        <a href="#">Journal</a>
+        <a href="#">Careers</a>
+      </div>
+      <div class="digest">
+        <h4>Join Digest</h4>
+        <p>Monthly notes on elegant AI systems.</p>
+        <form class="digest-form">
+          <input type="email" placeholder="Email address" aria-label="Email address" />
+          <button type="submit" aria-label="Submit">→</button>
+        </form>
+      </div>
+    </div>
+  </footer>
+
+  <script data-manor-preview-src="app.js">
+const stage = document.querySelector('#neuralStage');
+const floaters = document.querySelectorAll('[data-depth]');
+
+if (stage) {
+  stage.addEventListener('mousemove', (event) => {
+    const rect = stage.getBoundingClientRect();
+    const x = (event.clientX - rect.left) / rect.width - 0.5;
+    const y = (event.clientY - rect.top) / rect.height - 0.5;
+
+    floaters.forEach((el) => {
+      const depth = Number(el.dataset.depth || 0);
+      const tx = x * depth;
+      const ty = y * depth;
+      const base = el.classList.contains('central-node') ? 'translate(-50%, -50%)' : '';
+      el.style.transform = `${base} translate3d(${tx}px, ${ty}px, 0)`;
+    });
+  });
+
+  stage.addEventListener('mouseleave', () => {
+    floaters.forEach((el) => {
+      el.style.transform = el.classList.contains('central-node') ? 'translate(-50%, -50%)' : '';
+    });
+  });
+}
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach((entry) => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+      observer.unobserve(entry.target);
+    }
+  });
+}, { threshold: 0.14 });
+
+document.querySelectorAll('.reveal').forEach((el, index) => {
+  el.style.transitionDelay = `${Math.min(index * 55, 320)}ms`;
+  observer.observe(el);
+});
+
+const billingButtons = document.querySelectorAll('[data-billing]');
+const priceValues = document.querySelectorAll('.price-card h3 span');
+
+billingButtons.forEach((button) => {
+  button.addEventListener('click', () => {
+    billingButtons.forEach((b) => b.classList.remove('active'));
+    button.classList.add('active');
+    const billing = button.dataset.billing;
+
+    priceValues.forEach((price) => {
+      price.animate([
+        { opacity: 1, transform: 'translateY(0)' },
+        { opacity: 0, transform: 'translateY(-8px)' },
+        { opacity: 1, transform: 'translateY(0)' }
+      ], {
+        duration: 320,
+        easing: 'cubic-bezier(0.4, 0, 0.2, 1)'
+      });
+      window.setTimeout(() => {
+        price.textContent = price.dataset[billing];
+      }, 150);
+    });
+  });
+});
+
+document.querySelector('.digest-form')?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const input = event.currentTarget.querySelector('input');
+  if (!input.value.trim()) return;
+  const button = event.currentTarget.querySelector('button');
+  button.textContent = '✓';
+  input.value = '';
+  window.setTimeout(() => { button.textContent = '→'; }, 1600);
+});
+
+</script>
+</body>
+</html>

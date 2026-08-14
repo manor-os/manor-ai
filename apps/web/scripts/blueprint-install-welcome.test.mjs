@@ -12,10 +12,10 @@ const workspaceDetail = readFileSync(
   "utf8",
 );
 
-test("blueprint install opens the standard workspace-created welcome dialog", () => {
+test("blueprint install routes simulation to Chat and live installs to the welcome dialog", () => {
   assert.match(
     installModal,
-    /navigate\(`\/workspaces\/\$\{result\.workspace_id\}\?created=1`\)/,
+    /mode === "simulate"[\s\S]*?`\/chat\?workspace=\$\{encodeURIComponent\(result\.workspace_id\)\}&simulation=1`[\s\S]*?`\/workspaces\/\$\{result\.workspace_id\}\?created=1`/,
   );
   assert.doesNotMatch(
     installModal,

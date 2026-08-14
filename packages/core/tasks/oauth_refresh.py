@@ -28,11 +28,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.document import Integration
 from packages.core.models.user import OAuthAccount
+from packages.core.services.oauth_account_credentials import (
+    clear_oauth_account_tokens,
+    lease_oauth_account_tokens,
+    store_oauth_account_tokens,
+)
 from packages.core.services.provider_keys import canonical_provider_key, provider_key_aliases
 
 logger = logging.getLogger(__name__)
@@ -250,8 +255,7 @@ def _mark_oauth_account_reauth_required(
         "checked_at": refresh_state["checked_at"],
     }
     row.profile = profile
-    row.access_token = None
-    row.refresh_token = None
+    clear_oauth_account_tokens(row)
     row.token_expires_at = None
 
 
@@ -285,7 +289,10 @@ async def _refresh_oauth_accounts(db: AsyncSession) -> int:
     rows = (await db.execute(
         select(OAuthAccount).where(
             OAuthAccount.provider.in_(_PROVIDER_LOOKUP_KEYS),
-            OAuthAccount.refresh_token.isnot(None),
+            or_(
+                OAuthAccount.credential_ref.isnot(None),
+                OAuthAccount.refresh_token.isnot(None),
+            ),
             OAuthAccount.token_expires_at.isnot(None),
             OAuthAccount.token_expires_at <= deadline,
         ).limit(_MAX_PER_RUN)
@@ -295,9 +302,17 @@ async def _refresh_oauth_accounts(db: AsyncSession) -> int:
     changed = False
     for row in rows:
         provider = canonical_provider_key(row.provider)
+        creds = lease_oauth_account_tokens(
+            row,
+            requester_id="oauth_refresh_task",
+            reason="oauth.token.refresh",
+        )
+        refresh_token = creds.get("refresh_token")
+        if not refresh_token:
+            continue
         data = await refresh_token_via_provider(
             provider,
-            row.refresh_token,
+            refresh_token,
             db=db,
         )
         if _is_permanent_refresh_error(data):
@@ -310,9 +325,13 @@ async def _refresh_oauth_accounts(db: AsyncSession) -> int:
             continue
         if not data or not data.get("access_token"):
             continue
-        row.access_token = data["access_token"]
-        if data.get("refresh_token"):
-            row.refresh_token = data["refresh_token"]  # rotated
+        store_oauth_account_tokens(
+            row,
+            access_token=data["access_token"],
+            refresh_token=data.get("refresh_token") or refresh_token,
+            preserve_existing_refresh=False,
+            requester_id="oauth_refresh_task",
+        )
         expires_in = data.get("expires_in")
         if expires_in:
             row.token_expires_at = datetime.now(timezone.utc) + timedelta(

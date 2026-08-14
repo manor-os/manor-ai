@@ -173,6 +173,98 @@ def _runtime_file_editor_format_guidance(file_type: str, editor_type: str) -> li
             "- Preserve unrelated nodes, configuration, input/output bindings, and edges "
             "unless the user explicitly asks to change them.",
         ]
+    if "video" in key:
+        return [
+            "",
+            "Video animation editor-state requirements:",
+            "- Patch the current JSON recipe and preserve "
+            '`kind:"manor.video_edit_recipe"` with `version:11`.',
+            "- Preserve unrelated source-document, canvas, manual-edit, render-contract, "
+            "and editor-setting fields. Treat `live_edit_context` as read-only targeting "
+            "context; it identifies the playhead and selected layer when present.",
+            "- Editable timeline arrays are `clips`, `shots`, `graphics`, `captions`, "
+            "`audio_cues`, and `markers`. Keep every existing item unless the user asks "
+            "to remove or replace it, and give new items unique stable string IDs.",
+            "- Clip animation fields include `speed` (0.25-4), `fadeIn`, `fadeOut`, "
+            '`fit` (`contain` or `cover`), base `x`, `y`, `scale`, `rotation`, `opacity`, '
+            "and `keyframes`. Optional seek-safe depth fields are `rotationX`, `rotationY`, "
+            "`perspective`, and `blur`. Do not invent replacement asset or document IDs.",
+            "- Each `shots` item is also a parent scene group. Its optional base `x`, `y`, `scale`, "
+            "`rotation`, `rotationX`, `rotationY`, `perspective`, `blur`, `opacity`, and `keyframes` "
+            "transform the video, graphics, and captions active inside that shot as one deterministic group. "
+            "Use shot group motion for camera moves across a composed scene instead of duplicating the same "
+            "keyframes across every child layer.",
+            "- Caption styles are `subtitle`, `speechBubble`, `narrationBox`, `titleCard`, "
+            "and `lowerThird`. Asset-free graphic kinds are `rectangle`, `ellipse`, `line`, "
+            "and `path`; use `image` or `video` only when the current recipe already provides "
+            "a real asset ID. Never invent media document IDs.",
+            "- Positions use normalized canvas percentages (`x` and `y` from 0 to 100). "
+            "Use scale 0.1-4, rotation -360 to 360 degrees, and opacity 0-1.",
+            "- Motion keyframe `time` is seconds relative to its owning clip/shot/caption/graphic "
+            "start. Snap new times to 30 fps and keep them inside the owning duration.",
+            "- Every motion keyframe must include `id`, `time`, `x`, `y`, `scale`, "
+            "`rotation`, `opacity`, and `easing`; optional `scaleX`, `scaleY`, `rotationX`, `rotationY`, "
+            "`perspective`, and `blur` animate wipes, depth tilt, focus transitions, and squash/stretch "
+            "without mutating layout. Graphic keyframes may additionally animate `effectStrength` from 0-1. "
+            "Supported easings are `linear`, `hold`, "
+            "`gentle`, `easeIn`, `easeOut`, `easeInOut`, `snappy`, `spring`, and `custom`.",
+            "- For `custom` easing, include `bezier:{x1,y1,x2,y2}` with x values from 0-1 "
+            "and y values from -1 to 2. `spatial` is either `linear` or `smooth` and "
+            "describes the path while arriving at that keyframe.",
+            "- For a complete production motion-graphics composition, set top-level "
+            "`motion_design` instead of hand-authoring dozens of layers. Supported presets "
+            "are `kinetic-type`, `swiss-grid`, `product-promo`, `editorial-data`, "
+            "`product-film`, `feature-reveal`, `product-story`, and `motion-design`. "
+            "Provide the user's real copy with `headline`, `kicker`, `subhead`, `cta`, "
+            "`statValue`, and `statLabel`; optional theme fields are `background`, `surface`, "
+            "`foreground`, `accent`, and `accent2`. Set `quality:\"production\"` unless the user "
+            "explicitly asks for a draft; `visualTone` may be `editorial`, `cinematic`, `technical`, "
+            "or `playful`, and `fontFamily` may be `sans`, `display`, or `mono`.",
+            "- Theme fields are user overrides, not decoration prompts. If the user did not explicitly "
+            "request colors or a named visual palette, omit `background`, `surface`, `foreground`, "
+            "`accent`, and `accent2` so the preset's authored production palette remains intact. "
+            "Never infer a neon cyan/magenta palette merely from words such as bold, motion, or cinematic.",
+            "- Production caption controls include `fontFamily`, `fontWeight`, `letterSpacing`, "
+            "`lineHeight`, `maxWidth`, `textTransform`, text shadow/outline fields, padding/corner "
+            "fields, `reveal` (`none`, `words`, `characters`, or `wipe`), `revealDuration`, and `zIndex`.",
+            "- Production graphic controls include `fillType` (`solid`, `linear`, or `radial`), "
+            "`fillSecondary`, `gradientAngle`, shadow/blur fields, `blendMode`, `assetFit`, `zIndex`, "
+            "SVG `pathData` for path layers, `maskShape` (`none`, `circle`, `diamond`, or `hexagon`), "
+            "and native `effect` treatments (`none`, `glass`, `glow`, `grain`, `scanlines`, `chromatic`, "
+            "`vignette`, `lightLeak`, `filmBurn`, `halation`, or `anamorphic`) with `effectStrength` from 0-1. "
+            "Use light leaks, burns, halation, and anamorphic flares as brief optical transitions or focal cues, "
+            "never as a permanent full-frame wash. Use effects as purposeful depth, focus, texture, "
+            "or beat punctuation rather than applying one treatment to every layer. Prefer authored hierarchy and 6-10 purposeful visual "
+            "roles over equal-weight centered shapes.",
+            "- A `video` graphic is a muted, independently timed overlay. It may use `sourceStart`, "
+            "`sourceEnd`, `speed` (0.25-4), `loop`, and `assetFit`; keep its source window within "
+            "`assetDuration`. Put any audible content on a separate `audio_cues` item so seeking, "
+            "mixing, and export remain deterministic.",
+            "- Audio cues with real assets may use `sourceStart` and `sourceEnd` to select a source window. "
+            "Keep them inside `assetDuration`; when `loop:true`, only that selected window repeats. Timeline "
+            "`start`/`end` still control placement and duration in the final composition.",
+            "- `motion_design.mode` is `replace` for a new full composition or `append` to "
+            "add the generated motion layers to existing timeline layers. The editor consumes "
+            "this request into deterministic, individually editable graphics, captions, scenes, "
+            "markers, and keyframes. Preserve `timeline.clips` and never invent source media.",
+            "- Choose `product-film` when real timeline footage should remain visible under "
+            "talking-head captions and product/code overlays; do not choose it without a real "
+            "source clip. Choose `feature-reveal` for clean multi-step timing bars, "
+            "`product-story` for layered browser/app storytelling, and `motion-design` for "
+            "a short motion-first typographic film. The original `kinetic-type`, `swiss-grid`, "
+            "`product-promo`, and `editorial-data` presets remain available for expressive type, "
+            "editorial systems, UI showcases, and chart-led narratives. Do not mention HyperFrames in "
+            "generated user-facing copy unless the user explicitly asks for that name.",
+            "- Use at least two keyframes for visible motion. Prefer restrained, purposeful "
+            "movement and preserve a readable end pose. Use `gentle` for slow camera drift, "
+            "`snappy` for concise UI motion, and `spring` for a controlled physical settle.",
+            "- All animation must be frame-seekable and deterministic: express visual state "
+            "only through explicit recipe values and keyframes; never use clocks, random "
+            "values, accumulated state, or playback-only assumptions.",
+            "- If the request requires new footage, images, or audio that is absent from the "
+            "recipe, make the useful asset-free animation edits now and state which media "
+            "must be generated or attached separately. Never fabricate an asset reference.",
+        ]
     if "diagram" in key:
         return [
             "",
@@ -559,8 +651,8 @@ def runtime_tool_usage_guidance(
         "Skills, call `invoke_skill(skill=\"chrome\", input=<latest user "
         "request>)` as the primary route; if the `invoke_skill` schema is "
         "deferred, load `invoke_skill` with `search_tools`; do not load Chrome MCP tools directly from the parent chat. The Chrome skill owns the Browser MCP package, including "
-        "documentation/capabilities/status/open_or_reuse/get_group_state/list-tabs/read_page/click_element/fill_or_select/"
-        "computer/key/scroll/upload/diagnostic tools, through the Runtime Harness. For nontrivial Chrome tasks, the Chrome skill should read the runtime-contract documentation before acting. It maintains a visible Browser Group with `open_or_reuse` and `groupTitle`. "
+        "documentation/capabilities/status/open_or_reuse/get_group_state/list-tabs/read_page/resolve_target/click_element/fill_or_select/"
+        "computer/key/scroll/upload/download/diagnostic tools, through the Runtime Harness. Documentation and capabilities are diagnostic, not a bootstrap step; ordinary Chrome work starts with `open_or_reuse` or a requested tab claim. The skill maintains a visible Browser Group with automatic task identity and an optional human-readable `groupTitle`. "
         f"{chrome_unavailable_clause}"
         "Do not use `web_search`, `web_fetch`, or "
         "`browse_web` as a substitute for Chrome.\n"
@@ -614,6 +706,16 @@ def runtime_tool_usage_guidance(
         if "rag" in loaded_tools
         else ""
     )
+    hitl_answer_routing_hint = (
+        "- When the user's latest message answers, confirms, or declines an "
+        "entry in Open Task Blockers, route it through `answer_task_blocker` "
+        "with that blocker's `request_id` so the paused task resumes with its "
+        "own tools. Never start `workspace_agent(action='delegate_service')` "
+        "for the same goal while its blocker is open — the delegate runs "
+        "without the paused task's tools and cannot finish the job.\n"
+        if "answer_task_blocker" in loaded_tools and "workspace_agent" in loaded_tools
+        else ""
+    )
     return (
         "## Tool Usage\n"
         "- Before the first tool call in a tool-using turn, emit one short, natural progress sentence "
@@ -622,6 +724,11 @@ def runtime_tool_usage_guidance(
         "- During long multi-step tool work, add brief progress text only when the intent changes "
         "meaningfully; do not narrate every low-level click, page read, or file read.\n"
         "- On tool error, explain the issue; chain tool calls when needed.\n"
+        "- A `blocked_by_governance` result is an action/capability/risk policy "
+        "decision. Do not claim that rewording a title or description will bypass "
+        "it, and do not retry the same action under a euphemistic label. Report the "
+        "matched rule and ask the user to change the workspace policy when the "
+        "requested action should be allowed.\n"
         "- Treat the latest user message as the active intent — don't "
         "resume earlier tasks unless asked.\n"
         "- Match response length to scope: short question → short answer.\n"
@@ -630,6 +737,7 @@ def runtime_tool_usage_guidance(
         f"{search_tools_two_step_hint}"
         f"{file_search_routing_hint}"
         f"{knowledge_retrieval_hint}"
+        f"{hitl_answer_routing_hint}"
         "- Route code/scripts/large content through generate_file(kind='code'), "
         "write_file, or bash, not inline chat text.\n"
         "- For LARGE files, prefer edit_file (targeted find/replace) over "
@@ -665,11 +773,21 @@ def runtime_workspace_agent_mode_guidance(
         "requests. When it does, call `workspace_resolve_hitl` with the matching "
         "`message_id` or `hitl_id` and action. When it does not, continue the "
         "normal workspace conversation without resolving HITL.\n"
+        "- If the Workspace Context includes Open Task Blockers, check whether "
+        "the latest user message answers, confirms, or declines one of them. "
+        "When it does, call `answer_task_blocker` with that blocker's "
+        "`request_id` — the paused task resumes with its own tools. Do not "
+        "re-delegate the same goal via `delegate_service` while its blocker is "
+        "open, and do not answer login-wall blockers with this tool.\n"
         "- For concrete one-off work, call `workspace_agent` with "
         "`action='create_task'` and include task-only instructions, required "
         "references, and task rules in `params`. Set `params.start=true` when "
         "the user asks you to do/prepare/run the work now; leave it false only "
         "when they explicitly ask to create a todo/task for later.\n"
+        "- Task-only rules constrain actions executed inside that task. Map each rule "
+        "to the actual downstream action: content or verification constraints belong "
+        "on send/publish actions, while `workspace.task.create` is appropriate only "
+        "when the user explicitly prohibits nested task creation.\n"
         "- When the user asks you to use an existing workspace service or a "
         "service-bound agent capability now, call `workspace_agent` with "
         "`action='delegate_service'`. Pass `params.service_key` (or "
@@ -1061,7 +1179,7 @@ def runtime_artifact_reference_guidance(
     tool_names: Iterable[str] | None,
     has_tools: bool,
 ) -> str | None:
-    """Require a real address whenever a file is produced or referred to.
+    """Require a canonical address whenever a user-visible file is mentioned.
 
     A filename on its own is not a reference. The UI can only turn a mention
     into something clickable when the text carries an address it can open, so
@@ -1070,24 +1188,29 @@ def runtime_artifact_reference_guidance(
     produces cards that lead nowhere. One staging reply named an MP4 with no
     path at all; the user's next message was that they could not find it.
     """
-    if not has_tools or not runtime_allows_prompt_guidance(envelope, "artifact_reference"):
-        return None
-    loaded = _tool_name_set(tool_names)
-    produces_files = bool(loaded & {
-        "generate_file", "generate_image", "generate_video", "generate_audio",
-        "write_file", "merge_videos", "compose_video_timeline", "upload_document",
-    })
-    if not produces_files:
+    if not runtime_allows_prompt_guidance(envelope, "artifact_reference"):
         return None
     return (
-        "## Naming a file is not delivering it\n"
-        "- Every time you tell the user about a file you produced or are "
-        "pointing them at, give the address the tool returned for it — the "
-        "`fs_path`, `document_id`, or file URL. Not the bare filename.\n"
-        "- Use the value verbatim from the tool result. Do not reconstruct a "
-        "path from the filename, the folder you intended, or a previous run: "
-        "a path you assembled yourself may not exist, and the user will click "
-        "it and find nothing.\n"
-        "- If a tool did not return an address, say the file was not saved "
-        "rather than naming it as though it were available."
+        "## File reference links\n"
+        "- Whenever you mention or return any user-visible file — from Knowledge, "
+        "a task, generation, or search — copy the exact `markdown_link` returned "
+        "with that file. This Markdown-v1 value is the fixed reference format; "
+        "treat its destination as opaque and never decode, humanize, or rewrite it.\n"
+        "- A synced file uses `[filename](/viewer/{document_id})`. A non-Knowledge "
+        "artifact may use `[filename](/api/v1/fs/{entity_id}/{encoded_path})` only "
+        "when that exact `open_url` was returned by a tool. A bare filename, "
+        "filesystem path, or document id is not a delivered file.\n"
+        "- `document_id` is internal routing metadata. It may appear only inside the "
+        "opaque `/viewer/{document_id}` link destination. Never print it separately, "
+        "never add a `Document ID` or `document_id` row, and never use it as visible "
+        "link text; show the exact filename instead.\n"
+        "- Copy `markdown_link` verbatim when present. If a result instead returns "
+        "the exact filename with `document_id`, insert only those returned values "
+        "into the viewer form above. If it returns a canonical `open_url`, use it "
+        "verbatim as the Markdown destination. Never guess an id or reconstruct "
+        "an address from a filename, intended folder, or previous run.\n"
+        "- If the current result only has a name, resolve it with a Knowledge "
+        "document list/search tool before mentioning it as an available file. "
+        "If no `document_id`, `open_url`, or `markdown_link` can be obtained, "
+        "say that no clickable file is available."
     )

@@ -4,6 +4,11 @@ import type { ChatMessage } from "../lib/chatStream";
 import { t } from "../lib/i18n";
 import type { Document } from "../lib/types";
 import {
+  generatedFileOpenReference,
+  isOpenableFileReference,
+} from "../lib/fileReferences";
+import InlineFileReferenceCard from "./InlineFileReferenceCard";
+import {
   getChatBoxModeConfig,
   type ChatBoxMode,
 } from "./ChatModeSelector";
@@ -24,6 +29,8 @@ export type ChatMessageDisplayReference = {
   mimeType?: string;
   url?: string;
   previewUrl?: string;
+  openUrl?: string;
+  fsPath?: string;
 };
 
 export type ParsedUserMessageDisplay = {
@@ -220,10 +227,16 @@ function pushReference(
   const name = String(ref.name || "").trim();
   if (!name) return;
   const kind = ref.kind || inferReferenceKind(name, ref.mimeType, ref.fileType);
+  const openReference = generatedFileOpenReference({
+    ...ref,
+    document_id: ref.id,
+    open_url: ref.openUrl,
+    fs_path: ref.fsPath,
+  });
   const previewKey = ref.previewUrl
     ? `${name}:${ref.previewUrl.length}:${ref.previewUrl.slice(-32)}`
     : "";
-  const key = ref.id || ref.url || previewKey || name;
+  const key = ref.id || openReference || ref.url || previewKey || name;
   const normalized = key.toLowerCase();
   if (references.some((item) => item.key.toLowerCase() === normalized)) return;
   references.push({
@@ -235,6 +248,8 @@ function pushReference(
     mimeType: ref.mimeType,
     url: ref.url,
     previewUrl: ref.previewUrl,
+    openUrl: ref.openUrl,
+    fsPath: ref.fsPath,
   });
 }
 
@@ -256,16 +271,38 @@ function stripReferenceTokens(text: string, references: ChatMessageDisplayRefere
     .replace(/\n[ \t]+/g, "\n");
 }
 
-function referenceFromAttachment(
-  attachment: NonNullable<ChatMessage["attachments"]>[number],
-) {
-  return {
-    name: attachment.name,
-    id: attachment.id,
-    fileType: attachment.fileType,
-    mimeType: attachment.mimeType,
-    previewUrl: attachment.previewUrl,
-  };
+export function chatMessageReferencesFromAttachments(
+  attachments: unknown,
+): ChatMessageDisplayReference[] {
+  if (!Array.isArray(attachments)) return [];
+  const references: ChatMessageDisplayReference[] = [];
+  for (const value of attachments) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const attachment = value as Record<string, unknown>;
+    pushReference(references, {
+      name: String(attachment.name || attachment.filename || attachment.title || ""),
+      id: attachment.id == null
+        ? String(attachment.document_id || attachment.documentId || attachment.doc_id || "") || undefined
+        : String(attachment.id),
+      fileType: attachment.fileType == null
+        ? String(attachment.file_type || attachment.type || "") || undefined
+        : String(attachment.fileType),
+      mimeType: attachment.mimeType == null
+        ? String(attachment.mime_type || "") || undefined
+        : String(attachment.mimeType),
+      url: String(attachment.url || attachment.public_url || "") || undefined,
+      previewUrl: attachment.previewUrl == null
+        ? String(attachment.preview_url || attachment.file_url || attachment.document_url || "") || undefined
+        : String(attachment.previewUrl),
+      openUrl: attachment.openUrl == null
+        ? String(attachment.open_url || attachment.viewer_url || "") || undefined
+        : String(attachment.openUrl),
+      fsPath: attachment.fsPath == null
+        ? String(attachment.fs_path || attachment.path || "") || undefined
+        : String(attachment.fsPath),
+    });
+  }
+  return references;
 }
 
 function documentReferenceKind(doc: Document): ChatMessageDisplayReference["kind"] {
@@ -317,8 +354,6 @@ export async function resolveChatMessageReferenceDocument(
       return (
         kindMatches.find((doc) => doc.name.toLowerCase() === exactName) ||
         items.find((doc) => doc.name.toLowerCase() === exactName) ||
-        kindMatches[0] ||
-        items[0] ||
         null
       );
     } catch {
@@ -363,8 +398,8 @@ export function parseUserMessageDisplay(msg: ChatMessage): ParsedUserMessageDisp
   let attachmentLineCount = 0;
   let parsedPayload: Record<string, unknown> = safeParsePayload(msg.chatModePayload);
 
-  for (const attachment of msg.attachments || []) {
-    pushReference(references, referenceFromAttachment(attachment));
+  for (const reference of chatMessageReferencesFromAttachments(msg.attachments)) {
+    pushReference(references, reference);
   }
 
   const explicitMode = normalizeMode(msg.chatMode);
@@ -594,10 +629,14 @@ export function ChatMessageReferenceStrip({
   references,
   align = "left",
   onOpenReference,
+  inlineFileCards = false,
+  returnTo,
 }: {
   references: ChatMessageDisplayReference[];
   align?: "left" | "right";
   onOpenReference?: (refItem: ChatMessageDisplayReference) => void;
+  inlineFileCards?: boolean;
+  returnTo?: string;
 }) {
   if (!references.length) return null;
   return (
@@ -607,8 +646,28 @@ export function ChatMessageReferenceStrip({
       }`}
       aria-label={t("component.chat_message.references")}
     >
-      {references.slice(0, 8).map((refItem) => (
-        onOpenReference ? (
+      {references.slice(0, 8).map((refItem) => {
+        const directReference = generatedFileOpenReference({
+          ...refItem,
+          document_id: refItem.id,
+          open_url: refItem.openUrl,
+          fs_path: refItem.fsPath,
+        }) || [refItem.url, refItem.previewUrl].find(isOpenableFileReference) || "";
+        if (inlineFileCards && directReference) {
+          return (
+            <InlineFileReferenceCard
+              key={refItem.key}
+              reference={directReference}
+              label={refItem.name}
+              returnTo={returnTo}
+              fileType={refItem.fileType}
+              mimeType={refItem.mimeType}
+              compact
+              trustedReference
+            />
+          );
+        }
+        return onOpenReference ? (
           <button
             key={refItem.key}
             type="button"
@@ -628,8 +687,8 @@ export function ChatMessageReferenceStrip({
             <ChatMessageReferenceThumb refItem={refItem} />
             <span className="chat-message-reference-name">{refItem.name}</span>
           </span>
-        )
-      ))}
+        );
+      })}
     </div>
   );
 }

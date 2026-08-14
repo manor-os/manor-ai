@@ -12,6 +12,7 @@ import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import Input from "../ui/Input";
 import Textarea from "../ui/Textarea";
+import Checkbox from "../ui/Checkbox";
 import { api } from "../../lib/api";
 import { useToastStore } from "../../stores/toast";
 import { t } from "../../lib/i18n";
@@ -28,11 +29,17 @@ interface SectionToggle {
   key:
     | "include_subscriptions"
     | "include_goals"
+    | "include_stats"
     | "include_scheduled_jobs"
+    | "include_workflows"
     | "include_custom_fields"
     | "include_governance"
     | "include_channel_requirements"
     | "include_session_requirements"
+    | "include_embedded_agents"
+    | "include_embedded_skills"
+    | "include_knowledge_packs"
+    | "include_starter_memory"
     | "include_memory_files";
   label: string;
   defaultOn: boolean;
@@ -42,12 +49,18 @@ interface SectionToggle {
 const SECTIONS: SectionToggle[] = [
   { key: "include_subscriptions",         label: t("component.export_blueprint_modal.agent_subscriptions"),  defaultOn: true,  hint: "Service-key → agent bindings (resolved by slug on install)." },
   { key: "include_goals",                 label: t("nav.goals"),                defaultOn: true,  hint: "Targets + measurement schedule. Runtime values are stripped." },
+  { key: "include_stats",                 label: t("page.workspace_stats.title"), defaultOn: true,  hint: "Collection definitions only. Observation history is never exported." },
   { key: "include_scheduled_jobs",        label: t("page.blueprint_detail.scheduled_jobs"),       defaultOn: true,  hint: "Cron triggers (last_run_at dropped)." },
+  { key: "include_workflows",             label: "Workflows",                  defaultOn: true,  hint: "Workspace workflow graphs, variables, and active bindings." },
   { key: "include_custom_fields",         label: t("component.export_blueprint_modal.custom_field_defs"),    defaultOn: true,  hint: "Per-workspace field schemas for tasks/clients." },
   { key: "include_governance",            label: t("page.blueprint_detail.governance_policy"),    defaultOn: true,  hint: "Current policy snapshot — operator picks a preset overlay on install." },
   { key: "include_channel_requirements",  label: t("component.export_blueprint_modal.channel_requirements"), defaultOn: true,  hint: "Just the *types* of channel needed — no credentials." },
-  { key: "include_session_requirements",  label: t("page.blueprint_detail.browser_sessions"),     defaultOn: true,  hint: "Just provider+label — installer rebuilds via HITL capture." },
-  { key: "include_memory_files",          label: t("component.export_blueprint_modal.memory_md_files"),      defaultOn: false, hint: "Workspace knowledge files. Heavy — opt in if you want to ship them." },
+  { key: "include_session_requirements",  label: t("page.blueprint_detail.browser_sessions"),     defaultOn: true,  hint: "Only referenced provider+label requirements; credentials are never copied." },
+  { key: "include_embedded_agents",       label: "Private Agents",             defaultOn: true,  hint: "Embed subscribed private Agents; public Agents remain catalog requirements." },
+  { key: "include_embedded_skills",       label: "Private Skills",             defaultOn: true,  hint: "Embed private Skills bound to exported Agents." },
+  { key: "include_starter_memory",        label: "Agent starter memory",       defaultOn: false, hint: "Include eligible agent-level memory; private and confidential entries stay excluded." },
+  { key: "include_knowledge_packs",       label: "Knowledge structure",        defaultOn: true,  hint: "Export Workspace Knowledge groups and safe document paths." },
+  { key: "include_memory_files",          label: t("component.export_blueprint_modal.memory_md_files"),      defaultOn: false, hint: "Include bodies only for public, clean, non-PII Markdown stored as Knowledge text." },
 ];
 
 function defaultSlug(name: string): string {
@@ -69,6 +82,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
   const [description, setDescription] = useState("");
   const [tagsInput, setTagsInput] = useState("");
   const [authorHandle, setAuthorHandle] = useState("");
+  const [replaceExisting, setReplaceExisting] = useState(false);
   const [includes, setIncludes] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(SECTIONS.map((s) => [s.key, s.defaultOn])),
   );
@@ -82,6 +96,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
       setDescription("");
       setTagsInput("");
       setAuthorHandle("");
+      setReplaceExisting(false);
       setIncludes(Object.fromEntries(SECTIONS.map((s) => [s.key, s.defaultOn])));
     }
   }, [open, workspaceName]);
@@ -95,6 +110,8 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
         description: description || undefined,
         tags: tagsInput.split(",").map((t) => t.trim()).filter(Boolean),
         author_handle: authorHandle || undefined,
+        knowledge_pack_mode: includes.include_memory_files ? "inline_text" : "skeleton",
+        replace_existing: replaceExisting,
         ...includes,
       }),
     onSuccess: (bp) => {
@@ -131,7 +148,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
       }
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        <div style={{ background: "rgba(79, 125, 117, 0.06)", padding: 12, borderRadius: 8, fontSize: 12, color: "rgb(28, 25, 23)" }}>
+        <div style={{ background: "var(--surface-muted)", padding: 12, borderRadius: "var(--radius-control)", fontSize: 12, color: "var(--text-default)" }}>
           {t("component.export_blueprint_modal.a_blueprint_is_a_portable_json_document_secrets_runtim")}</div>
 
         <Input
@@ -169,34 +186,61 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
           placeholder="calvin"
         />
 
+        <div style={{ padding: "2px 0" }}>
+          <Checkbox
+            checked={replaceExisting}
+            onChange={setReplaceExisting}
+            label={(
+              <span>
+                <span style={{ display: "block", fontWeight: 600, color: "var(--text-strong)" }}>
+                  Replace an existing draft with this slug
+                </span>
+                <span style={{ display: "block", marginTop: 2, fontSize: 11, color: "var(--text-muted)" }}>
+                  Only an editable Blueprint previously exported from this Workspace can be replaced.
+                </span>
+              </span>
+            )}
+          />
+        </div>
+
         <div>
           <h4 style={{ fontSize: 13, fontWeight: 600, margin: "8px 0 8px" }}>{t("component.export_blueprint_modal.what_to_include")}</h4>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {SECTIONS.map((s) => (
-              <label
+              <div
                 key={s.key}
                 style={{
-                  display: "flex",
-                  alignItems: "flex-start",
-                  gap: 10,
                   padding: 8,
-                  borderRadius: 6,
-                  background: includes[s.key] ? "rgba(79, 125, 117, 0.04)" : "transparent",
-                  cursor: "pointer",
+                  borderRadius: "var(--radius-control)",
+                  background: includes[s.key] ? "var(--surface-muted)" : "transparent",
                   fontSize: 12,
                 }}
               >
-                <input
-                  type="checkbox"
+                <Checkbox
                   checked={!!includes[s.key]}
-                  onChange={(e) => setIncludes((p) => ({ ...p, [s.key]: e.target.checked }))}
-                  style={{ marginTop: 2 }}
+                  disabled={
+                    (s.key === "include_starter_memory" && !includes.include_embedded_agents)
+                    || (s.key === "include_memory_files" && !includes.include_knowledge_packs)
+                  }
+                  onChange={(checked) => setIncludes((previous) => ({
+                    ...previous,
+                    [s.key]: checked,
+                    ...(s.key === "include_knowledge_packs" && !checked
+                      ? { include_memory_files: false }
+                      : {}),
+                    ...(s.key === "include_embedded_agents" && !checked
+                      ? { include_starter_memory: false }
+                      : {}),
+                  }))}
+                  style={{ width: "100%", alignItems: "flex-start" }}
+                  label={(
+                    <span style={{ minWidth: 0 }}>
+                      <span style={{ display: "block", fontWeight: 500, color: "var(--text-strong)" }}>{s.label}</span>
+                      <span style={{ display: "block", color: "var(--text-muted)", fontSize: 11, marginTop: 2 }}>{s.hint}</span>
+                    </span>
+                  )}
                 />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 500 }}>{s.label}</div>
-                  <div style={{ color: "rgb(120, 113, 108)", fontSize: 11, marginTop: 2 }}>{s.hint}</div>
-                </div>
-              </label>
+              </div>
             ))}
           </div>
         </div>

@@ -89,45 +89,56 @@ async def resolve_official_model_route(
     vercel_reason: str = "llm.chat.vercel_gateway_key",
     openrouter_reason: str = "llm.chat.openrouter_fallback_key",
     gateway_provider: str | None = None,
+    provider_chain: tuple[str, ...] | None = None,
 ) -> ModelGatewayRoute | None:
     """Resolve official platform routing for a catalog model.
 
-    Manor official calls prefer Vercel AI Gateway and fall back to OpenRouter.
-    ``gateway_provider`` narrows resolution to one gateway for runtime failover.
     User BYOK is resolved by the caller before this platform route is queried.
+    The compatible provider chain remains authoritative, but credential source
+    priority is global: try all allowed providers' admin DB keys first, then
+    their environment keys. This prevents an environment Vercel key from
+    bypassing an OpenRouter key explicitly configured in Admin -> Models.
     """
 
     if not provider_for_model_id(model_id):
         return None
 
-    gateway_chain = (gateway_provider,) if gateway_provider else ("vercel", "openrouter")
+    gateway_chain = (
+        tuple(dict.fromkeys(provider_chain))
+        if provider_chain is not None
+        else ((gateway_provider,) if gateway_provider else ("vercel", "openrouter"))
+    )
     reasons = {
         "vercel": reason or vercel_reason,
         "openrouter": openrouter_reason,
     }
     for provider in gateway_chain:
-        if provider not in reasons:
-            continue
-        try:
-            credential = await provider_key_service.resolve_official_provider_credential(
-                provider,
-                reason=reasons[provider],
-            )
-        except Exception:
-            logger.warning(
-                "Official %s credential lookup failed; trying the next managed gateway.",
-                provider,
-                exc_info=True,
-            )
-            continue
-        if credential and credential.api_key:
-            return ModelGatewayRoute(
-                api_key=credential.api_key,
-                base_url=credential.base_url,
-                provider=provider,
-                source=credential.source,
-                source_detail=credential.source_detail,
-            )
+        reasons.setdefault(provider, reason or f"model.{provider}.official_provider_key")
+    for source in ("db", "env"):
+        for provider in gateway_chain:
+            if provider not in reasons:
+                continue
+            try:
+                credential = await provider_key_service.resolve_official_provider_credential(
+                    provider,
+                    reason=reasons[provider],
+                    sources=(source,),
+                )
+            except Exception:
+                logger.warning(
+                    "Official %s credential lookup failed; trying the next managed gateway.",
+                    provider,
+                    exc_info=True,
+                )
+                continue
+            if credential and credential.api_key:
+                return ModelGatewayRoute(
+                    api_key=credential.api_key,
+                    base_url=credential.base_url,
+                    provider=provider,
+                    source=credential.source,
+                    source_detail=credential.source_detail,
+                )
 
     return None
 
@@ -136,8 +147,13 @@ async def resolve_gateway_credential(
     provider: str,
     *,
     reason: str,
+    sources: tuple[str, ...] = ("db", "env"),
 ) -> OfficialProviderCredential | None:
-    return await provider_key_service.resolve_official_provider_credential(provider, reason=reason)
+    return await provider_key_service.resolve_official_provider_credential(
+        provider,
+        reason=reason,
+        sources=sources,
+    )
 
 
 async def list_model_provider_statuses(db: AsyncSession) -> list[dict[str, Any]]:

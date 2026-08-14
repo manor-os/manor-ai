@@ -43,6 +43,24 @@ async def push_goal_progress(user_id: str, goal: dict):
     await _send_to_user(user_id, "goal_progress", goal)
 
 
+async def push_chat_stream_snapshot(user_id: str, snapshot: dict):
+    """In-progress state of a personal chat turn, for tabs that are not the streamer.
+
+    A personal conversation streams over the SSE body of the POST that started
+    it, so the transcript only exists in the tab that sent the message. Reload
+    that page and the connection dies while the turn keeps running server-side —
+    with no second channel the reader is stuck on the last DB checkpoint until
+    they reload again. These snapshots are that second channel.
+
+    Unlike the other helpers this is not a "go refetch" ping: ``snapshot``
+    carries the reply itself (partial text, tool cards, assistant blocks), so
+    the receiver renders straight from it. Keep the payload JSON-primitive —
+    ``_redis_publish`` uses a bare ``json.dumps`` and a raise there is swallowed
+    at DEBUG, which looks exactly like the feature not working.
+    """
+    await _send_to_user(user_id, "chat_stream_snapshot", snapshot)
+
+
 # ── Entity-wide broadcast ──────────────────────────────────────────────────
 
 async def broadcast_task_update(entity_id: str, task: dict):

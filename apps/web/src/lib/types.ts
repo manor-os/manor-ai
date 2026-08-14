@@ -1,3 +1,9 @@
+export enum VideoGenerationMode {
+  AUTO = "auto",
+  NATIVE_MOTION = "native_motion",
+  AI_VIDEO = "ai_video",
+}
+
 // Auth
 export interface User {
   id: string;
@@ -533,6 +539,8 @@ export interface Message {
   error?: string | null;
   limit_detail?: Record<string, any> | null;
   hitl_requests?: Record<string, any>[] | null;
+  message_kind?: string | null;
+  refs?: Record<string, any>[] | null;
   created_at?: string;
 }
 
@@ -575,6 +583,7 @@ export interface Document {
   } | null;
   created_by?: string;
   created_at?: string;
+  updated_at?: string;
   // ── Permission-v1 fields ──────────────────────────────────────────────
   visibility?: Visibility;
   classification?: Classification;
@@ -703,7 +712,10 @@ export interface Workspace {
    *  since. Detection only — applying an update is a deliberate act. */
   blueprint_update?: {
     status: "current" | "update_available" | "unknown" | "not_from_blueprint";
+    blueprint_id?: string | null;
     blueprint_slug?: string | null;
+    installed_version?: string | null;
+    current_version?: string | null;
     installed_at?: string | null;
     installed_fingerprint?: string | null;
     current_fingerprint?: string | null;

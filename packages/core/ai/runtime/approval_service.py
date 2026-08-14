@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from sqlalchemy import select
+
 from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
 from packages.core.ai.runtime.approval_classifier import classify_runtime_tool_action
 from packages.core.ai.runtime.approval_messages import (
@@ -53,6 +55,7 @@ from packages.core.services.hitl_options import (
     APPROVAL_CHOICE_ALWAYS_APPROVE,
     APPROVAL_CHOICE_APPROVE,
     APPROVAL_CHOICE_REJECT,
+    APPROVAL_CHOICE_REVISE,
     approval_options,
     normalize_approval_choice,
 )
@@ -87,6 +90,124 @@ async def _set_direct_chat_always_approve_preference(db, *, req, user_id: str) -
     )
 
 
+def _step_scoped_provider_scope_allows(
+    *,
+    workspace_settings: dict[str, Any] | None,
+    step_owner_service_key: str | None,
+    step_key: str | None,
+    step_kind: str | None,
+    provider: str | None,
+    policy_category: str | None,
+) -> bool:
+    """Return true only for a blueprint scope explicitly promoted by Always.
+
+    The proposal card's standing decision is intentionally separate from the
+    normal workspace action policy.  A scope names the accountable service,
+    provider, and Chrome policy categories; it cannot authorize an arbitrary
+    Chrome action or a task owned by another service.
+    """
+    settings = workspace_settings if isinstance(workspace_settings, dict) else {}
+    owner = str(step_owner_service_key or "").strip()
+    key = str(step_key or "").strip().lower()
+    kind = str(step_kind or "").strip().lower()
+    provider_name = str(provider or "").strip().lower()
+    category = str(policy_category or "").strip().lower()
+    if not owner or not provider_name or not category:
+        return False
+    grants = settings.get("runtime_approval_scope_grants")
+    if not isinstance(grants, list):
+        return False
+    for raw in grants:
+        if not isinstance(raw, dict) or raw.get("enabled") is not True:
+            continue
+        if str(raw.get("owner_service_key") or "").strip() != owner:
+            continue
+        if str(raw.get("provider") or "").strip().lower() != provider_name:
+            continue
+        required_key = str(raw.get("step_key") or "").strip().lower()
+        if required_key and key != required_key:
+            continue
+        required_kind = str(raw.get("step_kind") or "").strip().lower()
+        if required_kind and kind != required_kind:
+            continue
+        categories = raw.get("policy_categories") or []
+        if isinstance(categories, str):
+            categories = [categories]
+        if category in {
+            str(value or "").strip().lower() for value in categories
+        }:
+            return True
+    return False
+
+
+async def activate_blueprint_provider_scopes_for_proposal(
+    db,
+    *,
+    workspace_id: str,
+    task_ids: Iterable[str],
+    user_id: str | None,
+) -> int:
+    """Promote only the Blueprint-declared provider scopes for a proposal.
+
+    A scope may opt into proposal Always approval through
+    ``proposal_service_keys``.  This keeps the choice bounded to the
+    workspace Blueprint and avoids adding ``chrome.action`` to the workspace
+    policy for every task.
+    """
+    from packages.core.models.task import Task
+    from packages.core.models.workspace import Workspace
+
+    workspace = await db.get(Workspace, workspace_id)
+    if workspace is None:
+        return 0
+    settings = dict(workspace.settings or {})
+    scopes = settings.get("runtime_approval_scopes")
+    if not isinstance(scopes, list):
+        return 0
+    ids = [str(value).strip() for value in task_ids if str(value).strip()]
+    if not ids:
+        return 0
+    owner_keys = set((await db.execute(
+        select(Task.owner_service_key).where(
+            Task.id.in_(ids), Task.workspace_id == workspace_id,
+        )
+    )).scalars().all())
+    grants = [
+        dict(value) for value in (settings.get("runtime_approval_scope_grants") or [])
+        if isinstance(value, dict)
+    ]
+    changed = 0
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        service_key = str(scope.get("owner_service_key") or "").strip()
+        if not service_key:
+            continue
+        proposal_keys = scope.get("proposal_service_keys") or [service_key]
+        if isinstance(proposal_keys, str):
+            proposal_keys = [proposal_keys]
+        if not owner_keys.intersection({str(value).strip() for value in proposal_keys}):
+            continue
+        if any(
+            str(grant.get("owner_service_key") or "").strip() == service_key
+            and str(grant.get("provider") or "").strip().lower()
+            == str(scope.get("provider") or "").strip().lower()
+            for grant in grants
+        ):
+            continue
+        grant = dict(scope)
+        grant["enabled"] = True
+        grant["source"] = "proposal_always_approve"
+        grant["granted_by"] = user_id
+        grants.append(grant)
+        changed += 1
+    if changed:
+        settings["runtime_approval_scope_grants"] = grants
+        workspace.settings = settings
+        await db.flush()
+    return changed
+
+
 def _provider_supports_always_approve(provider: str | None) -> bool:
     """Can a standing "Always approve" be honored for this provider?
 
@@ -114,6 +235,9 @@ async def runtime_auto_confirm_provider_approval(
     entity_id: str,
     user_id: str | None,
     workspace_id: str | None,
+    task_id: str | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
+    step_id: str | None = None,
 ) -> str:
     """Answer a Manor-owned provider's approval gate from a standing grant.
 
@@ -162,7 +286,158 @@ async def runtime_auto_confirm_provider_approval(
     action_key = str(request.get("action_key") or f"{provider}.action")
     capability_id = f"{provider}.action"
 
+    proposal_authorization = (
+        runtime_metadata.get("proposal_external_authorization")
+        if isinstance(runtime_metadata, dict)
+        else None
+    )
+    if isinstance(proposal_authorization, dict):
+        from packages.core.proposals.external_authorization import (
+            proposal_youtube_public_request_matches,
+            proposal_youtube_public_upload_entry_request_matches,
+            proposal_youtube_public_upload_transfer_request_matches,
+        )
+
+        proposal_request_kind = None
+        if proposal_youtube_public_request_matches(
+            proposal_authorization,
+            request,
+            task_id=task_id,
+            workspace_id=workspace_id,
+        ):
+            proposal_request_kind = "publish"
+        elif proposal_youtube_public_upload_entry_request_matches(
+            proposal_authorization,
+            request,
+            task_id=task_id,
+            workspace_id=workspace_id,
+        ):
+            proposal_request_kind = "upload_entry"
+        elif proposal_youtube_public_upload_transfer_request_matches(
+            proposal_authorization,
+            request,
+            task_id=task_id,
+            workspace_id=workspace_id,
+        ):
+            proposal_request_kind = "upload_transfer"
+        else:
+            logger.info(
+                "proposal external authorization did not match provider approval: "
+                "task_id=%s workspace_id=%s tool=%s confirmation_mode=%s "
+                "policy_category=%s target_label=%s url=%s",
+                task_id,
+                workspace_id,
+                request.get("retry_tool"),
+                request.get("confirmation_mode"),
+                request.get("policy_category"),
+                request.get("target_label"),
+                request.get("url"),
+            )
+            # A Proposal-scoped run fails closed on any target mismatch. It
+            # must not silently fall through to a broader standing grant.
+            return result
+
     from packages.core.database import async_session
+
+    if isinstance(proposal_authorization, dict) and task_id and workspace_id:
+        async with async_session() as db:
+            if proposal_request_kind == "upload_entry":
+                from packages.core.proposals.external_authorization import (
+                    begin_proposal_youtube_public_authorization,
+                )
+
+                granted = await begin_proposal_youtube_public_authorization(
+                    db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    runtime_authorization=proposal_authorization,
+                    provider_request=request,
+                )
+            elif proposal_request_kind == "upload_transfer":
+                from packages.core.proposals.external_authorization import (
+                    record_proposal_youtube_public_upload_transfer,
+                )
+
+                granted = await record_proposal_youtube_public_upload_transfer(
+                    db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    runtime_authorization=proposal_authorization,
+                    provider_request=request,
+                )
+            else:
+                from packages.core.proposals.external_authorization import (
+                    consume_proposal_youtube_public_authorization,
+                )
+
+                granted = await consume_proposal_youtube_public_authorization(
+                    db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    runtime_authorization=proposal_authorization,
+                    provider_request=request,
+                )
+            if not granted:
+                return result
+
+            try:
+                confirmation = await execute(
+                    confirmation_tool,
+                    dict(confirmation_arguments),
+                )
+                token = _provider_approval_token(confirmation)
+                logger.info(
+                    "proposal provider confirmation completed: task_id=%s "
+                    "request_kind=%s status=%s token_present=%s",
+                    task_id,
+                    proposal_request_kind,
+                    _provider_result_field(confirmation, "status"),
+                    bool(token),
+                )
+                if not token:
+                    await db.rollback()
+                    return result
+                retried = await execute(
+                    retry_tool,
+                    {**retry_arguments, "approvalToken": token},
+                )
+            except Exception:
+                await db.rollback()
+                logger.warning(
+                    "proposal auto-confirm for %s failed before execution was proven; "
+                    "authorization was not recorded",
+                    tool_name,
+                    exc_info=True,
+                )
+                return result
+
+            action_executed = _provider_action_was_executed(retried)
+            logger.info(
+                "proposal provider retry completed: task_id=%s request_kind=%s "
+                "status=%s reason=%s action_executed=%s",
+                task_id,
+                proposal_request_kind,
+                _provider_result_field(retried, "status"),
+                _provider_result_field(retried, "reason"),
+                action_executed,
+            )
+            if not action_executed:
+                await db.rollback()
+                return retried if isinstance(retried, str) and retried else result
+
+            try:
+                await db.commit()
+            except Exception:
+                logger.exception(
+                    "provider action executed but Proposal authorization persistence "
+                    "failed: task_id=%s request_kind=%s",
+                    task_id,
+                    proposal_request_kind,
+                )
+            return retried if isinstance(retried, str) and retried else result
 
     async with async_session() as db:
         granted = await _provider_standing_grant(
@@ -172,6 +447,9 @@ async def runtime_auto_confirm_provider_approval(
             user_id=user_id,
             action_key=action_key,
             capability_id=capability_id,
+            policy_category=str(request.get("policy_category") or "").strip() or None,
+            step_id=step_id,
+            provider=provider,
         )
     if not granted:
         return result
@@ -191,6 +469,37 @@ async def runtime_auto_confirm_provider_approval(
         )
         return result
     return retried if isinstance(retried, str) and retried else result
+
+
+def _provider_result_field(value: Any, field: str) -> Any:
+    if not isinstance(value, str):
+        return None
+    try:
+        payload = json.loads(value)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload.get(field)
+
+
+def _provider_action_was_executed(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        payload = json.loads(value)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if "action_executed" in payload:
+        return payload.get("action_executed") is True
+    post_action_state = payload.get("post_action_page_state")
+    return bool(
+        payload.get("ok") is True
+        and isinstance(post_action_state, dict)
+        and post_action_state.get("state_verified") is True
+    )
 
 
 def _provider_approval_token(confirmation: Any) -> str | None:
@@ -218,6 +527,9 @@ async def _provider_standing_grant(
     user_id: str | None,
     action_key: str,
     capability_id: str,
+    policy_category: str | None = None,
+    step_id: str | None = None,
+    provider: str | None = None,
 ) -> bool:
     """Did the operator already say "always" for this provider action?
 
@@ -227,6 +539,21 @@ async def _provider_standing_grant(
     never_allow still denies through the normal gate.
     """
     if workspace_id:
+        if step_id:
+            step_owner, step_key, step_kind = await _step_provider_scope_context(
+                db, step_id, workspace_id,
+            )
+            if _step_scoped_provider_scope_allows(
+                workspace_settings=(
+                    await _workspace_settings_for_provider_scope(db, workspace_id)
+                ),
+                step_owner_service_key=step_owner,
+                provider=provider or (action_key.split(".", 1)[0] if action_key else None),
+                policy_category=policy_category,
+                step_key=step_key,
+                step_kind=step_kind,
+            ):
+                return True
         from packages.core.governance.service import workspace_policy_auto_approves
 
         if await workspace_policy_auto_approves(
@@ -244,10 +571,54 @@ async def _provider_standing_grant(
     ) == "always_approve"
 
 
+async def _workspace_settings_for_provider_scope(db, workspace_id: str) -> dict[str, Any]:
+    from packages.core.models.workspace import Workspace
+
+    workspace = await db.get(Workspace, workspace_id)
+    return dict(workspace.settings or {}) if workspace else {}
+
+
+async def _step_provider_scope_context(
+    db, step_id: str, workspace_id: str,
+) -> tuple[str | None, str | None, str | None]:
+    from packages.core.models.execution import ExecutionStep
+
+    step = await db.get(ExecutionStep, step_id)
+    if step is None or str(step.workspace_id or "") != str(workspace_id):
+        return None, None, None
+    return (
+        str(step.service_key or "").strip() or None,
+        str(step.step_key or "").strip() or None,
+        str(step.kind or "").strip() or None,
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeApprovalResolution:
     message: str
     runtime_metadata: dict[str, Any] | None = None
+
+
+def _chrome_confirmation_receipt(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    if tool_name != "mcp__chrome__confirm_action":
+        return {}
+    mode = str(arguments.get("confirmation_mode") or "").strip()
+    category = str(arguments.get("policy_category") or "").strip()
+    if mode not in {
+        "always_action_time",
+        "preapproval_allowed",
+        "handoff_required",
+        "no_confirmation",
+    } or not category:
+        return {}
+    return {
+        "confirmation_mode": mode,
+        "policy_category": category,
+        "preapproved": arguments.get("preapproved") is True,
+    }
 
 
 def _boolish_confirmation_control(value: Any) -> bool:
@@ -364,6 +735,7 @@ async def _runtime_render_context(
             workspace = await runtime_approval_workspace_context(db, conv)
     public_content = approval_public_content(args_preview)
     content_preview = approval_content_preview(public_content) if public_content else ""
+    confirmation_receipt = _chrome_confirmation_receipt(tool_name, arguments)
     return {
         "tool": tool_name,
         "args_hash": approval_args_hash(arguments),
@@ -373,6 +745,7 @@ async def _runtime_render_context(
         "workspace": workspace,
         "content": content_preview,
         "requested_by": user_id,
+        **confirmation_receipt,
     }
 
 
@@ -388,6 +761,11 @@ def _runtime_hitl_payload(
     """The blocking __hitl__ tool result. Shape is a frontend contract —
     identical to the pre-rewrite payload, with approval_token = request id."""
     prompt = runtime_approval_prompt(action, tool_name, arguments)
+    confirmation_receipt = {
+        key: render[key]
+        for key in ("confirmation_mode", "policy_category", "preapproved")
+        if key in render
+    }
     return json.dumps({
         "__hitl__": True,
         "error": "approval_required",
@@ -404,6 +782,7 @@ def _runtime_hitl_payload(
             "content": render.get("content"),
             "args_preview": render.get("args_preview"),
             "options": approval_options(),
+            **confirmation_receipt,
         },
         "message": (
             "Workspace governance requires approval before this action. "
@@ -419,6 +798,7 @@ def _runtime_hitl_payload(
             "args_preview": render.get("args_preview"),
             "paths": render.get("paths"),
             "workspace": render.get("workspace"),
+            **confirmation_receipt,
         },
     }, ensure_ascii=False)
 
@@ -512,6 +892,7 @@ async def guard_runtime_tool_action(
     workspace_id: str | None,
     conversation_id: str | None,
     task_id: str | None = None,
+    step_id: str | None = None,
 ) -> str | None:
     """Return a blocking tool result, or ``None`` when execution may continue.
 
@@ -633,6 +1014,7 @@ async def guard_runtime_tool_action(
                 # Thread the task so task-level runtime rules gate this plane
                 # too, and so task-terminal cleanup can expire these requests.
                 task_id=task_id,
+                step_id=step_id,
                 args_hash=approval_args_hash(arguments),
                 context=render,
             ),
@@ -739,6 +1121,7 @@ async def resolve_runtime_approval_turn(
     user_id: str,
     hitl_id: str,
     action: str,
+    revision_request: str | None = None,
 ) -> RuntimeApprovalResolution | None:
     """Resolve a runtime approval and expose any deterministic continuation."""
     # ── unified store first: the token is a HitlRequest id ──
@@ -757,6 +1140,44 @@ async def resolve_runtime_approval_turn(
                 "Do not retry the blocked tool call."
             )
         normalized = normalize_approval_choice(action)
+        if normalized == APPROVAL_CHOICE_REVISE and is_provider:
+            if not _provider_approval_supports_revision(
+                _provider_item_from_request(req)
+            ):
+                return RuntimeApprovalResolution(
+                    "This provider approval cannot be revised. Choose approve or reject."
+                )
+            revision = str(revision_request or "").strip()
+            if not revision:
+                return RuntimeApprovalResolution(
+                    "Revision instructions are required before requesting changes."
+                )
+            req.status = ApprovalStatus.EXPIRED.value
+            req.decided_by_user_id = user_id
+            req.decided_at = datetime.now(timezone.utc)
+            req.decided_via = "chat_card_revise"
+            req.resolved_reason = "revision_requested"
+            await mark_runtime_hitl_request_resolved(
+                db,
+                conversation_id=conversation_id,
+                hitl_id=hitl_id,
+                choice=normalized,
+            )
+            return RuntimeApprovalResolution(
+                "[Runtime approval revision requested] Do not confirm or retry "
+                "the blocked provider action. Revise the proposed content as "
+                "requested, then prepare the new final action for approval.\n\n"
+                f"Revision request:\n{revision[:4000]}",
+                {
+                    "approval_kind": "provider_revision",
+                    "approval_resume_guidance": (
+                        "Revise the proposed content according to the user's "
+                        "instructions. Do not confirm or reuse the superseded "
+                        "provider approval; request approval again only for the "
+                        "new final external action."
+                    ),
+                },
+            )
         if normalized in {APPROVAL_CHOICE_APPROVE, APPROVAL_CHOICE_ALWAYS_APPROVE}:
             from packages.core.governance.approvals import grant_approval
 
@@ -922,6 +1343,13 @@ def _provider_hitl_data(
         "target_label": target or None,
         "data_summary": data_summary or None,
     }
+    options = (
+        approval_options()
+        if _provider_supports_always_approve(item.get("provider"))
+        else [APPROVAL_CHOICE_APPROVE, APPROVAL_CHOICE_REJECT]
+    )
+    if _provider_approval_supports_revision(item):
+        options.insert(-1, APPROVAL_CHOICE_REVISE)
     return {
         "__hitl__": True,
         "error": "approval_required",
@@ -935,11 +1363,7 @@ def _provider_hitl_data(
             "tool": item.get("tool"),
             "content": data_summary or None,
             "args_preview": item.get("args_preview"),
-            "options": (
-                approval_options()
-                if _provider_supports_always_approve(item.get("provider"))
-                else [APPROVAL_CHOICE_APPROVE, APPROVAL_CHOICE_REJECT]
-            ),
+            "options": options,
         },
         "operation": operation,
         "message": (
@@ -947,6 +1371,17 @@ def _provider_hitl_data(
             "standard HITL request is resolved."
         ),
     }
+
+
+def _provider_approval_supports_revision(item: dict[str, Any]) -> bool:
+    """Only proposed external communications have a meaningful draft to revise."""
+
+    continuation = item.get("continuation") or {}
+    return (
+        isinstance(continuation, dict)
+        and str(continuation.get("policy_category") or "").strip()
+        == "representational_communication"
+    )
 
 
 def _provider_item_from_request(req) -> dict[str, Any]:
@@ -1010,7 +1445,6 @@ async def register_provider_runtime_approval(
     action_key = str(request.get("action_key") or f"{provider}.action")
     capability_id = f"{provider}.action"
     workspace_id = getattr(conv, "workspace_id", None)
-
     # Standing grant from a previous "Always approve" on this Manor-owned
     # provider: auto-confirm instead of asking the same question again. The
     # provider's own per-action gate still fires — Manor just answers it with
@@ -1023,6 +1457,8 @@ async def register_provider_runtime_approval(
         user_id=user_id,
         action_key=action_key,
         capability_id=capability_id,
+        policy_category=str(request.get("policy_category") or "").strip() or None,
+        provider=provider,
     ):
         return None
 
@@ -1236,6 +1672,25 @@ async def consume_runtime_approval(
                     "status": "consumed",
                     "approval_token": hitl_id,
                 })
+            if req.status == ApprovalStatus.PENDING:
+                # Still waiting on a person — nothing has gone wrong, the model
+                # simply retried early. Returning a bare `approval_not_granted`
+                # here produced the second half of the email incident: it is not
+                # a `__hitl__` envelope, so no card was recorded, and the model
+                # told the user "已重试，新的审批卡已经生成。请在新的 approval
+                # card 上点 Approve" — a card that did not exist. Re-emit THIS
+                # request's own envelope (same id, same stored render context,
+                # so no duplicate request is minted) and the sentence becomes
+                # true: the card is back, and answering it resolves the one
+                # blocker rather than a fresh one.
+                return _runtime_hitl_payload(
+                    request_id=req.id,
+                    action=action,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    matched_rule=req.matched_rule,
+                    render=ctx,
+                )
             status_label = {"denied": "rejected"}.get(req.status, req.status)
             return json.dumps({
                 "error": "approval_not_granted",

@@ -1,5 +1,6 @@
-# Manor's web application contains authenticated, user-specific routes.
-# Public product and project content lives at manorai.xyz and GitHub.
+# Manor's web application is an authenticated, user-specific SPA.
+# Let crawlers fetch app pages so the noindex directives in HTML/headers
+# can be seen; public product content lives on manorai.xyz.
 User-agent: *
-Disallow: /
-Allow: /llms.txt
+Allow: /
+Sitemap: https://manorai.xyz/sitemap.xml

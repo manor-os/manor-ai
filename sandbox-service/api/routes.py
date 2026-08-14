@@ -275,6 +275,26 @@ async def get_sandbox(sandbox_id: str):
         raise HTTPException(status_code=404, detail=f"Sandbox not found: {sandbox_id}")
 
 
+@router.post("/sandbox/{sandbox_id}/touch", response_model=SandboxInfo, tags=["sandbox"])
+async def touch_sandbox(sandbox_id: str):
+    """Refresh a sandbox's idle lease without running a command."""
+
+    try:
+        result = _get_runner().touch_sandbox(sandbox_id)
+        logger.debug(
+            "sandbox/touch: sandbox_id=%s status=%s expires_at=%s",
+            sandbox_id,
+            result.status,
+            result.expires_at,
+        )
+        return result
+    except KeyError:
+        logger.warning("sandbox/touch: not found sandbox_id=%s", sandbox_id)
+        raise HTTPException(status_code=404, detail=f"Sandbox not found: {sandbox_id}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @router.delete("/sandbox/{sandbox_id}", tags=["sandbox"])
 async def destroy_sandbox(sandbox_id: str):
     """Destroy a sandbox and remove its container."""

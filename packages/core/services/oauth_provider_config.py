@@ -34,6 +34,8 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.external_api_versions import META_GRAPH
+
 logger = logging.getLogger(__name__)
 _OAUTH_SECRET_DECRYPT_WARNED: set[str] = set()
 
@@ -58,9 +60,9 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
         "scopes": (
-            "openid email profile "
-            "https://www.googleapis.com/auth/gmail.send "
-            "https://www.googleapis.com/auth/gmail.readonly "
+            "openid "
+            "https://www.googleapis.com/auth/userinfo.email "
+            "https://www.googleapis.com/auth/userinfo.profile "
             "https://www.googleapis.com/auth/gmail.modify"
         ),
         "client_id_env": "GOOGLE_CLIENT_ID",
@@ -69,7 +71,14 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
     "google_calendar": {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
-        "scopes": "openid email profile https://www.googleapis.com/auth/calendar",
+        "scopes": (
+            "openid "
+            "https://www.googleapis.com/auth/userinfo.email "
+            "https://www.googleapis.com/auth/userinfo.profile "
+            "https://www.googleapis.com/auth/calendar.events "
+            "https://www.googleapis.com/auth/calendar.calendarlist.readonly "
+            "https://www.googleapis.com/auth/calendar.events.freebusy"
+        ),
         "client_id_env": "GOOGLE_CLIENT_ID",
         "client_secret_env": "GOOGLE_CLIENT_SECRET",
     },
@@ -77,7 +86,9 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
         "scopes": (
-            "openid email profile "
+            "openid "
+            "https://www.googleapis.com/auth/userinfo.email "
+            "https://www.googleapis.com/auth/userinfo.profile "
             "https://www.googleapis.com/auth/drive.file "
             "https://www.googleapis.com/auth/drive.readonly"
         ),
@@ -90,8 +101,9 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
         "scopes": (
-            "openid email profile "
-            "https://www.googleapis.com/auth/youtube.readonly "
+            "openid "
+            "https://www.googleapis.com/auth/userinfo.email "
+            "https://www.googleapis.com/auth/userinfo.profile "
             "https://www.googleapis.com/auth/youtube.force-ssl"
         ),
         "client_id_env": "GOOGLE_CLIENT_ID",
@@ -117,6 +129,22 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         "scopes": "repo,read:org,user",
         "client_id_env": "GITHUB_CLIENT_ID",
         "client_secret_env": "GITHUB_CLIENT_SECRET",
+    },
+    "facebook": {
+        "authorize_url": f"https://www.facebook.com/{META_GRAPH.value}/dialog/oauth",
+        "token_url": f"https://graph.facebook.com/{META_GRAPH.value}/oauth/access_token",
+        # Keep this aligned with the operations implemented by the built-in
+        # Facebook MCP. ``email`` is intentionally excluded: the connector
+        # identifies the account through /me and never reads the email field.
+        "scopes": (
+            "public_profile,pages_show_list,pages_read_engagement,"
+            "pages_manage_posts,pages_manage_engagement,pages_messaging,"
+            "pages_manage_metadata,read_insights,instagram_basic,"
+            "instagram_content_publish,instagram_manage_comments,"
+            "instagram_manage_insights"
+        ),
+        "client_id_env": "FACEBOOK_CLIENT_ID",
+        "client_secret_env": "FACEBOOK_CLIENT_SECRET",
     },
     "linkedin": {
         "authorize_url": "https://www.linkedin.com/oauth/v2/authorization",
@@ -360,6 +388,11 @@ _GOOGLE_PROVIDERS: frozenset[str] = frozenset(
     {"gmail", "google_calendar", "google_drive", "youtube"}
 )
 
+# Meta's documented server-side Facebook Login flow does not use Google's
+# offline-access/prompt parameters or PKCE. Sending those generic parameters
+# can make the dialog reject an otherwise valid request.
+_FACEBOOK_PROVIDERS: frozenset[str] = frozenset({"facebook"})
+
 
 def is_google_provider(server_key: str) -> bool:
     """True for the Google-family OAuth providers (shared GOOGLE_CLIENT_ID)."""
@@ -392,6 +425,14 @@ def apply_authorize_param_conventions(
         out["prompt"] = " ".join(
             ["select_account"] + [v for v in existing if v != "select_account"]
         )
+    if config.server_key in _FACEBOOK_PROVIDERS:
+        for key in (
+            "access_type",
+            "prompt",
+            "code_challenge",
+            "code_challenge_method",
+        ):
+            out.pop(key, None)
     return out
 
 
@@ -456,7 +497,10 @@ async def resolve_oauth_config(
         cfg = server.default_config if isinstance(server.default_config, dict) else {}
         client_id = cfg.get("oauth_client_id") or None
         scope_override = cfg.get("oauth_scopes")
-        if scope_override:
+        # Google verifies the exact scope strings deployed by the application.
+        # Never let a stale DB/admin override silently diverge from the reviewed
+        # static manifest; all four Google services share this verified client.
+        if scope_override and server_key not in _GOOGLE_PROVIDERS:
             scopes = str(scope_override)
         if client_id:
             source = (cfg.get("_oauth_source") or "db").strip() or "db"
@@ -558,7 +602,9 @@ async def save_oauth_config(
     cfg = dict(server.default_config or {})
     cfg["oauth_client_id"] = client_id
     cfg["_oauth_source"] = "ui"
-    if scopes:
+    if server_key in _GOOGLE_PROVIDERS:
+        cfg.pop("oauth_scopes", None)
+    elif scopes:
         cfg["oauth_scopes"] = scopes
     cfg.pop("oauth_client_secret", None)  # never store plaintext
     server.default_config = cfg

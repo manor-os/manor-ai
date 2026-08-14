@@ -1,0 +1,23 @@
+{
+  "id": "business-report",
+  "renderer": "business_report",
+  "page_size": "A4",
+  "orientation": "L",
+  "required": ["brand", "document_title", "subtitle", "summary", "metrics", "sections"],
+  "palette": {
+    "primary": "182A2E",
+    "accent": "FF6B5A",
+    "secondary": "F6C85F",
+    "ink": "182A2E",
+    "muted": "647276",
+    "surface": "F4EFE8",
+    "line": "D9D3CA"
+  },
+  "labels": {
+    "prepared_for": "PREPARED FOR",
+    "prepared_by": "RESEARCH LEAD",
+    "date": "PUBLISHED",
+    "overview": "SIGNALS AT A GLANCE",
+    "summary": "EXECUTIVE READOUT"
+  }
+}

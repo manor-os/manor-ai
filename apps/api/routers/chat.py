@@ -5,6 +5,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from enum import StrEnum
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -24,6 +25,7 @@ from packages.core.ai.runtime.surfaces import infer_chat_surface
 from packages.core.models.chat_feedback import ChatMessageFeedback
 from packages.core.models.task import Conversation, Message
 from packages.core.models.user import User
+from packages.core.models.workflow import WorkflowRun
 from packages.core.schemas.chat import (
     ChatMessageResponse,
     ConversationResponse,
@@ -51,6 +53,7 @@ from packages.core.services.conversation_export import (
 )
 from packages.core.services.chat_approvals import (
     cancel_chat_approvals,
+    chat_hitl_action_is_pending,
     resolve_chat_approval_turn,
 )
 from packages.core.services.chat_manual_skills import (
@@ -68,7 +71,13 @@ from packages.core.services.runtime_file_context import (
 from packages.core.services.share_service import (
     create_share, get_shared_conversation, revoke_share, list_shares,
 )
-from packages.core.services.workspace_access import user_can_read_workspace_id
+from packages.core.services.local_worker_targeting import (
+    select_conversation_local_worker_target,
+)
+from packages.core.services.workspace_access import (
+    user_can_read_workspace_id,
+    user_readable_workspace_ids,
+)
 from apps.api.deps import get_current_user, require_plan
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
@@ -79,6 +88,29 @@ _RUNTIME_APPROVAL_REJECTED_RE = re.compile(r"^\[Runtime approval rejected\]", re
 _RUNTIME_APPROVAL_REJECTED_REPLY = (
     "The blocked tool call was cancelled and will not access the filesystem. "
     "You can continue chatting or upload the file again if you still want it analyzed."
+)
+_WORKFLOW_CHAT_META_KEYS = frozenset({
+    "workflow_attempt_number",
+    "workflow_binding_id",
+    "workflow_business_outcome",
+    "workflow_current_step_id",
+    "workflow_error",
+    "workflow_retry_of_run_id",
+    "workflow_route_source",
+    "workflow_run_id",
+    "workflow_status",
+    "workflow_steps",
+    "workflow_title",
+})
+# A reload lands mid-turn with no way to tell a finished reply from one that is
+# still being written — the row looks identical either way. Without this the
+# page shows a dead placeholder until the first resume snapshot arrives, and
+# shows it forever when the turn produced no further events.
+_STREAM_STATE_META_KEYS = frozenset({"stream_status"})
+_CHAT_MESSAGE_META_KEYS = (
+    _WORKFLOW_CHAT_META_KEYS
+    | _STREAM_STATE_META_KEYS
+    | frozenset({"chat_mode", "chat_mode_payload"})
 )
 
 
@@ -94,10 +126,28 @@ class ChatMessageFeedbackResponse(BaseModel):
     updated_at: str | None = None
 
 
+class ResolveChatActionRequest(BaseModel):
+    choice: str
+    note: str | None = None
+    payload: dict | None = None
+
+
 class MessagesPageResponse(BaseModel):
     items: list[MessageResponse]
     has_more: bool
     next_cursor: str | None = None
+
+
+class GlobalChatFlowEntrypointResponse(BaseModel):
+    binding_id: str
+    workflow_id: str
+    workspace_id: str
+    workspace_name: str
+    title: str
+    description: str
+    placeholder: str
+    order: int
+    inputs: list[dict]
 
 
 def _encode_message_cursor(message: Message | None) -> str | None:
@@ -117,7 +167,74 @@ def _decode_message_cursor(value: str | None) -> tuple[datetime | None, str | No
     return parsed, message_id if separator and message_id else None
 
 
-def _to_chat_message_response(message: Message) -> MessageResponse:
+def _workflow_run_id_for_message(message: Message) -> str | None:
+    pending_action = message.pending_action if isinstance(message.pending_action, dict) else {}
+    raw_meta = message.meta if isinstance(message.meta, dict) else {}
+    for value in (pending_action.get("workflow_run_id"), raw_meta.get("workflow_run_id")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    refs = message.refs if isinstance(message.refs, list) else []
+    for ref in refs:
+        if not isinstance(ref, dict) or ref.get("type") != "workflow_run":
+            continue
+        run_id = ref.get("id")
+        if isinstance(run_id, str) and run_id.strip():
+            return run_id.strip()
+    return None
+
+
+async def _workflow_run_accessibility_by_message_id(
+    db: AsyncSession,
+    user: User,
+    messages: list[Message],
+) -> dict[str, bool]:
+    run_id_by_message_id = {
+        message.id: run_id
+        for message in messages
+        if (run_id := _workflow_run_id_for_message(message))
+    }
+    if not run_id_by_message_id:
+        return {}
+
+    runs = (await db.execute(
+        select(WorkflowRun.id, WorkflowRun.workspace_id).where(
+            WorkflowRun.id.in_(set(run_id_by_message_id.values())),
+            WorkflowRun.entity_id == user.entity_id,
+        )
+    )).all()
+    workspace_id_by_run_id = {
+        str(run_id): str(workspace_id) if workspace_id else None
+        for run_id, workspace_id in runs
+    }
+    readable_workspace_ids = await user_readable_workspace_ids(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+        workspace_ids={
+            workspace_id
+            for workspace_id in workspace_id_by_run_id.values()
+            if workspace_id
+        },
+    )
+    return {
+        message_id: run_id in workspace_id_by_run_id and (
+            workspace_id_by_run_id[run_id] is None
+            or workspace_id_by_run_id[run_id] in readable_workspace_ids
+        )
+        for message_id, run_id in run_id_by_message_id.items()
+    }
+
+
+def _to_chat_message_response(
+    message: Message,
+    *,
+    workflow_run_accessible: bool | None = None,
+) -> MessageResponse:
+    raw_meta = message.meta if isinstance(message.meta, dict) else {}
+    response_meta = {key: raw_meta[key] for key in _CHAT_MESSAGE_META_KEYS if key in raw_meta}
+    if workflow_run_accessible is False:
+        response_meta["workflow_run_accessible"] = False
     return MessageResponse(
         id=message.id,
         conversation_id=message.conversation_id,
@@ -128,9 +245,39 @@ def _to_chat_message_response(message: Message) -> MessageResponse:
         token_usage=message.token_usage,
         attachments=message.attachments,
         hitl_requests=_message_hitl_requests(message),
+        message_kind=message.message_kind,
+        refs=message.refs,
+        meta=response_meta,
+        pending_action=(
+            message.pending_action
+            if isinstance(message.pending_action, dict) and message.pending_action.get("kind")
+            else None
+        ),
+        resolved_at=message.resolved_at.isoformat() if message.resolved_at else None,
+        resolution=message.resolution,
+        workflow_result=_message_workflow_result(message),
         **_message_limit_meta(message),
         created_at=message.created_at.isoformat() if message.created_at else None,
     )
+
+
+async def _chat_message_responses(
+    db: AsyncSession,
+    user: User,
+    messages: list[Message],
+) -> list[MessageResponse]:
+    workflow_run_accessibility = await _workflow_run_accessibility_by_message_id(
+        db,
+        user,
+        messages,
+    )
+    return [
+        _to_chat_message_response(
+            message,
+            workflow_run_accessible=workflow_run_accessibility.get(message.id),
+        )
+        for message in messages
+    ]
 
 
 def _reference_url_variants(ref_url: str | None) -> set[str]:
@@ -225,6 +372,31 @@ def _surface_for_chat_request(
     )
 
 
+def _chat_mode_blocked_tools(
+    chat_mode: str | None,
+    *,
+    surface: ChatSurface,
+) -> set[str]:
+    """Keep Global Chat Flow execution on the user-facing launcher."""
+    if surface != ChatSurface.GLOBAL_OWNER_CHAT:
+        return set()
+    if _normalize_chat_mode(chat_mode) == "flows":
+        from packages.core.ai.runtime.tool_registry import (
+            runtime_registered_tool_names,
+        )
+
+        allowed = {
+            "search_tools",
+            "list_workspace_flows",
+            "start_workspace_flow",
+            "get_workflow_run",
+            "cancel_workflow_run",
+            "resume_workflow_run",
+        }
+        return set(runtime_registered_tool_names()) - allowed
+    return {"start_workspace_flow", "run_workflow"}
+
+
 class CancelFileApprovalsRequest(BaseModel):
     hitl_ids: list[str] | None = None
     reason: str | None = None
@@ -260,6 +432,12 @@ def _message_assistant_blocks(message) -> list[dict] | None:
     meta = message.meta or {}
     blocks = meta.get("assistant_blocks")
     return blocks if isinstance(blocks, list) else None
+
+
+def _message_workflow_result(message) -> dict | None:
+    meta = message.meta or {}
+    result = meta.get("workflow_result")
+    return result if isinstance(result, dict) else None
 
 
 def _is_internal_file_permission_marker(content: str | None) -> bool:
@@ -319,6 +497,30 @@ async def _runtime_approval_rejected_stream(conversation_id: str, content: str, 
             "tool_calls": [],
         },
     )
+
+
+async def _require_chat_budget_unless_pending_approval(
+    db: AsyncSession,
+    *,
+    user: User,
+    conversation_id: str | None,
+    message: str,
+) -> bool:
+    """Apply the AI-credit gate unless this turn resolves a live HITL card."""
+
+    pending_approval = await chat_hitl_action_is_pending(
+        db,
+        conversation_id=conversation_id,
+        entity_id=user.entity_id,
+        message=message,
+    )
+    if not pending_approval:
+        await require_plan("ai_budget_usd")(user=user, db=db)
+    return pending_approval
+
+
+def _is_workflow_approval_resolution(metadata: dict | None) -> bool:
+    return bool(metadata and metadata.get("approval_kind") == "workflow")
 
 
 async def _can_access_conversation(db: AsyncSession, conv: Conversation, user: User) -> bool:
@@ -472,6 +674,7 @@ _CHAT_MODE_ALIASES = {
     "website": "website",
     "app": "website",
     "research": "research",
+    "flows": "flows",
 }
 _VIDEO_ASPECT_RATIO_ALIASES = {
     "auto": "adaptive",
@@ -481,6 +684,39 @@ _VIDEO_ASPECT_RATIO_ALIASES = {
     "自适应": "adaptive",
 }
 _VIDEO_ASPECT_RATIO_CHOICES = {"adaptive", "21:9", "16:9", "4:3", "3:4", "1:1", "9:16"}
+class _VideoGenerationMode(StrEnum):
+    AUTO = "auto"
+    NATIVE_MOTION = "native_motion"
+    AI_VIDEO = "ai_video"
+
+
+class _VideoEditRouteState(StrEnum):
+    INACTIVE = "inactive"
+    SKILL_SANDBOX = "skill_sandbox"
+    EDIT_SESSION = "edit_session"
+
+
+class _VideoSandboxSkill(StrEnum):
+    EDIT_SKILL = "video-edit"
+    EDIT_RUNTIME = "video-edit-runtime"
+
+
+_LIVE_VIDEO_SANDBOX_STATUSES = frozenset({"ready", "executing"})
+
+
+_VIDEO_GENERATION_MODE_ALIASES: dict[str, _VideoGenerationMode] = {
+    "auto": _VideoGenerationMode.AUTO,
+    "native": _VideoGenerationMode.NATIVE_MOTION,
+    "motion": _VideoGenerationMode.NATIVE_MOTION,
+    "native_motion": _VideoGenerationMode.NATIVE_MOTION,
+    "coded_motion": _VideoGenerationMode.NATIVE_MOTION,
+    "code_motion": _VideoGenerationMode.NATIVE_MOTION,
+    "ai": _VideoGenerationMode.AI_VIDEO,
+    "model": _VideoGenerationMode.AI_VIDEO,
+    "generated": _VideoGenerationMode.AI_VIDEO,
+    "ai_generated": _VideoGenerationMode.AI_VIDEO,
+    "ai_video": _VideoGenerationMode.AI_VIDEO,
+}
 _IMAGE_ASPECT_RATIO_CHOICES = {"21:9", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16"}
 _IMAGE_TEXT_POLICIES = {"avoid_text", "text_if_requested", "typography"}
 _IMAGE_TASKS = {"generate", "edit", "variant"}
@@ -549,6 +785,12 @@ def _parse_chat_mode_payload(raw: str | dict | None, chat_mode: str | None) -> d
             payload = {}
 
     if _normalize_chat_mode(chat_mode) == "video":
+        raw_generation_mode = payload.get("generation_mode")
+        generation_mode = str(raw_generation_mode or _VideoGenerationMode.AUTO).strip().lower().replace("-", "_")
+        payload["generation_mode"] = _VIDEO_GENERATION_MODE_ALIASES.get(
+            generation_mode,
+            _VideoGenerationMode.AUTO,
+        )
         duration = payload.get("clip_duration_seconds") or payload.get("duration_seconds") or payload.get("duration")
         try:
             duration_value = int(float(duration))
@@ -684,6 +926,150 @@ def _audio_chat_mode_tool_call(prompt_text: str, payload: dict) -> dict:
     }
 
 
+def _video_edit_skill_input(
+    prompt_text: str,
+    payload: dict,
+    attachments: FileAttachments,
+) -> str:
+    sections = [prompt_text]
+    if attachments.text_context:
+        sections.append(f"<attached_files>\n{attachments.text_context}\n</attached_files>")
+
+    selected_urls: list[str] = []
+    for urls, media_flag in (
+        (list(attachments.image_urls or []), "image"),
+        (list(attachments.video_urls or []), "video"),
+        (list(attachments.audio_urls or []), "audio"),
+    ):
+        if attachments.attachment_refs:
+            urls = _direct_media_selected_urls(
+                urls,
+                prompt=prompt_text,
+                attachments=attachments,
+                media_flag=media_flag,
+            )
+        for url in urls:
+            value = str(url or "").strip()
+            if value and value not in selected_urls:
+                selected_urls.append(value)
+    if selected_urls:
+        sections.append(
+            "<media_references>\n"
+            + "\n".join(f"- {url}" for url in selected_urls)
+            + "\n</media_references>"
+        )
+
+    settings = {
+        key: payload.get(key)
+        for key in (
+            "aspect_ratio",
+            "clip_duration_seconds",
+            "resolution",
+            "audio_policy",
+            "reference_policy",
+        )
+        if payload.get(key) not in {None, ""}
+    }
+    if settings:
+        sections.append(
+            "<video_mode_settings>\n"
+            + json.dumps(settings, ensure_ascii=False, indent=2)
+            + "\n</video_mode_settings>"
+        )
+    return "\n\n".join(sections)
+
+
+async def _live_video_sandbox_matches_skill(
+    sandbox_id: str,
+    expected_skill: _VideoSandboxSkill,
+) -> bool:
+    """Read Sandbox state without extending its lease."""
+
+    normalized_id = str(sandbox_id or "").strip()
+    if not normalized_id:
+        return False
+    try:
+        from packages.core.config import get_settings
+        from packages.core.services.sandbox_sdk import SandboxClient
+
+        sandbox_url = get_settings().SANDBOX_SERVICE_URL.strip()
+        if not sandbox_url:
+            return False
+        client = SandboxClient(base_url=sandbox_url, timeout=10.0)
+        try:
+            info = await client.status(normalized_id)
+        finally:
+            await client.close()
+        status = getattr(info, "status", "")
+        normalized_status = str(getattr(status, "value", status) or "").strip().lower()
+        return (
+            normalized_status in _LIVE_VIDEO_SANDBOX_STATUSES
+            and str(getattr(info, "skill_name", "") or "").strip()
+            == expected_skill.value
+        )
+    except Exception:
+        return False
+
+
+async def _conversation_video_edit_route_state(
+    conversation_id: str | None,
+    *,
+    entity_id: str,
+    user_id: str,
+) -> _VideoEditRouteState:
+    """Resolve Auto-mode continuation from owned, live session state only."""
+
+    normalized_conversation_id = str(conversation_id or "").strip()
+    if not normalized_conversation_id:
+        return _VideoEditRouteState.INACTIVE
+
+    from packages.core.ai.runtime import (
+        runtime_load_sandbox_context,
+        runtime_sandbox_context_owner_matches,
+    )
+    from packages.core.ai.runtime.video_edit_sessions import (
+        assert_video_edit_session_owner,
+        load_conversation_video_edit_session,
+    )
+
+    edit_session = await load_conversation_video_edit_session(
+        normalized_conversation_id,
+    )
+    if isinstance(edit_session, dict):
+        try:
+            assert_video_edit_session_owner(
+                edit_session,
+                entity_id=entity_id,
+                user_id=user_id,
+                conversation_id=normalized_conversation_id,
+            )
+        except PermissionError:
+            edit_session = None
+        if edit_session and await _live_video_sandbox_matches_skill(
+            str(edit_session.get("sandbox_id") or ""),
+            _VideoSandboxSkill.EDIT_RUNTIME,
+        ):
+            return _VideoEditRouteState.EDIT_SESSION
+
+    skill_context = await runtime_load_sandbox_context(normalized_conversation_id)
+    if (
+        runtime_sandbox_context_owner_matches(
+            skill_context,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+        and str((skill_context or {}).get("skill_id") or "").strip()
+        == _VideoSandboxSkill.EDIT_SKILL.value
+        and await _live_video_sandbox_matches_skill(
+            str((skill_context or {}).get("sandbox_id") or ""),
+            _VideoSandboxSkill.EDIT_SKILL,
+        )
+    ):
+        return _VideoEditRouteState.SKILL_SANDBOX
+
+    return _VideoEditRouteState.INACTIVE
+
+
 def _chat_mode_direct_tool_calls(
     *,
     chat_mode: str | None,
@@ -691,15 +1077,31 @@ def _chat_mode_direct_tool_calls(
     prompt: str,
     attachments: FileAttachments,
     manual_skill_refs: list[dict] | None = None,
+    video_edit_route_state: _VideoEditRouteState = _VideoEditRouteState.INACTIVE,
 ) -> list[dict]:
     """Build deterministic media tool calls for mode-specific composer sends."""
     mode = _normalize_chat_mode(chat_mode)
-    if mode not in {"image", "video", "audio"} or manual_skill_refs:
+    prompt_text = str(prompt or "").strip()
+    if not prompt_text or manual_skill_refs:
+        return []
+
+    if (
+        mode in {None, "auto"}
+        and video_edit_route_state is not _VideoEditRouteState.INACTIVE
+    ):
+        return [
+            {
+                "name": "invoke_skill",
+                "arguments": {
+                    "skill": _VideoSandboxSkill.EDIT_SKILL.value,
+                    "input": _video_edit_skill_input(prompt_text, {}, attachments),
+                },
+            }
+        ]
+
+    if mode not in {"image", "video", "audio"}:
         return []
     payload = _parse_chat_mode_payload(chat_mode_payload, mode)
-    prompt_text = str(prompt or "").strip()
-    if not prompt_text:
-        return []
 
     if mode == "image":
         return [_image_chat_mode_tool_call(prompt_text, payload, attachments)]
@@ -710,6 +1112,20 @@ def _chat_mode_direct_tool_calls(
     output_type = str(payload.get("output_type") or "single_clip").strip().lower()
     if output_type not in _DIRECT_VIDEO_OUTPUT_TYPES:
         return []
+    generation_mode = payload["generation_mode"]
+    if generation_mode in {
+        _VideoGenerationMode.AUTO,
+        _VideoGenerationMode.NATIVE_MOTION,
+    }:
+        return [
+            {
+                "name": "invoke_skill",
+                "arguments": {
+                    "skill": "video-edit",
+                    "input": _video_edit_skill_input(prompt_text, payload, attachments),
+                },
+            }
+        ]
 
     image_urls = [url for url in (attachments.image_urls or []) if str(url or "").strip()]
     video_urls = [url for url in (attachments.video_urls or []) if str(url or "").strip()]
@@ -842,6 +1258,39 @@ def _video_reference_policy_prompt(reference_policy: str | None) -> str:
     )
 
 
+def _video_generation_mode_prompt(generation_mode: str | None) -> str:
+    try:
+        mode = _VideoGenerationMode(generation_mode or _VideoGenerationMode.AUTO)
+    except ValueError:
+        mode = _VideoGenerationMode.AUTO
+    if mode is _VideoGenerationMode.NATIVE_MOTION:
+        return (
+            "Selected generation mode: native_motion/coded motion. Do not call a video-generation model or "
+            "generate_file(kind='video'). Invoke the built-in video-edit skill and let it own the complete "
+            "professional editing workflow. It must build an editable coded composition, run strict checks, "
+            "generate review snapshots, and stop for explicit user approval before final rendering. Do not substitute "
+            "manor.video_edit_recipe or a fixed motion preset unless the video runtime is unavailable and the user "
+            "explicitly accepts the lower-fidelity fast/editable fallback. Do not stop at a prose plan."
+        )
+    if mode is _VideoGenerationMode.AI_VIDEO:
+        return (
+            "Selected generation mode: ai_video. Generate new footage with generate_file(kind='video'). Video "
+            "generation is async and returns status='pending' with a job_id. You MUST call wait_media_jobs with "
+            "that job_id, then report the completed video or the real failure reason. Never claim success while a "
+            "video job is pending. Keep generated clips replaceable in the final edit when the request is a composed video."
+        )
+    return (
+        "Selected generation mode: auto. Decide per scene instead of routing every video request to a video model. "
+        "For video editing, product demos, UI walkthroughs, promos, explainers, captioned videos, or any final containing "
+        "UI, typography, diagrams, particles, product animation, or brand motion, invoke the built-in video-edit skill "
+        "once and let it own the final composition, quality review, and render. "
+        "Use generate_file(kind='video') only for photorealistic people, environments, or footage that cannot be built "
+        "efficiently as motion graphics; the Video Edit composition may incorporate those completed clips as replaceable "
+        "assets. Do not silently fall back to manor.video_edit_recipe or a fixed motion preset. For every AI-generated clip, "
+        "call wait_media_jobs and wait for the real result before continuing."
+    )
+
+
 def _slides_render_prompt(render: str | None) -> str:
     if str(render or "").strip().lower() == "full_page_image":
         return (
@@ -874,14 +1323,11 @@ def _chat_mode_runtime_prompt(chat_mode: str | None, chat_mode_payload: str | di
             "Respect image mode settings such as task, aspect_ratio, resolution, reference_policy, and text_policy."
         ),
         "video": (
-            f"{shared}\nMode: Video generation. For video output, call generate_file with kind='video' and pass "
-            "available first_frame_url, last_frame_url, reference_urls, reference_video_urls, "
-            "or audio_reference_urls exactly when the user provided them. A single model video generation is limited "
-            "to 15 seconds max; split longer finals into multiple <=15s clips and then compose them.\n"
-            "Video generation is async and returns status='pending' with a job_id. You MUST then call "
-            "wait_media_jobs with that job_id (it blocks until the video finishes), and report the real "
-            "outcome — the completed video, or the failure reason if it failed. Never end your turn while a "
-            "video job is still pending; do not claim success before wait_media_jobs confirms completion.\n"
+            f"{shared}\nMode: Video creation. Follow the selected generation path below. Preserve available "
+            "first_frame_url, last_frame_url, reference_urls, reference_video_urls, or audio_reference_urls exactly "
+            "when the user provided them. A single video-model clip is limited to 15 seconds; split longer AI-video "
+            "sections into multiple <=15s clips and then compose them.\n"
+            f"{_video_generation_mode_prompt(str(payload.get('generation_mode') or 'auto'))}\n"
             f"{_video_reference_policy_prompt(str(payload.get('reference_policy') or 'hash_references'))}"
         ),
         "audio": (
@@ -896,8 +1342,32 @@ def _chat_mode_runtime_prompt(chat_mode: str | None, chat_mode_payload: str | di
             + _slides_render_prompt(str(payload.get("render") or "editable"))
         ),
         "sheet": f"{shared}\nMode: Spreadsheet generation. Use generate_file with kind='spreadsheet'.",
-        "website": f"{shared}\nMode: Website/app generation. Use generate_file with kind='code'.",
+        "website": (
+            f"{shared}\nMode: Website/app generation. Build or edit a real responsive implementation with "
+            "generate_file(kind='code'), preserve supplied source files and visual references, and produce a root "
+            "index.html with browser-ready relative assets. Copy generated media into the bundle with params.assets; "
+            "never leave publishable HTML/CSS/JS dependent on /api/ paths. Every link must have a real destination, "
+            "every fragment target must exist, and every enabled button or form must have real behavior. Repair all "
+            "returned static-site preflight errors until validation.valid is true, then verify the rendered result when "
+            "browser tools are available, including console errors and failed requests. A static prototype must not "
+            "pretend that login, payment, persistence, or server APIs are production-backed. Return the runnable "
+            "artifact rather than stopping at a mockup or prose plan. For behavior that should connect after Manor Site "
+            "publishing, use the declarative Site Bridge contract: mark newsletter/subscription forms with "
+            "data-manor-action='subscription', contact/demo/lead forms with data-manor-action='lead', and meaningful CTA "
+            "elements with a stable data-manor-event value. Put an aria-live element with data-manor-status inside each "
+            "connected form. Do not add Manor API URLs, Workspace IDs, Flow IDs, chat tokens, credentials, password fields, "
+            "payment card fields, or hand-written fetch calls for those connections; publishing injects the same-origin "
+            "runtime, infers the originating Workspace, and automatically creates or reuses the required Webchat and "
+            "Flows after the user confirms publishing."
+        ),
         "research": f"{shared}\nMode: Research. Prioritize source-backed research, comparisons, citations, and synthesis.",
+        "flows": (
+            f"{shared}\nMode: Workspace Flows. First use search_tools to load list_workspace_flows, "
+            "call list_workspace_flows, then use search_tools to load start_workspace_flow. Select the Flow "
+            "that matches the user's request and call start_workspace_flow with the complete source brief. "
+            "If matching Flow names exist in multiple Workspaces, require the user to name the Workspace; "
+            "do not guess, use recency, or start more than one Flow."
+        ),
     }
     prompt = prompts.get(mode)
     if prompt and payload_summary:
@@ -915,11 +1385,16 @@ def _message_with_chat_mode_marker(message: str, chat_mode: str | None, chat_mod
 def _runtime_metadata_for_chat_mode(
     file_context_turn: RuntimeFileContextTurn,
     *,
+    chat_mode: str | None,
     chat_mode_prompt: str | None,
     direct_tool_calls: list[dict] | None,
     approval_runtime_metadata: dict | None = None,
+    origin_user_message_id: str | None = None,
 ) -> dict:
-    metadata = dict(file_context_turn.runtime_metadata or {})
+    metadata = dict(getattr(file_context_turn, "runtime_metadata", None) or {})
+    metadata["chat_mode"] = _normalize_chat_mode(chat_mode) or "auto"
+    if origin_user_message_id:
+        metadata["origin_user_message_id"] = origin_user_message_id
     if chat_mode_prompt:
         metadata["chat_mode_prompt"] = chat_mode_prompt
     if direct_tool_calls:
@@ -931,10 +1406,150 @@ def _runtime_metadata_for_chat_mode(
 
 # ── SSE Streaming ──
 
+@router.get(
+    "/flow-entrypoints",
+    response_model=list[GlobalChatFlowEntrypointResponse],
+)
+async def list_global_chat_flow_entrypoints(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from packages.core.services.workspace_workflow_router import (
+        list_global_chat_flow_entrypoints as list_entrypoints,
+    )
+
+    rows = await list_entrypoints(
+        db,
+        entity_id=user.entity_id,
+        user=user,
+        require_control=True,
+    )
+    return [
+        GlobalChatFlowEntrypointResponse(
+            **entrypoint.public_dict(),
+            workspace_id=workspace.id,
+            workspace_name=workspace.name,
+        )
+        for entrypoint, _binding, _workflow, workspace in rows
+    ]
+
+
+@router.post("/flow-entrypoints/{binding_id}/stream")
+async def stream_global_chat_flow_entrypoint(
+    binding_id: str,
+    message: str = Form(...),
+    conversation_id: str | None = Form(None),
+    agent_id: str | None = Form(None),
+    local_worker_id: str | None = Form(None),
+    document_ids: str | None = Form(None),
+    files: list[UploadFile] = File(default=[]),
+    _gate=Depends(require_plan("ai_budget_usd")),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deterministically invoke one selected Workspace Flow from personal Chat."""
+    from apps.api.routers.workspace_chat import _workspace_entrypoint_started_stream
+    from packages.core.services.workspace_flow_launcher import launch_workspace_flow
+    from packages.core.services.workspace_workflow_router import (
+        get_global_chat_flow_entrypoint,
+    )
+
+    resolved = await get_global_chat_flow_entrypoint(
+        db,
+        entity_id=user.entity_id,
+        user=user,
+        binding_id=binding_id,
+    )
+    if resolved is None:
+        raise HTTPException(404, "Flow not found")
+    entrypoint, binding, _workflow, workspace = resolved
+    file_context_turn = await _build_attachments(
+        message,
+        document_ids,
+        files,
+        user.entity_id,
+        db,
+        workspace_id=workspace.id,
+        user_id=user.id,
+    )
+    cleaned_message = file_context_turn.cleaned_message.strip()
+    if not cleaned_message:
+        cleaned_message = entrypoint.title.rstrip(".!?。！？") + "."
+    title = cleaned_message.split("\n", 1)[0][:100].strip() if not conversation_id else None
+    try:
+        conversation = await get_or_create_conversation(
+            db,
+            user.entity_id,
+            user.id,
+            agent_id=agent_id,
+            workspace_id=None,
+            conversation_id=conversation_id,
+            title=title,
+        )
+    except (LookupError, PermissionError):
+        raise HTTPException(404, "Conversation not found")
+    if conversation.workspace_id:
+        raise HTTPException(409, "Use Workspace Chat to run a Flow in this conversation")
+    if local_worker_id:
+        try:
+            await select_conversation_local_worker_target(
+                db,
+                conversation_id=conversation.id,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                worker_id=local_worker_id,
+            )
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    saved_text = runtime_saved_message_with_file_references(
+        cleaned_message,
+        file_context_turn.attachments,
+    )
+    origin_message = await add_message(
+        db,
+        conversation.id,
+        role="user",
+        content=saved_text,
+        attachments=file_context_turn.attachments.attachment_refs or None,
+        refs=[
+            {"type": "workflow", "id": entrypoint.workflow_id, "title": entrypoint.title},
+            {"type": "workspace", "id": workspace.id, "title": workspace.name},
+        ],
+        meta={"author_user_id": user.id, "chat_mode": "flows"},
+    )
+    try:
+        started = await launch_workspace_flow(
+            db,
+            source="global_chat",
+            entrypoint=entrypoint,
+            binding=binding,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            workspace_id=workspace.id,
+            conversation_id=conversation.id,
+            origin_message_id=origin_message.id,
+            source_brief=cleaned_message,
+            attachments=file_context_turn.attachments,
+            starter_policy="always_review",
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return StreamingResponse(
+        _workspace_entrypoint_started_stream(started),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
 @router.post("/stream")
 async def chat_stream(
     message: str = Form(...),
     conversation_id: str | None = Form(None),
+    local_worker_id: str | None = Form(None),
     agent_id: str | None = Form(None),
     workspace_id: str | None = Form(None),
     workspace_context: bool = Form(False),
@@ -949,7 +1564,6 @@ async def chat_stream(
     editor_context: str | None = Form(None),
     ephemeral: bool = Form(False),
     files: list[UploadFile] = File(default=[]),
-    _gate=Depends(require_plan("ai_budget_usd")),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -959,6 +1573,12 @@ async def chat_stream(
     knowledge-base document IDs (comma-separated). File contents are
     extracted and injected into the LLM context automatically.
     """
+    pending_approval_turn = await _require_chat_budget_unless_pending_approval(
+        db,
+        user=user,
+        conversation_id=conversation_id,
+        message=message,
+    )
     workspace_id, thread_ref_kind, thread_ref_id = await _resolve_chat_workspace_scope(
         db,
         user,
@@ -967,6 +1587,11 @@ async def chat_stream(
         thread_ref_kind=thread_ref_kind,
         thread_ref_id=thread_ref_id,
         workspace_context=workspace_context,
+    )
+    video_edit_route_state = await _conversation_video_edit_route_state(
+        conversation_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
     )
     file_context_turn = await _build_attachments(
         message, document_ids, files, user.entity_id, db,
@@ -1000,6 +1625,8 @@ async def chat_stream(
         thread_ref_id=thread_ref_id,
         disable_tools=disable_tools,
         blocked_tools=blocked_tools,
+    ) and (
+        video_edit_route_state is _VideoEditRouteState.INACTIVE
     ) and not await conversation_message_is_pending_action_reply(
         db,
         conversation_id,
@@ -1068,6 +1695,7 @@ async def chat_stream(
         prompt=llm_base_message,
         attachments=attachments,
         manual_skill_refs=manual_skill_refs,
+        video_edit_route_state=video_edit_route_state,
     )
     llm_message = _stream_llm_message_with_attachments(
         llm_base_message,
@@ -1077,26 +1705,31 @@ async def chat_stream(
 
     if ephemeral:
         parsed_editor_context = runtime_parse_editor_context(editor_context)
+        turn_surface = _surface_for_chat_request(
+            agent_id=agent_id,
+            workspace_id=workspace_id,
+            ephemeral=True,
+            editor_context=parsed_editor_context,
+        )
         return StreamingResponse(
             runtime_stream_chat_turn(
                 llm_message,
                 None,
-                surface=_surface_for_chat_request(
-                    agent_id=agent_id,
-                    workspace_id=workspace_id,
-                    ephemeral=True,
-                    editor_context=parsed_editor_context,
-                ),
+                surface=turn_surface,
                 entity_id=user.entity_id,
                 user_id=user.id,
                 agent_id=agent_id,
                 workspace_id=workspace_id,
                 manual_skill_refs=manual_skill_refs,
                 disable_tools=disable_tools,
-                blocked_tools=_parse_csv_names(blocked_tools),
+                blocked_tools=(
+                    set(_parse_csv_names(blocked_tools))
+                    | _chat_mode_blocked_tools(chat_mode, surface=turn_surface)
+                ),
                 editor_context=parsed_editor_context,
                 runtime_metadata=_runtime_metadata_for_chat_mode(
                     file_context_turn,
+                    chat_mode=chat_mode,
                     chat_mode_prompt=chat_mode_prompt,
                     direct_tool_calls=direct_tool_calls,
                 ),
@@ -1127,6 +1760,20 @@ async def chat_stream(
     except (LookupError, PermissionError):
         raise HTTPException(404, "Conversation not found")
 
+    if local_worker_id:
+        try:
+            await select_conversation_local_worker_target(
+                db,
+                conversation_id=conv.id,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                worker_id=local_worker_id,
+            )
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     if _is_runtime_approval_rejected_message(llm_base_message):
         assistant_msg = await add_message(db, conv.id, role="assistant", content=_RUNTIME_APPROVAL_REJECTED_REPLY)
         await db.commit()
@@ -1150,10 +1797,37 @@ async def chat_stream(
         llm_message = replacement
         approval_saved_text = resolved_saved_text
         direct_tool_calls = []
+    elif pending_approval_turn:
+        # The card changed between the preflight lookup and resolution.  Do not
+        # let a stale structured action become an ungated AI prompt.
+        await require_plan("ai_budget_usd")(user=user, db=db)
+
+    if replacement and _is_workflow_approval_resolution(approval_runtime_metadata):
+        if save_user_message:
+            await add_message(
+                db,
+                conv.id,
+                role="user",
+                content=resolved_saved_text or saved_user_base,
+                meta={"author_user_id": user.id},
+            )
+        assistant_msg = await add_message(
+            db,
+            conv.id,
+            role="assistant",
+            content=replacement,
+        )
+        await db.commit()
+        return StreamingResponse(
+            _runtime_approval_rejected_stream(conv.id, replacement, assistant_msg.id),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
 
     # Save user message in DB as plain text. The image bytes are only
     # multimodal for this turn, but the stable /api/v1/fs references must
     # remain in history so follow-up turns can use them for media tools.
+    origin_user_message = None
     if save_user_message:
         saved_text = approval_saved_text or saved_user_base
         if not approval_saved_text:
@@ -1161,7 +1835,7 @@ async def chat_stream(
         # Stash the posting user so workspace chat can attribute the message
         # to its real author. Without this, every user message reads back with
         # no author_user_id and the UI renders all of them as the viewer's own.
-        await add_message(
+        origin_user_message = await add_message(
             db, conv.id, role="user", content=saved_text,
             meta={"author_user_id": user.id},
         )
@@ -1178,29 +1852,37 @@ async def chat_stream(
     # the generator creates its own short-lived sessions to avoid
     # holding a DB connection for the entire SSE stream duration.
     parsed_editor_context = runtime_parse_editor_context(editor_context)
+    turn_surface = _surface_for_chat_request(
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        editor_context=parsed_editor_context,
+    )
     return StreamingResponse(
         runtime_stream_chat_turn(
             llm_message,
             conv.id,
-            surface=_surface_for_chat_request(
-                agent_id=agent_id,
-                workspace_id=workspace_id,
-                editor_context=parsed_editor_context,
-            ),
+            surface=turn_surface,
             entity_id=user.entity_id,
             user_id=user.id,
             agent_id=agent_id,
             workspace_id=workspace_id,
             manual_skill_refs=manual_skill_refs,
             disable_tools=disable_tools,
-            blocked_tools=_parse_csv_names(blocked_tools),
+            blocked_tools=(
+                set(_parse_csv_names(blocked_tools))
+                | _chat_mode_blocked_tools(chat_mode, surface=turn_surface)
+            ),
             editor_context=parsed_editor_context,
             assistant_message_id=assistant_placeholder.id,
             runtime_metadata=_runtime_metadata_for_chat_mode(
                 file_context_turn,
+                chat_mode=chat_mode,
                 chat_mode_prompt=chat_mode_prompt,
                 direct_tool_calls=direct_tool_calls,
                 approval_runtime_metadata=approval_runtime_metadata,
+                origin_user_message_id=(
+                    origin_user_message.id if origin_user_message is not None else None
+                ),
             ),
         ),
         media_type="text/event-stream",
@@ -1216,6 +1898,7 @@ async def chat_message(
     request: Request,
     message: str | None = Form(None),
     conversation_id: str | None = Form(None),
+    local_worker_id: str | None = Form(None),
     agent_id: str | None = Form(None),
     workspace_id: str | None = Form(None),
     workspace_context: bool = Form(False),
@@ -1228,7 +1911,6 @@ async def chat_message(
     blocked_tools: str | None = Form(None),
     editor_context: str | None = Form(None),
     files: list[UploadFile] = File(default=[]),
-    _gate=Depends(require_plan("ai_budget_usd")),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1241,6 +1923,7 @@ async def chat_message(
         body = await request.json()
         message = body.get("message")
         conversation_id = body.get("conversation_id", conversation_id)
+        local_worker_id = body.get("local_worker_id", local_worker_id)
         agent_id = body.get("agent_id", agent_id)
         workspace_id = body.get("workspace_id", workspace_id)
         workspace_context = _coerce_bool(body.get("workspace_context", workspace_context))
@@ -1255,6 +1938,13 @@ async def chat_message(
     if message is None:
         raise HTTPException(422, "message is required")
 
+    pending_approval_turn = await _require_chat_budget_unless_pending_approval(
+        db,
+        user=user,
+        conversation_id=conversation_id,
+        message=message,
+    )
+
     workspace_id, thread_ref_kind, thread_ref_id = await _resolve_chat_workspace_scope(
         db,
         user,
@@ -1263,6 +1953,11 @@ async def chat_message(
         thread_ref_kind=thread_ref_kind,
         thread_ref_id=thread_ref_id,
         workspace_context=bool(workspace_context),
+    )
+    video_edit_route_state = await _conversation_video_edit_route_state(
+        conversation_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
     )
     file_context_turn = await _build_attachments(
         message, document_ids, files, user.entity_id, db,
@@ -1287,6 +1982,7 @@ async def chat_message(
         prompt=llm_base_message,
         attachments=attachments,
         manual_skill_refs=manual_skill_refs,
+        video_edit_route_state=video_edit_route_state,
     )
     llm_message = _stream_llm_message_with_attachments(
         llm_base_message,
@@ -1315,6 +2011,20 @@ async def chat_message(
     except (LookupError, PermissionError):
         raise HTTPException(404, "Conversation not found")
 
+    if local_worker_id:
+        try:
+            await select_conversation_local_worker_target(
+                db,
+                conversation_id=conv.id,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                worker_id=local_worker_id,
+            )
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     if _is_runtime_approval_rejected_message(llm_base_message):
         assistant_msg = await add_message(db, conv.id, role="assistant", content=_RUNTIME_APPROVAL_REJECTED_REPLY)
         await db.commit()
@@ -1341,15 +2051,45 @@ async def chat_message(
         llm_message = replacement
         approval_saved_text = resolved_saved_text
         direct_tool_calls = []
+    elif pending_approval_turn:
+        # The card changed between the preflight lookup and resolution.  Do not
+        # let a stale structured action become an ungated AI prompt.
+        await require_plan("ai_budget_usd")(user=user, db=db)
+
+    if replacement and _is_workflow_approval_resolution(approval_runtime_metadata):
+        if save_user_message:
+            await add_message(
+                db,
+                conv.id,
+                role="user",
+                content=resolved_saved_text or saved_user_base,
+                meta={"author_user_id": user.id},
+            )
+        assistant_msg = await add_message(
+            db,
+            conv.id,
+            role="assistant",
+            content=replacement,
+        )
+        await db.commit()
+        return ChatMessageResponse(
+            conversation_id=conv.id,
+            message_id=assistant_msg.id,
+            content=replacement,
+            tool_calls_made=[],
+            usage={},
+            rounds=0,
+        )
 
     # Save user message
+    origin_user_message = None
     if save_user_message:
         saved_text = approval_saved_text or saved_user_base
         if not approval_saved_text:
             saved_text = runtime_saved_message_with_file_references(saved_text, attachments)
         # Attribute the message to its author so workspace chat can tell who
         # sent it (see /chat/stream above for the full rationale).
-        await add_message(
+        origin_user_message = await add_message(
             db, conv.id, role="user", content=saved_text,
             meta={"author_user_id": user.id},
         )
@@ -1357,27 +2097,35 @@ async def chat_message(
 
     # Run agentic loop
     parsed_editor_context = runtime_parse_editor_context(editor_context)
+    turn_surface = _surface_for_chat_request(
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        editor_context=parsed_editor_context,
+    )
     result = await runtime_run_chat_turn(
         llm_message,
         conv.id,
-        surface=_surface_for_chat_request(
-            agent_id=agent_id,
-            workspace_id=workspace_id,
-            editor_context=parsed_editor_context,
-        ),
+        surface=turn_surface,
         entity_id=user.entity_id,
         user_id=user.id,
         agent_id=agent_id,
         workspace_id=workspace_id,
         db=db,
         manual_skill_refs=manual_skill_refs,
-        blocked_tools=_parse_csv_names(blocked_tools),
+        blocked_tools=(
+            set(_parse_csv_names(blocked_tools))
+            | _chat_mode_blocked_tools(chat_mode, surface=turn_surface)
+        ),
         editor_context=parsed_editor_context,
         runtime_metadata=_runtime_metadata_for_chat_mode(
             file_context_turn,
+            chat_mode=chat_mode,
             chat_mode_prompt=chat_mode_prompt,
             direct_tool_calls=direct_tool_calls,
             approval_runtime_metadata=approval_runtime_metadata,
+            origin_user_message_id=(
+                origin_user_message.id if origin_user_message is not None else None
+            ),
         ),
     )
 
@@ -1507,7 +2255,7 @@ async def get_messages(
     )
     if len(msgs) > limit:
         msgs = msgs[-limit:]
-    return [_to_chat_message_response(m) for m in msgs]
+    return await _chat_message_responses(db, user, msgs)
 
 
 @router.get(
@@ -1538,10 +2286,53 @@ async def get_messages_page(
         visible = visible[-limit:]
     next_cursor = _encode_message_cursor(visible[0]) if has_more and visible else None
     return MessagesPageResponse(
-        items=[_to_chat_message_response(m) for m in visible],
+        items=await _chat_message_responses(db, user, visible),
         has_more=has_more,
         next_cursor=next_cursor,
     )
+
+
+@router.post("/messages/{message_id}/resolve", response_model=MessageResponse)
+async def resolve_global_chat_action(
+    message_id: str,
+    req: ResolveChatActionRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    message = (await db.execute(
+        select(Message).where(Message.id == message_id)
+    )).scalar_one_or_none()
+    if message is None:
+        raise HTTPException(404, "message not found")
+    conversation = (await db.execute(
+        select(Conversation).where(
+            Conversation.id == message.conversation_id,
+            Conversation.entity_id == user.entity_id,
+            Conversation.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if conversation is None:
+        raise HTTPException(404, "message not found")
+    from packages.core.services.workflow_message_actions import (
+        WorkflowMessageActionError,
+        resolve_workflow_message_action,
+    )
+
+    try:
+        result = await resolve_workflow_message_action(
+            db,
+            message=message,
+            conversation=conversation,
+            choice=req.choice,
+            note=req.note,
+            payload=req.payload,
+            user=user,
+        )
+    except WorkflowMessageActionError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    if result is None:
+        raise HTTPException(400, "Message is not a Workflow action")
+    return _to_chat_message_response(result.message)
 
 
 @router.post(
@@ -1627,6 +2418,7 @@ async def cancel_conversation_file_approvals(
         user_id=user.id,
         hitl_ids=(req.hitl_ids if req else None),
         reason=(req.reason if req and req.reason else "request_stopped"),
+        cancel_turn=True,
     )
     await db.commit()
     return cancelled
@@ -1757,6 +2549,7 @@ async def view_shared_conversation(
                 token_usage=m.token_usage,
                 attachments=_redact_local_fs_urls(m.attachments),
                 hitl_requests=_redact_local_fs_urls(_message_hitl_requests(m)),
+                workflow_result=_redact_local_fs_urls(_message_workflow_result(m)),
                 **_message_limit_meta(m),
                 created_at=m.created_at.isoformat() if m.created_at else None,
             )

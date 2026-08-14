@@ -16,13 +16,13 @@ type ChipVariant =
 
 // Chips are plain data labels, so they stay neutral by default — no colour
 // where none is needed. Only `red` keeps a tint, to flag danger.
-const NEUTRAL = { bg: "#f5f5f4", fg: "#57534e" };
+const NEUTRAL = { bg: "var(--chip-neutral-bg)", fg: "var(--chip-neutral-fg)" };
 const VARIANT_STYLES: Record<ChipVariant, { bg: string; fg: string; border?: string }> = {
   teal:   NEUTRAL,
   orange: NEUTRAL,
   blue:   NEUTRAL,
   green:  NEUTRAL,
-  red:    { bg: "#f8f0ef", fg: "#a23e38" },
+  red:    { bg: "var(--chip-danger-bg)", fg: "var(--chip-danger-fg)" },
   slate:  NEUTRAL,
   purple: NEUTRAL,
 };

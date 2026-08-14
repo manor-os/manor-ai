@@ -818,6 +818,7 @@ def upgrade() -> None:
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('entity_id', sa.String(length=26), nullable=False),
     sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('stat_id', sa.String(length=26), nullable=True),
     sa.Column('title', sa.String(length=255), nullable=False),
     sa.Column('description', sa.Text(), nullable=True),
     sa.Column('metric_key', sa.String(length=100), nullable=False),
@@ -1155,6 +1156,8 @@ def upgrade() -> None:
     sa.Column('provider_user_id', sa.String(length=255), nullable=False),
     sa.Column('access_token', sa.String(), nullable=True),
     sa.Column('refresh_token', sa.String(), nullable=True),
+    sa.Column('credential_ref', sa.Text(), nullable=True),
+    sa.Column('credential_scheme', sa.String(length=32), server_default='legacy_columns', nullable=False),
     sa.Column('token_expires_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('profile', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
@@ -1428,6 +1431,7 @@ def upgrade() -> None:
     op.create_table('scheduled_job_runs',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('job_id', sa.String(length=100), nullable=False),
+    sa.Column('idempotency_key', sa.String(length=200), nullable=True),
     sa.Column('status', sa.String(length=20), nullable=False),
     sa.Column('trigger_type', sa.String(length=20), nullable=True),
     sa.Column('result', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
@@ -1497,6 +1501,38 @@ def upgrade() -> None:
     sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('token_hash')
+    )
+    op.create_table('site_events',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('site_id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('event_type', sa.String(length=32), nullable=False),
+    sa.Column('action', sa.String(length=64), nullable=True),
+    sa.Column('session_id', sa.String(length=64), nullable=True),
+    sa.Column('path', sa.String(length=1024), nullable=True),
+    sa.Column('referrer', sa.String(length=2048), nullable=True),
+    sa.Column('properties', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('sites',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('name', sa.String(length=255), nullable=False),
+    sa.Column('slug', sa.String(length=63), nullable=False),
+    sa.Column('status', sa.String(length=16), nullable=False),
+    sa.Column('source_path', sa.String(length=1024), nullable=False),
+    sa.Column('entry', sa.String(length=255), nullable=False),
+    sa.Column('revision', sa.Integer(), nullable=False),
+    sa.Column('custom_domain', sa.String(length=255), nullable=True),
+    sa.Column('domain_status', sa.String(length=16), nullable=True),
+    sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('connections', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('published_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.PrimaryKeyConstraint('id')
     )
     op.create_table('skills',
     sa.Column('id', sa.String(length=26), nullable=False),
@@ -1855,6 +1891,7 @@ def upgrade() -> None:
     sa.Column('status', sa.String(length=20), nullable=False),
     sa.Column('last_login_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('last_login_ip', sa.String(length=128), nullable=True),
+    sa.Column('token_version', sa.Integer(), server_default='0', nullable=False),
     sa.Column('totp_secret', sa.String(length=255), nullable=True),
     sa.Column('totp_enabled', sa.Boolean(), server_default='false', nullable=False),
     sa.Column('backup_codes', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
@@ -2052,6 +2089,7 @@ def upgrade() -> None:
     sa.Column('entity_id', sa.String(length=26), nullable=False),
     sa.Column('workspace_id', sa.String(length=26), nullable=False),
     sa.Column('project_type', sa.String(length=80), nullable=False),
+    sa.Column('project_key', sa.String(length=200), nullable=True),
     sa.Column('schema_version', sa.Integer(), nullable=False),
     sa.Column('current_stage', sa.String(length=40), nullable=False),
     sa.Column('state', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
@@ -2088,6 +2126,21 @@ def upgrade() -> None:
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('workflow_template_installations',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('template_id', sa.String(length=160), nullable=False),
+    sa.Column('component_key', sa.String(length=120), server_default='main', nullable=False),
+    sa.Column('workflow_id', sa.String(length=26), nullable=False),
+    sa.Column('installed_version', sa.String(length=20), server_default='1.0.0', nullable=False),
+    sa.Column('installed_by', sa.String(length=26), nullable=True),
+    sa.Column('source_type', sa.String(length=30), server_default='flow_template', nullable=False),
+    sa.Column('installation_metadata', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('entity_id', 'template_id', 'component_key', name='uq_workflow_template_installations_source')
     )
     op.create_table('workspace_activities',
     sa.Column('id', sa.String(length=26), nullable=False),
@@ -2204,6 +2257,49 @@ def upgrade() -> None:
     sa.Column('added_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('expires_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('status', sa.String(length=20), server_default='active', nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('workspace_stat_observations',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('stat_id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('workspace_id', sa.String(length=26), nullable=False),
+    sa.Column('value', sa.Numeric(precision=24, scale=6), nullable=False),
+    sa.Column('observed_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('window_start', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('window_end', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('source', sa.String(length=100), nullable=False),
+    sa.Column('evidence', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('collector_revision', sa.Integer(), nullable=False),
+    sa.Column('idempotency_key', sa.String(length=200), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('workspace_stats',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('workspace_id', sa.String(length=26), nullable=False),
+    sa.Column('key', sa.String(length=120), nullable=False),
+    sa.Column('name', sa.String(length=255), nullable=False),
+    sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('value_type', sa.String(length=24), nullable=False),
+    sa.Column('unit', sa.String(length=40), nullable=True),
+    sa.Column('window', sa.String(length=40), nullable=False),
+    sa.Column('collector_type', sa.String(length=32), nullable=False),
+    sa.Column('collector_config', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('collection_cadence', sa.String(length=64), nullable=True),
+    sa.Column('freshness_limit_seconds', sa.Integer(), nullable=True),
+    sa.Column('origin', sa.String(length=24), nullable=False),
+    sa.Column('library_key', sa.String(length=120), nullable=True),
+    sa.Column('status', sa.String(length=20), nullable=False),
+    sa.Column('goal_eligible', sa.Boolean(), server_default='true', nullable=False),
+    sa.Column('current_value', sa.Numeric(precision=24, scale=6), nullable=True),
+    sa.Column('current_value_updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('last_collection_status', sa.String(length=24), nullable=True),
+    sa.Column('last_collection_error', sa.Text(), nullable=True),
+    sa.Column('revision', sa.Integer(), server_default='1', nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
@@ -2435,6 +2531,7 @@ def upgrade() -> None:
     op.create_index('ix_feature_flag_overrides_scope', 'feature_flag_overrides', ['scope', 'scope_id'], unique=False)
     op.create_index('ix_goal_task_links_task', 'goal_task_links', ['task_id'], unique=False)
     op.create_index('ix_goals_entity_status', 'goals', ['entity_id', 'status'], unique=False)
+    op.create_index('ix_goals_stat_id', 'goals', ['stat_id'], unique=False)
     op.create_index('ix_goals_workspace_status', 'goals', ['workspace_id', 'status'], unique=False)
     op.create_index(op.f('ix_governance_policies_entity_id'), 'governance_policies', ['entity_id'], unique=False)
     op.create_index(op.f('ix_governance_revisions_workspace_id'), 'governance_revisions', ['workspace_id'], unique=False)
@@ -2508,9 +2605,18 @@ def upgrade() -> None:
     op.create_index('ix_runtime_evidence_task_created', 'runtime_evidence', ['task_id', 'created_at'], unique=False)
     op.create_index('ix_runtime_evidence_type_status', 'runtime_evidence', ['evidence_type', 'status'], unique=False)
     op.create_index('ix_runtime_evidence_workspace_created', 'runtime_evidence', ['entity_id', 'workspace_id', 'created_at'], unique=False)
+    op.create_index('uq_scheduled_job_runs_occurrence', 'scheduled_job_runs', ['job_id', 'idempotency_key'], unique=True)
     op.create_index('ix_shares_entity_status', 'shares', ['entity_id', 'status'], unique=False)
     op.create_index('ix_shares_expires', 'shares', ['expires_at'], unique=False)
     op.create_index('ix_shares_resource', 'shares', ['resource_type', 'resource_id'], unique=False)
+    op.create_index('ix_site_events_site_created', 'site_events', ['site_id', 'created_at'], unique=False)
+    op.create_index('ix_site_events_type', 'site_events', ['site_id', 'event_type'], unique=False)
+    op.create_index('ix_site_events_workspace_created', 'site_events', ['workspace_id', 'created_at'], unique=False)
+    op.create_index('ix_sites_custom_domain', 'sites', ['custom_domain'], unique=True)
+    op.create_index('ix_sites_entity', 'sites', ['entity_id'], unique=False)
+    op.create_index('ix_sites_slug', 'sites', ['slug'], unique=True)
+    op.create_index('ix_sites_workspace', 'sites', ['workspace_id'], unique=False)
+    op.create_index('uq_sites_entity_source', 'sites', ['entity_id', 'source_path'], unique=True)
     op.create_index('ix_skills_category', 'skills', ['category'], unique=False)
     op.create_index('ix_skills_entity', 'skills', ['entity_id'], unique=False)
     op.create_index('ix_skills_owner', 'skills', ['entity_id', 'owner_user_id'], unique=False)
@@ -2576,11 +2682,15 @@ def upgrade() -> None:
     op.create_index('ix_workflow_definitions_workspace', 'workflow_definitions', ['entity_id', 'workspace_id'], unique=False)
     op.create_index('ix_workflow_projects_entity_type', 'workflow_projects', ['entity_id', 'project_type'], unique=False)
     op.create_index('ix_workflow_projects_workspace_stage', 'workflow_projects', ['workspace_id', 'current_stage'], unique=False)
+    op.create_index('uq_workflow_projects_business_key', 'workflow_projects', ['entity_id', 'workspace_id', 'project_type', 'project_key'], unique=True)
     op.create_index('ix_workflow_runs_entity_status', 'workflow_runs', ['entity_id', 'status'], unique=False)
     op.create_index('ix_workflow_runs_lineage_root_run_id', 'workflow_runs', ['lineage_root_run_id'], unique=False)
     op.create_index('ix_workflow_runs_retry_of_run_id', 'workflow_runs', ['retry_of_run_id'], unique=False)
     op.create_index('ix_workflow_runs_workflow', 'workflow_runs', ['workflow_id', 'created_at'], unique=False)
     op.create_index('ix_workflow_runs_workspace', 'workflow_runs', ['workspace_id'], unique=False)
+    op.create_index(op.f('ix_workflow_template_installations_entity_id'), 'workflow_template_installations', ['entity_id'], unique=False)
+    op.create_index(op.f('ix_workflow_template_installations_installed_by'), 'workflow_template_installations', ['installed_by'], unique=False)
+    op.create_index('ix_workflow_template_installations_workflow', 'workflow_template_installations', ['workflow_id'], unique=False)
     op.create_index('ix_ws_activity_workspace', 'workspace_activities', ['workspace_id', 'created_at'], unique=False)
     op.create_index(op.f('ix_workspace_blueprints_author_user_id'), 'workspace_blueprints', ['author_user_id'], unique=False)
     op.create_index(op.f('ix_workspace_blueprints_entity_id'), 'workspace_blueprints', ['entity_id'], unique=False)
@@ -2598,6 +2708,12 @@ def upgrade() -> None:
     op.create_index('ix_ws_operation_drafts_workspace_status', 'workspace_operation_drafts', ['workspace_id', 'status'], unique=False)
     op.create_index('ix_workspace_staff_user', 'workspace_staff', ['user_id'], unique=False)
     op.create_index('ix_workspace_staff_workspace_user', 'workspace_staff', ['workspace_id', 'user_id'], unique=False)
+    op.create_index('ix_workspace_stat_observations_stat_time', 'workspace_stat_observations', ['stat_id', 'observed_at'], unique=False)
+    op.create_index('ix_workspace_stat_observations_workspace_time', 'workspace_stat_observations', ['workspace_id', 'observed_at'], unique=False)
+    op.create_index('uq_workspace_stat_observations_idempotency', 'workspace_stat_observations', ['stat_id', 'idempotency_key'], unique=True)
+    op.create_index('ix_workspace_stats_entity_status', 'workspace_stats', ['entity_id', 'status'], unique=False)
+    op.create_index('ix_workspace_stats_library_key', 'workspace_stats', ['library_key'], unique=False)
+    op.create_index('uq_workspace_stats_workspace_key', 'workspace_stats', ['workspace_id', 'key'], unique=True)
     op.create_index('ix_ws_work_batches_entity_workspace', 'workspace_work_batches', ['entity_id', 'workspace_id'], unique=False)
     op.create_index('ix_ws_work_batches_workspace_status', 'workspace_work_batches', ['workspace_id', 'status'], unique=False)
     op.create_index(op.f('ix_workspaces_deleted_at'), 'workspaces', ['deleted_at'], unique=False)
@@ -2636,6 +2752,14 @@ def downgrade() -> None:
     op.drop_index('ix_ws_work_batches_workspace_status', table_name='workspace_work_batches')
     op.drop_index('ix_ws_work_batches_entity_workspace', table_name='workspace_work_batches')
     op.drop_table('workspace_work_batches')
+    op.drop_index('uq_workspace_stats_workspace_key', table_name='workspace_stats')
+    op.drop_index('ix_workspace_stats_library_key', table_name='workspace_stats')
+    op.drop_index('ix_workspace_stats_entity_status', table_name='workspace_stats')
+    op.drop_table('workspace_stats')
+    op.drop_index('uq_workspace_stat_observations_idempotency', table_name='workspace_stat_observations')
+    op.drop_index('ix_workspace_stat_observations_workspace_time', table_name='workspace_stat_observations')
+    op.drop_index('ix_workspace_stat_observations_stat_time', table_name='workspace_stat_observations')
+    op.drop_table('workspace_stat_observations')
     op.drop_index('ix_workspace_staff_workspace_user', table_name='workspace_staff')
     op.drop_index('ix_workspace_staff_user', table_name='workspace_staff')
     op.drop_table('workspace_staff')
@@ -2659,12 +2783,17 @@ def downgrade() -> None:
     op.drop_table('workspace_blueprints')
     op.drop_index('ix_ws_activity_workspace', table_name='workspace_activities')
     op.drop_table('workspace_activities')
+    op.drop_index('ix_workflow_template_installations_workflow', table_name='workflow_template_installations')
+    op.drop_index(op.f('ix_workflow_template_installations_installed_by'), table_name='workflow_template_installations')
+    op.drop_index(op.f('ix_workflow_template_installations_entity_id'), table_name='workflow_template_installations')
+    op.drop_table('workflow_template_installations')
     op.drop_index('ix_workflow_runs_workspace', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_workflow', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_retry_of_run_id', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_lineage_root_run_id', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_entity_status', table_name='workflow_runs')
     op.drop_table('workflow_runs')
+    op.drop_index('uq_workflow_projects_business_key', table_name='workflow_projects')
     op.drop_index('ix_workflow_projects_workspace_stage', table_name='workflow_projects')
     op.drop_index('ix_workflow_projects_entity_type', table_name='workflow_projects')
     op.drop_table('workflow_projects')
@@ -2763,11 +2892,22 @@ def downgrade() -> None:
     op.drop_index('ix_skills_entity', table_name='skills')
     op.drop_index('ix_skills_category', table_name='skills')
     op.drop_table('skills')
+    op.drop_index('uq_sites_entity_source', table_name='sites')
+    op.drop_index('ix_sites_workspace', table_name='sites')
+    op.drop_index('ix_sites_slug', table_name='sites')
+    op.drop_index('ix_sites_entity', table_name='sites')
+    op.drop_index('ix_sites_custom_domain', table_name='sites')
+    op.drop_table('sites')
+    op.drop_index('ix_site_events_workspace_created', table_name='site_events')
+    op.drop_index('ix_site_events_type', table_name='site_events')
+    op.drop_index('ix_site_events_site_created', table_name='site_events')
+    op.drop_table('site_events')
     op.drop_index('ix_shares_resource', table_name='shares')
     op.drop_index('ix_shares_expires', table_name='shares')
     op.drop_index('ix_shares_entity_status', table_name='shares')
     op.drop_table('shares')
     op.drop_table('scheduled_jobs')
+    op.drop_index('uq_scheduled_job_runs_occurrence', table_name='scheduled_job_runs')
     op.drop_table('scheduled_job_runs')
     op.drop_index('ix_runtime_evidence_workspace_created', table_name='runtime_evidence')
     op.drop_index('ix_runtime_evidence_type_status', table_name='runtime_evidence')
@@ -2880,6 +3020,7 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_governance_policies_entity_id'), table_name='governance_policies')
     op.drop_table('governance_policies')
     op.drop_index('ix_goals_workspace_status', table_name='goals')
+    op.drop_index('ix_goals_stat_id', table_name='goals')
     op.drop_index('ix_goals_entity_status', table_name='goals')
     op.drop_table('goals')
     op.drop_index('ix_goal_task_links_task', table_name='goal_task_links')

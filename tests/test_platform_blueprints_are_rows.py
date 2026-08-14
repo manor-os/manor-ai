@@ -22,6 +22,7 @@ from packages.core.blueprints.seed import (
     platform_blueprint_id,
     seed_platform_blueprints,
 )
+from packages.core.blueprints.payload import detect_version
 from packages.core.blueprints.solo_company import get_solo_company_blueprints
 from packages.core.models.blueprint import WorkspaceBlueprint
 
@@ -46,6 +47,7 @@ async def test_every_config_becomes_a_published_row(db_session):
     assert SLUG in rows
     assert rows[SLUG].status == "published"
     assert rows[SLUG].entity_id is None, "the platform owns it"
+    assert rows[SLUG].payload_version == detect_version(rows[SLUG].payload)
 
 
 @pytest.mark.asyncio
@@ -64,6 +66,34 @@ async def test_the_id_it_already_had_is_kept(db_session):
 async def test_seeding_starts_the_version(db_session):
     versions = await seed_platform_blueprints(db_session)
     assert versions[SLUG] == "1.0.1", "the first publish is a release"
+
+
+@pytest.mark.asyncio
+async def test_seeding_adopts_a_legacy_platform_row_without_aborting(db_session):
+    """A pre-stable-id official row must not block every Blueprint refresh."""
+    older = copy.deepcopy(next(
+        payload for payload in get_solo_company_blueprints()
+        if payload["manifest"]["slug"] == SLUG
+    ))
+    older["embedded"]["skills"][0]["system_prompt"] = "legacy stub"
+    legacy = WorkspaceBlueprint(
+        id="01LEGACYPLATFORMBLUEPRINT01",
+        entity_id=None,
+        slug=SLUG,
+        title="Legacy platform listing",
+        payload=older,
+        content_version="1.0.0",
+        status="published",
+    )
+    db_session.add(legacy)
+    await db_session.flush()
+
+    versions = await seed_platform_blueprints(db_session)
+
+    assert versions[SLUG] != "1.0.0"
+    assert legacy.payload["embedded"]["skills"][0]["system_prompt"] != "legacy stub"
+    assert legacy.title != "Legacy platform listing"
+    assert await db_session.get(WorkspaceBlueprint, platform_blueprint_id(SLUG)) is None
 
 
 @pytest.mark.asyncio
@@ -151,6 +181,20 @@ def test_nothing_resolves_a_payload_from_the_config_directory():
     body = inspect.getsource(workspaces._blueprint_payloads_for)
     assert "get_solo_company_blueprint" not in body
     assert "WorkspaceBlueprint" in body
+
+
+def test_marketplace_listing_does_not_append_the_configs_to_the_rows():
+    """Seeded platform rows and frozen configs are the same blueprints.
+
+    Returning both makes every marketplace card and its count appear twice.
+    """
+    import inspect
+
+    from apps.api.routers import blueprints
+
+    body = inspect.getsource(blueprints.list_blueprints)
+    assert "get_solo_company_blueprints" not in body
+    assert "return summaries" in body
 
 
 def test_the_seeder_runs_at_startup():

@@ -98,6 +98,8 @@ class ApprovalOriginKind(str, Enum):
     OPERATION = "operation"
     #: A mid-execution lease pause ("path C") — the worker stopped and asked.
     LEASE = "lease"
+    #: A task-level review or recovery decision surfaced in Workspace Chat.
+    TASK = "task"
 
     # Render the wire value from ``str()`` / f-strings rather than the mixin
     # enum's qualified name, so a member is interchangeable with the literal it

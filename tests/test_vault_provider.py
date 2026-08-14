@@ -8,10 +8,15 @@ from packages.core.credentials.vault_provider import VaultKeyProvider
 class _FakeTransit:
     def __init__(self) -> None:
         self.read_calls = 0
+        self.encrypt_calls = 0
 
     def read_key(self, *, name: str, mount_point: str):
         self.read_calls += 1
         return {"data": {"name": name, "mount_point": mount_point}}
+
+    def encrypt_data(self, **_kwargs):
+        self.encrypt_calls += 1
+        return {"data": {"ciphertext": "vault:v1:health"}}
 
 
 class _FakeSys:
@@ -59,3 +64,15 @@ def test_health_reports_invalid_vault_token() -> None:
 
     assert health.ok is False
     assert "token" in health.detail.lower()
+
+
+def test_health_ensures_transit_key_before_encrypt_probe() -> None:
+    client = _FakeClient(authenticated=True)
+    provider = _provider_with_client(client)
+
+    health = provider.health()
+
+    assert health.ok is True
+    assert client.secrets.transit.read_calls == 1
+    assert client.secrets.transit.encrypt_calls == 1
+    assert client.sys.enable_calls == 0

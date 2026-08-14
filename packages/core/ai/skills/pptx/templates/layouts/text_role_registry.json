@@ -1,0 +1,152 @@
+{
+  "version": 1,
+  "roles": {
+    "eyebrow": {
+      "purpose": "Short context above a title: section, audience, status, or category.",
+      "family_role": "body",
+      "ratio_to_body": [0.9, 1.0],
+      "weight": "bold",
+      "max_lines": 1
+    },
+    "deck-title": {
+      "purpose": "The presentation's primary opening statement.",
+      "family_role": "title",
+      "ratio_to_body": [2.8, 5.0],
+      "weight": "heavy",
+      "max_lines": 2
+    },
+    "slide-title": {
+      "purpose": "A claim-led page title that advances the narrative.",
+      "family_role": "title",
+      "ratio_to_body": [2.0, 2.4],
+      "weight": "bold",
+      "max_lines": 2
+    },
+    "dek": {
+      "purpose": "A one-sentence explanation immediately below a title.",
+      "family_role": "body",
+      "ratio_to_body": [1.0, 1.25],
+      "weight": "regular",
+      "max_lines": 2
+    },
+    "lead": {
+      "purpose": "A larger narrative sentence that carries the main read without a container.",
+      "family_role": "emphasis",
+      "ratio_to_body": [1.35, 1.8],
+      "weight": "semibold",
+      "max_lines": 4
+    },
+    "body": {
+      "purpose": "Explanatory prose, limited to compact readable blocks.",
+      "family_role": "body",
+      "ratio_to_body": [1.0, 1.15],
+      "weight": "regular",
+      "max_lines": 5
+    },
+    "metric": {
+      "purpose": "A dominant number, ratio, amount, or short measurable outcome.",
+      "family_role": "emphasis",
+      "ratio_to_body": [1.7, 3.6],
+      "weight": "heavy",
+      "max_lines": 1
+    },
+    "metric-context": {
+      "purpose": "Baseline, target, comparison, or interpretation paired with a metric.",
+      "family_role": "body",
+      "ratio_to_body": [0.9, 1.15],
+      "weight": "regular",
+      "max_lines": 3
+    },
+    "step-index": {
+      "purpose": "A compact ordinal that establishes sequence without becoming a card badge.",
+      "family_role": "emphasis",
+      "ratio_to_body": [1.25, 2.0],
+      "weight": "bold",
+      "max_lines": 1
+    },
+    "step-label": {
+      "purpose": "A verb-led stage or milestone name paired with an ordinal or connector.",
+      "family_role": "body",
+      "ratio_to_body": [1.0, 1.35],
+      "weight": "bold",
+      "max_lines": 2
+    },
+    "quote": {
+      "purpose": "A short attributed quotation or deliberate editorial statement.",
+      "family_role": "emphasis",
+      "ratio_to_body": [1.5, 2.6],
+      "weight": "regular",
+      "max_lines": 5
+    },
+    "attribution": {
+      "purpose": "Speaker, source, or evidence attribution paired with a quotation.",
+      "family_role": "body",
+      "ratio_to_body": [0.9, 1.0],
+      "weight": "bold",
+      "max_lines": 2
+    },
+    "definition": {
+      "purpose": "A precise term plus a short definition, often using typographic contrast.",
+      "family_role": "emphasis",
+      "ratio_to_body": [1.15, 1.6],
+      "weight": "semibold",
+      "max_lines": 4
+    },
+    "decision": {
+      "purpose": "The explicit recommendation or approval statement on a closing page.",
+      "family_role": "title",
+      "ratio_to_body": [1.8, 3.0],
+      "weight": "bold",
+      "max_lines": 3
+    },
+    "question": {
+      "purpose": "A framing question used sparingly to create a narrative turn.",
+      "family_role": "emphasis",
+      "ratio_to_body": [1.5, 2.4],
+      "weight": "semibold",
+      "max_lines": 3
+    },
+    "annotation": {
+      "purpose": "A concise label tied to a mark, connector, axis, or highlighted region.",
+      "family_role": "body",
+      "ratio_to_body": [0.9, 1.0],
+      "weight": "regular",
+      "max_lines": 2
+    },
+    "caption": {
+      "purpose": "A short explanation directly attached to an image or visual.",
+      "family_role": "body",
+      "ratio_to_body": [0.9, 1.0],
+      "weight": "regular",
+      "max_lines": 3
+    },
+    "table-header": {
+      "purpose": "A column or row header that establishes comparison grammar.",
+      "family_role": "body",
+      "ratio_to_body": [0.9, 1.05],
+      "weight": "bold",
+      "max_lines": 2
+    },
+    "code": {
+      "purpose": "A short identifier, command, formula, or technical token.",
+      "family_role": "code",
+      "ratio_to_body": [0.9, 1.05],
+      "weight": "regular",
+      "max_lines": 4
+    },
+    "source": {
+      "purpose": "Compact on-slide source or methodology credit in the footer zone.",
+      "family_role": "body",
+      "ratio_to_body": [0.5, 0.75],
+      "weight": "regular",
+      "max_lines": 2
+    },
+    "footer": {
+      "purpose": "Page number, confidentiality marker, or recurring deck chrome.",
+      "family_role": "body",
+      "ratio_to_body": [0.5, 0.75],
+      "weight": "regular",
+      "max_lines": 1
+    }
+  }
+}

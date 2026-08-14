@@ -59,14 +59,35 @@ async def runtime_init_sandbox_context(
     conversation_id: str,
     sandbox_id: str,
     skill_id: str,
+    *,
+    entity_id: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Initialize Runtime-owned sandbox conversation context."""
 
     ctx: dict[str, Any] = {
         "sandbox_id": sandbox_id,
         "skill_id": skill_id,
+        "entity_id": str(entity_id or ""),
+        "user_id": str(user_id or ""),
         "created_at": time.time(),
         "exec_history": [],
     }
     await runtime_save_sandbox_context(conversation_id, ctx)
     return ctx
+
+
+def runtime_sandbox_context_owner_matches(
+    ctx: dict[str, Any] | None,
+    *,
+    entity_id: str,
+    user_id: str | None,
+) -> bool:
+    """Require an exact tenant/user match before reusing a conversation sandbox."""
+
+    if not isinstance(ctx, dict):
+        return False
+    return (
+        str(ctx.get("entity_id") or "") == str(entity_id or "")
+        and str(ctx.get("user_id") or "") == str(user_id or "")
+    )

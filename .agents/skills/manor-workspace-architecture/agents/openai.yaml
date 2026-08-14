@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manor Workspace Architecture"
+  short_description: "Trace and test Workspace runtime boundaries"
+  default_prompt: "Use $manor-workspace-architecture to map this Workspace change to runtime nodes, downstream contracts, and independent tests before editing code."

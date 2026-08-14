@@ -43,14 +43,25 @@ async def voice_stream(ws: WebSocket, config_id: str):
 
     # Resolve the entity's chosen voice model up-front so the TTS engine
     # used for this whole call respects the user's Account → Voice pick.
-    from packages.core.services.voice.tts import get_tts_engine, resolve_voice_model
+    from packages.core.services.voice.tts import (
+        get_tts_engine,
+        resolve_channel_tts_credentials,
+        resolve_voice_model,
+    )
     voice_model = await resolve_voice_model(cc.entity_id)
+    voice_key, voice_base_url, _voice_is_byok = await resolve_channel_tts_credentials(
+        cc.entity_id, voice_model,
+    )
     session = TwilioVoiceSession(
         ws=ws,
         agent_callable=_voice_agent_call,
         channel_config_id=cc.id,
         entity_id=cc.entity_id,
-        tts=get_tts_engine(model=voice_model),
+        tts=get_tts_engine(
+            model=voice_model,
+            api_key=voice_key or None,
+            base_url=voice_base_url or None,
+        ),
     )
     try:
         await session.run()

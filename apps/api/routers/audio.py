@@ -62,6 +62,16 @@ async def transcribe_audio(
         raise HTTPException(400, f"Unsupported audio type: {file.content_type!r}")
 
     blob = await file.read()
+    from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+    try:
+        await inspect_upload_content(
+            blob,
+            filename=file.filename,
+            declared_content_type=file.content_type,
+            allowed_extensions={".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".webm"},
+        )
+    except UploadSecurityError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
     # Resolve BYOK key + STT model from tenant settings.
     user_key = None

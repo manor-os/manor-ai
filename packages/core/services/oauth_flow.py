@@ -24,10 +24,10 @@ change.
 
 PKCE
 ────
-Every flow gets ``code_challenge_method=S256``. Providers that don't
-support PKCE ignore the extra params; providers that require it
-(Twitter v2 user-context) need them. There's no harm in always
-sending. See RFC 7636.
+Flows use ``code_challenge_method=S256`` by default. Providers that require it
+(Twitter v2 user-context) receive the verifier. Facebook follows Meta's
+documented server-side flow and omits PKCE plus Google-only prompt parameters.
+See RFC 7636.
 """
 from __future__ import annotations
 
@@ -42,6 +42,8 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi.responses import HTMLResponse
+
+from packages.core.external_api_versions import META_GRAPH
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +233,7 @@ async def complete_authorization(
         "client_id": config.client_id,
         "client_secret": config.client_secret,
     }
-    if code_verifier:
+    if code_verifier and server_key != "facebook":
         body["code_verifier"] = code_verifier
 
     from packages.core.services.oauth_provider_config import build_token_request_auth
@@ -239,11 +241,21 @@ async def complete_authorization(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                config.token_url,
-                data=body,
-                headers=headers,
-            )
+            if server_key == "facebook":
+                # Meta documents the server-side code exchange as a GET to
+                # /oauth/access_token. Keep secrets out of logs at the caller
+                # and let httpx encode the query safely.
+                resp = await client.get(
+                    config.token_url,
+                    params=body,
+                    headers=headers,
+                )
+            else:
+                resp = await client.post(
+                    config.token_url,
+                    data=body,
+                    headers=headers,
+                )
     except Exception as exc:
         raise OAuthFlowError(502, f"Token exchange failed: {exc}") from exc
 
@@ -264,6 +276,45 @@ async def complete_authorization(
         raise OAuthFlowError(
             400, f"Provider did not return an access_token: {data}",
         )
+
+    if server_key == "facebook":
+        # The first token is short-lived. Exchange it immediately so Page,
+        # Messenger, and Instagram automations remain usable for roughly the
+        # full Meta long-lived-token window instead of expiring after an hour.
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                long_resp = await client.get(
+                    config.token_url,
+                    params={
+                        "grant_type": "fb_exchange_token",
+                        "client_id": config.client_id,
+                        "client_secret": config.client_secret,
+                        "fb_exchange_token": access_token,
+                    },
+                    headers={"Accept": "application/json"},
+                )
+        except Exception as exc:
+            raise OAuthFlowError(
+                502, f"Facebook long-lived token exchange failed: {exc}",
+            ) from exc
+        if long_resp.status_code >= 400:
+            raise OAuthFlowError(
+                400,
+                "Facebook long-lived token exchange was rejected "
+                f"(HTTP {long_resp.status_code}).",
+            )
+        try:
+            long_data = long_resp.json()
+        except Exception as exc:
+            raise OAuthFlowError(
+                502, "Facebook returned a non-JSON long-lived token response",
+            ) from exc
+        if not long_data.get("access_token"):
+            raise OAuthFlowError(
+                400, "Facebook did not return a long-lived access token.",
+            )
+        data = {**data, **long_data}
+        access_token = data["access_token"]
 
     expires_in = data.get("expires_in")
     expires_at = (
@@ -288,6 +339,10 @@ _PROFILE_ENDPOINTS: dict[str, tuple[str, dict[str, str] | None]] = {
     "google_drive": ("https://openidconnect.googleapis.com/v1/userinfo", None),
     "youtube": ("https://openidconnect.googleapis.com/v1/userinfo", None),
     "github": ("https://api.github.com/user", None),
+    "facebook": (
+        f"https://graph.facebook.com/{META_GRAPH.value}/me",
+        {"fields": "id,name"},
+    ),
     "discord": ("https://discord.com/api/users/@me", None),
     "linkedin": ("https://api.linkedin.com/v2/userinfo", None),
     "twitter_x": ("https://api.x.com/2/users/me", {"user.fields": "name,username"}),

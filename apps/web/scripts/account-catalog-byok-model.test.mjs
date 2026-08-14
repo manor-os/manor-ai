@@ -26,8 +26,15 @@ test("catalog BYOK roles can edit the model id field", () => {
   );
   const modelIdField = between("{/* Model ID */}", "{/* API Key + Base URL */}");
 
-  assert.match(roleFlags, /const canUseCatalogByok\s*=\s*\["image",\s*"video",\s*"voice",\s*"stt"\]\.includes\(/);
-  assert.match(roleFlags, /const canEditModelId\s*=\s*canUseCustomModel\s*\|\|\s*canUseCatalogByok/);
+  assert.match(roleFlags, /const isDraftCatalogModel\s*=\s*options\.some\(/);
+  assert.match(roleFlags, /const canUseCatalogByok\s*=\s*isDraftCatalogModel\s*&&/);
+  for (const role of ["primary", "worker", "image", "video", "voice", "audio", "sfx", "stt"]) {
+    assert.match(roleFlags, new RegExp(`"${role}"`));
+  }
+  assert.match(
+    roleFlags,
+    /const canEditModelId\s*=\s*byokAllowed\s*&&\s*\(canUseCustomModel\s*\|\|\s*canUseCatalogByok\)/,
+  );
   assert.match(modelIdField, /disabled=\{!canEditModelId\}/);
   assert.match(modelIdField, /opacity:\s*canEditModelId\s*\?\s*1\s*:\s*0\.75/);
   assert.doesNotMatch(modelIdField, /disabled=\{!canUseCustomModel\}/);
@@ -44,22 +51,62 @@ test("saving catalog BYOK uses one atomic model and credential request", () => {
   assert.match(saveCatalogByok, /api_key:\s*draft\.apiKey\.trim\(\)\s*\|\|\s*undefined/);
   assert.match(saveCatalogByok, /use_saved_api_key:/);
   assert.match(saveCatalogByok, /base_url:\s*draft\.baseUrl\.trim\(\)/);
+  assert.match(saveCatalogByok, /testState\?\.status\s*!==\s*"passed"/);
+  assert.match(saveCatalogByok, /testState\.testedSignature\s*!==\s*draftSignature\(role,\s*draft\)/);
+  assert.match(saveCatalogByok, /test_token:\s*testState\.testToken/);
   assert.doesNotMatch(saveCatalogByok, /saveLlmApiKey|saveLlmBaseUrl|updateMyModels/);
   assert.match(saveCatalogByok, /models:\s*\{\s*\.\.\.\(prev\.models\s*\|\|\s*\{\}\),\s*\[role\]:\s*draft\.model\.trim\(\)/);
   assert.match(saveCatalogByok, /user_models:\s*\{\s*\.\.\.\(prev\.user_models\s*\|\|\s*\{\}\),\s*\[role\]:\s*draft\.model\.trim\(\)/);
+});
+
+test("selecting another model preserves saved BYOK and refreshes its source state", () => {
+  const selectModel = between(
+    "const handleSelectModel = async",
+    "const draftSignature =",
+  );
+
+  assert.match(selectModel, /updateMyModels\?\.\(\{ models: \{ \[role\]: modelId \} \}\)/);
+  assert.match(selectModel, /invalidateQueries\(\{ queryKey: \["llm-config"\] \}\)/);
+  assert.doesNotMatch(selectModel, /use_official|saveCatalogModel|saveLlmApiKey/);
+});
+
+test("the BYOK badge only applies to the model its key was saved for", () => {
+  const roleFlags = between(
+    "const roleApiKeys =",
+    "const draft = drafts[role.key]",
+  );
+
+  assert.match(roleFlags, /role_api_key_models/);
+  assert.match(roleFlags, /savedApiKeyModel === currentModel/);
 });
 
 test("API client exposes the atomic catalog model settings contract", () => {
   assert.match(apiSource, /saveCatalogModel:\s*\(data:/);
   assert.match(apiSource, /"\/auth\/me\/models\/catalog"/);
   assert.match(apiSource, /clear_api_key\?:\s*boolean/);
+  assert.match(apiSource, /test_token\?:\s*string\s*\|\s*null/);
+  assert.match(apiSource, /role_api_key_models\?:\s*Record<string,\s*string>/);
+});
+
+test("every catalog BYOK role must pass a live model test before save", () => {
+  const roleFlags = between(
+    "const canUseCustomModel =",
+    "const apiKeyError =",
+  );
+  const actions = between("{/* Test + Save buttons */}", "{apiKeyError && (");
+
+  assert.match(roleFlags, /const canUseOwnProvider\s*=\s*canUseCustomModel\s*\|\|\s*canUseCatalogByok/);
+  assert.match(roleFlags, /const canSaveCatalogByok[\s\S]*testState\.status\s*===\s*"passed"/);
+  assert.match(roleFlags, /testState\.testedSignature\s*===\s*currentSignature/);
+  assert.match(actions, /\{canUseOwnProvider\s*&&\s*\(/);
+  assert.match(actions, /handleTestCustomModel\(role\.key\)/);
 });
 
 test("catalog BYOK model changes replace only provider-derived base URLs", () => {
   const modelIdField = between("{/* Model ID */}", "{/* API Key + Base URL */}");
   const compactField = modelIdField.replace(/\s+/g, " ");
 
-  assert.match(modelIdField, /const previousAutoUrl = inferBaseUrl\(draft\.model\)/);
+  assert.match(modelIdField, /const previousAutoUrl = inferBaseUrl\(draft\.model, role\.key\)/);
   assert.ok(
     compactField.includes(
       'const shouldReplaceBaseUrl = !draft.baseUrl || draft.baseUrl.replace(/\\/+$/, "") === previousAutoUrl;',
@@ -80,5 +127,17 @@ test("Kimi catalog BYOK defaults to the international native endpoint", () => {
   assert.doesNotMatch(
     providerUrls,
     /moonshotai:\s*"https:\/\/api\.moonshot\.cn\/v1"/,
+  );
+});
+
+test("Sesame catalog BYOK keeps its supported OpenRouter provider endpoint", () => {
+  const providerUrls = between(
+    "const PROVIDER_BASE_URLS:",
+    "const inferBaseUrl =",
+  );
+
+  assert.match(
+    providerUrls,
+    /sesame:\s*"https:\/\/openrouter\.ai\/api\/v1"/,
   );
 });

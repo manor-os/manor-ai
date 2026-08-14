@@ -118,12 +118,13 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
         "openai", 2.50, 10.00, "official",
         audio_input_per_m=40.00, audio_output_per_m=80.00,
     ),
-    # "gpt-5-image-mini" is an OpenRouter catalog name with no entry in
-    # OpenAI's official price list or on Vercel AI Gateway; OpenAI's own
-    # catalog analog is gpt-image-1-mini ($2 text-in / $8 image-out).
-    # OpenRouter-routed calls re-price from the synced cache at runtime.
-    "openai/gpt-5-image-mini": TokenModelPrice("openai", 2.50, 2.00, "openrouter"),
-    "openai/gpt-5.4-image-2": TokenModelPrice("openai", 5.00, 30.00, "official"),
+    "openai/gpt-image-1-mini": TokenModelPrice(
+        "openai",
+        2.00,
+        8.00,
+        "official",
+        note="Text input and image output token rates; image input tokens bill separately.",
+    ),
     "openai/gpt-image-2": TokenModelPrice(
         "openai",
         5.00,
@@ -137,6 +138,11 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
 
     # Anthropic
     "anthropic/claude-fable-5": TokenModelPrice("anthropic", 10.00, 50.00, "official"),
+    "anthropic/claude-opus-5": TokenModelPrice(
+        "anthropic", 5.00, 25.00, "official",
+        cache_read_multiplier=0.10,
+        cache_write_multiplier=1.25,
+    ),
     "anthropic/claude-haiku-4.5": TokenModelPrice("anthropic", 1.00, 5.00, "official"),
     "anthropic/claude-sonnet-4.6": TokenModelPrice("anthropic", 3.00, 15.00, "official"),
     "anthropic/claude-opus-4.6": TokenModelPrice("anthropic", 5.00, 25.00, "official"),
@@ -149,6 +155,14 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
         "google", 1.25, 10.00, "official",
         long_context_threshold=200_000,
         long_input_per_m=2.50, long_output_per_m=15.00,
+    ),
+    "google/gemini-3.5-flash-lite": TokenModelPrice(
+        "google", 0.30, 2.50, "official",
+        cache_read_multiplier=0.10,
+    ),
+    "google/gemini-3.6-flash": TokenModelPrice(
+        "google", 1.50, 7.50, "official",
+        cache_read_multiplier=0.10,
     ),
     "google/gemini-3.1-flash-image": TokenModelPrice("google", 0.50, 3.00, "official"),
     "google/gemini-3.1-flash-image-preview": TokenModelPrice("google", 0.50, 3.00, "official"),
@@ -178,6 +192,30 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
         long_input_per_m=2.00,
         long_output_per_m=6.00,
     ),
+    "qwen/qwen3.7-flash": TokenModelPrice(
+        "qwen",
+        0.03,
+        0.13,
+        "official",
+        note=(
+            "DashScope international rate. Qwen prices this model in three prompt tiers "
+            "(≤32K, 32K–256K, >256K); TokenModelPrice models one, so >256K requests "
+            "(list rate $0.20/$0.80) are billed at the 32K–256K rate."
+        ),
+        cache_read_multiplier=0.20,
+        long_context_threshold=32_000,
+        long_input_per_m=0.10,
+        long_output_per_m=0.40,
+    ),
+    "qwen/qwen3.8-max": TokenModelPrice(
+        "qwen",
+        2.00,
+        6.00,
+        "official",
+        note="DashScope international rate (mainland CNY pricing does not apply to gateway-routed traffic).",
+        cache_read_multiplier=0.125,
+        cache_write_multiplier=1.25,
+    ),
 
     # Moonshot / Kimi. Keep explicit until Moonshot exposes a stable machine-readable price feed.
     "moonshotai/kimi-k3": TokenModelPrice(
@@ -194,14 +232,21 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
     "nomic-embed-text": TokenModelPrice("ollama", 0.0, 0.0, "local"),
 }
 
+# Vercel reports Qwen usage under ``alibaba`` while Manor's fixed Catalog uses
+# ``qwen``. Price either wire ID identically so routing never changes billing.
+for _legacy_qwen_id, _vercel_qwen_id in (
+    ("qwen/qwen3.6-plus", "alibaba/qwen3.6-plus"),
+    ("qwen/qwen3.7-flash", "alibaba/qwen3.7-flash"),
+    ("qwen/qwen3.8-max", "alibaba/qwen3.8-max"),
+):
+    OFFICIAL_TOKEN_PRICES[_vercel_qwen_id] = OFFICIAL_TOKEN_PRICES[_legacy_qwen_id]
+
 
 OFFICIAL_IMAGE_PRICES: dict[str, FlatModelPrice] = {
-    # ≈ gpt-image-1-mini at 1024², medium quality ($0.042 per official calculator).
-    "openai/gpt-5-image-mini": FlatModelPrice("openai", "image", 0.04, "openrouter_fallback"),
-    "gpt-5-image-mini": FlatModelPrice("openai", "image", 0.04, "openrouter_fallback"),
+    "openai/gpt-image-1-mini": FlatModelPrice("openai", "image", 0.011, "official"),
+    "gpt-image-1-mini": FlatModelPrice("openai", "image", 0.011, "official"),
     "openai/gpt-image-1": FlatModelPrice("openai", "image", 0.04, "official"),
     "gpt-image-1": FlatModelPrice("openai", "image", 0.04, "official"),
-    "openai/gpt-5.4-image-2": FlatModelPrice("openai", "image", 0.08, "official"),
     "openai/gpt-image-2": FlatModelPrice("openai", "image", 0.08, "official"),
     # $60/M image-output tokens; the default 1024px image is 1120 tokens ≈ $0.067.
     "google/gemini-3.1-flash-image-preview": FlatModelPrice("google", "image", 0.067, "official"),
@@ -305,11 +350,19 @@ def _load_vercel_cache_if_needed() -> None:
 
 def _vercel_cache_candidates(model_id: str) -> list[str]:
     candidates = [model_id]
+    # Catalog IDs are intentionally gateway-neutral. Include Vercel's wire ID
+    # so a compatibility alias still uses the live Gateway price cache.
+    from packages.core.services.model_provider_handlers import vercel_model_id
+
+    wire_id = vercel_model_id(model_id)
+    if wire_id and wire_id not in candidates:
+        candidates.append(wire_id)
     if "/" in model_id:
         prefix, bare = model_id.split("/", 1)
         alias = _VERCEL_PROVIDER_ALIASES.get(prefix.lower())
-        if alias:
-            candidates.append(f"{alias}/{bare}")
+        provider_alias = f"{alias}/{bare}" if alias else ""
+        if provider_alias and provider_alias not in candidates:
+            candidates.append(provider_alias)
     return candidates
 
 

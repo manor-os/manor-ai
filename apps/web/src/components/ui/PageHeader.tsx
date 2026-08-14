@@ -3,6 +3,7 @@ import {
   useContext,
   useState,
   type ButtonHTMLAttributes,
+  type HTMLAttributes,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
@@ -10,10 +11,12 @@ import { IconPlus } from "../icons";
 
 const PAGE_HEADER_TITLE_CLASS =
   "page-header-title m-0 flex h-10 min-w-0 items-center overflow-hidden text-ellipsis whitespace-nowrap text-2xl font-bold leading-[1.2] tracking-[-0.014em] text-[color:var(--text-strong)] md:text-[28px]";
+const EDITOR_HEADER_TITLE_CLASS =
+  "page-header-title manor-editor-title m-0 min-w-0 max-w-[58vw] flex-auto overflow-hidden text-ellipsis whitespace-nowrap text-base font-[750] leading-5 tracking-[-0.014em] text-[color:var(--text-strong)] 2xl:max-w-[760px]";
 const PAGE_HEADER_SUBTITLE_CLASS =
   "page-header-subtitle mt-1 h-5 max-w-3xl overflow-hidden text-ellipsis whitespace-nowrap text-[13px] font-normal leading-5 text-[color:var(--text-muted)]";
 const PAGE_HEADER_META_CLASS =
-  "page-header-meta mt-1 flex h-6 max-w-3xl items-center overflow-x-auto overflow-y-hidden whitespace-nowrap text-[13px] font-normal leading-5 text-[color:var(--text-muted)]";
+  "page-header-meta mt-1 flex min-h-6 max-w-3xl items-center text-[13px] font-normal leading-5 text-[color:var(--text-muted)]";
 
 interface PageHeaderPortalContextValue {
   target: HTMLDivElement | null;
@@ -24,6 +27,9 @@ const PageHeaderPortalContext = createContext<PageHeaderPortalContextValue | nul
 export interface PageHeaderProps {
   title: ReactNode;
   subtitle?: ReactNode;
+  /** Small navigation row (e.g. a back link) pinned above the title, so it
+   *  stays visible in the app-level header instead of scrolling with content. */
+  breadcrumb?: ReactNode;
   /** Counts, scope, or other compact context shown in the dedicated metadata row. */
   meta?: ReactNode;
   /** Primary page-level actions. */
@@ -43,8 +49,23 @@ interface PageHeaderAddButtonProps extends ButtonHTMLAttributes<HTMLButtonElemen
   caret?: boolean;
 }
 
-export function PageHeaderTitle({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <h1 className={`${PAGE_HEADER_TITLE_CLASS} ${className}`}>{children}</h1>;
+interface PageHeaderTitleProps extends HTMLAttributes<HTMLHeadingElement> {
+  children: ReactNode;
+  variant?: "page" | "editor";
+}
+
+export function PageHeaderTitle({
+  children,
+  className = "",
+  variant = "page",
+  ...props
+}: PageHeaderTitleProps) {
+  const titleClass = variant === "editor" ? EDITOR_HEADER_TITLE_CLASS : PAGE_HEADER_TITLE_CLASS;
+  return (
+    <h1 className={`${titleClass} ${className}`} {...props}>
+      {children}
+    </h1>
+  );
 }
 
 export function PageHeaderSubtitle({ children, className = "" }: { children: ReactNode; className?: string }) {
@@ -103,6 +124,7 @@ export function PageHeaderAddButton({
 export default function PageHeader({
   title,
   subtitle,
+  breadcrumb,
   meta,
   actions,
   tabs,
@@ -114,7 +136,9 @@ export default function PageHeader({
   const hasControls = tabs || toolbar || children || actions;
   const frameClass =
     "flex w-full flex-col gap-3 2xl:flex-row 2xl:items-start 2xl:justify-between 2xl:gap-6";
-  const titleClass = "min-w-0 text-left 2xl:w-[420px] 2xl:flex-none";
+  // The title column takes all the space the controls don't need — a fixed
+  // cap truncated long titles while the row had plenty of room.
+  const titleClass = "min-w-0 text-left 2xl:flex-1";
   const controlsClass =
     "flex w-full min-w-0 flex-row flex-wrap items-center justify-start gap-2.5 2xl:mt-1 2xl:flex-1 2xl:flex-nowrap 2xl:justify-end";
   const groupClass =
@@ -129,6 +153,11 @@ export default function PageHeader({
         : "page-header mb-4 shrink-0 px-2 pt-1"}
       data-page-header-layout={portalContext && !inline ? "app" : "inline"}
     >
+      {breadcrumb && (
+        <div className="page-header-breadcrumb mb-2 flex items-center">
+          {breadcrumb}
+        </div>
+      )}
       <div className={frameClass}>
         <div className={titleClass}>
           <PageHeaderTitle>{title}</PageHeaderTitle>
@@ -137,7 +166,7 @@ export default function PageHeader({
           </PageHeaderSubtitle>
           {meta && (
             <div className={PAGE_HEADER_META_CLASS}>
-              <div className="flex h-full min-w-0 flex-nowrap items-center gap-2">{meta}</div>
+              <div className="flex min-w-0 flex-wrap items-center gap-2">{meta}</div>
             </div>
           )}
         </div>

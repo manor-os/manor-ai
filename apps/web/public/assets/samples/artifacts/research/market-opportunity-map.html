@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>2026 One-Person Business Market Opportunity Map</title>
+  <style>
+    :root{
+      --bg:#f6f2ea;--paper:#fffaf0;--ink:#191715;--muted:#625b50;--line:#d7cbb9;
+      --accent:#1f5e56;--accent2:#b85c38;--accent3:#2e4d7b;--good:#1d6b3a;--warn:#9a6310;--bad:#a3332b;
+      --shadow:0 16px 40px rgba(36,28,18,.10);--radius:22px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      --sans:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    }
+    *{box-sizing:border-box} html{scroll-behavior:smooth} body{margin:0;background:radial-gradient(circle at 10% 0%,#fff4d8 0,#f6f2ea 28%,#efe7da 100%);color:var(--ink);font-family:var(--sans);line-height:1.5}
+    a{color:var(--accent3);text-underline-offset:3px} a:hover{color:var(--accent2)}
+    .wrap{max-width:1180px;margin:auto;padding:28px clamp(16px,3vw,36px) 56px}
+    header{display:grid;grid-template-columns:1.25fr .75fr;gap:24px;align-items:stretch;margin:18px 0 26px}
+    .hero,.note,.card,.panel{background:rgba(255,250,240,.88);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+    .hero{padding:34px;position:relative;overflow:hidden}.hero:after{content:"";position:absolute;right:-120px;top:-120px;width:320px;height:320px;border-radius:50%;background:rgba(31,94,86,.10)}
+    .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);font-weight:700} h1{font-size:clamp(34px,6vw,64px);line-height:.95;margin:14px 0 16px;letter-spacing:-.05em} h2{font-size:clamp(24px,3vw,36px);line-height:1.05;margin:0 0 14px;letter-spacing:-.035em} h3{font-size:21px;margin:0 0 8px;letter-spacing:-.02em} h4{margin:0 0 6px;font-size:15px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.sub{font-size:18px;color:var(--muted);max-width:790px}.note{padding:24px;display:flex;flex-direction:column;justify-content:space-between;gap:16px}.stamp{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:#fff;padding:9px 12px;border-radius:999px;font-size:13px;color:var(--muted)}
+    .nav{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 30px}.nav a{background:#fff;border:1px solid var(--line);border-radius:999px;padding:10px 13px;text-decoration:none;color:var(--ink);font-weight:650;font-size:14px}.nav a:hover{background:#f7ead7}
+    .grid{display:grid;gap:16px}.grid.cols4{grid-template-columns:repeat(4,1fr)}.grid.cols2{grid-template-columns:repeat(2,1fr)}
+    .card{padding:20px}.rank{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:6px 9px;font-size:12px;font-weight:750;background:#efe6d6;color:#443a31;white-space:nowrap}.pill.good{background:#dfeedd;color:var(--good)}.pill.warn{background:#faecd2;color:var(--warn)}.pill.bad{background:#f5dedb;color:var(--bad)}
+    .score{font-size:42px;line-height:1;font-weight:850;letter-spacing:-.06em}.score small{font-size:14px;color:var(--muted);font-weight:650;letter-spacing:0}.muted{color:var(--muted)}
+    .matrix{overflow:auto;border:1px solid var(--line);border-radius:var(--radius);background:#fffaf0;box-shadow:var(--shadow)} table{border-collapse:collapse;width:100%;min-width:980px} th,td{border-bottom:1px solid var(--line);padding:14px 13px;text-align:left;vertical-align:top} th{position:sticky;top:0;background:#efe6d6;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#4b4238} tr:last-child td{border-bottom:0} td:first-child,th:first-child{font-weight:800;color:var(--ink)}
+    .bar{height:10px;background:#eadfcd;border-radius:999px;overflow:hidden;margin-top:8px}.bar span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),#75a89d)}
+    section{margin:34px 0}.opps{display:grid;grid-template-columns:1fr;gap:18px}.opp{border-left:7px solid var(--accent);padding:22px}.opp:nth-child(2){border-left-color:var(--accent2)}.opp:nth-child(3){border-left-color:var(--accent3)}.opp:nth-child(4){border-left-color:#7a5aa6}.facts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}.box{background:#fff;border:1px solid var(--line);border-radius:16px;padding:15px}.box ul{margin:8px 0 0;padding-left:19px}.box li{margin:6px 0}.label{font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--accent);font-weight:800}.test{background:#1f5e56;color:#fff;border-radius:18px;padding:18px;margin-top:14px}.test a{color:#fff}.test .label{color:#d5fff7}.split{display:grid;grid-template-columns:.9fr 1.1fr;gap:18px}.legend{display:flex;gap:10px;flex-wrap:wrap}.dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--accent)}.source-list{columns:2;column-gap:28px}.source-list li{break-inside:avoid;margin:0 0 10px}.callout{border:1px dashed var(--accent2);background:#fff6e8;border-radius:18px;padding:18px}.mini{font-size:13px}.footer{font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:20px;margin-top:40px}
+    @media (max-width:900px){header,.grid.cols4,.grid.cols2,.facts,.split{grid-template-columns:1fr}.hero{padding:24px}.source-list{columns:1} table{min-width:760px}}
+    @media print{body{background:#fff}.nav{display:none}.hero,.note,.card,.panel,.matrix{box-shadow:none} a{color:#000}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="hero">
+        <div class="eyebrow">Research artifact · 2026 adjacent solo opportunities</div>
+        <h1>Market Opportunity Map</h1>
+        <p class="sub">A source-backed comparison of four one-person-business opportunities: AI workflow setup services, creator operations templates, local service lead systems, and niche customer-success consulting.</p>
+      </div>
+      <aside class="note">
+        <div>
+          <span class="stamp">Updated from public web evidence · August 2026</span>
+          <p><strong>Important split:</strong> “Facts” below are sourced observations. “Inference” is the research interpretation drawn from those facts, not a claim directly made by a source.</p>
+        </div>
+        <div class="legend mini"><span><i class="dot"></i> Higher = more attractive for solo operator</span><span><i class="dot" style="background:var(--accent2)"></i> Test first where contradictions are high</span></div>
+      </aside>
+    </header>
+
+    <nav class="nav" aria-label="Page navigation">
+      <a href="#ranking">Ranking</a><a href="#matrix">Comparison matrix</a><a href="#opportunities">Opportunity briefs</a><a href="#contradictions">Contradictions</a><a href="#tests">Cheapest decisive tests</a><a href="#sources">Sources</a>
+    </nav>
+
+    <section id="ranking">
+      <div class="grid cols4">
+        <article class="card">
+          <div class="rank"><span class="pill good">#1 Best near-term</span><div class="score">82<small>/100</small></div></div>
+          <h3>AI workflow setup services</h3>
+          <p class="muted">Strong urgency and willingness to pay; crowded supply; needs proof via narrow workflow ROI.</p>
+          <div class="bar"><span style="width:82%"></span></div>
+        </article>
+        <article class="card">
+          <div class="rank"><span class="pill good">#2 Highest ticket</span><div class="score">78<small>/100</small></div></div>
+          <h3>Niche customer-success consulting</h3>
+          <p class="muted">Clear revenue pain in B2B SaaS; less template-like delivery; depends on operator credibility.</p>
+          <div class="bar"><span style="width:78%"></span></div>
+        </article>
+        <article class="card">
+          <div class="rank"><span class="pill warn">#3 Cashflow angle</span><div class="score">70<small>/100</small></div></div>
+          <h3>Local service lead systems</h3>
+          <p class="muted">Urgent buyer pain, but dense competition and volatile lead quality economics.</p>
+          <div class="bar"><span style="width:70%"></span></div>
+        </article>
+        <article class="card">
+          <div class="rank"><span class="pill warn">#4 Productizable</span><div class="score">63<small>/100</small></div></div>
+          <h3>Creator operations templates</h3>
+          <p class="muted">Easy to ship and distribute; hard to stand out; low proof burden but low price ceiling.</p>
+          <div class="bar"><span style="width:63%"></span></div>
+        </article>
+      </div>
+    </section>
+
+    <section id="matrix">
+      <h2>Side-by-side opportunity matrix</h2>
+      <div class="matrix">
+        <table>
+          <thead><tr><th>Opportunity</th><th>Urgency</th><th>Reachable buyers</th><th>Competitor density</th><th>Pricing evidence</th><th>Delivery complexity</th><th>Contradiction risk</th><th>Cheapest decisive test</th></tr></thead>
+          <tbody>
+            <tr><td>AI workflow setup services</td><td><strong>High.</strong> Buyers face visible AI adoption pressure and repetitive manual-work cost.</td><td>Founders, agencies, ops managers, local firms using Google Workspace, CRMs, forms, inboxes, Zapier/Make/n8n.</td><td><strong>High.</strong> Automation platforms and gig marketplaces expose many specialists.</td><td>Zapier markets AI orchestration across 9,000+ apps; Upwork search results show AI automation/Zapier/Make/n8n services and consultants.</td><td>Medium–high: discovery, data access, API limits, permissions, handoff documentation.</td><td>High: “AI” demand is real, but many prospects do not know what workflow is worth buying.</td><td>Offer a $300–$700 “one workflow in 72 hours” audit/build to 20 reachable businesses; success = 3 paid pilots or 5 qualified workflow maps.</td></tr>
+            <tr><td>Creator operations templates</td><td><strong>Medium.</strong> Creators want organization, but pain is often aspirational until revenue grows.</td><td>Solo creators selling on Gumroad, Notion users, newsletter/podcast/course operators, creator agencies.</td><td><strong>Very high.</strong> Notion Marketplace and Etsy/Gumroad listings make template competition obvious.</td><td>Gumroad publishes a 10% + $0.50 direct fee and 30% Discover fee; Notion Marketplace lists creator business OS templates and links to Etsy shops.</td><td>Low–medium: template design is simple; differentiation, examples, onboarding, and updates drive value.</td><td>Medium: marketplace supply is huge, but niche operational kits tied to a specific monetization model can still convert.</td><td>Publish one niche landing page plus demo template; drive 100 targeted creator DMs/comments; success = 10 email signups or 3 preorders at $29–$99.</td></tr>
+            <tr><td>Local service lead systems</td><td><strong>High.</strong> Contractors, clinics, and service SMBs buy leads when calendars are underfilled.</td><td>Roofers, HVAC, plumbers, med spas, dentists, lawyers, landscapers, specialty contractors.</td><td><strong>Very high.</strong> Google Local Services Ads, Thumbtack, Angi-style lead sellers, and local agencies all compete.</td><td>Google Local Services Ads are positioned for reaching local customers and official help covers budget editing; third-party 2026 LSA benchmarks report average CPL around $53 for home services.</td><td>High: ads, tracking, call handling, landing pages, lead qualification, refund disputes, category compliance.</td><td>Very high: buyer urgency is strong, but lead quality and exclusivity disputes can destroy trust.</td><td>Pick one trade/metro; sell 5 exclusive test leads manually sourced/qualified; success = buyer pays twice or requests weekly volume.</td></tr>
+            <tr><td>Niche customer-success consulting</td><td><strong>Medium–high.</strong> Churn, onboarding friction, and expansion revenue are board-level SaaS problems.</td><td>B2B SaaS founders at $1M–$20M ARR, PE-backed software, vertical SaaS, product-led startups adding sales-led motion.</td><td>Medium. There are specialist consultancies, but fewer credible niche operators than automation/template sellers.</td><td>Upwork search snippet reports CSM median hourly rate of $45 and typical $30–$60; specialist fractional CS firms position around retention, NRR, onboarding, and renewal systems.</td><td>High: requires diagnosis, stakeholder alignment, playbooks, metrics, change management, and often sensitive customer data.</td><td>Medium: clear pain, but buyers may prefer full-time hires or established consultancies for strategic CS work.</td><td>Offer a fixed-price “churn leak audit” for one niche; success = 2 paid audits from 30 targeted founders or one $2k+ implementation follow-on.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="opportunities" class="opps">
+      <article class="card opp">
+        <h2>1. AI workflow setup services</h2>
+        <p><strong>Inference:</strong> This is the most attractive 2026 entry point if positioned around a painfully specific workflow rather than “AI automation” broadly.</p>
+        <div class="facts">
+          <div class="box"><div class="label">Facts</div><ul><li>Zapier’s pricing page describes “AI orchestration” combining workflows, tables, forms, chatbots, agents, MCP, AI steps and integrations across 9,000+ apps.</li><li>Make positions itself as a visual AI automation platform for building, scaling and managing automations and AI agents.</li><li>Public freelance-marketplace search results show services explicitly offering n8n, Make, Zapier, OpenAI, CRM and lead-generation automations.</li></ul></div>
+          <div class="box"><div class="label">Inference</div><ul><li>Buyers likely understand outcomes like “route every inbound lead into CRM and draft follow-up” better than platform names.</li><li>Best solo wedge: one department, one stack, one measurable before/after metric.</li><li>Proof asset should be a live loom/video and before/after time savings, not a generic portfolio.</li></ul></div>
+        </div>
+        <div class="test"><div class="label">Cheapest decisive test</div>Build one demo workflow in a common stack, then offer a paid 72-hour implementation to 20 businesses already using that stack. Kill or reposition if calls praise the idea but avoid paying a small pilot fee.</div>
+      </article>
+
+      <article class="card opp">
+        <h2>2. Creator operations templates</h2>
+        <p><strong>Inference:</strong> This works best as an audience-specific operating system attached to a real creator revenue model, not as another generic content calendar.</p>
+        <div class="facts">
+          <div class="box"><div class="label">Facts</div><ul><li>Notion Marketplace contains creator business templates, including “Creator Business OS 2026,” which says it helps creators organize ideas, offers, revenue and decisions.</li><li>Gumroad’s pricing page says direct/profile sales carry a 10% + $0.50 per-transaction fee, while Discover carries 30%.</li><li>The same Notion listing links to Etsy and a creator shop, showing cross-marketplace distribution.</li></ul></div>
+          <div class="box"><div class="label">Inference</div><ul><li>Distribution is the constraint. The product is easy to copy, so the niche and examples matter more than database structure.</li><li>Bundled services—setup call, audits, swipe files—can raise effective price above template-only sales.</li><li>The lowest-friction buyer is already earning, not a beginner planning a creator business.</li></ul></div>
+        </div>
+        <div class="test"><div class="label">Cheapest decisive test</div>Pre-sell one narrowly named template such as “Sponsorship Ops for 10k–100k YouTube Channels” before building the full system. Success threshold: 3 paid preorders or 10 qualified waitlist replies from 100 targeted contacts.</div>
+      </article>
+
+      <article class="card opp">
+        <h2>3. Local service lead systems</h2>
+        <p><strong>Inference:</strong> The opportunity is real but operationally unforgiving. Solo founders should test manual, exclusive, qualified leads before buying ads or building software.</p>
+        <div class="facts">
+          <div class="box"><div class="label">Facts</div><ul><li>Google Local Services Ads is an official channel for local customer acquisition; Google’s help pages cover getting started and editing budgets.</li><li>Public 2026 LSA benchmark search results cite average home-services CPL near $53 across a large contractor/spend sample.</li><li>Thumbtack support content describes a pay-for-lead marketplace model, though static extraction is messy and some pricing pages are not easily fetchable.</li></ul></div>
+          <div class="box"><div class="label">Inference</div><ul><li>Contractors will pay for demand, but only if lead quality, speed-to-lead and exclusivity are trusted.</li><li>A solo operator should avoid competing head-on with national marketplaces; choose one local vertical and own qualification.</li><li>Refund expectations and attribution disputes are the main hidden cost.</li></ul></div>
+        </div>
+        <div class="test"><div class="label">Cheapest decisive test</div>Manually generate and qualify five leads for one trade in one metro. Sell them one-by-one before building a site. If the buyer will not reorder after the first successful job opportunity, the channel economics are probably too weak.</div>
+      </article>
+
+      <article class="card opp">
+        <h2>4. Niche customer-success consulting</h2>
+        <p><strong>Inference:</strong> This is the strongest premium-service candidate for a solo operator with SaaS/customer-facing credibility.</p>
+        <div class="facts">
+          <div class="box"><div class="label">Facts</div><ul><li>Public search snippets for Upwork’s CSM cost page report a median hourly rate of $45 and a typical $30–$60 range for Customer Success Managers.</li><li>Specialist CS consultancies publicly position around reducing churn, increasing NRR, onboarding, renewal process, and fractional CS leadership.</li><li>Customer-success software and consulting markets frame retention and expansion as measurable business outcomes.</li></ul></div>
+          <div class="box"><div class="label">Inference</div><ul><li>Hourly CSM benchmarks understate strategic consulting potential, but they set a buyer’s lower anchor.</li><li>The best wedge is a diagnostic offer for a painful lifecycle moment: onboarding, renewal risk, activation, or expansion.</li><li>Credibility is the bottleneck; case studies, teardown samples, and niche vocabulary matter.</li></ul></div>
+        </div>
+        <div class="test"><div class="label">Cheapest decisive test</div>Create a one-page teardown of onboarding/renewal gaps for 10 target SaaS companies in a single niche. Offer a fixed-price audit. Continue only if at least two founders pay or one asks for implementation.</div>
+      </article>
+    </section>
+
+    <section id="contradictions" class="split">
+      <div class="card">
+        <h2>Key contradictions to resolve before committing</h2>
+        <ul>
+          <li><strong>AI workflow services:</strong> demand is loud, but “automation agency” supply is also loud. The decisive question is whether a buyer pays for one specific workflow now.</li>
+          <li><strong>Creator templates:</strong> distribution platforms lower selling friction, but they also make copycat competition trivial. The decisive question is whether a niche buyer recognizes themselves in the offer.</li>
+          <li><strong>Local leads:</strong> buyers urgently need jobs, but lead sellers often suffer quality and attribution distrust. The decisive question is reorder rate, not first-sale interest.</li>
+          <li><strong>Customer success:</strong> churn and NRR are strategic, but early SaaS teams may defer CS spend until revenue pain is acute. The decisive question is whether the audit leads to implementation.</li>
+        </ul>
+      </div>
+      <div class="callout">
+        <h2>Overall recommendation</h2>
+        <p><strong>Start with AI workflow setup services</strong> if the operator has technical confidence and can access SMB operators. It has the fastest visible pain-to-delivery loop.</p>
+        <p><strong>Start with niche customer-success consulting</strong> if the operator has credible SaaS/customer experience. It can support higher tickets and less marketplace commoditization.</p>
+        <p><strong>Avoid starting with generic creator templates or generic local lead-gen.</strong> Both are viable only after narrowing by niche, channel, and buyer trigger.</p>
+      </div>
+    </section>
+
+    <section id="tests">
+      <h2>Cheapest decisive tests, ranked by speed</h2>
+      <div class="grid cols2">
+        <div class="card"><h3>Fastest cash test: AI workflow setup</h3><p>Timebox a productized build: one workflow, fixed scope, fixed timeline. Charge enough to prove willingness to pay, but low enough to remove procurement friction.</p></div>
+        <div class="card"><h3>Highest-signal service test: CS audit</h3><p>Send teardown samples to a narrowly defined SaaS segment. A paid audit or implementation request is stronger evidence than positive feedback.</p></div>
+        <div class="card"><h3>Lowest-cost product test: creator template preorder</h3><p>Sell the promise and screenshots before building the full template. If audience-specific language does not convert, more features will not fix it.</p></div>
+        <div class="card"><h3>Most operational test: local leads</h3><p>Manually qualify and sell a tiny batch. Track reorder, show-up rate, closed revenue, and refund pressure before spending on ads.</p></div>
+      </div>
+    </section>
+
+    <section id="sources">
+      <h2>Direct public sources consulted</h2>
+      <ol class="source-list">
+        <li><a href="https://zapier.com/pricing">Zapier pricing: AI orchestration, workflows, tasks, apps and platform packaging</a></li>
+        <li><a href="https://www.make.com/">Make: visual AI automation platform positioning</a></li>
+        <li><a href="https://gumroad.com/pricing">Gumroad pricing: 10% + $0.50 direct/profile sales; 30% via Discover</a></li>
+        <li><a href="https://www.notion.com/templates/creator-business-os-2026">Notion Marketplace: Creator Business OS 2026 template listing</a></li>
+        <li><a href="https://ads.google.com/local-services-ads/">Google Local Services Ads overview</a></li>
+        <li><a href="https://support.google.com/localservices/answer/6224841?hl=en">Google Local Services Help: getting started in the United States</a></li>
+        <li><a href="https://support.google.com/localservices/answer/7434558?hl=en">Google Local Services Help: editing budgets</a></li>
+        <li><a href="https://support.thumbtack.com/articles/how-thumbtack-pricing-works">Thumbtack support: pricing model for pros</a></li>
+        <li><a href="https://searchlightdigital.io/google-local-service-ads-cost-per-lead/">SearchLight Digital: 2026 Google Local Service Ads CPL benchmarks</a></li>
+        <li><a href="https://www.upwork.com/hire/customer-success-managers/cost/">Upwork: Customer Success Manager cost page</a></li>
+        <li><a href="https://www.upwork.com/services/product/development-it-ai-automation-workflows-with-n8n-make-com-zapier-1952998355085291157">Upwork service example: AI automation workflows with n8n, Make and Zapier</a></li>
+        <li><a href="https://www.elevatecustomer-success.com/">Elevate Customer Success: SaaS customer-success consulting positioning</a></li>
+        <li><a href="https://scotchcreekconsulting.com/">Scotch Creek Consulting: fractional CS leadership positioning</a></li>
+      </ol>
+      <p class="mini muted">Source limitations: some marketplace and pricing pages use dynamic rendering or block static fetches. Where extraction was blocked, the artifact cites public URLs and uses only visible search-result snippets or accessible page text as factual support.</p>
+    </section>
+
+    <div class="footer">This artifact is informational research, not financial advice. Scores are structured inference based on the cited public evidence, expected solo delivery burden, and speed of decisive validation.</div>
+  </div>
+</body>
+</html>

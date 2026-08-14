@@ -19,9 +19,12 @@ export default function ManorAvatar({
   shape = "circle",
 }: ManorAvatarProps) {
   const radius = shape === "circle" ? "50%" : Math.round(size * 0.28);
+  const classes = ["manor-avatar", className || ""]
+    .filter(Boolean)
+    .join(" ");
   return (
     <div
-      className={className}
+      className={classes}
       style={{
         width: size,
         height: size,
@@ -36,7 +39,11 @@ export default function ManorAvatar({
         ...style,
       }}
     >
-      <IconManorLogo size={Math.round(size * 0.4)} style={{ color: "#fff" }} />
+      <IconManorLogo
+        size={Math.round(size * 0.4)}
+        className="manor-avatar__logo"
+        style={{ color: "#fff" }}
+      />
     </div>
   );
 }

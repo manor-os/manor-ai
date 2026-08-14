@@ -17,6 +17,8 @@ export const PendingActionKind = {
   NEEDS_CONFIRMATION: "needs_confirmation",
   HUMAN_INPUT: "human_input",
   GOVERNANCE_APPROVAL: "governance_approval",
+  TASK_APPROVAL: "task_approval",
+  TASK_RECOVERY: "task_recovery",
   APPROVE_PROPOSALS: "approve_proposals",
   RETRY_STRATEGIST_REVIEW: "retry_strategist_review",
   WORKSPACE_OPERATION_REVIEW: "workspace_operation_review",

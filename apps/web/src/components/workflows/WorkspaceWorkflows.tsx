@@ -6,7 +6,7 @@ import { formatDateLong, relativeTime } from "../../lib/format";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingText } from "../../lib/taskDisplay";
 import { useToastStore } from "../../stores/toast";
-import { IconClock, IconFlow, IconPlay, IconTrash } from "../icons";
+import { IconClock, IconFlow, IconPlay, IconStop, IconTrash } from "../icons";
 import Button from "../ui/Button";
 import CompactCard from "../ui/CompactCard";
 import ConfirmDialog from "../ui/ConfirmDialog";
@@ -19,6 +19,7 @@ import Select from "../ui/Select";
 import TabSwitcher from "../ui/TabSwitcher";
 import WorkflowRunDetail from "./WorkflowRunDetail";
 import {
+  canCancelWorkflowRun,
   formatWorkflowDuration,
   formatWorkflowError,
   groupWorkflowRunFamilies,
@@ -76,6 +77,7 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
   const [attachOpen, setAttachOpen] = useState(false);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
   const [detachTarget, setDetachTarget] = useState<WorkflowBinding | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<WorkflowHistoryRun | null>(null);
   const requestedWorkflowView = searchParams.get("workflow_view");
   const requestedRunId = searchParams.get("workflow_run") || "";
   const [section, setSection] = useState<"attached" | "history">(
@@ -192,6 +194,19 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
       translateApiError(error, "The workflow service is unavailable. Refresh and try again."),
     ),
   });
+  const cancelMutation = useMutation({
+    mutationFn: (runId: string) => api.workflows.cancelRun(runId),
+    onSuccess: async (_result, runId) => {
+      setCancelTarget(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: runsKey }),
+        queryClient.invalidateQueries({ queryKey: ["workflow-run-history-detail", runId] }),
+        queryClient.invalidateQueries({ queryKey: ["workflow-run-history-family"] }),
+        queryClient.invalidateQueries({ queryKey: ["workflow-run", runId] }),
+        queryClient.invalidateQueries({ queryKey: ["workspace-chat", workspaceId] }),
+      ]);
+    },
+  });
 
   const openAttach = () => {
     setSelectedWorkflowId(availableWorkflows[0]?.id || "");
@@ -227,6 +242,10 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
     setSelectedRunId("");
     updateHistoryLocation("history");
     window.requestAnimationFrame(() => historyRowRefs.current.get(previousRunId)?.focus());
+  };
+  const requestRunCancellation = (run: WorkflowHistoryRun) => {
+    cancelMutation.reset();
+    setCancelTarget(run);
   };
 
   return (
@@ -320,9 +339,11 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
         <WorkflowRunDetail
           runId={selectedRunId}
           workspaceId={workspaceId}
-              workflow={selectedRunWorkflow}
-              onBack={showHistoryList}
-              onSelectRun={openHistoryRun}
+          workflow={selectedRunWorkflow}
+          onBack={showHistoryList}
+          onSelectRun={openHistoryRun}
+          onRequestCancel={requestRunCancellation}
+          cancellingRunId={cancelMutation.isPending ? cancelTarget?.id : undefined}
         />
       ) : runsLoading || workflowsLoading ? (
         <div className="workspace-workflows-loading" aria-live="polite">
@@ -362,60 +383,80 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
               || (run.current_step_id
                 ? `${run.status === "failed" ? t("component.workflow_run_history.failed_node") : t("component.workflow_run_history.current_node")}: ${formatUserFacingText(currentNodeName)}`
                 : t("component.workflow_run_history.no_current_node"));
+            const canCancel = canCancelWorkflowRun(run);
             return (
-              <button
-                type="button"
+              <div
                 className="workflow-run-history-row"
                 key={family.id}
                 data-run-id={run.id}
-                ref={(node) => {
-                  if (node) historyRowRefs.current.set(run.id, node);
-                  else historyRowRefs.current.delete(run.id);
-                }}
-                onClick={() => openHistoryRun(run.id)}
               >
-                <span className="workflow-run-history-row-identity">
-                  <IconTile size={34}><IconFlow size={17} /></IconTile>
-                  <span>
-                    <span className="workflow-run-history-row-title">
-                      <strong>{formatUserFacingText(workflowName)}</strong>
-                      {!immutableListMetadata && (
-                        <span className="workflow-run-history-legacy-label">
-                          {t("component.workflow_run_history.legacy_list_metadata")}
-                        </span>
-                      )}
-                      {run.lineage_status === "legacy_untrusted_incomplete" && (
-                        <span className="workflow-run-history-legacy-label">
-                          {t("component.workflow_run_history.legacy_lineage_label")}
-                        </span>
-                      )}
-                    </span>
-                    <span className="workflow-run-history-row-progress">
-                      {family.totalCount > 0
-                        ? t("component.workflow_run_history.steps_progress", {
-                            count: family.processedCount,
-                            total: family.totalCount,
-                          })
-                        : t("component.workflow_run_history.progress_in_details")}
+                <button
+                  type="button"
+                  className="workflow-run-history-row-main"
+                  ref={(node) => {
+                    if (node) historyRowRefs.current.set(run.id, node);
+                    else historyRowRefs.current.delete(run.id);
+                  }}
+                  onClick={() => openHistoryRun(run.id)}
+                >
+                  <span className="workflow-run-history-row-identity">
+                    <IconTile size={34}><IconFlow size={17} /></IconTile>
+                    <span>
+                      <span className="workflow-run-history-row-title">
+                        <strong>{formatUserFacingText(workflowName)}</strong>
+                        {!immutableListMetadata && (
+                          <span className="workflow-run-history-legacy-label">
+                            {t("component.workflow_run_history.legacy_list_metadata")}
+                          </span>
+                        )}
+                        {run.lineage_status === "legacy_untrusted_incomplete" && (
+                          <span className="workflow-run-history-legacy-label">
+                            {t("component.workflow_run_history.legacy_lineage_label")}
+                          </span>
+                        )}
+                      </span>
+                      <span className="workflow-run-history-row-progress">
+                        {family.totalCount > 0
+                          ? t("component.workflow_run_history.steps_progress", {
+                              count: family.processedCount,
+                              total: family.totalCount,
+                            })
+                          : t("component.workflow_run_history.progress_in_details")}
+                      </span>
                     </span>
                   </span>
-                </span>
-                <span className="workflow-run-history-status" data-status={statusPresentation.iconStatus}>
-                  <span aria-hidden="true" />
-                  {t(`component.workflow_run.status.${statusPresentation.labelKey}`)}
-                </span>
-                <span className="workflow-run-history-row-meta">
-                  <span>{t("component.workflow_run_history.attempts", { count: family.attemptCount })}</span>
-                  <span>{formatUserFacingLabel(run.trigger_source || "manual")}</span>
-                  <span className="mono">{formatDateLong(family.startedAt)}</span>
-                  <span className="mono">{formatWorkflowDuration(family.durationMs)}</span>
-                  {family.artifactCount !== null && (
-                    <span>{t("component.workflow_run_history.artifact_count", { count: family.artifactCount })}</span>
-                  )}
-                </span>
-                <span className="workflow-run-history-row-context">{contextLabel}</span>
-                <IconPlay className="workflow-run-history-row-open" size={14} />
-              </button>
+                  <span className="workflow-run-history-status" data-status={statusPresentation.iconStatus}>
+                    <span aria-hidden="true" />
+                    {t(`component.workflow_run.status.${statusPresentation.labelKey}`)}
+                  </span>
+                  <span className="workflow-run-history-row-meta">
+                    <span>{t("component.workflow_run_history.attempts", { count: family.attemptCount })}</span>
+                    <span>{formatUserFacingLabel(run.trigger_source || "manual")}</span>
+                    <span className="mono">{formatDateLong(family.startedAt)}</span>
+                    <span className="mono">{formatWorkflowDuration(family.durationMs)}</span>
+                    {family.artifactCount !== null && (
+                      <span>{t("component.workflow_run_history.artifact_count", { count: family.artifactCount })}</span>
+                    )}
+                  </span>
+                  <span className="workflow-run-history-row-context">{contextLabel}</span>
+                  <IconPlay className="workflow-run-history-row-open" size={14} />
+                </button>
+                {canCancel && (
+                  <button
+                    type="button"
+                    className="workflow-run-history-row-cancel"
+                    title={t("component.workflow_run.action.cancel")}
+                    aria-label={t("component.workflow_run.action.cancel")}
+                    disabled={cancelMutation.isPending && cancelTarget?.id === run.id}
+                    onClick={() => requestRunCancellation(run)}
+                  >
+                    {cancelMutation.isPending && cancelTarget?.id === run.id
+                      ? <LoadingSpinner size={13} />
+                      : <IconStop size={13} aria-hidden="true" />}
+                    <span>{t("component.workflow_run.action.cancel")}</span>
+                  </button>
+                )}
+              </div>
             );
           })}
         </div>
@@ -457,6 +498,24 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
           />
         )}
       </Modal>
+
+      <ConfirmDialog
+        open={!!cancelTarget}
+        onClose={() => setCancelTarget(null)}
+        onConfirm={() => {
+          if (cancelTarget) cancelMutation.mutate(cancelTarget.id);
+        }}
+        title={t("component.workflow_run.cancel_confirm_title")}
+        message={t("component.workflow_run.cancel_confirm_message")}
+        confirmLabel={t("component.workflow_run.cancel_confirm_action")}
+        cancelLabel={t("component.workflow_run.cancel_confirm_keep_running")}
+        danger
+        loading={cancelMutation.isPending}
+        closeOnConfirm={false}
+        error={cancelMutation.isError
+          ? translateApiError(cancelMutation.error, t("component.workflow_run_history.cancel_error"))
+          : undefined}
+      />
 
       <ConfirmDialog
         open={!!detachTarget}

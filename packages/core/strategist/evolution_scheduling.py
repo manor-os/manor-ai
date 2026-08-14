@@ -5,9 +5,10 @@ Two ScheduledJob rows are installed per workspace:
   * ``oe:<workspace_id>`` — outcome evaluation, daily at 02:15 UTC
   * ``cie:<workspace_id>`` — chat insight extraction, every 6 hours
 
-Both are idempotent — re-running ``install_evolution_schedules`` updates
-the existing rows in place. Use ``remove_evolution_schedules`` when a
-workspace is deleted or paused.
+Both are idempotent — re-running ``install_evolution_schedules`` updates the
+existing rows in place. Use ``remove_evolution_schedules`` when a workspace's
+heartbeat is disabled; workspace pause keeps the rows and disables them so
+their paused state remains visible.
 
 Designed to be called from ``workspace_setup_service.finalize_setup``
 right after ``install_strategist_schedule`` so a fresh workspace gets

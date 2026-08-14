@@ -25,7 +25,14 @@ from packages.core.models.task import Conversation, Message
 from packages.core.models.workspace import Workspace
 
 
-async def _ws_with_card(db, *, plan_id: str, step_id: str, resolved: bool = False):
+async def _ws_with_card(
+    db,
+    *,
+    plan_id: str,
+    step_id: str,
+    task_id: str | None = None,
+    resolved: bool = False,
+):
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
     conversation_id = generate_ulid()
@@ -44,6 +51,7 @@ async def _ws_with_card(db, *, plan_id: str, step_id: str, resolved: bool = Fals
             "kind": "governance_approval",
             "step_id": step_id,
             "plan_id": plan_id,
+            **({"task_id": task_id} if task_id else {}),
             "step_key": "publish",
         },
     )
@@ -87,6 +95,67 @@ async def test_resolve_stale_cards_by_step_ids(db_session):
 
 
 @pytest.mark.asyncio
+async def test_task_terminal_cleanup_closes_stale_cards_and_requests(db_session):
+    from packages.core.governance.approvals import resolve_origin_requests
+
+    task_id = generate_ulid()
+    stale_plan_id, stale_step_id = generate_ulid(), generate_ulid()
+    other_task_id, other_plan_id, other_step_id = generate_ulid(), generate_ulid(), generate_ulid()
+    entity_id, workspace_id, target = await _ws_with_card(
+        db_session,
+        plan_id=stale_plan_id,
+        step_id=stale_step_id,
+        task_id=task_id,
+    )
+    _, _, bystander = await _ws_with_card(
+        db_session,
+        plan_id=other_plan_id,
+        step_id=other_step_id,
+        task_id=other_task_id,
+    )
+
+    decision = await resolve_approval(
+        db_session,
+        subject=ApprovalSubject(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            action_key="social_post.publish",
+            capability_id="external.social",
+            risk_level="high",
+            kind="action",
+        ),
+        origin=ApprovalOrigin(
+            kind="step",
+            step_id=stale_step_id,
+            plan_id=stale_plan_id,
+            task_id=task_id,
+        ),
+    )
+    assert decision.outcome == "needs_human"
+    await db_session.flush()
+
+    expired = await resolve_origin_requests(
+        db_session,
+        task_id=task_id,
+        reason="task_terminal",
+    )
+    closed = await resolve_stale_hitl_cards(
+        db_session,
+        task_id=task_id,
+        reason="task_terminal",
+    )
+
+    request = await db_session.get(HitlRequest, decision.request.id)
+    assert expired == 1
+    assert request.status == "expired"
+    assert request.resolved_reason == "task_terminal"
+    assert closed == 1
+    assert target.resolved_at is not None
+    assert target.resolution == {"choice": "expired", "reason": "task_terminal"}
+    assert bystander.resolved_at is None
+
+
+@pytest.mark.asyncio
 async def test_finalize_expires_requests_and_closes_cards(db_session):
     """The _finalize integration: terminal plan → open request expired AND its
     chat card resolved, in one cleanup pass."""
@@ -119,6 +188,39 @@ async def test_finalize_expires_requests_and_closes_cards(db_session):
     assert request.status == "expired"
     assert card.resolved_at is not None
     assert card.resolution == {"choice": "expired", "reason": "plan_terminal"}
+
+
+@pytest.mark.asyncio
+async def test_replanned_plan_closes_old_cards(db_session):
+    """Replanning also detaches the old plan, so its card cannot stay open."""
+    from packages.core.governance.approvals import resolve_origin_requests
+
+    task_id = generate_ulid()
+    plan_id, step_id = generate_ulid(), generate_ulid()
+    entity_id, workspace_id, card = await _ws_with_card(
+        db_session, plan_id=plan_id, step_id=step_id, task_id=task_id,
+    )
+    decision = await resolve_approval(
+        db_session,
+        subject=ApprovalSubject(
+            entity_id=entity_id, workspace_id=workspace_id,
+            action_key="social_post.publish", capability_id="external.social",
+            risk_level="high", kind="action",
+        ),
+        origin=ApprovalOrigin(
+            kind="step", step_id=step_id, plan_id=plan_id, task_id=task_id,
+        ),
+    )
+    assert decision.outcome == "needs_human"
+    await db_session.flush()
+
+    await resolve_origin_requests(db_session, plan_id=plan_id, reason="plan_replanned")
+    closed = await resolve_stale_hitl_cards(
+        db_session, plan_id=plan_id, reason="plan_replanned",
+    )
+
+    assert closed == 1
+    assert card.resolution == {"choice": "expired", "reason": "plan_replanned"}
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lead Nurture System — Design Studio Ops Map</title>
+  <style>
+    :root {
+      --bg: #090604;
+      --panel: #17100c;
+      --panel-2: #21150f;
+      --copper: #c46d38;
+      --copper-2: #f0a15e;
+      --copper-dim: #6f3e24;
+      --amber: #ffcc73;
+      --red: #ff6d55;
+      --green: #7bd88f;
+      --blue: #83b7ff;
+      --text: #f7eadd;
+      --muted: #b99e8a;
+      --line: rgba(240, 161, 94, 0.24);
+      --shadow: rgba(0, 0, 0, 0.42);
+      --glass: rgba(255, 208, 150, 0.06);
+      --radius: 22px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 12% 10%, rgba(196,109,56,.22), transparent 32%),
+        radial-gradient(circle at 88% 3%, rgba(255,204,115,.12), transparent 30%),
+        linear-gradient(135deg, #050302 0%, #120b08 46%, #070403 100%);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: radial-gradient(circle at center, black, transparent 78%);
+      z-index: 0;
+    }
+
+    .shell {
+      position: relative;
+      z-index: 1;
+      width: min(1440px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 48px;
+    }
+
+    header.hero {
+      display: grid;
+      grid-template-columns: 1.35fr .65fr;
+      gap: 22px;
+      align-items: stretch;
+      margin-bottom: 22px;
+    }
+
+    .hero-card, .status-card, .module, .timeline, .summary, .modal-panel {
+      background: linear-gradient(145deg, rgba(33,21,15,.94), rgba(14,9,6,.94));
+      border: 1px solid var(--line);
+      box-shadow: 0 24px 70px var(--shadow), inset 0 1px 0 rgba(255,255,255,.05);
+      border-radius: var(--radius);
+    }
+
+    .hero-card {
+      position: relative;
+      overflow: hidden;
+      padding: 34px;
+      min-height: 285px;
+    }
+
+    .hero-card::after {
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -160px;
+      top: -150px;
+      border-radius: 50%;
+      border: 1px solid rgba(240,161,94,.2);
+      box-shadow: inset 0 0 60px rgba(196,109,56,.16), 0 0 80px rgba(196,109,56,.12);
+    }
+
+    .kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border: 1px solid rgba(240,161,94,.28);
+      border-radius: 999px;
+      background: rgba(196,109,56,.1);
+      color: var(--amber);
+      font-size: 12px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      font-weight: 800;
+    }
+
+    .pulse {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 0 0 rgba(123,216,143,.8);
+      animation: pulse 1.8s infinite;
+    }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(123,216,143,.55); }
+      70% { box-shadow: 0 0 0 12px rgba(123,216,143,0); }
+      100% { box-shadow: 0 0 0 0 rgba(123,216,143,0); }
+    }
+
+    h1 {
+      position: relative;
+      margin: 24px 0 14px;
+      max-width: 900px;
+      font-size: clamp(38px, 6vw, 78px);
+      line-height: .9;
+      letter-spacing: -0.07em;
+    }
+
+    .hero-card p {
+      position: relative;
+      max-width: 760px;
+      margin: 0;
+      color: var(--muted);
+      font-size: clamp(16px, 2vw, 19px);
+      line-height: 1.65;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    button, .chip-button {
+      appearance: none;
+      border: 0;
+      color: var(--text);
+      background: linear-gradient(180deg, var(--copper), #8e4d2b);
+      border-radius: 14px;
+      padding: 12px 16px;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 10px 25px rgba(196,109,56,.22);
+      transition: transform .18s ease, filter .18s ease, background .18s ease;
+    }
+
+    button:hover, .chip-button:hover { transform: translateY(-2px); filter: brightness(1.08); }
+    button.secondary {
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(240,161,94,.24);
+      box-shadow: none;
+      color: var(--amber);
+    }
+
+    .status-card {
+      padding: 24px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 16px;
+      overflow: hidden;
+    }
+
+    .clock {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 16px;
+    }
+
+    .clock strong {
+      font-size: 30px;
+      letter-spacing: -0.04em;
+    }
+
+    .clock span, .mini-label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      font-weight: 800;
+    }
+
+    .radar {
+      position: relative;
+      min-height: 165px;
+      border-radius: 18px;
+      background:
+        radial-gradient(circle, transparent 0 22%, rgba(240,161,94,.08) 23% 24%, transparent 25% 45%, rgba(240,161,94,.08) 46% 47%, transparent 48%),
+        linear-gradient(90deg, transparent 49.6%, rgba(240,161,94,.12) 50%, transparent 50.4%),
+        linear-gradient(0deg, transparent 49.6%, rgba(240,161,94,.12) 50%, transparent 50.4%);
+      border: 1px solid rgba(240,161,94,.16);
+      overflow: hidden;
+    }
+
+    .radar::after {
+      content: "";
+      position: absolute;
+      inset: 50% 50% 0 0;
+      background: linear-gradient(45deg, rgba(240,161,94,.28), transparent 70%);
+      transform-origin: 100% 0%;
+      animation: sweep 4s linear infinite;
+    }
+
+    @keyframes sweep { to { transform: rotate(360deg); } }
+
+    .dot {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--amber);
+      box-shadow: 0 0 18px var(--amber);
+    }
+    .dot:nth-child(1) { left: 29%; top: 38%; }
+    .dot:nth-child(2) { left: 64%; top: 22%; background: var(--green); box-shadow: 0 0 18px var(--green); }
+    .dot:nth-child(3) { left: 73%; top: 66%; background: var(--red); box-shadow: 0 0 18px var(--red); }
+    .dot:nth-child(4) { left: 45%; top: 74%; background: var(--blue); box-shadow: 0 0 18px var(--blue); }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+
+    .metric {
+      padding: 13px;
+      border-radius: 16px;
+      background: var(--glass);
+      border: 1px solid rgba(255,255,255,.06);
+    }
+
+    .metric b { display: block; font-size: 23px; }
+    .metric small { color: var(--muted); font-weight: 700; }
+
+    .nav-rail {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding: 8px 0 20px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--copper) transparent;
+    }
+
+    .nav-rail a {
+      white-space: nowrap;
+      text-decoration: none;
+      color: var(--muted);
+      padding: 10px 14px;
+      border: 1px solid rgba(240,161,94,.17);
+      border-radius: 999px;
+      background: rgba(255,255,255,.035);
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .nav-rail a:hover { color: var(--amber); border-color: rgba(240,161,94,.42); }
+
+    .ops-map {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .module {
+      position: relative;
+      padding: 22px;
+      overflow: hidden;
+    }
+
+    .module::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(240,161,94,.08), transparent 38%);
+      pointer-events: none;
+    }
+
+    .module > * { position: relative; }
+    .wide { grid-column: span 8; }
+    .half { grid-column: span 6; }
+    .third { grid-column: span 4; }
+    .full { grid-column: 1 / -1; }
+
+    .module-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: -0.03em;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--amber);
+      background: rgba(255,204,115,.08);
+      border: 1px solid rgba(255,204,115,.2);
+      border-radius: 999px;
+      padding: 7px 10px;
+      font-size: 12px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .flow-step, .rule, .draft-card, .gate, .summary-card, .signal {
+      background: rgba(255,255,255,.045);
+      border: 1px solid rgba(255,255,255,.075);
+      border-radius: 18px;
+      padding: 15px;
+    }
+
+    .flow-step .num {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 12px;
+      color: #140b07;
+      background: var(--copper-2);
+      font-weight: 1000;
+      margin-bottom: 12px;
+    }
+
+    h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+
+    p, li {
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 14px;
+    }
+
+    ul { margin: 10px 0 0; padding-left: 18px; }
+
+    .rules-grid, .drafts-grid, .signals-grid, .gates-grid, .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+
+    .rule strong, .signal strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .pill {
+      font-size: 12px;
+      color: var(--amber);
+      background: rgba(196,109,56,.13);
+      border: 1px solid rgba(240,161,94,.2);
+      padding: 6px 9px;
+      border-radius: 999px;
+      font-weight: 800;
+    }
+
+    .stage-board {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+    }
+
+    .stage {
+      min-height: 175px;
+      padding: 12px;
+      border-radius: 18px;
+      background: rgba(0,0,0,.18);
+      border: 1px solid rgba(240,161,94,.14);
+    }
+
+    .stage-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 13px;
+      font-weight: 950;
+      color: var(--amber);
+    }
+
+    .lead-card {
+      padding: 12px;
+      margin: 8px 0;
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.035));
+      border: 1px solid rgba(255,255,255,.07);
+      cursor: pointer;
+    }
+
+    .lead-card:hover { border-color: rgba(240,161,94,.35); }
+    .lead-card b { display: block; font-size: 13px; }
+    .lead-card small { color: var(--muted); }
+
+    .heat {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 7px;
+    }
+    .hot { background: var(--red); box-shadow: 0 0 12px var(--red); }
+    .warm { background: var(--amber); box-shadow: 0 0 12px var(--amber); }
+    .cool { background: var(--blue); box-shadow: 0 0 12px var(--blue); }
+
+    .timeline {
+      grid-column: span 4;
+      padding: 22px;
+    }
+
+    .cadence {
+      position: relative;
+      display: grid;
+      gap: 13px;
+      margin-top: 14px;
+    }
+
+    .cadence::before {
+      content: "";
+      position: absolute;
+      left: 13px;
+      top: 8px;
+      bottom: 8px;
+      width: 2px;
+      background: linear-gradient(var(--copper), transparent);
+    }
+
+    .cadence-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .cadence-dot {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #2a170f;
+      border: 1px solid rgba(240,161,94,.35);
+      color: var(--amber);
+      font-size: 11px;
+      font-weight: 1000;
+      z-index: 1;
+    }
+
+    .cadence-copy {
+      padding: 11px 12px;
+      border-radius: 14px;
+      background: rgba(255,255,255,.045);
+      border: 1px solid rgba(255,255,255,.06);
+    }
+
+    .cadence-copy strong { display: block; font-size: 13px; margin-bottom: 3px; }
+    .cadence-copy span { color: var(--muted); font-size: 12px; line-height: 1.45; display: block; }
+
+    .draft-card {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .draft-card textarea {
+      width: 100%;
+      min-height: 118px;
+      resize: vertical;
+      color: var(--text);
+      background: rgba(0,0,0,.22);
+      border: 1px solid rgba(240,161,94,.15);
+      border-radius: 14px;
+      padding: 12px;
+      font: inherit;
+      line-height: 1.45;
+      outline: none;
+    }
+
+    .draft-card textarea:focus { border-color: rgba(240,161,94,.52); }
+
+    .approval-switch {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 16px;
+      background: rgba(255,204,115,.07);
+      border: 1px dashed rgba(255,204,115,.28);
+    }
+
+    .toggle {
+      width: 52px;
+      height: 28px;
+      border-radius: 999px;
+      padding: 4px;
+      background: rgba(255,255,255,.15);
+      cursor: pointer;
+      transition: .2s;
+      flex: 0 0 auto;
+    }
+
+    .toggle span {
+      display: block;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--muted);
+      transition: .2s;
+    }
+
+    .toggle.on { background: rgba(123,216,143,.22); }
+    .toggle.on span { transform: translateX(24px); background: var(--green); }
+
+    .bar {
+      height: 10px;
+      background: rgba(255,255,255,.08);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 10px;
+    }
+    .bar i {
+      display: block;
+      height: 100%;
+      width: var(--w);
+      background: linear-gradient(90deg, var(--copper), var(--amber));
+      border-radius: 999px;
+    }
+
+    .summary-card b {
+      display: block;
+      font-size: 30px;
+      letter-spacing: -0.04em;
+      margin-bottom: 4px;
+    }
+
+    .summary-card span { color: var(--muted); font-size: 13px; }
+
+    .console {
+      display: grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap: 12px;
+    }
+
+    .terminal {
+      min-height: 220px;
+      padding: 16px;
+      border-radius: 18px;
+      background: #050302;
+      border: 1px solid rgba(240,161,94,.16);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      color: #ffd6a4;
+      overflow: hidden;
+    }
+
+    .terminal div { margin: 0 0 9px; color: #d8b38f; }
+    .terminal .ok { color: var(--green); }
+    .terminal .warn { color: var(--amber); }
+    .terminal .stop { color: var(--red); }
+
+    .review-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .review-list label {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      color: var(--muted);
+      padding: 11px;
+      border-radius: 14px;
+      background: rgba(255,255,255,.045);
+      border: 1px solid rgba(255,255,255,.06);
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    input[type="checkbox"] {
+      accent-color: var(--copper);
+      margin-top: 3px;
+    }
+
+    footer {
+      margin-top: 18px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      place-items: center;
+      z-index: 20;
+      background: rgba(0,0,0,.62);
+      backdrop-filter: blur(8px);
+      padding: 20px;
+    }
+    .modal.show { display: grid; }
+    .modal-panel {
+      width: min(640px, 100%);
+      padding: 24px;
+    }
+    .modal-panel .close {
+      float: right;
+      background: rgba(255,255,255,.07);
+      box-shadow: none;
+      padding: 8px 11px;
+    }
+
+    @media (max-width: 1080px) {
+      header.hero { grid-template-columns: 1fr; }
+      .wide, .half, .third, .timeline { grid-column: 1 / -1; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      .stage-board { grid-template-columns: repeat(2, 1fr); }
+      .rules-grid, .drafts-grid, .signals-grid, .gates-grid, .summary-grid { grid-template-columns: repeat(2, 1fr); }
+      .console { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 640px) {
+      .shell { width: min(100% - 20px, 1440px); padding-top: 12px; }
+      .hero-card, .status-card, .module, .timeline { padding: 18px; border-radius: 18px; }
+      h1 { font-size: 42px; }
+      .flow, .stage-board, .rules-grid, .drafts-grid, .signals-grid, .gates-grid, .summary-grid, .status-grid { grid-template-columns: 1fr; }
+      .module-head { flex-direction: column; }
+      .hero-actions button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <section class="hero-card">
+        <div class="kicker"><span class="pulse"></span> One-person design studio automation</div>
+        <h1>Lead Nurture Control Room</h1>
+        <p>A responsive operations map for qualifying inbound opportunities, assigning pipeline stages, protecting consent, drafting follow-ups, detecting stalls, and keeping every client touch under human approval.</p>
+        <div class="hero-actions">
+          <button onclick="scrollToSection('qualification')">Trace the lead path</button>
+          <button class="secondary" onclick="scrollToSection('weekly')">Open weekly review</button>
+        </div>
+      </section>
+      <aside class="status-card" aria-label="Live status overview">
+        <div class="clock">
+          <div><span>Studio local time</span><strong id="clock">--:--</strong></div>
+          <div class="badge">Automation armed</div>
+        </div>
+        <div class="radar" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+        <div class="status-grid">
+          <div class="metric"><b>14</b><small>active leads</small></div>
+          <div class="metric"><b>5</b><small>needs review</small></div>
+          <div class="metric"><b>2</b><small>stalled flags</small></div>
+        </div>
+      </aside>
+    </header>
+
+    <nav class="nav-rail" aria-label="Operations map sections">
+      <a href="#qualification">Qualification</a>
+      <a href="#stages">Stages</a>
+      <a href="#consent">Consent</a>
+      <a href="#drafts">Drafts</a>
+      <a href="#cadence">Cadence</a>
+      <a href="#stalls">Stalls</a>
+      <a href="#gates">Approval Gates</a>
+      <a href="#weekly">Weekly Summary</a>
+    </nav>
+
+    <main class="ops-map">
+      <section class="module wide" id="qualification">
+        <div class="module-head"><div><h2>Inbound qualification intake</h2><p>Every inquiry is converted into a structured brief before the studio owner spends time replying.</p></div><span class="badge">First 10 minutes</span></div>
+        <div class="flow">
+          <div class="flow-step"><div class="num">1</div><h3>Capture source</h3><p>Website form, referral email, portfolio inquiry, or social DM is logged with timestamp and original message.</p></div>
+          <div class="flow-step"><div class="num">2</div><h3>Score fit</h3><p>Budget range, project type, deadline, decision maker, and brand maturity create a 0–100 fit score.</p></div>
+          <div class="flow-step"><div class="num">3</div><h3>Spot blockers</h3><p>Flags impossible timelines, speculative work requests, unclear ownership, or no consent to follow up.</p></div>
+          <div class="flow-step"><div class="num">4</div><h3>Suggest next move</h3><p>Assigns the safest stage and prepares an owner-reviewed response path.</p></div>
+        </div>
+      </section>
+
+      <aside class="timeline" id="cadence">
+        <div class="module-head"><div><h2>Reminder cadence</h2><p>Quiet, consent-aware reminders that never pretend to be human-sent.</p></div></div>
+        <div class="cadence">
+          <div class="cadence-item"><div class="cadence-dot">D0</div><div class="cadence-copy"><strong>Receipt confirmation</strong><span>Draft a warm acknowledgment and promise a considered reply.</span></div></div>
+          <div class="cadence-item"><div class="cadence-dot">D2</div><div class="cadence-copy"><strong>Discovery nudge</strong><span>Ask for missing scope, timeline, or decision criteria.</span></div></div>
+          <div class="cadence-item"><div class="cadence-dot">D5</div><div class="cadence-copy"><strong>Value follow-up</strong><span>Share a relevant process note, audit angle, or portfolio match.</span></div></div>
+          <div class="cadence-item"><div class="cadence-dot">D9</div><div class="cadence-copy"><strong>Close-the-loop</strong><span>Offer to pause the conversation or book a call if timing changed.</span></div></div>
+          <div class="cadence-item"><div class="cadence-dot">D14</div><div class="cadence-copy"><strong>Archive prompt</strong><span>Move to nurture unless the owner marks renewed intent.</span></div></div>
+        </div>
+      </aside>
+
+      <section class="module full" id="stages">
+        <div class="module-head"><div><h2>Stage assignment board</h2><p>Click any lead card to inspect the routing reason and recommended human action.</p></div><span class="badge">Pipeline map</span></div>
+        <div class="stage-board">
+          <div class="stage"><div class="stage-title">New inbound <span>4</span></div><div class="lead-card" data-title="Brightline Cafe" data-detail="High-fit rebrand inquiry. Missing launch date. Recommended action: approve discovery-question draft."><b><span class="heat warm"></span>Brightline Cafe</b><small>Brand refresh · $8k–$12k</small></div><div class="lead-card" data-title="North Pier Yoga" data-detail="Referral source confirmed. Budget unknown. Recommended action: ask for goals and budget comfort."><b><span class="heat cool"></span>North Pier Yoga</b><small>Website update · unknown</small></div></div>
+          <div class="stage"><div class="stage-title">Qualified <span>3</span></div><div class="lead-card" data-title="Atlas Ceramics" data-detail="Fit score 88. Decision maker identified. Recommended action: send approved booking link draft."><b><span class="heat hot"></span>Atlas Ceramics</b><small>Identity system · $15k</small></div><div class="lead-card" data-title="Pocket Grove" data-detail="Good scope, soft deadline. Recommended action: prepare mini roadmap before call."><b><span class="heat warm"></span>Pocket Grove</b><small>Packaging · $9k</small></div></div>
+          <div class="stage"><div class="stage-title">Discovery booked <span>2</span></div><div class="lead-card" data-title="Mira Finch Studio" data-detail="Call booked Friday. Recommended action: review pre-call notes and confirm attendees."><b><span class="heat hot"></span>Mira Finch Studio</b><small>Portfolio site · $7k</small></div></div>
+          <div class="stage"><div class="stage-title">Proposal sent <span>3</span></div><div class="lead-card" data-title="Lumen Field Labs" data-detail="Proposal sent 6 days ago. Reminder due tomorrow, but requires owner approval."><b><span class="heat warm"></span>Lumen Field Labs</b><small>Launch visuals · $18k</small></div><div class="lead-card" data-title="Hearth & Rue" data-detail="Pricing question unresolved. Recommended action: manual reply only."><b><span class="heat cool"></span>Hearth & Rue</b><small>Brand kit · $6k</small></div></div>
+          <div class="stage"><div class="stage-title">Nurture / stalled <span>2</span></div><div class="lead-card" data-title="Cobalt Table" data-detail="No response after D14. Consent valid, but frequency cap reached. Recommended action: archive for monthly digest."><b><span class="heat cool"></span>Cobalt Table</b><small>Interior concept · $11k</small></div></div>
+        </div>
+      </section>
+
+      <section class="module half" id="consent">
+        <div class="module-head"><div><h2>Consent and opt-out protection</h2><p>Follow-up automation is blocked unless permission, relevance, and frequency checks all pass.</p></div><span class="badge">Safety layer</span></div>
+        <div class="rules-grid">
+          <div class="rule"><strong>Consent proof</strong><p>Stores form checkbox, email context, or direct request before any reminder is drafted.</p><div class="pill-row"><span class="pill">required</span><span class="pill">auditable</span></div></div>
+          <div class="rule"><strong>Opt-out lock</strong><p>Unsubscribe, “not now,” or “stop” language freezes cadence and routes to owner review.</p><div class="pill-row"><span class="pill">instant block</span><span class="pill">no override by bot</span></div></div>
+          <div class="rule"><strong>Frequency cap</strong><p>No more than three proactive touches in 14 days without a fresh human-approved reason.</p><div class="pill-row"><span class="pill">3 / 14 days</span></div></div>
+        </div>
+        <div class="approval-switch"><div><strong>Automation send disabled</strong><p style="margin:4px 0 0">Drafts can be prepared, but outbound messages wait for the studio owner.</p></div><div class="toggle" id="sendToggle" onclick="toggleSend()"><span></span></div></div>
+      </section>
+
+      <section class="module half" id="stalls">
+        <div class="module-head"><div><h2>Stalled-opportunity detection</h2><p>Signals are ranked by revenue risk and relationship sensitivity.</p></div><span class="badge">2 alerts</span></div>
+        <div class="signals-grid">
+          <div class="signal"><strong>Silent after proposal</strong><p>Lumen Field Labs has no reply six days after proposal. Draft soft check-in for approval.</p><div class="bar"><i style="--w: 72%"></i></div></div>
+          <div class="signal"><strong>Decision date passed</strong><p>Hearth & Rue missed the decision window and asked a pricing question. Manual response required.</p><div class="bar"><i style="--w: 84%"></i></div></div>
+          <div class="signal"><strong>Low-fit nurture drift</strong><p>Cobalt Table reached the frequency cap. Archive unless they re-engage.</p><div class="bar"><i style="--w: 51%"></i></div></div>
+        </div>
+      </section>
+
+      <section class="module full" id="drafts">
+        <div class="module-head"><div><h2>Approved follow-up draft library</h2><p>Reusable, editable drafts stay factual, polite, and clearly tied to the lead’s stated interest.</p></div><button class="secondary" onclick="randomizeDraftStatus()">Cycle draft status</button></div>
+        <div class="drafts-grid">
+          <div class="draft-card"><div><span class="badge" id="draftBadge1">Approved template</span><h3>Discovery question follow-up</h3></div><textarea>Hello {{first_name}}, thanks for reaching out about {{project_type}}. Before I suggest the best next step, could you share your ideal launch window, budget comfort, and who will approve the final direction?</textarea><button onclick="copyDraft(this)">Copy draft</button></div>
+          <div class="draft-card"><div><span class="badge" id="draftBadge2">Owner review</span><h3>Proposal check-in</h3></div><textarea>Hi {{first_name}}, I wanted to gently check whether the proposal answered the questions your team had. If priorities have shifted, I can either revise the scope or pause this until the timing is better.</textarea><button onclick="copyDraft(this)">Copy draft</button></div>
+          <div class="draft-card"><div><span class="badge" id="draftBadge3">Approved template</span><h3>Close-the-loop note</h3></div><textarea>Hi {{first_name}}, I haven’t heard back, so I’ll close the loop for now. If the project becomes active again, reply anytime and I’ll be happy to revisit the brief.</textarea><button onclick="copyDraft(this)">Copy draft</button></div>
+        </div>
+      </section>
+
+      <section class="module half" id="gates">
+        <div class="module-head"><div><h2>Human approval gates</h2><p>The system recommends action; the solo owner controls judgment, tone, price, and send decisions.</p></div><span class="badge">Owner accountable</span></div>
+        <div class="gates-grid">
+          <div class="gate"><h3>Price or scope change</h3><p>Any mention of discounting, alternate packages, or timeline tradeoffs is manual only.</p></div>
+          <div class="gate"><h3>High-value lead</h3><p>Opportunities above $15k require review of context, risk, and next-step framing.</p></div>
+          <div class="gate"><h3>Sensitive language</h3><p>Complaints, opt-outs, urgency, legal terms, or negative sentiment stop automation immediately.</p></div>
+        </div>
+      </section>
+
+      <section class="module half">
+        <div class="module-head"><div><h2>Routing rules console</h2><p>Plain-English logic keeps the automation explainable.</p></div></div>
+        <div class="console">
+          <div class="terminal" id="terminal">
+            <div class="ok">✓ If consent missing → hold all reminders</div>
+            <div class="ok">✓ If fit score ≥ 75 → qualified stage</div>
+            <div class="warn">⚠ If proposal silent ≥ 5 days → draft check-in</div>
+            <div class="stop">✕ If opt-out detected → freeze lead record</div>
+            <div class="warn">⚠ If project value ≥ $15k → owner approval gate</div>
+          </div>
+          <div class="review-list">
+            <label><input type="checkbox" checked /> Review new high-fit inquiries before noon</label>
+            <label><input type="checkbox" /> Approve or rewrite two proposal reminders</label>
+            <label><input type="checkbox" checked /> Archive leads that exceeded cadence cap</label>
+            <label><input type="checkbox" /> Update source tags for referral leads</label>
+          </div>
+        </div>
+      </section>
+
+      <section class="module full" id="weekly">
+        <div class="module-head"><div><h2>Weekly pipeline summary</h2><p>A Friday control-room view for deciding what to pursue, pause, improve, or decline.</p></div><span class="badge">Friday 15:30</span></div>
+        <div class="summary-grid">
+          <div class="summary-card"><b>$78k</b><span>potential project value in active pipeline</span><div class="bar"><i style="--w: 78%"></i></div></div>
+          <div class="summary-card"><b>64%</b><span>qualified-to-discovery conversion this week</span><div class="bar"><i style="--w: 64%"></i></div></div>
+          <div class="summary-card"><b>9</b><span>follow-up drafts prepared, 0 auto-sent</span><div class="bar"><i style="--w: 90%"></i></div></div>
+          <div class="summary-card"><b>3</b><span>leads declined due to poor fit or timeline risk</span><div class="bar"><i style="--w: 34%"></i></div></div>
+          <div class="summary-card"><b>2</b><span>stalled deals require personal judgment</span><div class="bar"><i style="--w: 42%"></i></div></div>
+          <div class="summary-card"><b>100%</b><span>cadence touches passed consent checks</span><div class="bar"><i style="--w: 100%"></i></div></div>
+        </div>
+      </section>
+    </main>
+
+    <footer>Fictional operational dashboard for a solo design studio. Self-contained HTML, CSS, and JavaScript.</footer>
+  </div>
+
+  <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-panel">
+      <button class="close" onclick="closeModal()" aria-label="Close dialog">×</button>
+      <span class="badge">Routing inspection</span>
+      <h2 id="modalTitle" style="margin-top:14px">Lead</h2>
+      <p id="modalDetail"></p>
+      <div class="pill-row"><span class="pill">human approval required</span><span class="pill">consent checked</span><span class="pill">stage reason logged</span></div>
+    </div>
+  </div>
+
+  <script>
+    function updateClock() {
+      const now = new Date();
+      document.getElementById('clock').textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+
+    function scrollToSection(id) {
+      document.getElementById(id).scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    document.querySelectorAll('.lead-card').forEach(card => {
+      card.addEventListener('click', () => {
+        document.getElementById('modalTitle').textContent = card.dataset.title;
+        document.getElementById('modalDetail').textContent = card.dataset.detail;
+        document.getElementById('modal').classList.add('show');
+      });
+    });
+
+    function closeModal() {
+      document.getElementById('modal').classList.remove('show');
+    }
+
+    document.getElementById('modal').addEventListener('click', (event) => {
+      if (event.target.id === 'modal') closeModal();
+    });
+
+    function toggleSend() {
+      const toggle = document.getElementById('sendToggle');
+      toggle.classList.toggle('on');
+      const terminal = document.getElementById('terminal');
+      const line = document.createElement('div');
+      if (toggle.classList.contains('on')) {
+        line.className = 'warn';
+        line.textContent = '⚠ Simulation only: outbound send remains owner-gated by policy';
+      } else {
+        line.className = 'ok';
+        line.textContent = '✓ Automation send disabled; draft-only mode restored';
+      }
+      terminal.prepend(line);
+    }
+
+    function copyDraft(button) {
+      const text = button.parentElement.querySelector('textarea').value;
+      navigator.clipboard?.writeText(text).then(() => {
+        button.textContent = 'Copied';
+        setTimeout(() => button.textContent = 'Copy draft', 1200);
+      }).catch(() => {
+        button.textContent = 'Select text to copy';
+        setTimeout(() => button.textContent = 'Copy draft', 1400);
+      });
+    }
+
+    function randomizeDraftStatus() {
+      const states = ['Approved template', 'Owner review', 'Needs personalization', 'Consent check'];
+      ['draftBadge1', 'draftBadge2', 'draftBadge3'].forEach((id, index) => {
+        const el = document.getElementById(id);
+        el.textContent = states[(Math.floor(Date.now() / 1000) + index) % states.length];
+      });
+    }
+  </script>
+</body>
+</html>

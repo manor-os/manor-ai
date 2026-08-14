@@ -32,6 +32,7 @@ async def create_goal(
     metric_key: str,
     target_value: Decimal | float | int,
     workspace_id: Optional[str] = None,
+    stat_id: Optional[str] = None,
     description: Optional[str] = None,
     baseline_value: Optional[Decimal | float | int] = None,
     deadline: Optional[date] = None,
@@ -50,9 +51,13 @@ async def create_goal(
         is_workspace_internal_measurement_source,
     )
 
-    measurement_source = default_workspace_measurement_source(
-        measurement_source,
-        workspace_id=workspace_id,
+    measurement_source = (
+        None
+        if stat_id
+        else default_workspace_measurement_source(
+            measurement_source,
+            workspace_id=workspace_id,
+        )
     )
     if measurement_source and is_workspace_internal_measurement_source(measurement_source):
         measurement_cadence = measurement_cadence or "daily"
@@ -63,6 +68,7 @@ async def create_goal(
         id=generate_ulid(),
         entity_id=entity_id,
         workspace_id=workspace_id,
+        stat_id=stat_id,
         title=title,
         description=description,
         metric_key=metric_key,
@@ -140,6 +146,7 @@ async def update_goal(
         "target_value": goal.target_value,
         "deadline": goal.deadline,
         "status": goal.status,
+        "stat_id": goal.stat_id,
     }
     schedule_relevant_changed = (
         ("measurement_source" in fields and fields["measurement_source"] != goal.measurement_source)
@@ -151,7 +158,7 @@ async def update_goal(
         if v is None and k not in {
             # explicit-clear-allowed fields
             "deadline", "description", "measurement_source",
-            "measurement_cadence", "baseline_value",
+            "measurement_cadence", "baseline_value", "stat_id",
         }:
             continue
         if k in {"target_value", "baseline_value", "current_value"} and v is not None:
@@ -173,10 +180,16 @@ async def update_goal(
         default_workspace_measurement_source,
         is_workspace_internal_measurement_source,
     )
-    goal.measurement_source = default_workspace_measurement_source(
-        goal.measurement_source,
-        workspace_id=goal.workspace_id,
+    goal.measurement_source = (
+        None
+        if goal.stat_id
+        else default_workspace_measurement_source(
+            goal.measurement_source,
+            workspace_id=goal.workspace_id,
+        )
     )
+    if goal.stat_id:
+        goal.measurement_cadence = None
     if goal.measurement_source and is_workspace_internal_measurement_source(goal.measurement_source):
         goal.measurement_cadence = goal.measurement_cadence or "daily"
         if goal.baseline_value is None:
@@ -187,7 +200,7 @@ async def update_goal(
         or goal.measurement_cadence != previous_measurement_cadence
     )
 
-    if schedule_relevant_changed or normalized_schedule_changed:
+    if schedule_relevant_changed or normalized_schedule_changed or "stat_id" in fields:
         from packages.core.goals.scheduling import (
             install_measurement_schedule,
             remove_measurement_schedule,

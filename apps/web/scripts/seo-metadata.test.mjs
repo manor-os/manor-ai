@@ -15,8 +15,9 @@ test("authenticated web app publishes safe discovery metadata", () => {
   assert.match(html, /name="twitter:card"/);
 
   assert.match(robots, /^User-agent: \*$/m);
-  assert.match(robots, /^Disallow: \/$/m);
-  assert.match(robots, /^Allow: \/llms\.txt$/m);
+  assert.doesNotMatch(robots, /^Disallow: \/$/m);
+  assert.match(robots, /^Allow: \/$/m);
+  assert.match(robots, /^Sitemap: https:\/\/manorai\.xyz\/sitemap\.xml$/m);
 
   assert.match(llms, /^# Manor AI Application$/m);
   assert.match(llms, /https:\/\/github\.com\/manor-os\/manor-ai/);

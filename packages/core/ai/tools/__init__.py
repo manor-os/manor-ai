@@ -14,6 +14,8 @@ def register_all_tools(pool) -> None:
         rag_tools,
         web_tools,
         weather_tools,
+        stickman_topic_tools,
+        youtube_tools,
         system_tools,
         bash_tool,
         file_tools,
@@ -32,6 +34,8 @@ def register_all_tools(pool) -> None:
         notification_tools,
         dashboard_tools,
         workflow_tools,
+        site_tools,
+        video_edit_tools,
     )
 
     # invoke_skill is always-loaded since any agent may call skills at runtime.
@@ -58,6 +62,8 @@ def register_all_tools(pool) -> None:
         rag_tools,
         web_tools,
         weather_tools,
+        stickman_topic_tools,
+        youtube_tools,
         system_tools,
         bash_tool,
         file_tools,
@@ -76,6 +82,8 @@ def register_all_tools(pool) -> None:
         notification_tools,
         dashboard_tools,
         workflow_tools,
+        site_tools,
+        video_edit_tools,
     ]:
         for schema, handler in module.get_tools():
             pool.register(schema["function"]["name"], schema, handler)

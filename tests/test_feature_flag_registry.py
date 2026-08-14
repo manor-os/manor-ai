@@ -39,6 +39,8 @@ def test_known_flags_are_unique_and_documented():
     assert len(keys) == len(set(keys)), "duplicate key in KNOWN_FLAGS"
     assert "strategist_review_v2" in keys
     assert "tool_discovery_v2" in keys
+    assert "flows_preview_access" in keys
+    assert "apps_preview_access" in keys
     for known in KNOWN_FLAGS:
         assert known.description.strip(), f"{known.key} needs a description"
         assert len(known.description) <= 200

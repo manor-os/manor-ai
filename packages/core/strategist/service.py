@@ -40,10 +40,7 @@ from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.workspace import Workspace
 from packages.core.ai.runtime import runtime_strategist_review_billing_context
 from packages.core.ai.runtime.task_requirements import merge_task_runtime_capabilities
-from packages.core.proposals.constants import (
-    TASK_ACTION_KEY,
-    strategist_action_label,
-)
+from packages.core.proposals.constants import strategist_action_label
 from packages.core.services.hitl_options import DEFAULT_APPROVAL_OPTIONS
 from packages.core.services.task_dependencies import dependency_ids_from_details, details_with_dependency_state
 from packages.core.services.task_service import update_task
@@ -172,8 +169,11 @@ async def run_review(
 
     # The last review still has unaccepted proposals. What happens next is
     # decided by the trigger KIND, never by the trigger text.
-    if ctx.open_proposed_tasks:
-        conflict = open_proposal_conflict(ctx.open_proposed_tasks)
+    if ctx.open_proposed_tasks or ctx.open_proposed_items:
+        conflict = open_proposal_conflict(
+            ctx.open_proposed_tasks,
+            open_items=ctx.open_proposed_items,
+        )
         await _post_review_skip_notice(
             db,
             workspace,
@@ -277,6 +277,7 @@ async def run_review(
             new_task_ids
             or proposal.human_requests
             or proposal.experiments
+            or proposal.workflow_runs
             or proposal.automation_changes
             or proposal.workflow_changes
             or proposal.goal_changes
@@ -292,6 +293,10 @@ async def run_review(
 
     policy_denied = governance.get("outcome") == "deny"
     standing_allow = governance.get("outcome") == "allow"
+    has_external_tasks = any(
+        task.external_action is not None for task in proposal.tasks
+    )
+    legacy_auto_approve = auto_approve_proposals and not has_external_tasks
 
     approved_task_ids: list[str] = []
     if policy_denied:
@@ -306,7 +311,7 @@ async def run_review(
             reason_code="POLICY_BLOCKED",
             actor_kind="system",
         )
-    elif (auto_approve_proposals or standing_allow) and new_task_ids:
+    elif (legacy_auto_approve or standing_allow) and new_task_ids:
         approved_task_ids = await approve_proposal(
             db,
             entity_id=workspace.entity_id,
@@ -335,11 +340,12 @@ async def run_review(
             auto_approved=bool(approved_task_ids),
             policy_denied=policy_denied,
             pending_items=pending_items,
-            # Name what authorised the auto-execution. The cohort approval
-            # is resolved against TASK_ACTION_KEY, so a standing-grant
-            # "allow" is exactly that key's grant; otherwise it was the
-            # legacy workspace-wide boolean.
-            auto_approved_action_key=TASK_ACTION_KEY if standing_allow else None,
+            # Name the exact cohort action that authorised auto-execution.
+            # External tasks use their dedicated high-risk standing grant;
+            # the legacy workspace-wide boolean covers internal tasks only.
+            auto_approved_action_key=(
+                governance.get("task_action_key") if standing_allow else None
+            ),
         )
 
     # Surface human requests in workspace chat (M10). Best-effort —
@@ -367,6 +373,8 @@ async def run_review(
             result["human_requests"] = governance["human_requests"]
         if governance.get("experiments"):
             result["experiments"] = governance["experiments"]
+        if governance.get("workflow_runs"):
+            result["workflow_runs"] = governance["workflow_runs"]
         if governance.get("changes"):
             result["changes"] = governance["changes"]
         if pending_items:
@@ -398,6 +406,7 @@ async def _wire_proposal_governance(
     )
     from packages.core.models.consolidation_report import ConsolidationReport
     from packages.core.proposals import (
+        EXTERNAL_TASK_ACTION_KEY,
         TASK_ACTION_KEY,
         create_proposal_with_items,
         get_items_for_review,
@@ -431,6 +440,12 @@ async def _wire_proposal_governance(
     validated = await validate_items(db, review_run, report_rows, items)
     validation_notes = [note for _, note in validated if note]
 
+    external_pairs = [
+        (pt, task) for pt, task in pairs if pt.external_action is not None
+    ]
+    cohort_action_key = EXTERNAL_TASK_ACTION_KEY if external_pairs else TASK_ACTION_KEY
+    cohort_risk_level = "high" if external_pairs else "low"
+
     # The cohort HitlRequest only concerns kind="task" items; a
     # human_requests-only proposal never mints one (M8 catalog).
     decision = None
@@ -439,11 +454,11 @@ async def _wire_proposal_governance(
             db,
             subject=ApprovalSubject(
                 entity_id=workspace.entity_id,
-                action_key=TASK_ACTION_KEY,
+                action_key=cohort_action_key,
                 capability_id=None,
                 resource_kind="proposal",
                 resource_id=record.id,
-                risk_level="low",
+                risk_level=cohort_risk_level,
                 kind="action",
                 # Proposals intrinsically need a human unless a standing grant
                 # (policy auto_approve_actions) or the legacy workspace boolean
@@ -460,6 +475,7 @@ async def _wire_proposal_governance(
                     "proposal_id": record.id,
                     "task_ids": list(new_task_ids),
                     "task_titles": [pt.title for pt, _ in pairs],
+                    "external_task_ids": [task.id for _, task in external_pairs],
                 },
             ),
             intrinsic_rule="proposal.review",
@@ -493,6 +509,14 @@ async def _wire_proposal_governance(
         proposal=proposal,
     )
 
+    workflow_runs = await _execute_workflow_run_items(
+        db,
+        workspace=workspace,
+        record=record,
+        review_id=review_id,
+        proposal=proposal,
+    )
+
     changes = await _execute_change_items(
         db,
         workspace=workspace,
@@ -512,9 +536,12 @@ async def _wire_proposal_governance(
         "outcome": decision.outcome if decision is not None else None,
         "reason": decision.reason if decision is not None else None,
         "approval_request_id": approval_request_id,
+        "has_external_tasks": bool(external_pairs),
+        "task_action_key": cohort_action_key,
         "validation_notes": validation_notes,
         "human_requests": human_requests,
         "experiments": experiments,
+        "workflow_runs": workflow_runs,
         "changes": changes,
     }
 
@@ -580,6 +607,135 @@ async def _execute_human_request_items(
             "role_required": proposed_request.role_required,
             "expected_by": expected_by.isoformat() if expected_by else None,
         })
+    await db.flush()
+    return digests
+
+
+async def _execute_workflow_run_items(
+    db: AsyncSession,
+    *,
+    workspace: Workspace,
+    record,
+    review_id: str,
+    proposal: Proposal,
+) -> list[dict]:
+    proposed = list(getattr(proposal, "workflow_runs", None) or [])
+    if not proposed:
+        return []
+
+    from packages.core.governance.approvals import (
+        ApprovalOrigin,
+        ApprovalSubject,
+        consume_approval,
+        resolve_approval,
+    )
+    from packages.core.proposals import (
+        WORKFLOW_RUN_ACTION_KEY,
+        create_workflow_run_items,
+    )
+    from packages.core.services.proposal_workflow_runs import (
+        ProposalWorkflowRunError,
+        dispatch_workflow_run_item,
+        resolve_proposal_workflow_binding,
+    )
+
+    items = await create_workflow_run_items(
+        db,
+        record=record,
+        proposed_runs=proposed,
+    )
+    now = datetime.now(timezone.utc)
+    digests: list[dict] = []
+    for proposed_run, item in zip(proposed, items):
+        digest = {
+            "item_id": item.id,
+            "kind": "workflow_run",
+            "run_key": proposed_run.run_key,
+            "workflow_ref": proposed_run.workflow_ref.model_dump(mode="json"),
+            "risk_level": item.risk_level,
+            "action_key": item.action_key,
+            "outcome": None,
+            "approval_request_id": None,
+            "workflow_run_id": None,
+        }
+        try:
+            await resolve_proposal_workflow_binding(db, item=item)
+        except ProposalWorkflowRunError as exc:
+            item.status = "rejected"
+            item.decided_at = now
+            item.decision = {
+                "decided_by": None,
+                "decision": "rejected",
+                "reason_code": "INSUFFICIENT_DATA",
+                "comment": str(exc),
+                "decided_at": now.isoformat(),
+            }
+            digest.update({"outcome": "rejected", "error": str(exc)})
+            digests.append(digest)
+            continue
+        decision = await resolve_approval(
+            db,
+            subject=ApprovalSubject(
+                entity_id=workspace.entity_id,
+                action_key=WORKFLOW_RUN_ACTION_KEY,
+                capability_id="workflow.run",
+                resource_kind="proposal_item",
+                resource_id=item.id,
+                risk_level=item.risk_level,
+                kind="action",
+                requires_approval=True,
+                workspace_id=workspace.id,
+            ),
+            origin=ApprovalOrigin(
+                kind=ApprovalOriginKind.OPERATION.value,
+                context={
+                    "plane": "strategist_proposal",
+                    "review_id": review_id,
+                    "proposal_id": record.id,
+                    "proposal_item_id": item.id,
+                    "run_key": proposed_run.run_key,
+                    "workflow_ref": proposed_run.workflow_ref.model_dump(mode="json"),
+                },
+            ),
+            intrinsic_rule="proposal.workflow_run",
+            intrinsic_reason=(
+                "Workspace Flow runs require approval before a new execution lineage is created."
+            ),
+        )
+        digest["outcome"] = decision.outcome
+        if decision.request is not None:
+            item.approval_request_id = decision.request.id
+            digest["approval_request_id"] = decision.request.id
+        if decision.outcome == "allow":
+            item.status = "approved"
+            item.decided_at = now
+            item.decision = {
+                "decided_by": None,
+                "decision": "approved",
+                "reason_code": None,
+                "comment": decision.reason or "standing grant",
+                "decided_at": now.isoformat(),
+            }
+            try:
+                run = await dispatch_workflow_run_item(db, item_id=item.id)
+                digest["workflow_run_id"] = run.id
+            except ProposalWorkflowRunError as exc:
+                item.status = "failed"
+                item.finished_at = datetime.now(timezone.utc)
+                digest["error"] = str(exc)
+            if decision.request is not None:
+                await consume_approval(db, decision.request)
+        elif decision.outcome == "deny":
+            item.status = "rejected"
+            item.decided_at = now
+            item.decision = {
+                "decided_by": None,
+                "decision": "rejected",
+                "reason_code": "POLICY_BLOCKED",
+                "comment": decision.reason,
+                "decided_at": now.isoformat(),
+            }
+        digests.append(digest)
     await db.flush()
     return digests
 
@@ -1000,6 +1156,16 @@ async def _mirror_item_decisions(
         only_item_ids=only_item_ids,
     )
 
+    await _mirror_workflow_run_items_on_cohort_decision(
+        db,
+        record=record,
+        approved=approved,
+        actor_id=actor_id,
+        reason=reason,
+        reason_code=reason_code,
+        only_item_ids=only_item_ids,
+    )
+
     # M10: configuration-change items ride the same cohort card.
     await _mirror_change_items_on_cohort_decision(
         db,
@@ -1010,6 +1176,114 @@ async def _mirror_item_decisions(
         reason_code=reason_code,
         only_item_ids=only_item_ids,
     )
+
+
+async def _mirror_workflow_run_items_on_cohort_decision(
+    db: AsyncSession,
+    *,
+    record,
+    approved: bool,
+    actor_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    only_item_ids: Optional[list[str]] = None,
+) -> None:
+    from sqlalchemy import select as sa_select
+
+    from packages.core.governance.approvals import (
+        consume_approval,
+        deny_approval,
+        find_requests_by_dedup,
+        grant_approval,
+    )
+    from packages.core.models.proposal import ProposalItemRecord
+    from packages.core.services.proposal_workflow_runs import (
+        ProposalWorkflowRunError,
+        dispatch_workflow_run_item,
+    )
+
+    if only_item_ids is not None and not only_item_ids:
+        return
+    query = sa_select(ProposalItemRecord).where(
+        ProposalItemRecord.proposal_id == record.id,
+        ProposalItemRecord.kind == "workflow_run",
+        ProposalItemRecord.status == "proposed",
+    )
+    if only_item_ids is not None:
+        query = query.where(ProposalItemRecord.id.in_(list(only_item_ids)))
+    items = list((await db.execute(
+        query.order_by(ProposalItemRecord.created_at.asc(), ProposalItemRecord.id.asc())
+    )).scalars().all())
+    now = datetime.now(timezone.utc)
+    for item in items:
+        requests = [
+            request for request in await find_requests_by_dedup(
+                db,
+                entity_id=record.entity_id,
+                dedup_key=f"proposal_item:{item.id}",
+            )
+            if request.status in APPROVAL_LIVE_STATUSES
+        ]
+        if approved:
+            item.status = "approved"
+            item.decided_at = now
+            item.decision = {
+                "decided_by": actor_id or "user",
+                "decision": "approved",
+                "reason_code": None,
+                "decided_at": now.isoformat(),
+            }
+            for request in requests:
+                if request.status == ApprovalStatus.PENDING:
+                    await grant_approval(
+                        db,
+                        request,
+                        by_user_id=actor_id,
+                        via="chat_card",
+                    )
+                if request.status == ApprovalStatus.GRANTED:
+                    await consume_approval(db, request)
+            try:
+                await dispatch_workflow_run_item(
+                    db,
+                    item_id=item.id,
+                    actor_id=actor_id,
+                )
+            except ProposalWorkflowRunError as exc:
+                item.status = "failed"
+                item.finished_at = datetime.now(timezone.utc)
+                decision = dict(item.decision or {})
+                decision["dispatch_error"] = str(exc)
+                item.decision = decision
+        else:
+            item.status = "rejected"
+            item.decided_at = now
+            item.decision = {
+                "decided_by": actor_id or "user",
+                "decision": "rejected",
+                "reason_code": reason_code or "OTHER",
+                "comment": reason,
+                "decided_at": now.isoformat(),
+            }
+            for request in requests:
+                if request.status == ApprovalStatus.PENDING:
+                    await deny_approval(
+                        db,
+                        request,
+                        by_user_id=actor_id,
+                        via="chat_card",
+                        reason=reason,
+                    )
+    remaining = (await db.execute(
+        sa_select(ProposalItemRecord.id).where(
+            ProposalItemRecord.proposal_id == record.id,
+            ProposalItemRecord.status == "proposed",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if remaining is None and record.status == "open":
+        record.status = "resolved"
+        record.resolved_at = now
+    await db.flush()
 
 
 async def _mirror_experiment_items_on_cohort_decision(
@@ -1237,6 +1511,19 @@ async def approve_proposal(
         batch_id = await _create_proposal_work_batch(db, rows, review_id=review_id)
     for t in rows:
         details = dict(t.details or {})
+        if details.get("external_action"):
+            from packages.core.proposals.external_authorization import (
+                issue_proposal_external_authorization,
+            )
+
+            details["proposal_external_authorization"] = (
+                issue_proposal_external_authorization(
+                    t,
+                    details=details,
+                    actor_kind=actor_kind,
+                    actor_id=actor_id,
+                )
+            )
         if batch_id:
             details["workspace_work_batch_id"] = batch_id
         dep_ids = dependency_ids_from_details(details)
@@ -1430,6 +1717,10 @@ async def set_proposal_auto_approval(
         else {}
     )
     strategist_settings[_AUTO_APPROVE_PROPOSALS_KEY] = bool(enabled)
+    # An explicit operator choice owns this setting. It must not later be
+    # mistaken for the temporary auto-run permission added by a Blueprint
+    # simulation and silently cleared during promotion.
+    strategist_settings.pop("auto_approve_proposals_source", None)
     now_iso = datetime.now(timezone.utc).isoformat()
     if enabled:
         strategist_settings["auto_approve_proposals_set_at"] = now_iso
@@ -1841,7 +2132,7 @@ def _enforce_proposal_shape(proposal: Proposal, ctx) -> None:
     """Apply ``recipe.strategist.proposal_shape`` constraints to a fresh
     proposal cohort.
 
-    Three things are enforced post-LLM:
+    Four things are enforced post-LLM:
       * ``max_tasks_per_cycle`` — hard cap. Excess tasks are dropped from
         the END of the list (the LLM is asked to put highest-impact first,
         so trimming the tail is the least bad option). A note is appended.
@@ -1850,6 +2141,8 @@ def _enforce_proposal_shape(proposal: Proposal, ctx) -> None:
       * ``must_include_categories_per_week`` — soft signal. If the cohort
         contains zero tasks in a "must include" category, a note prompts
         the operator (we don't fabricate tasks).
+      * ``task_contracts`` — machine-readable ownership constraints for named
+        task keys. Only explicitly configured fields are replaced.
 
     Hard rejection (drop) is reserved for the max cap because it's the
     only constraint with a clear, non-arbitrary truncation rule.
@@ -1873,6 +2166,27 @@ def _enforce_proposal_shape(proposal: Proposal, ctx) -> None:
             proposal.notes,
             f"Dropped {dropped} proposal(s) above proposal_shape.max_tasks_per_cycle={max_cap}.",
         )
+
+    task_contracts = shape.get("task_contracts")
+    if isinstance(task_contracts, dict):
+        for task in proposal.tasks:
+            task_key = str(getattr(task, "task_key", "") or "").strip()
+            contract = task_contracts.get(task_key)
+            if not task_key or not isinstance(contract, dict):
+                continue
+
+            owner_service_key = contract.get("owner_service_key")
+            if isinstance(owner_service_key, str) and owner_service_key.strip():
+                task.owner_service_key = owner_service_key.strip()
+
+            if "delegate_service_keys" in contract:
+                delegate_service_keys = contract.get("delegate_service_keys")
+                if isinstance(delegate_service_keys, list):
+                    task.delegate_service_keys = [
+                        str(service_key).strip()
+                        for service_key in delegate_service_keys
+                        if str(service_key or "").strip()
+                    ]
 
     preferred = [str(c) for c in (shape.get("preferred_categories") or []) if c]
     if preferred and proposal.tasks:
@@ -2060,49 +2374,85 @@ def _trigger_noun(trigger: ReviewTrigger) -> str:
     return _TRIGGER_NOUNS[trigger.kind]
 
 
-def open_proposal_conflict(open_tasks: list[Task]) -> dict:
+def open_proposal_conflict(
+    open_tasks: list[Task],
+    *,
+    open_items: list[dict] | None = None,
+) -> dict:
     """Describe the undecided cohort that blocks a review.
 
     The shape is the contract the chat tool hands to the model when a
     human-requested review cannot run: how many proposals, what they are
     called, which review produced them, and when.
     """
+    normalized = [
+        {
+            "id": task.id,
+            "task_id": task.id,
+            "item_id": None,
+            "title": task.title,
+            "review_id": (task.details or {}).get("strategist_review_id")
+            if isinstance(task.details, dict)
+            else None,
+            "created_at": task.created_at,
+        }
+        for task in open_tasks
+    ]
+    normalized.extend({
+        "id": str(item.get("id") or ""),
+        "task_id": None,
+        "item_id": str(item.get("id") or "") or None,
+        "title": str(item.get("title") or item.get("kind") or "Proposal"),
+        "review_id": item.get("review_id"),
+        "created_at": item.get("created_at"),
+    } for item in (open_items or []))
     ordered = sorted(
-        open_tasks,
-        key=lambda task: (task.created_at or datetime.min.replace(tzinfo=timezone.utc)),
+        normalized,
+        key=lambda item: (item.get("created_at") or datetime.min.replace(tzinfo=timezone.utc)),
         reverse=True,
     )
     proposals: list[dict] = []
     review_ids: list[str] = []
-    for task in ordered[:_CONFLICT_SAMPLE_LIMIT]:
-        details = task.details if isinstance(task.details, dict) else {}
-        review_id = details.get("strategist_review_id")
+    for item in ordered[:_CONFLICT_SAMPLE_LIMIT]:
+        review_id = item.get("review_id")
         if review_id and review_id not in review_ids:
             review_ids.append(str(review_id))
         proposals.append({
-            "task_id": task.id,
-            "title": task.title,
+            "task_id": item.get("task_id"),
+            "item_id": item.get("item_id"),
+            "title": item.get("title"),
             "review_id": review_id,
-            "proposed_at": task.created_at.isoformat() if task.created_at else None,
+            "proposed_at": item["created_at"].isoformat() if item.get("created_at") else None,
         })
-    newest = ordered[0].created_at if ordered else None
-    oldest = ordered[-1].created_at if ordered else None
+    newest = ordered[0].get("created_at") if ordered else None
+    oldest = ordered[-1].get("created_at") if ordered else None
     task_ids = sorted(task.id for task in open_tasks)
+    item_ids = sorted(
+        str(item.get("id") or "")
+        for item in (open_items or [])
+        if str(item.get("id") or "")
+    )
+    fingerprint_ids = [f"task:{task_id}" for task_id in task_ids]
+    fingerprint_ids.extend(f"item:{item_id}" for item_id in item_ids)
     return {
         "kind": "open_proposals",
-        "open_count": len(open_tasks),
+        "open_count": len(normalized),
         "review_ids": review_ids,
         "review_id": review_ids[0] if review_ids else None,
         "proposals": proposals,
         "newest_proposed_at": newest.isoformat() if newest else None,
         "oldest_proposed_at": oldest.isoformat() if oldest else None,
         "task_ids": task_ids,
-        "fingerprint": _fingerprint("open_proposals", task_ids),
+        "item_ids": item_ids,
+        "fingerprint": _fingerprint("open_proposals", sorted(fingerprint_ids)),
     }
 
 
 def _fingerprint(kind: str, parts: list[str]) -> str:
-    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha1(
+        "|".join(parts).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:16]
     return f"{kind}:{digest}"
 
 
@@ -2476,6 +2826,8 @@ async def _persist_tasks(
             "estimated_impact": pt.estimated_impact.model_dump() if pt.estimated_impact else None,
             "rationale": pt.rationale,
         }
+        if pt.external_action is not None:
+            details["external_action"] = pt.external_action.model_dump(mode="json")
         runtime_context = merge_task_runtime_capabilities(
             {},
             pt.required_capabilities,
@@ -2684,6 +3036,7 @@ _OPERATION_VERB: dict[str, str] = {
 # do — they open a HumanCommitment answered from the Human queue.
 _CARD_ITEM_KINDS: tuple[str, ...] = (
     "automation_change", "workflow_change", "goal_change", "experiment",
+    "workflow_run",
 )
 
 
@@ -2730,6 +3083,10 @@ async def _proposal_item_summary(db: AsyncSession, item) -> str:
     if item.kind == "experiment":
         text = str(payload.get("hypothesis") or "").strip()
         return _clip(text or str(payload.get("experiment_key") or "experiment"), 140)
+    if item.kind == "workflow_run":
+        ref = payload.get("workflow_ref") if isinstance(payload.get("workflow_ref"), dict) else {}
+        title = str(ref.get("workflow_slug") or payload.get("run_key") or "Flow")
+        return _clip(f"Run {title}", 140)
 
     operation = str(payload.get("operation") or "").strip()
     target_kind = str(payload.get("target_kind") or "").strip()
@@ -2897,10 +3254,92 @@ async def _proposal_impact_goals(
         return {}
 
 
+async def _proposal_basis_reports(
+    entity_id: str,
+    workspace_id: str,
+    review_id: str,
+) -> list:
+    """Load the review facts needed to explain a proposal in plain language.
+
+    The task keeps its raw ``basis`` refs for auditability. The card gets a
+    separate display payload resolved from the same review, so it can show an
+    observation such as "3 executions failed" instead of a ledger ULID.
+    """
+    if not review_id:
+        return []
+    try:
+        from packages.core.database import async_session
+        from packages.core.models.consolidation_report import ConsolidationReport
+
+        async with async_session() as db:
+            return list((await db.execute(
+                select(ConsolidationReport)
+                .where(
+                    ConsolidationReport.entity_id == entity_id,
+                    ConsolidationReport.workspace_id == workspace_id,
+                    ConsolidationReport.review_id == review_id,
+                )
+                .order_by(ConsolidationReport.created_at.asc())
+            )).scalars().all())
+    except Exception:
+        logger.debug("Strategist: basis lookup for proposal card failed", exc_info=True)
+        return []
+
+
+def _proposal_basis_display(pt: ProposedTask, reports: list) -> Optional[dict]:
+    """Resolve opaque task-basis refs to readable report domains and facts."""
+    if not pt.basis or not reports:
+        return None
+
+    report_refs = {
+        str(ref).strip() for ref in pt.basis.report_refs if str(ref).strip()
+    }
+    evidence_refs = {
+        str(ref).strip() for ref in pt.basis.evidence_refs if str(ref).strip()
+    }
+    report_domains: list[str] = []
+    signals: list[dict] = []
+    seen_domains: set[str] = set()
+    seen_signals: set[str] = set()
+
+    for report in reports:
+        domain = str(getattr(report, "domain", "") or "").strip()
+        report_id = str(getattr(report, "id", "") or "").strip()
+        if domain and (domain in report_refs or report_id in report_refs):
+            if domain not in seen_domains and len(report_domains) < 4:
+                report_domains.append(domain)
+                seen_domains.add(domain)
+
+        observations = getattr(report, "observations", None) or []
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            observation_refs = {
+                str(ref).strip()
+                for ref in (observation.get("evidence_refs") or [])
+                if str(ref).strip()
+            }
+            if not evidence_refs.intersection(observation_refs):
+                continue
+            description = str(observation.get("description") or "").strip()
+            if not description or description in seen_signals or len(signals) >= 4:
+                continue
+            signals.append({"description": description, "domain": domain or None})
+            seen_signals.add(description)
+            if domain and domain not in seen_domains and len(report_domains) < 4:
+                report_domains.append(domain)
+                seen_domains.add(domain)
+
+    if not report_domains and not signals:
+        return None
+    return {"report_domains": report_domains, "signals": signals}
+
+
 def _proposal_task_entries(
     proposal: Proposal,
     task_ids: list[str],
     goals: dict[str, dict],
+    reports: Optional[list] = None,
 ) -> list[dict]:
     """One typed entry per proposed task, for the card to render directly.
 
@@ -2917,6 +3356,11 @@ def _proposal_task_entries(
         }
         if pt.rationale:
             entry["rationale"] = pt.rationale
+        if pt.basis:
+            entry["basis"] = pt.basis.model_dump(mode="json")
+            basis_display = _proposal_basis_display(pt, reports or [])
+            if basis_display:
+                entry["basis_display"] = basis_display
         impact = pt.estimated_impact
         goal = goals.get(str(impact.goal_id)) if (impact and impact.goal_id) else None
         if goal and impact.metric_delta is not None:
@@ -3005,6 +3449,11 @@ async def _post_proposal_chat(
         proposal,
         task_ids,
         await _proposal_impact_goals(workspace.entity_id, goal_ids),
+        await _proposal_basis_reports(
+            workspace.entity_id,
+            workspace.id,
+            proposal.review_id,
+        ),
     )
     auto_approve_label = (
         strategist_action_label(auto_approved_action_key)

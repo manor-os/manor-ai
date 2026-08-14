@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from types import SimpleNamespace
 from typing import Any
-from xml.etree import ElementTree
+from defusedxml import ElementTree
 
 from jsonschema import Draft202012Validator
 
@@ -40,6 +40,8 @@ from packages.core.ai.runtime import (
     runtime_execute_workflow_tool_step,
     runtime_invoke_skill,
     runtime_merge_prompt_appendix,
+    runtime_agent_tool_scope,
+    runtime_prepare_agent_tool_surface_for_turn,
     runtime_prepare_named_tool_surface_for_turn,
     runtime_prepare_prompt_appendix_for_turn,
     runtime_prepare_trace_envelope_for_turn,
@@ -234,6 +236,8 @@ def workflow_approval_decision_metadata(
             or ["approve", "approved", "accept", "accepted", "yes"]
         )
     }
+    if config.get("allow_always"):
+        approval_values.add("always_approve")
     return {
         "decision": normalized_decision,
         "approved": normalized_decision.lower() in approval_values,
@@ -381,6 +385,12 @@ def _walk_path(value: Any, parts: list[str], missing: Any = None) -> Any:
             if index >= len(current):
                 return missing
             current = current[index]
+        elif part == "choice" and not isinstance(current, (dict, list, tuple)):
+            # Workflow wait responses are stored as {choice: ...} by Chat, but
+            # the low-level resume API historically accepted the scalar choice
+            # directly. Treat ``decision.choice`` as that scalar so one graph
+            # behaves identically on both resume surfaces.
+            continue
         else:
             return missing
     return current
@@ -442,6 +452,34 @@ def _parse_agent_output(value: Any, output_format: Any) -> Any:
         return extract_json_object(str(value or ""))
     except ValueError as exc:
         raise ValueError(f"Agent output must be a valid JSON object: {exc}") from exc
+
+
+def _agent_loop_failure_message(result: Any) -> str | None:
+    stop_reason = str(getattr(result, "stop_reason", "") or "").strip()
+    error = str(getattr(result, "error", "") or "").strip()
+    if not error and stop_reason != "error":
+        return None
+
+    detail_obj = getattr(result, "error_detail", None)
+    detail = ""
+    if isinstance(detail_obj, dict):
+        detail = str(detail_obj.get("message") or detail_obj.get("error") or "").strip()
+    elif detail_obj:
+        detail = str(detail_obj).strip()
+
+    generic_errors = {"llm_call_failed", "provider_error", "error"}
+    if not detail and error and error not in generic_errors:
+        detail = error
+    if not detail:
+        content = str(getattr(result, "content", "") or "").strip()
+        marker = "Error detail:"
+        if marker in content:
+            detail = content.rsplit(marker, 1)[1].strip()
+        elif content:
+            detail = content
+
+    message = "Model provider request failed before producing a response."
+    return f"{message} {detail}" if detail else message
 
 
 def _merge_project_state(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -585,6 +623,7 @@ def _child_workflow_context(run: WorkflowRun, seed: dict[str, Any]) -> dict[str,
     trusted = _trusted_workflow_context(run)
     for key in (
         "workflow_project_id",
+        "workflow_project_root",
         "workflow_action_grant_id",
         "workflow_scene_id",
         "workflow_batch_capture",
@@ -878,7 +917,7 @@ def _bind_inputs(config: dict, variables: dict) -> None:
             continue
         key = str(item.get("key") or item.get("name") or "").strip()
         if key:
-            resolved = _resolve_binding(item.get("value", ""), variables)
+            resolved = _resolve_structure(item.get("value", ""), variables)
             variables[key] = _coerce_typed(resolved, item.get("type"))
 
 
@@ -1261,13 +1300,13 @@ class WorkflowRunner:
         self, workflow: WorkflowDefinition, run: WorkflowRun, db, progress=None,
     ) -> None:
         """Loop: find runnable steps -> execute -> advance -> repeat."""
-        trigger_data = run.trigger_data if isinstance(run.trigger_data, dict) else {}
-        entrypoint_context = trigger_data.get("_workspace_chat_entrypoint")
-        projects_to_workspace_chat = (
-            str(run.trigger_source or "") == "workspace_chat"
-            and isinstance(entrypoint_context, dict)
-            and bool(entrypoint_context.get("enabled"))
-        )
+        from packages.core.services.workflow_chat_projection import workflow_chat_context
+
+        # The execution Workspace is a resource boundary, not necessarily the
+        # conversation that owns progress and HITL. Agent-tool runs started in
+        # personal Chat carry the generic origin key and must receive the same
+        # node/output/wait projections as legacy Workspace Chat entrypoints.
+        projects_to_origin_chat = workflow_chat_context(run) is not None
 
         async def _emit(step, status, result=None):
             step_id = step["id"]
@@ -1282,7 +1321,7 @@ class WorkflowRunner:
                     await progress({"id": step_id, "status": status})
                 except Exception:  # noqa: BLE001 — progress is best-effort telemetry
                     pass
-            if not projects_to_workspace_chat:
+            if not projects_to_origin_chat:
                 return
             try:
                 from packages.core.services.workflow_chat_projection import (
@@ -1304,6 +1343,8 @@ class WorkflowRunner:
         max_iterations = len(steps) * 3  # safety cap
 
         for _ in range(max_iterations):
+            if await self._externally_paused_or_cancelled(run, db):
+                return
             runnable = self._find_runnable_steps(workflow, run)
             if not runnable:
                 # No more steps to run — check if we're done
@@ -1335,8 +1376,11 @@ class WorkflowRunner:
             if len(runnable) > 1:
                 for step in runnable:
                     await _emit(step, "running")
-                if projects_to_workspace_chat:
-                    await db.commit()
+                # Persist the running frontier before executing side effects so
+                # a concurrent Pause/Stop request has a durable node boundary.
+                await db.commit()
+                if await self._externally_paused_or_cancelled(run, db):
+                    return
                 tasks = [
                     self._execute_step_safe(step, run, db)
                     for step in runnable
@@ -1361,6 +1405,12 @@ class WorkflowRunner:
                         "skipped" if result.get("skipped") else result.get("status"),
                         result,
                     )
+                # A control request may arrive while a node is in flight. Save
+                # every completed receipt, then honor the remote state before
+                # evaluating routes or starting another node.
+                await db.commit()
+                if await self._externally_paused_or_cancelled(run, db):
+                    return
                 for step, result in batch:
                     if result.get("status") == "paused":
                         run.status = "paused"
@@ -1392,8 +1442,9 @@ class WorkflowRunner:
             else:
                 step = runnable[0]
                 await _emit(step, "running")
-                if projects_to_workspace_chat:
-                    await db.commit()
+                await db.commit()
+                if await self._externally_paused_or_cancelled(run, db):
+                    return
                 result = await self._execute_step_safe(step, run, db)
                 if result.get("status") == "failed" and _continues_on_error(step):
                     result["continued"] = True
@@ -1403,6 +1454,9 @@ class WorkflowRunner:
                     "skipped" if result.get("skipped") else result.get("status"),
                     result,
                 )
+                await db.commit()
+                if await self._externally_paused_or_cancelled(run, db):
+                    return
                 if result.get("status") == "paused":
                     run.status = "paused"
                     from packages.core.services.workflow_chat_projection import project_workflow_run_status
@@ -1445,6 +1499,38 @@ class WorkflowRunner:
             run=run,
         )
         await db.commit()
+
+    @staticmethod
+    async def _externally_paused_or_cancelled(run: WorkflowRun, db) -> bool:
+        """Reload operator state at a safe node boundary.
+
+        Pause/Stop is written from a separate API session. Without this refresh,
+        a long-lived runner could continue from its stale in-memory ``running``
+        value and eventually overwrite the operator's decision with
+        ``completed``.
+        """
+        # Lightweight runner harnesses use a commit-only session double; there
+        # is no concurrent database state to reconcile in that environment.
+        if not hasattr(db, "refresh"):
+            return run.status in {"paused", "cancelled"}
+        await db.refresh(
+            run,
+            attribute_names=["status", "completed_at", "trigger_data"],
+        )
+        if run.status not in {"paused", "cancelled"}:
+            return False
+
+        from packages.core.services.workflow_chat_projection import (
+            project_workflow_run_status,
+        )
+
+        await _project_workflow_chat_safely(
+            db,
+            project_workflow_run_status,
+            run=run,
+        )
+        await db.commit()
+        return True
 
     # ── Step dispatch ────────────────────────────────────────────────────
 
@@ -1595,7 +1681,7 @@ class WorkflowRunner:
         elif step_type == "condition":
             return await self._execute_condition_step(step, variables, run)
         elif step_type == "wait":
-            return await self._execute_wait_step(step, run)
+            return await self._execute_wait_step(step, run, db)
         elif step_type == "parallel":
             return await self._execute_parallel_step(step, variables, entity_id, run, db)
         elif step_type == "transform":
@@ -1606,6 +1692,8 @@ class WorkflowRunner:
             return await self._execute_workflow_action_grant_step(step, variables, run, db)
         elif step_type == "browser_effect":
             return await self._execute_browser_effect_step(step, variables)
+        elif step_type == "publication_receipt":
+            return self._execute_publication_receipt_step(step, variables)
         elif step_type == "notify":
             return await self._execute_notify_step(
                 step, variables, entity_id, user_id, runtime_context,
@@ -1689,7 +1777,29 @@ class WorkflowRunner:
             # Runtime trigger payload is the n8n-style first item. This matters
             # for chat/webhook flows where downstream nodes read fields such as
             # ``chatInput`` from the trigger output.
-            output = dict(run.trigger_data or {}) or (step.get("name") or step_type)
+            output = dict(run.trigger_data or {})
+            # Manual/Chat binding inputs are validated into run.variables, while
+            # webhook payloads originate in trigger_data. Project every declared
+            # run input into the trigger output so generated named outputs such
+            # as ``{{start.youtube_visibility}}`` resolve identically on both
+            # entry paths instead of overwriting the valid run variable with an
+            # unresolved template literal.
+            run_variables = run.variables if isinstance(run.variables, dict) else {}
+            missing = object()
+            for item in (step.get("config") or {}).get("run_inputs") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key") or item.get("name") or "").strip()
+                if not key:
+                    continue
+                target = str(item.get("target") or key).strip()
+                value = _lookup_reference(target, run_variables, missing=missing)
+                if value is missing and target != key:
+                    value = _lookup_reference(key, run_variables, missing=missing)
+                if value is not missing:
+                    output[key] = deepcopy(value)
+            if not output:
+                output = step.get("name") or step_type
             return {"status": "completed", "output": output}
         elif step_type == "note":
             # Canvas annotation — never part of the run; skip if ever reached.
@@ -2212,7 +2322,30 @@ class WorkflowRunner:
         # Resolve tools through Runtime prompt assembly so context blocks,
         # skill descriptors, tool filtering, and the trace envelope come from
         # one source of truth.
-        tool_names = config.get("tools", [])
+        # No node-level ``tools`` override means "use the selected Agent's
+        # bindings". Passing an empty list here accidentally selected the
+        # named-tool path with an empty surface, so Workflow Agent steps lost
+        # every AgentToolBinding / AgentMCPBinding even though Chat could use
+        # those same tools. Preserve an explicitly configured empty list as an
+        # intentional disable. An anonymous node also stays default-deny.
+        bound_tool_names: set[str] | None = None
+        mcp_allowed_names: set[str] | None = None
+        is_master = False
+        if "tools" in config:
+            tool_names = config.get("tools")
+        elif agent_id and db is not None:
+            from packages.core.constants.agents import is_master_agent
+
+            is_master = is_master_agent(agent_id)
+            agent_tool_scope = await runtime_agent_tool_scope(
+                db,
+                agent_id=agent_id,
+                is_master=is_master,
+            )
+            bound_tool_names, mcp_allowed_names = agent_tool_scope.mutable_pair()
+            tool_names = None
+        else:
+            tool_names = []
         runtime_request = runtime_request_for_surface_turn(
             surface=ChatSurface.WORKFLOW_AGENT_STEP,
             entity_id=entity_id,
@@ -2228,6 +2361,10 @@ class WorkflowRunner:
             appendix = await runtime_prepare_prompt_appendix_for_turn(
                 db,
                 request=runtime_request,
+                agent_id=agent_id or None,
+                bound_tool_names=bound_tool_names,
+                is_master=is_master,
+                mcp_allowed_names=mcp_allowed_names,
                 active_user_message=user_message,
                 configured_tool_names=tool_names,
             )
@@ -2237,10 +2374,19 @@ class WorkflowRunner:
             system_prompt = runtime_merge_prompt_appendix(system_prompt, appendix)
         except Exception:
             logger.debug("Workflow runtime prompt appendix failed; using tool surface fallback", exc_info=True)
-            runtime_surface_result = runtime_prepare_named_tool_surface_for_turn(
-                runtime_request,
-                tool_names=tool_names,
-            )
+            if tool_names is None:
+                runtime_surface_result = runtime_prepare_agent_tool_surface_for_turn(
+                    runtime_request,
+                    agent_id=agent_id or None,
+                    bound_tool_names=bound_tool_names,
+                    is_master=is_master,
+                    mcp_allowed_names=mcp_allowed_names,
+                )
+            else:
+                runtime_surface_result = runtime_prepare_named_tool_surface_for_turn(
+                    runtime_request,
+                    tool_names=tool_names,
+                )
             tool_schemas = runtime_surface_result.tool_schemas
             allowed_tool_names = runtime_surface_result.allowed_tool_names
             runtime_envelope = runtime_surface_result.envelope
@@ -2266,6 +2412,21 @@ class WorkflowRunner:
             output_schema=output_schema,
             forced_tool_calls=forced_tool_calls,
         )
+
+        failure_message = _agent_loop_failure_message(result)
+        if failure_message:
+            failure = {
+                "status": "failed",
+                "error": failure_message,
+                "stop_reason": result.stop_reason,
+                "usage": result.usage,
+                "tools_used": result.tool_calls_made,
+                "rounds": result.rounds,
+            }
+            return await runtime_attach_and_persist_workflow_runner_result(
+                failure,
+                runtime_envelope,
+            )
 
         output_var = config.get("output_var")
         output = _parse_agent_output(result.content, config.get("output_format"))
@@ -2692,6 +2853,7 @@ class WorkflowRunner:
         return {
             "project_id": project.id,
             "project_type": project.project_type,
+            "project_key": project.project_key,
             "schema_version": project.schema_version,
             "current_stage": project.current_stage,
             "state": deepcopy(project.state or {}),
@@ -2708,6 +2870,7 @@ class WorkflowRunner:
     ) -> dict:
         from packages.core.services.workflow_project_service import (
             WorkflowProjectConflict,
+            claim_workflow_project,
             create_workflow_project,
             get_workflow_project,
             patch_workflow_project,
@@ -2751,8 +2914,39 @@ class WorkflowRunner:
             project_id = str(
                 _resolve_binding(config.get("project_id", ""), variables) or ""
             ).strip()
+            project_key = str(
+                _resolve_binding(config.get("project_key", ""), variables) or ""
+            ).strip()
 
-            if operation == "create":
+            claimed: bool | None = None
+            if operation == "claim":
+                if not project_type:
+                    raise ValueError("Workflow project claim requires project_type")
+                if not project_key:
+                    raise ValueError("Workflow project claim requires project_key")
+                if not run.started_by:
+                    raise ValueError("Workflow project claim requires a triggering user")
+                state = _resolve_structure(config.get("state", {}), variables)
+                checked = validated_state(state)
+                if checked.get("code") == "workflow_project_state_validation_failed":
+                    return checked
+                current_stage = str(
+                    _resolve_binding(config.get("current_stage", "draft"), variables)
+                    or "draft"
+                ).strip()
+                project, claimed = await claim_workflow_project(
+                    db,
+                    entity_id=run.entity_id,
+                    workspace_id=run.workspace_id,
+                    project_type=project_type,
+                    project_key=project_key,
+                    state=state,
+                    created_by=run.started_by,
+                    schema_version=max(1, int(config.get("schema_version") or 1)),
+                    current_stage=current_stage,
+                    last_run_id=run.id,
+                )
+            elif operation == "create":
                 if not project_type:
                     raise ValueError("Workflow project create requires project_type")
                 if not run.started_by:
@@ -2770,6 +2964,7 @@ class WorkflowRunner:
                     entity_id=run.entity_id,
                     workspace_id=run.workspace_id,
                     project_type=project_type,
+                    project_key=project_key or None,
                     state=state,
                     created_by=run.started_by,
                     schema_version=max(1, int(config.get("schema_version") or 1)),
@@ -2904,12 +3099,16 @@ class WorkflowRunner:
             _set_trusted_workflow_context(
                 run,
                 workflow_project_id=project.id,
+                workflow_project_root=state.get("project_root"),
                 workflow_action_grant_id=state.get("capture_grant_id"),
                 approved_plan_version=state.get("approved_plan_version"),
             )
+            output = self._workflow_project_output(project)
+            if claimed is not None:
+                output["claimed"] = claimed
             return {
                 "status": "completed",
-                "output": self._workflow_project_output(project),
+                "output": output,
                 "output_var": output_var,
             }
         except WorkflowProjectConflict as exc:
@@ -3115,9 +3314,43 @@ class WorkflowRunner:
                 "error": str(exc),
             }
 
+    def _execute_publication_receipt_step(
+        self,
+        step: dict,
+        variables: dict,
+    ) -> dict:
+        """Turn a provider-specific publish result into an auditable receipt."""
+        from packages.core.services.workflow_publication_receipts import (
+            PublicationReceiptError,
+            normalize_publication_receipt,
+        )
+
+        config = step.get("config", {})
+        try:
+            receipt = normalize_publication_receipt(
+                _resolve_structure(config.get("receipt"), variables),
+                payload=(
+                    _resolve_structure(config.get("payload"), variables)
+                    if config.get("payload") is not None
+                    else None
+                ),
+                require_verified=config.get("require_verified", True) is not False,
+            )
+            return {
+                "status": "completed",
+                "output": receipt,
+                "output_var": config.get("output_var"),
+            }
+        except PublicationReceiptError as exc:
+            return {
+                "status": "failed",
+                "code": "publication_receipt_invalid",
+                "error": str(exc),
+            }
+
     # ── Wait step ────────────────────────────────────────────────────────
 
-    async def _execute_wait_step(self, step: dict, run: WorkflowRun) -> dict:
+    async def _execute_wait_step(self, step: dict, run: WorkflowRun, db) -> dict:
         """Pause or delay execution — HITL approval, timer, or external event.
 
         Config keys:
@@ -3137,6 +3370,31 @@ class WorkflowRunner:
             config.get("message", f"Waiting for {wait_type}"),
             variables,
         )
+
+        if wait_type == "approval" and config.get("allow_always"):
+            from packages.core.services.workflow_chat_approvals import (
+                workflow_wait_has_standing_approval,
+            )
+
+            if await workflow_wait_has_standing_approval(
+                db,
+                run=run,
+                config=config,
+            ):
+                response_variable = str(
+                    config.get("response_variable") or f"{step.get('id')}_response"
+                )
+                return {
+                    "status": "completed",
+                    "output": {"choice": "always_approve", "standing": True},
+                    "output_var": response_variable,
+                    "wait_type": wait_type,
+                    "decision": "always_approve",
+                    "approved": True,
+                    "approved_by": run.started_by,
+                    "approved_at": _utc_now().isoformat(),
+                    "standing_approval": True,
+                }
 
         if wait_type == "timer":
             raw = _resolve_binding(
@@ -3859,8 +4117,13 @@ class WorkflowRunner:
 
     def _execute_stop_step(self, step, variables) -> dict:
         """n8n Stop And Error — deliberately fail the run with a message."""
-        msg = _render_template(str(step.get("config", {}).get("message") or "Stopped by workflow"), variables)
-        return {"status": "failed", "error": msg}
+        config = step.get("config", {})
+        msg = _render_template(str(config.get("message") or "Stopped by workflow"), variables)
+        result = {"status": "failed", "error": msg}
+        retry_from_step_id = str(config.get("retry_from_step_id") or "").strip()
+        if retry_from_step_id:
+            result["retry_from_step_id"] = retry_from_step_id
+        return result
 
     def _execute_extractfromfile_step(self, step, variables) -> dict:
         """Parse text content as JSON or CSV into structured data.
@@ -4354,15 +4617,99 @@ class WorkflowRunner:
 
     def _eval_bool_expr(self, expression: str, variables: dict) -> bool:
         """Evaluate a (possibly compound) boolean expression."""
-        expression = expression.strip()
+        expression = self._strip_outer_bool_parentheses(expression.strip())
         # OR has the lowest precedence
-        or_parts = re.split(r"\s+or\s+", expression, flags=re.IGNORECASE)
+        or_parts = self._split_top_level_bool_operator(expression, "or")
         if len(or_parts) > 1:
             return any(self._eval_bool_expr(p, variables) for p in or_parts)
-        and_parts = re.split(r"\s+and\s+", expression, flags=re.IGNORECASE)
+        and_parts = self._split_top_level_bool_operator(expression, "and")
         if len(and_parts) > 1:
             return all(self._eval_bool_expr(p, variables) for p in and_parts)
         return self._eval_atom(expression, variables)
+
+    @staticmethod
+    def _strip_outer_bool_parentheses(expression: str) -> str:
+        """Remove only parentheses that wrap the complete boolean expression."""
+        value = expression.strip()
+        while value.startswith("(") and value.endswith(")"):
+            depth = 0
+            quote = ""
+            escaped = False
+            wraps_all = True
+            for index, char in enumerate(value):
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\" and quote:
+                    escaped = True
+                    continue
+                if quote:
+                    if char == quote:
+                        quote = ""
+                    continue
+                if char in {"'", '"'}:
+                    quote = char
+                    continue
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0 and index != len(value) - 1:
+                        wraps_all = False
+                        break
+            if not wraps_all or depth != 0 or quote:
+                break
+            value = value[1:-1].strip()
+        return value
+
+    @staticmethod
+    def _split_top_level_bool_operator(expression: str, keyword: str) -> list[str]:
+        """Split ``and``/``or`` outside quotes and nested parentheses."""
+        lowered = expression.lower()
+        marker = f" {keyword.lower()} "
+        parts: list[str] = []
+        start = 0
+        depth = 0
+        quote = ""
+        escaped = False
+        index = 0
+        while index < len(expression):
+            char = expression[index]
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if char == "\\" and quote:
+                escaped = True
+                index += 1
+                continue
+            if quote:
+                if char == quote:
+                    quote = ""
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "(":
+                depth += 1
+                index += 1
+                continue
+            if char == ")":
+                depth = max(0, depth - 1)
+                index += 1
+                continue
+            if depth == 0 and lowered.startswith(marker, index):
+                parts.append(expression[start:index].strip())
+                index += len(marker)
+                start = index
+                continue
+            index += 1
+        if not parts:
+            return [expression]
+        parts.append(expression[start:].strip())
+        return parts
 
     def _eval_atom(self, expression: str, variables: dict) -> bool:
         """Evaluate a single comparison clause (no and/or)."""
@@ -4643,12 +4990,22 @@ class WorkflowRunner:
                 if not key:
                     continue
                 raw = item.get("value")
-                resolved = output if raw in (None, "") else _resolve_binding(str(raw), updated_vars)
+                resolved = output if raw in (None, "") else _resolve_structure(raw, updated_vars)
                 updated_vars[key] = _coerce_typed(resolved, item.get("type"))
             if updated_vars != (run.variables or {}):
                 run.variables = updated_vars
         elif result.get("status") == "paused":
             run.current_step_id = step_id
+        elif result.get("status") == "failed":
+            retry_from_step_id = str(
+                result.get("retry_from_step_id")
+                or (step.get("config") or {}).get("retry_from_step_id")
+                or ""
+            ).strip()
+            if retry_from_step_id:
+                # A stop/check node often reports a downstream symptom while
+                # the repairable work lives in an upstream producer.
+                run.retry_from_step_id = retry_from_step_id
 
     # ── Re-enqueue via Celery ────────────────────────────────────────────
 
@@ -4694,6 +5051,12 @@ class WorkflowRunner:
                 run.completed_at = _utc_now()
                 await db.commit()
                 return "definition_changed"
+            from packages.core.services.workflow_run_control import resume_manual_run
+
+            manual_resume = resume_manual_run(
+                run,
+                actor_id=str(resumed_by or "").strip(),
+            )
             current_step_id = run.current_step_id
             current_step = next(
                 (
@@ -4710,7 +5073,11 @@ class WorkflowRunner:
                 else {}
             )
             stage_wait_context = workflow_stage_wait_context(run, current_step)
-            if isinstance(current_step, dict) and current_step.get("type") == "stage":
+            if (
+                not manual_resume
+                and isinstance(current_step, dict)
+                and current_step.get("type") == "stage"
+            ):
                 if stage_wait_context is None:
                     return "not_paused"
                 internal_wait = stage_wait_context[1]
@@ -4719,7 +5086,10 @@ class WorkflowRunner:
                     if isinstance(internal_wait.get("config"), dict)
                     else {}
                 )
-            is_approval = current_config.get("wait_type", "approval") == "approval"
+            is_approval = (
+                not manual_resume
+                and current_config.get("wait_type", "approval") == "approval"
+            )
             approval_metadata: dict[str, Any] = {}
             if is_approval:
                 actor_id = str(resumed_by or "").strip()
@@ -4751,14 +5121,14 @@ class WorkflowRunner:
                 updated_vars.update(variables)
             run.variables = updated_vars
 
-            if current_step_id and stage_wait_context is not None:
+            if current_step_id and stage_wait_context is not None and not manual_resume:
                 complete_workflow_stage_wait(
                     run,
                     current_step,
                     stage_wait_context,
                     metadata=approval_metadata,
                 )
-            elif current_step_id:
+            elif current_step_id and not manual_resume:
                 step_results = dict(run.step_results or {})
                 previous = dict(step_results.get(current_step_id) or {})
                 completed_at = _utc_now().isoformat()

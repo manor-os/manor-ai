@@ -62,15 +62,20 @@ class PlanStep(BaseModel):
     """JSON Schema. For action kinds, the Planner can leave these null;
     Runtime action binding hydration attaches provider schemas before
     ExecutionStep materialization when the catalog knows them. For
-    llm/subagent kinds, the Planner must write an output schema if
-    downstream steps consume the result."""
+    llm/subagent kinds, use this for an exact custom payload when no canonical
+    output_shape fits; Runtime provenance-marks and hard-validates it. A
+    terminal task-authored expected_output is bound as a hard nested payload
+    contract during materialization and takes precedence."""
 
     output_shape: Optional[str] = None
     """Canonical shape name from packages.core.contracts.shapes (e.g.
     ``ArtifactResult``). Preferred over a hand-written
     ``expected_output_schema`` for llm/subagent kinds: the plan-time linker
     derives ``expected_output_schema`` from the shape so producer, normalizer,
-    and validator share one vocabulary. Legacy plans without it still work."""
+    and validator share one vocabulary. A new llm/subagent must declare either
+    this or an exact expected_output_schema, except the unique terminal step
+    governed by Task.expected_output. Legacy materialized schemas without
+    provenance remain readable through the advisory path."""
 
     depends_on: list[str] = Field(default_factory=list)
     """List of prior step keys that must reach ``done`` before this

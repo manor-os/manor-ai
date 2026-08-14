@@ -220,3 +220,176 @@ def test_file_deliverable_completion_requires_generation_tool_result():
     assert "text-only report" in done_when
     assert "terminal failure reason" in done_when
     assert "generated video" in deliverable
+
+
+@pytest.mark.asyncio
+async def test_scheduled_job_credit_preflight_carries_owner_scope(monkeypatch):
+    from packages.core.tasks import scheduler_tasks
+
+    seen = {}
+
+    async def fake_assert_credit_available(entity_id, *, source, **kwargs):
+        seen.update(entity_id=entity_id, source=source, kwargs=kwargs)
+
+    monkeypatch.setattr(
+        scheduler_tasks,
+        "runtime_assert_credit_available",
+        fake_assert_credit_available,
+        raising=False,
+    )
+
+    job = _make_job(
+        entity_id="ENT-SCHEDULED-CREDITS",
+        workspace_id="WS-SCHEDULED-CREDITS",
+        user_id="USR-SCHEDULED-CREDITS",
+        execution_type="agent",
+        execution_target={"complexity": "worker"},
+    )
+
+    await scheduler_tasks._preflight_scheduled_job_credits(job)
+
+    assert seen == {
+        "entity_id": "ENT-SCHEDULED-CREDITS",
+        "source": "scheduled_job",
+        "kwargs": {
+            "user_id": "USR-SCHEDULED-CREDITS",
+            "workspace_id": "WS-SCHEDULED-CREDITS",
+            "byok": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_scheduled_job_credit_preflight_prefers_resolved_workspace_scope(monkeypatch):
+    from packages.core.tasks import scheduler_tasks
+
+    seen = {}
+
+    async def fake_assert_credit_available(entity_id, *, source, **kwargs):
+        seen.update(entity_id=entity_id, source=source, kwargs=kwargs)
+
+    monkeypatch.setattr(scheduler_tasks, "runtime_assert_credit_available", fake_assert_credit_available)
+
+    job = _make_job(
+        entity_id="ENT-SCHEDULED-CREDITS",
+        workspace_id="WS-STORED-SCOPE",
+        user_id="USR-SCHEDULED-CREDITS",
+        execution_type="agent",
+        execution_target={},
+    )
+
+    await scheduler_tasks._preflight_scheduled_job_credits(
+        job,
+        workspace_id="WS-RESOLVED-SCOPE",
+    )
+
+    assert seen["kwargs"]["workspace_id"] == "WS-RESOLVED-SCOPE"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_job_credit_exhaustion_stops_before_fanout(monkeypatch):
+    from types import SimpleNamespace
+
+    from packages.core.ai.llm_client import CreditExhaustedError
+    from packages.core.tasks import scheduler_tasks
+
+    now = datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc)
+    job = _make_job(
+        entity_id="ENT-SCHEDULED-CREDITS",
+        workspace_id=None,
+        execution_type="agent",
+        execution_target={},
+        payload_message="run this",
+    )
+    run = SimpleNamespace(
+        id="scheduled-run-1",
+        status="running",
+        started_at=now,
+        completed_at=None,
+        duration_ms=None,
+        error=None,
+        result=None,
+    )
+
+    async def fake_claim_job_run(*args, **kwargs):
+        return run, True
+
+    async def fake_effective_config(*args, **kwargs):
+        return {}, None, None
+
+    async def fake_preflight(*args, **kwargs):
+        raise CreditExhaustedError("no credits")
+
+    class FakeDB:
+        async def flush(self):
+            return None
+
+    import packages.core.services.scheduler_service as scheduler_service
+    import packages.core.experiments as experiments
+
+    monkeypatch.setattr(scheduler_service, "claim_job_run", fake_claim_job_run)
+    monkeypatch.setattr(experiments, "effective_dispatch_config", fake_effective_config)
+    monkeypatch.setattr(scheduler_tasks, "_preflight_scheduled_job_credits", fake_preflight)
+
+    await scheduler_tasks._dispatch_job(FakeDB(), job, now)
+
+    assert run.status == "error"
+    assert run.error == "credits_exhausted: no credits"
+    assert job.last_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_job_without_entity_id_fails_closed_for_ai_dispatch(monkeypatch):
+    from types import SimpleNamespace
+
+    from packages.core.tasks import scheduler_tasks
+    import packages.core.services.scheduler_service as scheduler_service
+    import packages.core.experiments as experiments
+
+    now = datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc)
+    job = _make_job(
+        entity_id="",
+        workspace_id="WS-MISSING-ENTITY",
+        execution_type="agent",
+        execution_target={},
+        payload_message="run this",
+    )
+    run = SimpleNamespace(
+        id="scheduled-run-empty-entity",
+        status="running",
+        started_at=now,
+        completed_at=None,
+        duration_ms=None,
+        error=None,
+        result=None,
+    )
+
+    async def fake_claim_job_run(*args, **kwargs):
+        return run, True
+
+    async def fake_effective_config(*args, **kwargs):
+        return {}, None, None
+
+    called = {"preflight": 0, "fanout": 0}
+
+    async def fake_preflight(*args, **kwargs):
+        called["preflight"] += 1
+
+    async def fake_dispatch_agent_task(*args, **kwargs):
+        called["fanout"] += 1
+
+    class FakeDB:
+        async def flush(self):
+            return None
+
+    monkeypatch.setattr(scheduler_service, "claim_job_run", fake_claim_job_run)
+    monkeypatch.setattr(experiments, "effective_dispatch_config", fake_effective_config)
+    monkeypatch.setattr(scheduler_tasks, "_preflight_scheduled_job_credits", fake_preflight)
+    monkeypatch.setattr(scheduler_tasks, "_dispatch_agent_task", fake_dispatch_agent_task)
+
+    await scheduler_tasks._dispatch_job(FakeDB(), job, now)
+
+    assert called == {"preflight": 0, "fanout": 0}
+    assert run.status == "error"
+    assert run.error == "scheduled job missing entity_id"
+    assert job.last_status == "error"

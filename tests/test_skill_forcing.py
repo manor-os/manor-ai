@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
 from packages.core.ai.runtime.skill_forcing import runtime_auto_skill_forced_tool_calls
 from packages.core.services import skill_service
 from tests.test_prompt_builder_routing import CHROME_RECORDING_REQUEST
@@ -33,3 +34,7 @@ async def test_explicit_chrome_intent_forces_chrome_before_local_coding(monkeypa
     calls = await runtime_auto_skill_forced_tool_calls(ctx, CHROME_RECORDING_REQUEST)
 
     assert calls[0]["arguments"]["skill"] == "chrome"
+
+
+def test_terse_current_page_request_is_explicit_chrome_intent() -> None:
+    assert detect_chrome_local_browser_route("用 Chrome 总结当前页") is not None

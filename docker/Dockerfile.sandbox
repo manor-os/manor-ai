@@ -10,7 +10,9 @@
 #
 # The sandbox-service uses this image via the SANDBOX_IMAGE env var.
 
-FROM python:3.12-slim
+FROM node:22-bookworm-slim AS node-runtime
+
+FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -20,36 +22,59 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # /home/sandbox is mounted as tmpfs at runtime (read-only root fs).
     NPM_CONFIG_CACHE=/home/sandbox/.npm \
     NPM_CONFIG_PREFIX=/home/sandbox/.npm-global \
+    NODE_PATH=/home/sandbox/.npm-global/lib/node_modules:/usr/local/lib/node_modules \
     PATH="/home/sandbox/.npm-global/bin:${PATH}"
 
-# Install base tools + Node.js from Debian.
-#
-# This used to add the NodeSource repo via `curl setup_20.x | bash -`. That
-# script exits 0 even when it fails: on 2026-07-27 its signing-key download
-# started returning 403, so the repo was never added, `apt-get install nodejs`
-# quietly took Debian's own package — which does NOT ship npm — and the build
-# died three steps later on `npm: not found`. Debian trixie ships Node 20.19,
-# exactly the major this image wants, so the third-party repo bought nothing
-# and cost us every deploy.
-#
-# `node --version` and `npm --version` at the end are the guard: if a future
-# base image stops providing either, THIS layer fails instead of something
-# downstream.
+# Install base tools and the system Chromium used by isolated video
+# review/render jobs. Node comes from the pinned Node 22 build stage below.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
+    chromium \
     curl \
+    ffmpeg \
     git \
     jq \
+    libreoffice-impress \
+    librsvg2-bin \
+    poppler-utils \
     ripgrep \
-    nodejs \
-    npm \
     && rm -rf /var/lib/apt/lists/* \
+    && chromium --version
+
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && node --version \
     && npm --version
 
+ARG HYPERFRAMES_VERSION=0.7.105
+ARG GSAP_VERSION=3.14.2
+ENV HYPERFRAMES_BROWSER_PATH=/usr/bin/chromium \
+    HYPERFRAMES_CLI_BIN=/usr/local/bin/hyperframes \
+    HYPERFRAMES_GSAP_PATH=/usr/local/lib/node_modules/gsap/dist/gsap.min.js
+RUN npm install --global --prefix /usr/local \
+      "hyperframes@${HYPERFRAMES_VERSION}" \
+      "gsap@${GSAP_VERSION}" \
+    && hyperframes telemetry disable \
+    && hyperframes browser ensure \
+    && hyperframes --version
+
 RUN useradd --create-home --shell /bin/bash sandbox
+
+# Office-compatible fonts keep generated and rendered presentations metrically
+# close to PowerPoint across Latin and CJK content.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    fonts-crosextra-caladea fonts-crosextra-carlito fonts-lato \
+    fonts-liberation fonts-noto-cjk fonts-roboto \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/fontconfig/70-manor-office-fonts.conf /etc/fonts/conf.d/70-manor-office-fonts.conf
+RUN fc-cache -f
+
 USER sandbox
 WORKDIR /skill
 

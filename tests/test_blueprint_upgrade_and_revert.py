@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 
 import pytest
+from sqlalchemy import select
 
 from packages.core.blueprints.freshness import (
     BLUEPRINT_ID_KEY,
@@ -39,8 +40,15 @@ from packages.core.blueprints.upgrade import (
     plan,
     revert,
 )
+from packages.core.models.blueprint import WorkspaceBlueprint
+from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.skill import Skill
-from packages.core.models.workspace import Agent, Workspace
+from packages.core.models.workflow import (
+    WorkflowBinding,
+    WorkflowDefinition,
+    WorkflowTemplateInstallation,
+)
+from packages.core.models.workspace import Workspace
 
 SLUG = "solo-faceless-stickman-studio-v1"
 STALE_PROMPT = "You are a professional AI video producer specialising in stickman videos."
@@ -97,6 +105,10 @@ async def _skill(db_session, entity_id, spec, *, prompt, revision=1):
 @pytest.fixture
 async def scenario(db_session, payload):
     """The production shape: blueprint corrected, workspace still on the stub."""
+    from packages.core.blueprints.installer import (
+        _blueprint_workflow_definition_values,
+    )
+
     entity_id = "01TESTENTITY0000000000000A"
     older = copy.deepcopy(payload)
     older["embedded"]["skills"][0]["system_prompt"] = STALE_PROMPT
@@ -105,7 +117,192 @@ async def scenario(db_session, payload):
     skill = await _skill(
         db_session, entity_id, older["embedded"]["skills"][0], prompt=STALE_PROMPT,
     )
+    workflow_spec = payload["recipe"]["workflows"][0]
+    definition = WorkflowDefinition(
+        entity_id=entity_id,
+        revision=1,
+        **_blueprint_workflow_definition_values(workflow_spec),
+    )
+    db_session.add(definition)
+    await db_session.flush()
+    db_session.add(WorkflowBinding(
+        entity_id=entity_id,
+        workspace_id=ws.id,
+        workflow_id=definition.id,
+        name=workflow_spec["name"],
+        trigger_type=workflow_spec["trigger_type"],
+        config={
+            "source": "blueprint",
+            "workspace_blueprint_workflow_slug": workflow_spec["slug"],
+        },
+        enabled=True,
+        status="active",
+    ))
+    await db_session.flush()
     return {"entity_id": entity_id, "workspace": ws, "skill": skill, "older": older}
+
+
+@pytest.fixture
+def opc_payload():
+    return get_solo_company_blueprint("solo-content-distribution-studio-v1")
+
+
+@pytest.fixture
+async def workflow_scenario(db_session, opc_payload):
+    """An installed Article Flow from before approved-result prefilling."""
+    from packages.core.blueprints.installer import (
+        _blueprint_workflow_definition_values,
+    )
+
+    entity_id = "01TESTENTITY0000000000000F"
+    workspace = Workspace(
+        entity_id=entity_id,
+        name="OPC Content Studio",
+        settings={
+            BLUEPRINT_SETTINGS_KEY: {
+                BLUEPRINT_ID_KEY: "builtin:solo-content-distribution-studio-v1",
+                "blueprint_slug": "solo-content-distribution-studio-v1",
+            }
+        },
+    )
+    db_session.add(workspace)
+    await db_session.flush()
+
+    current_spec = next(
+        item for item in opc_payload["recipe"]["workflows"]
+        if item["slug"] == "opc-write-article-from-topic-v1"
+    )
+    older_spec = copy.deepcopy(current_spec)
+    older_spec["run_inputs"][0].pop("hidden", None)
+    topic_input = next(
+        item for item in older_spec["run_inputs"] if item["key"] == "topic_brief"
+    )
+    topic_input.pop("schema", None)
+    topic_input.pop("prefill", None)
+    values = _blueprint_workflow_definition_values(older_spec)
+    definition = WorkflowDefinition(entity_id=entity_id, revision=1, **values)
+    db_session.add(definition)
+    await db_session.flush()
+    binding = WorkflowBinding(
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        workflow_id=definition.id,
+        name=current_spec["name"],
+        trigger_type="mcp",
+        config={
+            "source": "blueprint",
+            "workspace_blueprint_workflow_slug": current_spec["slug"],
+        },
+        enabled=True,
+        status="active",
+    )
+    db_session.add(binding)
+    await db_session.flush()
+    return {
+        "workspace": workspace,
+        "definition": definition,
+        "older_steps": copy.deepcopy(definition.steps),
+        "spec": current_spec,
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_orphaned_duplicate_blueprint_id_falls_back_to_the_platform_row(
+    db_session, opc_payload,
+):
+    """Marketplace deduplication must not strand existing workspaces."""
+    from apps.api.routers.workspaces import _blueprint_payloads_for
+
+    slug = "solo-content-distribution-studio-v1"
+    stable_id = f"builtin:{slug}"
+    row = WorkspaceBlueprint(
+        id=stable_id,
+        entity_id=None,
+        slug=slug,
+        title="OPC Content Studio and Distribution",
+        payload=opc_payload,
+        content_version="1.0.7",
+        status="published",
+    )
+    obsolete = WorkspaceBlueprint(
+        id="01DELETEDBLUEPRINT00000001",
+        entity_id="01TESTENTITY0000000000000G",
+        slug=slug,
+        title="Old duplicate OPC Blueprint",
+        payload={"manifest": {"slug": slug}, "recipe": {}},
+        content_version="1.0.0",
+        status="archived",
+    )
+    workspace = Workspace(
+        entity_id="01TESTENTITY0000000000000G",
+        name="Legacy duplicate install",
+        settings={
+            BLUEPRINT_SETTINGS_KEY: {
+                BLUEPRINT_ID_KEY: "01DELETEDBLUEPRINT00000001",
+                "blueprint_slug": slug,
+            }
+        },
+    )
+    db_session.add_all([row, obsolete, workspace])
+    await db_session.flush()
+
+    resolved = await _blueprint_payloads_for(db_session, [workspace])
+
+    assert resolved[workspace.id] == (opc_payload, "1.0.7", stable_id)
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_slug_only_install_gets_an_upgrade_plan(
+    db_session, workflow_scenario, opc_payload,
+):
+    """The API resolves the payload from the legacy slug and repairs its id
+    on apply; preview must not discard that already-resolved payload."""
+    workspace = workflow_scenario["workspace"]
+    settings = copy.deepcopy(workspace.settings)
+    settings[BLUEPRINT_SETTINGS_KEY].pop(BLUEPRINT_ID_KEY)
+    workspace.settings = settings
+    await db_session.flush()
+
+    result = await plan(db_session, workspace=workspace, payload=opc_payload)
+
+    article = next(
+        item for item in result["items"]
+        if item["slug"] == "opc-write-article-from-topic-v1"
+    )
+    assert article["action"] == UpgradeAction.UPDATE.value
+
+
+@pytest.mark.asyncio
+async def test_an_installed_internal_workflow_is_not_reported_missing(
+    db_session, workflow_scenario, opc_payload,
+):
+    from packages.core.blueprints.installer import (
+        _blueprint_workflow_definition_values,
+    )
+
+    internal_spec = next(
+        item for item in opc_payload["recipe"]["workflows"]
+        if item.get("internal")
+    )
+    internal = WorkflowDefinition(
+        entity_id=workflow_scenario["workspace"].entity_id,
+        revision=1,
+        **_blueprint_workflow_definition_values(internal_spec),
+    )
+    db_session.add(internal)
+    await db_session.flush()
+
+    result = await plan(
+        db_session,
+        workspace=workflow_scenario["workspace"],
+        payload=opc_payload,
+    )
+
+    item = next(
+        candidate for candidate in result["items"]
+        if candidate["slug"] == internal_spec["slug"]
+    )
+    assert item["action"] == UpgradeAction.UNCHANGED.value
 
 
 # ── The plan ──────────────────────────────────────────────────────────
@@ -164,16 +361,19 @@ async def test_the_plan_carries_the_new_version_itself(db_session, scenario, pay
     result = await plan(db_session, workspace=scenario["workspace"], payload=payload)
     item = next(i for i in result["items"] if i["slug"] == scenario["skill"].slug)
 
+    source_prompt = payload["embedded"]["skills"][0]["system_prompt"]
     new_prompt = item["new_content"]["system_prompt"]
-    assert new_prompt.startswith(payload["embedded"]["skills"][0]["system_prompt"][:80])
-    # A marker well past the 80-char prefix checked above, so this only
-    # passes if the full body made it through rather than a short preview.
-    # (The blueprint's own wording has moved on since this test was written —
-    # "CRITICAL FACTS" was the marker for an earlier draft of this prompt;
-    # the production content now uses "NONNEGOTIABLE PRODUCTION RULES" for
-    # the same purpose. What matters here is that *some* mid-prompt content
-    # survives into new_content, not this exact heading.)
-    assert "NONNEGOTIABLE PRODUCTION RULES" in new_prompt, "the part that was missing must be visible"
+    assert new_prompt.startswith(source_prompt[:80])
+    # A marker well past the 80-char prefix checked above, so this only passes
+    # if the full body made it through rather than a short preview. Sliced out
+    # of the payload rather than hardcoded: this assertion has already been
+    # broken twice by the blueprint rewording its own headings ("CRITICAL
+    # FACTS", then "NONNEGOTIABLE PRODUCTION RULES"), which tested the
+    # copywriting instead of the upgrade plan. What matters is that *some*
+    # mid-prompt content survives into new_content, whatever it says.
+    marker = source_prompt[1000:1200]
+    assert len(marker) == 200, "fixture prompt is too short for the mid-prompt probe"
+    assert marker in new_prompt, "the part that was missing must be visible"
 
 
 @pytest.mark.asyncio
@@ -210,6 +410,127 @@ def test_the_dialog_shows_the_new_version():
     assert "upgrade_show_new" in body
 
 
+@pytest.mark.asyncio
+async def test_the_plan_includes_stale_blueprint_workflows(
+    db_session, workflow_scenario, opc_payload,
+):
+    result = await plan(
+        db_session,
+        workspace=workflow_scenario["workspace"],
+        payload=opc_payload,
+    )
+    item = next(
+        entry for entry in result["items"]
+        if entry["kind"] == "workflow"
+        and entry["slug"] == workflow_scenario["spec"]["slug"]
+    )
+    assert item["action"] == UpgradeAction.UPDATE.value
+    assert any("workflow graph" in change for change in item["changes"])
+    assert '"prefill"' in item["new_content"]["steps"]
+
+
+@pytest.mark.asyncio
+async def test_an_edited_blueprint_workflow_is_kept(
+    db_session, workflow_scenario, opc_payload,
+):
+    workflow_scenario["definition"].revision = 4
+    await db_session.flush()
+
+    result = await plan(
+        db_session,
+        workspace=workflow_scenario["workspace"],
+        payload=opc_payload,
+    )
+    item = next(
+        entry for entry in result["items"]
+        if entry["kind"] == "workflow"
+        and entry["slug"] == workflow_scenario["spec"]["slug"]
+    )
+    assert item["action"] == UpgradeAction.KEEP_YOURS.value
+
+
+@pytest.mark.asyncio
+async def test_a_new_blueprint_workflow_is_installed_and_bound_on_upgrade(
+    db_session, payload,
+):
+    """Shipping a new Flow must reach existing Blueprint workspaces too."""
+    entity_id = "01TESTENTITY0000000000000H"
+    workflow_payload = copy.deepcopy(payload)
+    workflow_payload["embedded"]["skills"] = []
+    workflow_payload["embedded"]["agents"] = []
+    workflow_payload["embedded"]["knowledge_packs"] = []
+    workflow_payload["recipe"]["workflows"] = [
+        copy.deepcopy(payload["recipe"]["workflows"][0])
+    ]
+    older = copy.deepcopy(workflow_payload)
+    older["recipe"]["workflows"] = []
+    workspace = await _workspace(
+        db_session,
+        entity_id,
+        installed_from=older,
+    )
+
+    preview = await plan(
+        db_session,
+        workspace=workspace,
+        payload=workflow_payload,
+    )
+    item = next(
+        entry
+        for entry in preview["items"]
+        if entry["kind"] == "workflow"
+    )
+    assert item["action"] == UpgradeAction.MISSING.value
+    assert item["changes"] == ["installs Blueprint Flow and Workspace binding"]
+    assert '"youtube_visibility"' in item["new_content"]["steps"]
+
+    result = await apply(
+        db_session,
+        workspace=workspace,
+        payload=workflow_payload,
+        current_version="1.0.21",
+    )
+
+    definition = (await db_session.execute(
+        select(WorkflowDefinition).where(
+            WorkflowDefinition.entity_id == entity_id,
+            WorkflowDefinition.name == "Create Stickman Video → YouTube",
+        )
+    )).scalar_one()
+    binding = (await db_session.execute(
+        select(WorkflowBinding).where(
+            WorkflowBinding.workspace_id == workspace.id,
+            WorkflowBinding.workflow_id == definition.id,
+        )
+    )).scalar_one()
+    installation = (await db_session.execute(
+        select(WorkflowTemplateInstallation).where(
+            WorkflowTemplateInstallation.workflow_id == definition.id,
+        )
+    )).scalar_one()
+    assert binding.name == "Create Stickman Video → YouTube"
+    assert binding.trigger_type == "mcp"
+    assert binding.variables["youtube_visibility"] == "public"
+    assert binding.config["workspace_blueprint_workflow_slug"] == (
+        "stickman-video-to-youtube-v1"
+    )
+    assert installation.template_id == f"builtin:{SLUG}"
+    assert result["updated"] == [{
+        "kind": "workflow",
+        "name": "Create Stickman Video → YouTube",
+        "changes": ["installs Blueprint Flow and Workspace binding"],
+    }]
+
+    reverted = await revert(db_session, workspace=workspace)
+    assert reverted["reverted"] == [{
+        "kind": "workflow",
+        "name": "Create Stickman Video → YouTube",
+    }]
+    assert await db_session.get(WorkflowDefinition, definition.id) is None
+    assert await db_session.get(WorkflowBinding, binding.id) is None
+    assert await db_session.get(WorkflowTemplateInstallation, installation.id) is None
+
+
 # ── Applying ──────────────────────────────────────────────────────────
 
 
@@ -218,6 +539,25 @@ async def test_applying_brings_the_item_to_the_blueprint(db_session, scenario, p
     await apply(db_session, workspace=scenario["workspace"], payload=payload, by_user_id="u1")
     assert scenario["skill"].system_prompt == payload["embedded"]["skills"][0]["system_prompt"]
     assert len(scenario["skill"].system_prompt) > len(STALE_PROMPT)
+
+
+@pytest.mark.asyncio
+async def test_applying_updates_blueprint_workflow_inputs(
+    db_session, workflow_scenario, opc_payload,
+):
+    await apply(
+        db_session,
+        workspace=workflow_scenario["workspace"],
+        payload=opc_payload,
+    )
+    start = next(
+        step for step in workflow_scenario["definition"].steps
+        if step["type"] == "trigger"
+    )
+    run_inputs = start["config"]["run_inputs"]
+    assert run_inputs[0]["hidden"] is True
+    topic_input = next(item for item in run_inputs if item["key"] == "topic_brief")
+    assert topic_input["prefill"]["workflow_slug"] == "opc-generate-topic-from-knowledge-v1"
 
 
 @pytest.mark.asyncio
@@ -291,6 +631,21 @@ async def test_revert_puts_the_old_content_back(db_session, scenario, payload):
     result = await revert(db_session, workspace=scenario["workspace"], by_user_id="u1")
     assert scenario["skill"].system_prompt == STALE_PROMPT
     assert len(result["reverted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_revert_restores_the_previous_workflow_graph(
+    db_session, workflow_scenario, opc_payload,
+):
+    await apply(
+        db_session,
+        workspace=workflow_scenario["workspace"],
+        payload=opc_payload,
+    )
+    assert workflow_scenario["definition"].steps != workflow_scenario["older_steps"]
+
+    await revert(db_session, workspace=workflow_scenario["workspace"])
+    assert workflow_scenario["definition"].steps == workflow_scenario["older_steps"]
 
 
 @pytest.mark.asyncio
@@ -385,6 +740,171 @@ async def test_applying_moves_the_installed_version_too(db_session, scenario, pa
     assert blueprint_freshness(
         ws.settings, payload, current_version="1.0.2",
     ) is BlueprintFreshness.CURRENT
+
+
+@pytest.mark.asyncio
+async def test_confirming_already_matching_content_advances_only_the_version(
+    db_session, scenario, payload,
+):
+    """A published version can move after the installed rows were already
+    reconciled by another idempotent path. The confirmation must clear that
+    stale version marker without inventing an update or an undo point."""
+    from packages.core.blueprints.freshness import BLUEPRINT_VERSION_KEY
+
+    ws = scenario["workspace"]
+    matching_payload = copy.deepcopy(payload)
+    # This fixture materialises only the embedded skill. Keep the plan scoped
+    # to that installed surface so the assertion is specifically about a
+    # version-only confirmation rather than missing agent/Flow installation.
+    matching_payload["embedded"]["agents"] = []
+    matching_payload["recipe"]["workflows"] = []
+    scenario["skill"].system_prompt = matching_payload["embedded"]["skills"][0]["system_prompt"]
+    settings = dict(ws.settings)
+    settings[BLUEPRINT_SETTINGS_KEY] = {
+        **settings[BLUEPRINT_SETTINGS_KEY], BLUEPRINT_VERSION_KEY: "1.0.1",
+    }
+    ws.settings = settings
+    await db_session.flush()
+
+    preview = await plan(db_session, workspace=ws, payload=matching_payload)
+    assert {item["action"] for item in preview["items"]} == {
+        UpgradeAction.UNCHANGED.value,
+    }
+
+    result = await apply(
+        db_session,
+        workspace=ws,
+        payload=matching_payload,
+        current_version="1.0.2",
+    )
+
+    assert result["updated"] == []
+    assert result["kept_yours"] == []
+    assert result["can_revert"] is False
+    assert RESTORE_POINT_KEY not in ws.settings[BLUEPRINT_SETTINGS_KEY]
+    assert blueprint_freshness(
+        ws.settings, matching_payload, current_version="1.0.2",
+    ) is BlueprintFreshness.CURRENT
+
+
+@pytest.mark.asyncio
+async def test_upgrade_materializes_and_can_revert_legacy_inline_knowledge(
+    db_session, scenario, payload,
+):
+    """Legacy installs have the Knowledge group but only todo placeholders."""
+    knowledge_payload = copy.deepcopy(payload)
+    knowledge_payload["embedded"]["skills"] = []
+    knowledge_payload["embedded"]["agents"] = []
+    knowledge_payload["recipe"]["workflows"] = []
+    pack = knowledge_payload["embedded"]["knowledge_packs"][0]
+    group = DocumentGroup(
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        name=pack["title"],
+        settings={"mode": "inline_text", "installed_from_blueprint_slug": pack["slug"]},
+    )
+    db_session.add(group)
+    await db_session.flush()
+
+    preview = await plan(
+        db_session,
+        workspace=scenario["workspace"],
+        payload=knowledge_payload,
+    )
+    additions = [
+        item for item in preview["items"]
+        if item["kind"] == "knowledge_document" and item["action"] == "update"
+    ]
+    assert len(additions) == len(pack["starter_documents"])
+
+    result = await apply(
+        db_session,
+        workspace=scenario["workspace"],
+        payload=knowledge_payload,
+    )
+    assert len(result["updated"]) == len(pack["starter_documents"])
+    rows = list((await db_session.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .where(DocumentGroupMember.group_id == group.id)
+    )).scalars().all())
+    assert {row.name for row in rows} == {
+        document["path"] for document in pack["starter_documents"]
+    }
+    assert all(row.metadata_.get("content_text") for row in rows)
+
+    reverted = await revert(db_session, workspace=scenario["workspace"])
+    assert len(reverted["reverted"]) == len(pack["starter_documents"])
+    remaining = list((await db_session.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .where(DocumentGroupMember.group_id == group.id)
+    )).scalars().all())
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_upgrade_binds_live_knowledge_template_without_overwriting_document(
+    db_session, scenario, payload,
+):
+    """A Blueprint update may attach a renderer, but never replace operator text."""
+
+    knowledge_payload = copy.deepcopy(payload)
+    knowledge_payload["embedded"]["skills"] = []
+    knowledge_payload["embedded"]["agents"] = []
+    knowledge_payload["recipe"]["workflows"] = []
+    pack = next(
+        item for item in knowledge_payload["embedded"]["knowledge_packs"]
+        if item["slug"] == "solo-stickman-studio-ops"
+    )
+    template_document = next(
+        item for item in pack["starter_documents"]
+        if item["path"] == "topic-ledger/ledger.md"
+    )
+    pack["starter_documents"] = [template_document]
+    group = DocumentGroup(
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        name=pack["title"],
+        settings={"mode": "inline_text", "installed_from_blueprint_slug": pack["slug"]},
+    )
+    db_session.add(group)
+    await db_session.flush()
+    legacy = Document(
+        entity_id=scenario["entity_id"],
+        name="topic-ledger/ledger.md",
+        source="blueprint",
+        metadata_={"content_text": "# Operator-owned Ledger notes"},
+    )
+    db_session.add(legacy)
+    await db_session.flush()
+    db_session.add(DocumentGroupMember(document_id=legacy.id, group_id=group.id))
+    await db_session.flush()
+
+    preview = await plan(
+        db_session,
+        workspace=scenario["workspace"],
+        payload=knowledge_payload,
+    )
+    ledger_item = next(
+        item for item in preview["items"]
+        if item["kind"] == "knowledge_document"
+    )
+    assert ledger_item["action"] == "update"
+    assert ledger_item["changes"] == ["updates live Knowledge template binding"]
+
+    await apply(
+        db_session,
+        workspace=scenario["workspace"],
+        payload=knowledge_payload,
+    )
+    assert legacy.metadata_["content_text"] == "# Operator-owned Ledger notes"
+    assert legacy.metadata_["blueprint_template"] == template_document["template"]
+    assert legacy.metadata_["blueprint_starter_path"] == "topic-ledger/ledger.md"
+
+    await revert(db_session, workspace=scenario["workspace"])
+    assert legacy.metadata_["content_text"] == "# Operator-owned Ledger notes"
+    assert "blueprint_template" not in legacy.metadata_
 
 
 @pytest.mark.asyncio

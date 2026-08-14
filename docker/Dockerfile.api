@@ -8,12 +8,17 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini curl ripgrep fuse3 ffmpeg \
     libreoffice-impress libreoffice-writer libreoffice-calc \
-    poppler-utils fonts-liberation fonts-noto-cjk && \
+    poppler-utils \
+    fonts-crosextra-caladea fonts-crosextra-carlito fonts-lato \
+    fonts-liberation fonts-noto-cjk fonts-roboto && \
     rm -rf /var/lib/apt/lists/* && \
     ARCH=$(dpkg --print-architecture) && \
     curl -sSL "https://github.com/juicedata/juicefs/releases/download/v1.2.3/juicefs-1.2.3-linux-${ARCH}.tar.gz" \
       | tar xz -C /usr/local/bin juicefs && \
     chmod +x /usr/local/bin/juicefs
+
+COPY docker/fontconfig/70-manor-office-fonts.conf /etc/fonts/conf.d/70-manor-office-fonts.conf
+RUN fc-cache -f
 
 # Install Python deps
 COPY pyproject.toml .

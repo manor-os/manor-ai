@@ -17,6 +17,9 @@ interface UseWebSocketOptions {
   onJobUpdate?: (data: Record<string, any>) => void;
   onGoalProgress?: (data: Record<string, any>) => void;
   onWorkspaceChatMessage?: (data: Record<string, any>) => void;
+  onConversationMessage?: (data: Record<string, any>) => void;
+  /** In-progress reply for a turn this tab is not streaming (see chat_service). */
+  onChatStreamSnapshot?: (data: Record<string, any>) => void;
   onConnect?: (data: Record<string, any>) => void;
   onTyping?: (data: Record<string, any>) => void;
   onPresence?: (data: Record<string, any>) => void;
@@ -138,6 +141,16 @@ function dispatchMessage(event: MessageEvent) {
       case "workspace_chat_message":
         for (const sub of subscribers.values()) {
           sub.optionsRef.current.onWorkspaceChatMessage?.(msg.data);
+        }
+        break;
+      case "conversation_message":
+        for (const sub of subscribers.values()) {
+          sub.optionsRef.current.onConversationMessage?.(msg.data);
+        }
+        break;
+      case "chat_stream_snapshot":
+        for (const sub of subscribers.values()) {
+          sub.optionsRef.current.onChatStreamSnapshot?.(msg.data);
         }
         break;
       case "typing":

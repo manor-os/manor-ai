@@ -30,6 +30,11 @@ from packages.core.contracts.envelope import (
     StepResultStatus,
     normalize_step_result_status,
 )
+from packages.core.contracts.task_output import (
+    declared_output_payload_schema,
+    is_plan_output_contract_schema,
+    task_output_payload_schema,
+)
 
 SUBMIT_RESULT_TOOL_NAME = "submit_result"
 
@@ -63,13 +68,21 @@ SUBMIT_RESULT_PROMPT_SUFFIX = (
 def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str, Any]:
     """The submit_result tool schema, shaped by the step's expected output.
 
-    ``result`` embeds the plan's expected_output_schema when it is an object
-    schema so the model fills the declared fields directly; otherwise a free
-    object. ``summary`` is the only required field — the envelope philosophy:
-    never let schema strictness turn a finished piece of work into a failure.
+    Legacy, unmarked object schemas expose their properties as advisory hints
+    without required fields. Task-authored terminal contracts and explicit
+    PlanStep output contracts preserve the complete payload schema and
+    require ``result``; missing fields must retry instead of becoming a
+    summary-only success. Steps without either schema receive a free object.
     """
+    declared_payload_schema = declared_output_payload_schema(expected_output_schema)
+    hard_declared_contract = declared_payload_schema is not None
     result_schema: dict[str, Any] = {"type": "object"}
-    if (
+    if hard_declared_contract:
+        # Task.expected_output and explicit PlanStep output contracts are
+        # known before execution. Preserve required fields, cardinality, and
+        # nested schemas in the tool call itself.
+        result_schema = declared_payload_schema
+    elif (
         isinstance(expected_output_schema, dict)
         and expected_output_schema.get("type") == "object"
         and isinstance(expected_output_schema.get("properties"), dict)
@@ -112,7 +125,7 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
                     },
                     "result": result_schema,
                 },
-                "required": ["summary"],
+                "required": ["summary", "result"] if hard_declared_contract else ["summary"],
             },
         },
     }
@@ -140,9 +153,32 @@ def submit_result_capture() -> tuple[Callable[[dict[str, Any]], str], Callable[[
     return handler, get_payload
 
 
-def step_result_from_submit(payload: dict[str, Any]) -> dict[str, Any]:
+def step_result_from_submit(
+    payload: dict[str, Any],
+    expected_output_schema: Optional[dict] = None,
+) -> Any:
     """Normalize a submit_result payload into the step_result dict shape the
     downstream mergers/envelope consume. Tolerant by construction."""
+    task_payload_schema = task_output_payload_schema(expected_output_schema)
+    if task_payload_schema is not None:
+        summary = str(payload.get("summary") or "").strip()
+        status = normalize_step_result_status(payload.get("status"))
+        envelope: dict[str, Any] = {
+            "status": (status or StepResultStatus.SUCCEEDED).value,
+            "summary": summary or "structured task output submitted",
+        }
+        # Presence matters: JSON null can be valid when the task schema allows
+        # it, while an omitted result must remain omitted and fail validation.
+        if "result" in payload:
+            envelope["outputs"] = {"data": payload.get("result")}
+        return envelope
+
+    if is_plan_output_contract_schema(expected_output_schema):
+        # A PlanStep payload is the exact declared value, not a control
+        # envelope. Injecting the tool's summary/status here would violate
+        # custom schemas that correctly use additionalProperties=false.
+        return payload.get("result") if "result" in payload else None
+
     result = payload.get("result")
     if not isinstance(result, dict):
         result = {}
@@ -150,7 +186,9 @@ def step_result_from_submit(payload: dict[str, Any]) -> dict[str, Any]:
         result = dict(result)
 
     summary = str(payload.get("summary") or "").strip()
-    if summary and not str(result.get("text") or "").strip():
+    outputs = result.get("outputs") if isinstance(result.get("outputs"), dict) else {}
+    has_output_text = isinstance(outputs.get("text"), str) and bool(outputs["text"].strip())
+    if summary and not str(result.get("text") or "").strip() and not has_output_text:
         result["text"] = summary
     if summary:
         result.setdefault("summary", summary)
@@ -176,13 +214,17 @@ def step_result_from_submit(payload: dict[str, Any]) -> dict[str, Any]:
 def submit_result_followup_message(expected_output_schema: Optional[dict]) -> str:
     """The nudge for the fallback round when the loop ended without a submit."""
     hint = ""
-    if (
-        isinstance(expected_output_schema, dict)
-        and isinstance(expected_output_schema.get("properties"), dict)
-    ):
-        fields = ", ".join(sorted(expected_output_schema["properties"].keys()))
+    payload_schema = declared_output_payload_schema(expected_output_schema)
+    schema_for_hint = payload_schema or expected_output_schema
+    if isinstance(schema_for_hint, dict) and isinstance(schema_for_hint.get("properties"), dict):
+        fields = ", ".join(sorted(schema_for_hint["properties"].keys()))
         if fields:
             hint = f" Fill these result fields where you have real values: {fields}."
+    elif isinstance(schema_for_hint, dict) and schema_for_hint.get("type") == "array":
+        minimum = schema_for_hint.get("minItems")
+        maximum = schema_for_hint.get("maxItems")
+        if isinstance(minimum, int) and minimum == maximum:
+            hint = f" Put exactly {minimum} records in result."
     return (
         "The step is over but no result was submitted. Call `submit_result` NOW "
         "with the final outcome of the work above — do not do anything else, do "

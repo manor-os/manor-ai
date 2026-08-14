@@ -22,6 +22,7 @@ import Pagination from "../components/ui/Pagination";
 import { t } from "../lib/i18n";
 import { formatUserFacingText } from "../lib/taskDisplay";
 import { stringifyJobRunResult, summarizeJobRunResult } from "../lib/jobRunResult";
+import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import {
   IconEdit, IconTrash, IconClock, IconChevronRight, IconPlay, IconFlow, IconWorkspace,
 } from "../components/icons";
@@ -364,10 +365,11 @@ interface ScheduledJobsProps {
 }
 
 /* ── main ── */
-export default function ScheduledJobs({ workspaceId, workflowsEnabled = true }: ScheduledJobsProps) {
+export default function ScheduledJobs({ workspaceId, workflowsEnabled }: ScheduledJobsProps) {
   const qc = useQueryClient();
   const toast = useToastStore();
-  const showWorkflowAutomations = workspaceId ? workflowsEnabled : true;
+  const flowsAccess = usePreviewFeatureAccess("flows");
+  const showWorkflowAutomations = workflowsEnabled ?? flowsAccess.enabled;
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search.trim());
   const [statusFilter, setStatusFilter] = useState<AutomationStatusFilter>("all");

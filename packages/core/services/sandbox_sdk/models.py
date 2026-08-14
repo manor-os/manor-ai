@@ -32,6 +32,7 @@ class ContainerConfig:
     pids_limit: int = 256
     read_only_root: bool = True
     tmpfs: list[str] = field(default_factory=lambda: ["/tmp", "/var/tmp"])
+    workdir_tmpfs_size: str = "256m"
     cap_drop: list[str] = field(default_factory=lambda: ["ALL"])
     container_prefix: str = "skill-sbx-"
     workdir: str = "/skill"
@@ -49,6 +50,7 @@ class ContainerConfig:
             "pids_limit": self.pids_limit,
             "read_only_root": self.read_only_root,
             "tmpfs": self.tmpfs,
+            "workdir_tmpfs_size": self.workdir_tmpfs_size,
             "cap_drop": self.cap_drop,
             "container_prefix": self.container_prefix,
             "workdir": self.workdir,

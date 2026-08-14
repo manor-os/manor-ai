@@ -25,7 +25,15 @@ from packages.core.services.task_state_machine import apply_task_status_transiti
 logger = logging.getLogger(__name__)
 
 
-_PLAN_COMPLETION_RECONCILABLE_TASK_STATUSES = {"pending", "in_progress", "waiting_on_customer", "completed"}
+_PLAN_COMPLETION_RECONCILABLE_TASK_STATUSES = {
+    "pending",
+    "in_progress",
+    "waiting_on_customer",
+    "completed",
+    # A retry can complete a new plan after the previous plan finalized the
+    # task as failed; dependency reads must be able to repair that stale row.
+    "failed",
+}
 
 
 def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -> dict[str, Any]:
@@ -48,7 +56,10 @@ def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -
         if step.result:
             entry["result_summary"] = _step_result_summary(step.result)
             if isinstance(step.result, dict):
-                refs = _artifact_refs_from_result(step.result, step_key=step.step_key)
+                refs = _dedupe_task_artifact_refs(
+                    _artifact_refs_from_result(step.result, step_key=step.step_key),
+                    entity_id=plan.entity_id,
+                )
                 if refs:
                     entry["files"] = refs
                     all_files.extend(refs)
@@ -67,23 +78,75 @@ def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -
         "plan_id": plan.id,
         "plan_status": plan.status,
         "steps": step_summaries,
-        "files": _dedupe_task_artifact_refs(all_files) if all_files else None,
+        "files": _dedupe_task_artifact_refs(
+            all_files,
+            entity_id=plan.entity_id,
+        ) if all_files else None,
         "reconciled_from_plan": True,
     }
 
 
 def _has_duplicate_file_refs(actual: dict[str, Any]) -> bool:
-    from packages.core.plans.executor import _artifact_ref_identity
+    from packages.core.services.generated_file_refs import generated_file_ref_aliases
 
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     for item in actual.get("files") or []:
         if not isinstance(item, dict):
             continue
-        key = (str(item.get("type") or ""), _artifact_ref_identity(item))
-        if key in seen:
+        aliases = generated_file_ref_aliases(item)
+        if aliases & seen:
             return True
-        seen.add(key)
+        seen.update(aliases)
     return False
+
+
+def _actual_artifact_refs(actual: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = [dict(item) for item in actual.get("files") or [] if isinstance(item, dict)]
+    if refs:
+        return refs
+    for step in actual.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        refs.extend(dict(item) for item in step.get("files") or [] if isinstance(item, dict))
+    return refs
+
+
+def _has_unprojected_local_artifacts(actual: dict[str, Any]) -> bool:
+    """A local file is not a delivered Artifact until it has a Document id."""
+
+    for item in _actual_artifact_refs(actual):
+        if not isinstance(item, dict) or item.get("document_id"):
+            continue
+        if any(item.get(key) for key in ("fs_path", "path", "file_path", "local_path", "saved_to")):
+            return True
+        url = str(item.get("url") or item.get("file_url") or item.get("result_url") or "")
+        if "/api/v1/fs/" in url:
+            return True
+    return False
+
+
+async def _project_actual_output_artifacts(task: Any, actual: dict[str, Any]) -> dict[str, Any]:
+    refs = _actual_artifact_refs(actual)
+    if not refs:
+        return actual
+
+    from packages.core.services.artifact_knowledge import project_artifact_refs_to_knowledge
+
+    projection = await project_artifact_refs_to_knowledge(
+        entity_id=task.entity_id,
+        refs=refs,
+        workspace_id=getattr(task, "workspace_id", None),
+        task_id=task.id,
+        agent_id=getattr(task, "agent_id", None),
+        tool_name="task_execution_reconcile",
+    )
+    projected = dict(actual)
+    projected["files"] = projection.refs
+    if projection.failures:
+        projected["artifact_knowledge_issues"] = projection.failures
+    else:
+        projected.pop("artifact_knowledge_issues", None)
+    return projected
 
 
 async def _has_open_supervisor_input_request(db: AsyncSession, *, task_id: str, plan_id: str) -> bool:
@@ -139,10 +202,12 @@ async def reconcile_task_from_latest_completed_plan(db: AsyncSession, task: Any)
         select(ExecutionPlan).where(
             ExecutionPlan.entity_id == entity_id,
             ExecutionPlan.task_id == task_id,
-            ExecutionPlan.status == ExecutionPlanStatus.COMPLETED,
-        ).order_by(ExecutionPlan.completed_at.desc().nullslast(), ExecutionPlan.created_at.desc()).limit(1)
+        ).order_by(
+            ExecutionPlan.created_at.desc(),
+            ExecutionPlan.id.desc(),
+        ).limit(1)
     )).scalar_one_or_none()
-    if not plan:
+    if not plan or plan.status != ExecutionPlanStatus.COMPLETED.value:
         return False
 
     actual = getattr(task, "actual_output", None) if isinstance(getattr(task, "actual_output", None), dict) else {}
@@ -161,13 +226,22 @@ async def reconcile_task_from_latest_completed_plan(db: AsyncSession, task: Any)
         and task_status == "completed"
         and not _has_duplicate_file_refs(actual)
     ):
-        return False
+        if not _has_unprojected_local_artifacts(actual):
+            return False
+        projected = await _project_actual_output_artifacts(task, actual)
+        if projected == actual:
+            return False
+        task.actual_output = projected
+        return True
 
     steps = list((await db.execute(
         select(ExecutionStep).where(ExecutionStep.plan_id == plan.id)
         .order_by(ExecutionStep.created_at)
     )).scalars().all())
-    task.actual_output = _actual_output_from_steps(plan, steps)
+    task.actual_output = await _project_actual_output_artifacts(
+        task,
+        _actual_output_from_steps(plan, steps),
+    )
 
     if task_status != "completed":
         try:

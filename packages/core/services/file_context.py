@@ -27,7 +27,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -507,7 +507,15 @@ async def build_file_context(
             out.unread_filenames.append(f.filename or "(unnamed)")
             continue
 
-        mime = (f.content_type or "").lower()
+        from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+        try:
+            mime = await inspect_upload_content(
+                content,
+                filename=f.filename,
+                declared_content_type=f.content_type,
+            )
+        except UploadSecurityError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
 
         # Image branch — pass through as multimodal block.
         if mime.startswith(_IMAGE_MIME_PREFIX):

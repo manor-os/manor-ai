@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
-test("blueprint updates stay inside their marketplace card grid item", async () => {
+test("blueprint updates stay inside their gallery card grid item", async () => {
   const source = await readFile(
     new URL("../src/pages/BlueprintList.tsx", import.meta.url),
     "utf8",
@@ -10,15 +10,11 @@ test("blueprint updates stay inside their marketplace card grid item", async () 
 
   assert.match(
     source,
-    /return \(\s*<div style=\{\{ position: "relative", minWidth: 0 \}\}>\s*\{renderCard\(\)\}/,
-    "each blueprint must return one grid wrapper with the card first",
+    /return \(\s*<div className="blueprint-marketplace-card-item">\s*<Link/,
+    "each blueprint must return one gallery card grid item",
   );
-  assert.doesNotMatch(
-    source,
-    /return \(\s*<>\s*\{stale\.length > 0/,
-    "update notices must not become separate CSS-grid children",
-  );
+  assert.match(source, /<WorkspaceAppCard/);
+  assert.match(source, /\{stale\.length > 0 && \(/);
   assert.ok(source.includes("aria-label={updateLabel}"));
-  assert.ok(source.includes('position: "absolute"'));
-  assert.ok(source.includes("reserveTopAction={stale.length > 0}"));
+  assert.match(source, /className="blueprint-marketplace-update"/);
 });

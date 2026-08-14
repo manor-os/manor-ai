@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.chat_logger import ChatTrace
+from packages.core.constants.hitl_envelope import parse_hitl_envelope
 from packages.core.ai.runtime import (
     ChannelRuntimeContext,
     ChatSurface,
@@ -22,6 +23,7 @@ from packages.core.ai.runtime import (
     runtime_release_billing_context,
     runtime_set_suppressed_billing_context,
 )
+from packages.core.ai.llm_client import CreditExhaustedError
 from packages.core.ai.runtime.skill_forcing import (
     runtime_forced_tool_calls_for_turn,
     runtime_message_text_for_intent,
@@ -62,6 +64,10 @@ from packages.core.services.assistant_blocks import (
 )
 from packages.core.services.chat_artifacts import chat_attachments_from_tool_results
 from packages.core.services.chat_approvals import register_chat_provider_approval
+from packages.core.services.chat_approvals import (
+    chat_turn_cancellation_requested,
+    get_chat_turn_cancel_generation,
+)
 from packages.core.services.hitl_requests import (
     hitl_requests_from_data,
     workspace_operation_pending_action_from_data,
@@ -76,7 +82,12 @@ from packages.core.services.runtime_learning import (
     schedule_learning_candidate_applies,
 )
 from packages.core.services.sse_events import format_sse
-from packages.core.services.usage_service import record_chat_llm_usage
+from packages.core.services.usage_service import record_chat_llm_usage  # noqa: F401
+from packages.core.services.usage_service import (
+    chat_llm_usage_is_byok,
+    chat_llm_usage_to_credits,
+    settle_chat_llm_call_usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +95,186 @@ KEEPALIVE_INTERVAL = 15  # seconds
 STREAM_CHECKPOINT_INTERVAL = 2.0  # seconds
 STREAM_CHECKPOINT_MIN_CHARS = 400
 STREAM_CHECKPOINT_MIN_DURABLE_CHARS = 24
+# Cadence for the WS snapshots that let a reloaded page follow a running turn.
+# Deliberately looser than a token stream (it is a catch-up channel, not the
+# primary one) and deliberately tighter than the DB checkpoint, whose 2s/400
+# char + "durable text" gates exist to spare the database, not the reader.
+STREAM_SNAPSHOT_INTERVAL = 0.8  # seconds
+STREAM_SNAPSHOT_PUBLISH_TIMEOUT = 5.0  # seconds
+# Surfaces whose transcript a browser tab renders from ``messages`` and can
+# therefore resume from a snapshot. Public webchat and channel turns persist
+# too, but their "user" is a customer, not the tab-owning account.
+_SNAPSHOT_CHAT_SURFACES = frozenset({
+    ChatSurface.GLOBAL_OWNER_CHAT.value,
+    ChatSurface.AGENT_DM.value,
+})
 FINAL_RESPONSE_SENTINEL = "<manor-final-response>"
 FINAL_RESPONSE_SENTINELS = (
     FINAL_RESPONSE_SENTINEL,
     "</manor-final-response>",
+    "<final>",
+    "</final>",
 )
+CHAT_LLM_RESERVATION_MAX_OUTPUT_TOKENS = int(
+    os.getenv("CHAT_LLM_RESERVATION_MAX_OUTPUT_TOKENS", "8192") or 8192
+)
+
+
+def _chat_llm_billing_callbacks(
+    *,
+    trace: ChatTrace,
+    entity_id: str | None,
+    user_id: str | None,
+    agent_id: str | None,
+    workspace_id: str | None,
+    conversation_id: str | None,
+    fallback_model: str | None,
+):
+    """Build per-turn durable billing callbacks for the agentic loop."""
+    source_ids: dict[int, str] = {}
+
+    def source_id(round_num: int) -> str:
+        return f"chat:{trace.trace_id}:{round_num}"
+
+    async def reserve_llm_call(
+        round_num: int,
+        model: str | None,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None,
+    ) -> None:
+        call_source_id = source_id(round_num)
+        source_ids[round_num] = call_source_id
+        if not entity_id or chat_llm_usage_is_byok():
+            return
+
+        from packages.core.ai.agentic_loop import _estimate_tokens
+        from packages.core.database import async_session
+        from packages.core.services.billing_service import tokens_to_credits
+        from packages.core.services.credit_reservations import (
+            CreditReservationError,
+            reserve_credits,
+        )
+
+        output_tokens = int(max_tokens or 0)
+        if output_tokens <= 0:
+            output_tokens = CHAT_LLM_RESERVATION_MAX_OUTPUT_TOKENS
+        try:
+            estimate = max(
+                1,
+                int(tokens_to_credits(_estimate_tokens(messages), output_tokens, model)),
+            )
+            async with async_session() as db:
+                await reserve_credits(
+                    db,
+                    entity_id=entity_id,
+                    amount_credits=estimate,
+                    source_kind="chat_llm_call",
+                    source_id=call_source_id,
+                    reason="chat LLM call estimate",
+                    workspace_id=workspace_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    metadata={"round": round_num, "model": model or ""},
+                )
+                await db.commit()
+        except CreditReservationError as exc:
+            raise CreditExhaustedError(str(exc)) from exc
+        except Exception as exc:
+            raise CreditExhaustedError(
+                "Unable to reserve credits for this request. Please try again shortly."
+            ) from exc
+
+    async def settle_llm_call(
+        round_num: int,
+        duration_ms: float,
+        usage: dict[str, Any],
+    ) -> None:
+        if not entity_id:
+            return
+
+        from packages.core.database import async_session
+        from packages.core.services.credit_reservations import resize_reservation_by_source
+
+        call_source_id = source_ids.pop(round_num, source_id(round_num))
+        billed_usage = dict(usage or {})
+        billed_usage.setdefault("model", fallback_model or "")
+        byok = chat_llm_usage_is_byok(billed_usage)
+        actual_credits = 0 if byok else chat_llm_usage_to_credits(billed_usage)
+
+        if not byok and actual_credits > 0:
+            # Commit the actual provider cost before attempting the ledger
+            # write. A later rollback must leave this active reservation.
+            async with async_session() as db:
+                await resize_reservation_by_source(
+                    db,
+                    source_kind="chat_llm_call",
+                    source_id=call_source_id,
+                    amount_credits=actual_credits,
+                    allow_overdraft=True,
+                )
+                await db.commit()
+
+        async with async_session() as db:
+            try:
+                await settle_chat_llm_call_usage(
+                    db,
+                    entity_id=entity_id,
+                    source_id=call_source_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                    conversation_id=conversation_id,
+                    usage=billed_usage,
+                    duration_ms=int(duration_ms),
+                    consumed_credits=actual_credits if not byok else None,
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    return reserve_llm_call, settle_llm_call
+
+
+def _snapshot_surface_allows_resume(runtime_surface: "ChatSurface | str | None") -> bool:
+    value = getattr(runtime_surface, "value", runtime_surface)
+    return str(value or "") in _SNAPSHOT_CHAT_SURFACES
+
+
+def _tool_calls_for_snapshot(tool_events: list[dict]) -> list[dict]:
+    """Tool cards for a broadcast, without the untruncated provider output.
+
+    ``tool_results`` carries ``raw_result`` so the DB row can be replayed and
+    HITL envelopes parsed; it is whole tool output and can be megabytes. The SSE
+    payload drops it for the same reason (RuntimeToolStreamSink), and a Redis
+    fan-out is a worse place to put it than a response body.
+    """
+    return [
+        {key: value for key, value in event.items() if key != "raw_result"}
+        for event in tool_events
+        if isinstance(event, dict)
+    ]
+
+
+# Snapshot publishes are fire-and-forget from sync tool callbacks, so they need
+# the same strong reference _DETACHED_CHAT_TURNS holds: a bare create_task can
+# be garbage-collected before it reaches the wire.
+_SNAPSHOT_PUBLISH_TASKS: "set[asyncio.Task]" = set()
+
+
+async def _publish_chat_stream_snapshot(user_id: str, payload: dict) -> None:
+    from packages.core.services.realtime import push_chat_stream_snapshot
+
+    try:
+        # A black-holed Redis has no socket timeout of its own, and this runs
+        # inside a turn that may already be detached from its request.
+        await asyncio.wait_for(
+            push_chat_stream_snapshot(user_id, payload),
+            timeout=STREAM_SNAPSHOT_PUBLISH_TIMEOUT,
+        )
+    except Exception:
+        logger.debug("Chat stream snapshot publish failed", exc_info=True)
 
 
 def _attach_raw_tool_result(tool_events: list[dict], name: str, result: str) -> None:
@@ -260,6 +446,17 @@ async def stream_chat_response(
     def scoped_sse(event: str, payload: dict | None = None) -> str:
         return format_sse(event, scoped_payload(payload))
 
+    cancel_generation = 0
+    if persist_messages and conversation_id and entity_id:
+        from packages.core.database import async_session as _cancel_check_session_factory
+
+        async with _cancel_check_session_factory() as cancel_check_db:
+            cancel_generation = await get_chat_turn_cancel_generation(
+                cancel_check_db,
+                conversation_id=conversation_id,
+                entity_id=entity_id,
+            )
+
     yield scoped_sse("stream_start", {
         "ephemeral": not persist_messages,
     })
@@ -317,6 +514,55 @@ async def stream_chat_response(
                 **assistant_blocks_stream_payload(assistant_blocks),
             }
 
+        # ── Resume channel ──
+        # Everything below keeps a reloaded page (or a second tab) in sync with
+        # a turn whose SSE connection it does not own. The SSE body is still the
+        # primary channel; this is the only one that survives the reload.
+        snapshot_enabled = bool(
+            persist_messages
+            and conversation_id
+            and user_id
+            # Workspace chat already has its own realtime path and its own
+            # renderer; a second event would double-render it.
+            and not ctx.workspace_id
+            and _snapshot_surface_allows_resume(runtime_surface)
+        )
+        snapshot_state = {"seq": 0, "time": 0.0, "terminal": False}
+
+        def publish_stream_snapshot(
+            status: str = "streaming",
+            *,
+            force: bool = False,
+            content: str | None = None,
+        ) -> None:
+            if not snapshot_enabled or not persisted_message_id[0]:
+                return
+            if snapshot_state["terminal"]:
+                return
+            now = time.time()
+            if not force and now - float(snapshot_state["time"]) < STREAM_SNAPSHOT_INTERVAL:
+                return
+            snapshot_state["time"] = now
+            snapshot_state["seq"] = int(snapshot_state["seq"]) + 1
+            if status != "streaming":
+                snapshot_state["terminal"] = True
+            visible = content if content is not None else streamed_text_content[0]
+            payload = {
+                "conversation_id": conversation_id,
+                "message_id": persisted_message_id[0],
+                # Publishes are fire-and-forget tasks and Redis pub/sub gives no
+                # cross-connection ordering, so the reader drops anything that
+                # does not move this forward.
+                "seq": snapshot_state["seq"],
+                "status": status,
+                "content": _strip_final_response_sentinel(visible).strip(),
+                "tool_calls": _tool_calls_for_snapshot(tool_results),
+                **assistant_blocks.meta(),
+            }
+            task = asyncio.create_task(_publish_chat_stream_snapshot(user_id, payload))
+            _SNAPSHOT_PUBLISH_TASKS.add(task)
+            task.add_done_callback(_SNAPSHOT_PUBLISH_TASKS.discard)
+
         def assistant_blocks_has_process() -> bool:
             return any(block.get("type") == "process" for block in assistant_blocks.blocks())
 
@@ -348,6 +594,7 @@ async def stream_chat_response(
             pending_post_tool_chunks.clear()
 
         def record_nested_tool_event(event_type: str, data: dict) -> None:
+            nonlocal hitl_data
             tool_call = data.get("tool_call") if isinstance(data, dict) else None
             if not isinstance(tool_call, dict):
                 return
@@ -375,6 +622,12 @@ async def stream_chat_response(
                 persisted_result = tool_call.get("raw_result")
                 if isinstance(persisted_result, str) and persisted_result:
                     _attach_raw_tool_result(tool_results, name, persisted_result)
+                    # FIRST blocker wins, not last: the one that stopped the
+                    # run is the one the user must answer. A later nested tool
+                    # asking for its own approval must not replace it, or the
+                    # user resolves the wrong gate and the original stays open.
+                    if hitl_data is None:
+                        hitl_data = parse_hitl_envelope(persisted_result)
                 assistant_blocks.end_tool(
                     name,
                     arguments=args,
@@ -384,6 +637,8 @@ async def stream_chat_response(
                     now_ms=int(time.time() * 1000),
                 )
             data.update(assistant_blocks_stream_payload(assistant_blocks))
+            # Throttled, not forced: a skill can emit nested events in bursts.
+            publish_stream_snapshot()
 
         def record_sub_agent_event(event: dict) -> None:
             runtime_record_sub_agent_event_for_chat(sub_agent_events, event)
@@ -423,8 +678,25 @@ async def stream_chat_response(
             if not token_text:
                 return
             if summary_started[0]:
-                emit_visible_text_delta(token_text)
-                assistant_blocks.append_text(token_text, phase="final")
+                combined = sentinel_scan_buffer[0] + token_text
+                for sentinel in FINAL_RESPONSE_SENTINELS:
+                    combined = combined.replace(sentinel, "")
+                held_prefix = 0
+                for sentinel in FINAL_RESPONSE_SENTINELS:
+                    max_prefix = min(len(combined), len(sentinel) - 1)
+                    for size in range(max_prefix, 0, -1):
+                        if combined.endswith(sentinel[:size]):
+                            held_prefix = max(held_prefix, size)
+                            break
+                if held_prefix:
+                    visible = combined[:-held_prefix]
+                    sentinel_scan_buffer[0] = combined[-held_prefix:]
+                else:
+                    visible = combined
+                    sentinel_scan_buffer[0] = ""
+                if visible:
+                    emit_visible_text_delta(visible)
+                    assistant_blocks.append_text(visible, phase="final")
                 return
 
             combined = sentinel_scan_buffer[0] + token_text
@@ -544,6 +816,9 @@ async def stream_chat_response(
                     "status": "pending",
                 },
             })))
+            # Forced: a tool boundary is the visible proof that a turn is alive,
+            # and a tool-only turn never reaches the text-growth publish below.
+            publish_stream_snapshot(force=True)
 
         streamed_text = [False]  # track if we streamed tokens in real-time
         streamed_text_content = [""]  # durable fallback when providers stream but omit final content
@@ -635,6 +910,10 @@ async def stream_chat_response(
                 process_stream_text_for_summary_sentinel(token_text)
                 if not synthetic_text:
                     await checkpoint_stream_text()
+                    # Its own cadence: checkpoint_stream_text is gated on
+                    # "durable" text (>=24 chars) and 2s/400 chars, so hanging
+                    # the snapshot off it would blank the first sentence.
+                    publish_stream_snapshot()
             elif event_type == "text_reset":
                 reset_stream_buffer[0] = True
                 text_buffer[0] = ""
@@ -665,11 +944,8 @@ async def stream_chat_response(
         def on_tool_end(name: str, result: str, duration_ms: float = 0, args: dict | None = None) -> None:
             nonlocal hitl_data
             provider_approvals.capture(name, args, result)
-            if result.strip().startswith('{"__hitl__":'):
-                try:
-                    hitl_data = json.loads(result)
-                except Exception:
-                    pass
+            if hitl_data is None:
+                hitl_data = parse_hitl_envelope(result)
 
             preview = tool_result_for_chat(name, result)
             status = tool_status_for_chat(result)
@@ -705,6 +981,7 @@ async def stream_chat_response(
                     "duration_ms": int(duration_ms),
                 },
             })))
+            publish_stream_snapshot(force=True)
             # ``tool_call_logs`` is only useful for failure analysis if the
             # row records the real outcome — without these two the column
             # default made every persisted row say success=True.
@@ -744,18 +1021,40 @@ async def stream_chat_response(
         # Run agentic loop in background task
         loop_result = [None]
         loop_error = [None]
+        loop_cancelled = [False]
+        error_saved_id: list[str | None] = [None]
         resolved_model = resolve_model_from_context(ctx)
         manual_skill_slugs = runtime_manual_skill_ids_from_refs(manual_skill_refs)
+        reserve_llm_call, settle_llm_call = _chat_llm_billing_callbacks(
+            trace=trace,
+            entity_id=entity_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            workspace_id=ctx.workspace_id,
+            conversation_id=conversation_id if persist_messages else None,
+            fallback_model=resolved_model,
+        )
+        async def is_cancelled() -> bool:
+            if not (persist_messages and conversation_id and entity_id):
+                return False
+            async with _cancel_check_session_factory() as cancel_check_db:
+                return await chat_turn_cancellation_requested(
+                    cancel_check_db,
+                    conversation_id=conversation_id,
+                    entity_id=entity_id,
+                    generation=cancel_generation,
+                )
 
         async def _run_loop():
             nonlocal hitl_data
-            # Suppress auto-billing — chat handles it via record_chat_llm_usage after the loop
+            # Chat settles every completed provider call through durable callbacks.
             _billing_handle = runtime_set_suppressed_billing_context(
                 entity_id=entity_id or "",
                 workspace_id=ctx.workspace_id,
                 agent_id=agent_id,
                 user_id=user_id,
                 conversation_id=conversation_id if persist_messages else None,
+                durable_per_call=True,
             )
             try:
                 result = await runtime_execute_chat_agent_loop(
@@ -781,16 +1080,37 @@ async def stream_chat_response(
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
                     on_llm_call=on_llm_call,
+                    on_llm_call_before=reserve_llm_call,
+                    on_llm_usage_settled=settle_llm_call,
                     stream_handler=on_stream_event,
                     metadata=resolve_llm_metadata_from_context(ctx),
                     forced_tool_calls=runtime_forced_tool_calls_for_turn(ctx, manual_skill_refs, message),
+                    is_cancelled=is_cancelled,
                 )
                 loop_result[0] = result
 
                 # Save assistant message immediately after loop completes,
                 # inside the task so it persists even if the SSE client
                 # disconnects before the generator resumes.
-                if result:
+                if result and result.stop_reason == "cancelled":
+                    try:
+                        interrupted_message_id = await save_assistant_stream_interrupted_message(
+                            conversation_id=conversation_id,
+                            entity_id=entity_id,
+                            workspace_id=ctx.workspace_id,
+                            agent_id=agent_id,
+                            tool_results=tool_results,
+                            attachments=chat_attachments_from_tool_results(tool_results) or None,
+                            message_id=persisted_message_id[0],
+                            meta=assistant_blocks.meta() or None,
+                        )
+                        if interrupted_message_id:
+                            persisted_message_id[0] = interrupted_message_id
+                            loop_saved[0] = True
+                            publish_stream_snapshot("interrupted", force=True)
+                    except Exception as save_err:
+                        logger.error("Failed to save cancelled assistant message: %s", save_err)
+                elif result:
                     if (
                         hitl_data is None
                         and persist_messages
@@ -901,6 +1221,14 @@ async def stream_chat_response(
                             if saved_id:
                                 persisted_message_id[0] = saved_id
                                 loop_saved[0] = True
+                                # Followers need the finished answer and the
+                                # "stopped working" edge; without this they sit
+                                # on the last partial until they reload.
+                                publish_stream_snapshot(
+                                    "done",
+                                    force=True,
+                                    content=result.content or "",
+                                )
                                 await runtime_persist_chat_stream_runtime_events(
                                     ctx.runtime_envelope,
                                     message_id=saved_id,
@@ -912,23 +1240,12 @@ async def stream_chat_response(
                         loop_saved[0] = True
                         flush_final_summary_text(result.content or "")
 
-                    # Persist token usage
-                    elapsed_ms = int((time.time() - trace.started_at) * 1000)
+                    # Per-call token usage and credit ledger rows were already
+                    # committed before the loop could continue. This transaction
+                    # records only post-turn learning evidence.
                     try:
                         from packages.core.database import async_session as _sf2
                         async with _sf2() as usage_db:
-                            await record_chat_llm_usage(
-                                usage_db,
-                                entity_id=entity_id,
-                                user_id=user_id,
-                                agent_id=agent_id,
-                                workspace_id=ctx.workspace_id,
-                                conversation_id=conversation_id if persist_messages else None,
-                                usage=result.usage or {},
-                                duration_ms=elapsed_ms,
-                                fallback_model=resolved_model,
-                                rounds=result.rounds,
-                            )
                             queued_learning_ids = (
                                 await record_chat_runtime_learning(
                                     usage_db,
@@ -957,8 +1274,36 @@ async def stream_chat_response(
                     except Exception as usage_err:
                         logger.error("Failed to persist usage/runtime evidence: %s", usage_err)
 
+            except asyncio.CancelledError:
+                # The generator cancels us on disconnect-before-tools; it then
+                # persists the interrupted row and publishes the terminal
+                # snapshot itself, in that order. Publishing "done" from here
+                # would tell followers an aborted turn finished cleanly.
+                loop_cancelled[0] = True
+                raise
             except Exception as exc:
                 loop_error[0] = exc
+                # A detached turn has no generator left to persist its failure:
+                # stream_chat_response's error handling sits after the yield
+                # loop, unreachable once the client is gone. Without this the
+                # row claims "streaming" until the next process restart, and the
+                # refetch that our terminal snapshot triggers finds a healthy-
+                # looking checkpoint contradicting the "error" status.
+                if persist_messages and conversation_id and not loop_saved[0]:
+                    try:
+                        error_saved_id[0] = await save_assistant_stream_error_message(
+                            conversation_id=conversation_id,
+                            entity_id=entity_id,
+                            workspace_id=ctx.workspace_id,
+                            agent_id=agent_id,
+                            error_message=str(exc) or "Unknown error",
+                            message_id=persisted_message_id[0],
+                            meta=assistant_blocks.meta() or None,
+                        )
+                        if error_saved_id[0]:
+                            persisted_message_id[0] = error_saved_id[0]
+                    except Exception:
+                        logger.exception("Failed to persist detached turn error")
             finally:
                 runtime_release_billing_context(_billing_handle)
                 result = loop_result[0]
@@ -967,6 +1312,18 @@ async def stream_chat_response(
                 else:
                     flush_text_buffer()
                 event_queue.put_nowait(None)  # sentinel
+                # Terminal edge for every non-cancel path the save above does
+                # not cover. No-op once a "done" snapshot already went out.
+                # Deliberately not awaited: this block also runs under
+                # cancellation, where an await re-raises.
+                if not loop_cancelled[0] and not (
+                    result and result.stop_reason == "cancelled"
+                ):
+                    publish_stream_snapshot(
+                        "error" if loop_error[0] else "done",
+                        force=True,
+                        content=(result.content if result and result.content else None),
+                    )
 
         task = asyncio.create_task(_run_loop())
 
@@ -1020,6 +1377,11 @@ async def stream_chat_response(
                         )
                         if interrupted_message_id:
                             persisted_message_id[0] = interrupted_message_id
+                        # After the row exists, so the refetch this triggers on
+                        # follower tabs finds the interruption, not a healthy-
+                        # looking checkpoint. _run_loop skipped its own terminal
+                        # publish for exactly this hand-off.
+                        publish_stream_snapshot("interrupted", force=True)
 
         # Normal-exit path: task is already done, this is a fast no-op.
         await task
@@ -1027,7 +1389,9 @@ async def stream_chat_response(
         if loop_error[0]:
             error_message = str(loop_error[0]) or "Unknown error"
             trace.log_error(error_message, phase="agentic_loop")
-            saved_error_id = (
+            # _run_loop already persisted the row (it must: on a detached turn
+            # this code never runs). Re-saving here would double-broadcast.
+            saved_error_id = error_saved_id[0] or (
                 await save_assistant_stream_error_message(
                     conversation_id=conversation_id,
                     entity_id=entity_id,
@@ -1062,9 +1426,11 @@ async def stream_chat_response(
         if result:
             trace.total_usage = result.usage or {}
 
-            # Stream the final text only if we didn't already stream it token-by-token
-            # (fallback content is already set by _run_loop if LLM returned nothing)
-            if result.content and not streamed_text[0]:
+            # Stream the final text only if no visible text was emitted. Tool-only
+            # turns can publish their terminal summary through the internal event
+            # queue without producing LLM tokens; checking ``streamed_text`` alone
+            # re-emits that same summary here and duplicates it in the chat bubble.
+            if result.content and not has_emitted_text[0]:
                 yield scoped_sse("text_delta", {"content": result.content})
 
             trace.log_complete(result=result)
@@ -1229,6 +1595,7 @@ async def run_chat_message(
         hitl_data: dict | None = None
 
         def _record_nested_tool_event(event_type: str, data: dict) -> None:
+            nonlocal hitl_data
             tool_call = data.get("tool_call") if isinstance(data, dict) else None
             if not isinstance(tool_call, dict):
                 return
@@ -1249,6 +1616,9 @@ async def run_chat_message(
                 persisted_result = tool_call.get("raw_result")
                 if isinstance(persisted_result, str) and persisted_result:
                     _attach_raw_tool_result(_tool_results, name, persisted_result)
+                    # First blocker wins — see the streaming path above.
+                    if hitl_data is None:
+                        hitl_data = parse_hitl_envelope(persisted_result)
 
         def _record_sub_agent_event(event: dict) -> None:
             runtime_record_sub_agent_event_for_chat(sub_agent_events, event)
@@ -1284,11 +1654,8 @@ async def run_chat_message(
         def _on_tool_end(name: str, result: str, duration_ms: float = 0, args: dict | None = None) -> None:
             nonlocal hitl_data
             provider_approvals.capture(name, args, result)
-            if result.strip().startswith('{"__hitl__":'):
-                try:
-                    hitl_data = json.loads(result)
-                except Exception:
-                    pass
+            if hitl_data is None:
+                hitl_data = parse_hitl_envelope(result)
             preview = tool_result_for_chat(name, result)
             status = tool_status_for_chat(result)
             fallback_args = _last_tool_args.pop(name, None)
@@ -1325,14 +1692,24 @@ async def run_chat_message(
         # The context already applies the Agent override before tenant and
         # platform defaults, matching the streaming path.
         _resolved_model = resolve_model_from_context(ctx)
+        _reserve_llm_call, _settle_llm_call = _chat_llm_billing_callbacks(
+            trace=trace,
+            entity_id=entity_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            workspace_id=ctx.workspace_id,
+            conversation_id=conversation_id,
+            fallback_model=_resolved_model,
+        )
 
-        # Suppress auto-billing — chat handles it via record_chat_llm_usage
+        # Chat settles every completed provider call through durable callbacks.
         _billing_handle = runtime_set_suppressed_billing_context(
             entity_id=entity_id or "",
             workspace_id=ctx.workspace_id,
             agent_id=agent_id,
             user_id=user_id,
             conversation_id=conversation_id,
+            durable_per_call=True,
         )
         manual_skill_slugs = runtime_manual_skill_ids_from_refs(manual_skill_refs)
 
@@ -1359,6 +1736,8 @@ async def run_chat_message(
             on_tool_start=_on_tool_start,
             on_tool_end=_on_tool_end,
             on_llm_call=_on_llm_call,
+            on_llm_call_before=_reserve_llm_call,
+            on_llm_usage_settled=_settle_llm_call,
             metadata=resolve_llm_metadata_from_context(ctx),
             forced_tool_calls=runtime_forced_tool_calls_for_turn(ctx, manual_skill_refs, message),
         )
@@ -1366,20 +1745,6 @@ async def run_chat_message(
         trace.total_usage = result.usage or {}
         trace.log_complete(result=result)
 
-        # Persist token usage to DB
-        elapsed_ms = int((time.time() - trace.started_at) * 1000)
-        await record_chat_llm_usage(
-            db,
-            entity_id=entity_id,
-            user_id=user_id,
-            agent_id=agent_id,
-            workspace_id=ctx.workspace_id,
-            conversation_id=conversation_id,
-            usage=result.usage or {},
-            duration_ms=elapsed_ms,
-            fallback_model=_resolved_model,
-            rounds=result.rounds,
-        )
     except Exception as exc:
         trace.log_error(str(exc), phase="run_chat_message")
         raise

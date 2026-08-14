@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
-import { Link, useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   api,
@@ -20,7 +20,7 @@ import { useToastStore } from "../stores/toast";
 import type { AgentLearningCandidate, RuntimeEvidence, Workspace, WorkspaceStaff, WorkspaceActivity } from "../lib/types";
 import { canManageWorkspace } from "../lib/permissions";
 import { useAuthStore } from "../stores/auth";
-import { useConfigStore } from "../stores/config";
+import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import { openAgentEditModal } from "../stores/agentEditModal";
 import { formatDate, relativeTime } from "../lib/format";
 import PageHeader from "../components/ui/PageHeader";
@@ -51,6 +51,7 @@ import {
 } from "../components/icons";
 import WorkspaceGoalGraph from "../components/ui/WorkspaceGoalGraph";
 import WorkspaceWorkflows from "../components/workflows/WorkspaceWorkflows";
+import WorkspaceStatsPanel from "../components/workspaces/WorkspaceStatsPanel";
 import ScheduledJobs from "./ScheduledJobs";
 import ExportBlueprintModal from "../components/blueprints/ExportBlueprintModal";
 import { SUPPORTED_LOCALES, t } from "../lib/i18n";
@@ -1324,6 +1325,7 @@ function WorkspaceNotificationRoutingCard({
 
 export default function WorkspaceDetail() {
   const { workspaceId } = useParams<{ workspaceId: string }>();
+  const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
@@ -1333,8 +1335,9 @@ export default function WorkspaceDetail() {
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
   const privateApiEnabled = !authLoading && Boolean(authToken);
-  const configLoaded = useConfigStore((s) => s.loaded);
-  const flowsAvailable = useConfigStore((s) => s.flows_available);
+  const flowsAccess = usePreviewFeatureAccess("flows");
+  const configLoaded = flowsAccess.loaded;
+  const flowsAvailable = flowsAccess.enabled;
   const [tab, setTab] = useState<Tab>(() => {
     const initial = requestedTab === "chat" ? "overview" : _normalizeWorkspaceDetailTab(requestedTab);
     return initial === "workflows" && !flowsAvailable ? "overview" : initial;
@@ -1345,10 +1348,6 @@ export default function WorkspaceDetail() {
   });
   const shouldShowWorkspaceWelcome = searchParams.get("created") === "1" || searchParams.get("welcome") === "1";
   const [showWorkspaceWelcome, setShowWorkspaceWelcome] = useState(shouldShowWorkspaceWelcome);
-
-  useEffect(() => {
-    useConfigStore.getState().load();
-  }, []);
 
   const setupTabItems = useMemo(
     () => SETUP_TAB_ITEMS.filter((item) => flowsAvailable || item.key !== "workflows"),
@@ -1396,6 +1395,22 @@ export default function WorkspaceDetail() {
   useEffect(() => {
     if (shouldShowWorkspaceWelcome) setShowWorkspaceWelcome(true);
   }, [shouldShowWorkspaceWelcome]);
+
+  useEffect(() => {
+    const targetId = tab === "settings" && location.hash === "#workspace-approval-automation"
+      ? "workspace-approval-automation"
+      : tab === "overview" && location.hash === "#workspace-stats"
+        ? "workspace-stats"
+        : "";
+    if (!targetId) return undefined;
+    const timer = window.setTimeout(() => {
+      document.getElementById(targetId)?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 100);
+    return () => window.clearTimeout(timer);
+  }, [location.hash, tab]);
 
   const handleTabChange = useCallback((t: string) => {
     const nextTab = _normalizeWorkspaceDetailTab(t);
@@ -1467,6 +1482,7 @@ export default function WorkspaceDetail() {
   const [showGoalEditor, setShowGoalEditor] = useState(false);
   const [editingGoal, setEditingGoal] = useState<any>(null);
   const [goalForm, setGoalForm] = useState<any>({});
+  const [goalGraphExpanded, setGoalGraphExpanded] = useState(false);
   const [goalsDraft, setGoalsDraft] = useState("");
   const [showSettingsEditor, setShowSettingsEditor] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState("");
@@ -1499,6 +1515,12 @@ export default function WorkspaceDetail() {
     queryKey: ["workspace-dashboard", workspaceId],
     queryFn: () => api.workspaces.dashboard(workspaceId!),
     enabled: !!workspaceId && tab === "overview",
+  });
+
+  const { data: workspaceStatsData } = useQuery({
+    queryKey: ["workspace-stats", workspaceId],
+    queryFn: () => api.workspaces.stats.list(workspaceId!),
+    enabled: !!workspaceId && (tab === "overview" || tab === "goals"),
   });
 
   const { data: heartbeatStatus } = useQuery({
@@ -2634,15 +2656,6 @@ export default function WorkspaceDetail() {
             </div>
           </GlassCard>
         )}
-        {showBlueprintUpgrade && (
-          <BlueprintUpgradeDialog
-            open
-            onClose={() => setShowBlueprintUpgrade(false)}
-            workspaceId={ws.id}
-            workspaceName={ws.name}
-          />
-        )}
-
         {renderWorkspaceEvaluationCard({ compact: true })}
 
         {/* Cover image */}
@@ -2802,6 +2815,8 @@ export default function WorkspaceDetail() {
             </GlassCard>
           );
         })()}
+
+        {workspaceId && <WorkspaceStatsPanel workspaceId={workspaceId} canManage={canManageWs} />}
 
         {/* Goals quick view */}
         {(() => {
@@ -5800,6 +5815,22 @@ export default function WorkspaceDetail() {
   function renderGoals() {
     const rawGoalsList: any[] = Array.isArray(goals) ? goals : (goals as any)?.items ?? [];
     const goalsList = _dedupeGoals(rawGoalsList);
+    const availableStats = workspaceStatsData?.items || [];
+    const measurementStats = availableStats.filter((stat) => stat.goal_eligible && stat.status === "active");
+    const measurementStatById = new Map(availableStats.map((stat) => [stat.id, stat]));
+
+    const formatMeasurementValue = (value: unknown, stat?: (typeof availableStats)[number]) => {
+      if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+        return t("page.workspace_detail.not_measured_yet");
+      }
+      const number = Number(value);
+      const formatted = number.toLocaleString(undefined, {
+        maximumFractionDigits: Number.isInteger(number) ? 0 : 2,
+      });
+      if (stat?.value_type === "percent") return `${formatted}%`;
+      if (stat?.value_type === "currency") return `${stat.unit || ""}${formatted}`;
+      return stat?.unit ? `${formatted} ${stat.unit}` : formatted;
+    };
 
     const openEdit = (g: any) => {
       setEditingGoal(g);
@@ -5810,19 +5841,9 @@ export default function WorkspaceDetail() {
         deadline: g.deadline || "",
         status: g.status || "active",
         measurement_cadence: g.measurement_cadence || "",
+        stat_id: g.stat_id || "",
         priority: g.priority ?? 3,
       });
-    };
-
-    const paceColors: Record<string, { bg: string; fg: string }> = {
-      on_track: { bg: "var(--surface-muted)", fg: "var(--text-default)" },
-      ahead: { bg: "var(--surface-muted)", fg: "var(--text-default)" },
-      achieved: { bg: "var(--accent-soft)", fg: "var(--accent)" },
-      behind: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
-      at_risk: { bg: "var(--surface-muted)", fg: "var(--text-strong)" },
-      tracking: { bg: "var(--accent-soft)", fg: "var(--accent)" },
-      paused: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
-      unknown: { bg: "var(--surface-muted)", fg: "var(--text-muted)" },
     };
 
     const computeProgress = (g: any) => {
@@ -5831,19 +5852,9 @@ export default function WorkspaceDetail() {
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        {workspaceId && (
-          <GlassCard hoverable={false}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 16 }}>
-              <div style={SECTION_TITLE}>{t("page.workspace_detail.goal_execution_canvas")}</div>
-              <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.55, maxWidth: 760 }}>
-                {t("page.workspace_detail.goal_execution_canvas_desc")}
-              </div>
-            </div>
-            <WorkspaceGoalGraph workspaceId={workspaceId} />
-          </GlassCard>
-        )}
+        {workspaceId && <WorkspaceStatsPanel workspaceId={workspaceId} canManage={canManageWs} context="goals" />}
 
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div className="workspace-goals-list-header">
           <div style={SECTION_TITLE}>{t("page.workspace_detail.goal_list")}{goalsList.length})</div>
         </div>
 
@@ -5858,14 +5869,18 @@ export default function WorkspaceDetail() {
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {goalsList.map((g: any) => {
               const progress = computeProgress(g);
-              const hasCurrentValue = g.current_value !== null && g.current_value !== undefined;
-              const current = Number(g.current_value ?? 0);
-              const target = Number(g.target_value ?? 0);
               const rawPace = String(g.pace_status || "").toLowerCase();
               const pace = rawPace && rawPace !== "unknown" ? rawPace : (g.status === "achieved" ? "achieved" : g.status === "paused" ? "paused" : "tracking");
               const paceLabel = pace === "tracking" ? t("page.workspace_detail.tracking") : pace.replace(/_/g, " ");
-              const pc = paceColors[pace] || paceColors.unknown;
+              const paceType = pace === "at_risk" || pace === "behind"
+                ? "warning"
+                : pace === "achieved"
+                  ? "success"
+                  : pace === "paused"
+                    ? "inactive"
+                    : "info";
               const isEditing = editingGoal?.id === g.id;
+              const linkedStat = g.stat_id ? measurementStatById.get(g.stat_id) : undefined;
               const linkedTaskCount = Array.isArray(g.linked_task_ids) ? g.linked_task_ids.length : 0;
               const taskCounts = g.task_status_counts || {};
               const completedTaskCount = Number(taskCounts.completed || 0);
@@ -5878,17 +5893,12 @@ export default function WorkspaceDetail() {
                   <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                     {/* Header */}
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "stretch", gap: 8 }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 4, width: "100%" }}>
-                        <div style={{ fontSize: 14, fontWeight: 700, color: "#1c1917", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <div className="workspace-goal-card-header" style={{ width: "100%" }}>
+                        <div className="workspace-goal-card-title">
                           {g.title}
                         </div>
                         <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-                          <span style={{
-                            fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 5,
-                            background: pc.bg, color: pc.fg, textTransform: "uppercase",
-                          }}>
-                            {paceLabel}
-                          </span>
+                          <StatusBadge type={paceType} dot>{paceLabel}</StatusBadge>
                           <Button variant="ghost" size="sm" onClick={() => isEditing ? setEditingGoal(null) : openEdit(g)}
                             style={{ padding: "2px 8px", height: 24, fontSize: 11 }}>
                             {isEditing ? t("page.flows.close") : t("action.edit")}
@@ -5902,8 +5912,8 @@ export default function WorkspaceDetail() {
                         </div>
                       )}
 
-                      {/* Progress bar + values */}
-                      <div style={{ marginBottom: 6 }}>
+                      {/* Progress bar */}
+                      <div style={{ marginBottom: 2 }}>
                         <div style={{ height: 5, borderRadius: 3, background: "var(--surface-muted)", overflow: "hidden" }}>
                           <div style={{
                             height: "100%", borderRadius: 3,
@@ -5911,20 +5921,30 @@ export default function WorkspaceDetail() {
                             width: `${progress}%`, transition: "width 0.5s",
                           }} />
                         </div>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--text-faint)", marginTop: 3 }}>
-                          <span>{t("page.workspace_detail.current")} <strong style={{ color: "var(--text-strong)" }}>{hasCurrentValue ? current.toLocaleString() : t("page.workspace_detail.not_measured_yet")}</strong></span>
-                          <span>{t("page.workspace_detail.target")} <strong style={{ color: "var(--text-strong)" }}>{target.toLocaleString()}</strong></span>
+                      </div>
+
+                      <div className="workspace-goal-measurement">
+                        <div className="workspace-goal-measurement-copy">
+                          <div className="workspace-goal-measurement-label">{t("page.workspace_stats.measurement")}</div>
+                          <div className="workspace-goal-measurement-source">
+                            {linkedStat?.name
+                              || (g.metric_key ? formatUserFacingLabel(g.metric_key) : t("page.workspace_stats.no_measurement_source"))}
+                          </div>
+                        </div>
+                        <div className="workspace-goal-measurement-value mono">
+                          <strong>{formatMeasurementValue(g.current_value, linkedStat)}</strong>
+                          <span> / {formatMeasurementValue(g.target_value, linkedStat)}</span>
                         </div>
                       </div>
 
                       {/* Meta chips */}
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                        {g.metric_key && <Chip variant="slate" size="sm">{formatUserFacingLabel(g.metric_key)}</Chip>}
-                        {g.measurement_cadence && <Chip variant="teal" size="sm">{g.measurement_cadence}</Chip>}
+                        {linkedStat && <Chip variant="slate" size="sm">{linkedStat.window.replace(/_/g, " ")}</Chip>}
+                        {g.measurement_cadence && <Chip variant="slate" size="sm">{g.measurement_cadence}</Chip>}
                         {g.deadline && <Chip variant="orange" size="sm">{t("page.task_process.due")} {g.deadline}</Chip>}
-                        <Chip variant={g.status === "active" ? "green" : g.status === "achieved" ? "blue" : "slate"} size="sm">{g.status}</Chip>
+                        <Chip variant="slate" size="sm">{g.status}</Chip>
                         {linkedTaskCount > 0 && (
-                          <Chip variant={completedTaskCount >= linkedTaskCount ? "green" : "blue"} size="sm">
+                          <Chip variant="slate" size="sm">
                             Execution {executionLabel}
                           </Chip>
                         )}
@@ -5939,43 +5959,89 @@ export default function WorkspaceDetail() {
                       marginTop: 14, paddingTop: 14,
                       borderTop: "1px solid rgba(28,25,23,0.06)",
                     }}>
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 10, marginBottom: 10 }}>
-                        <div>
-                          <label style={{ fontSize: 11, fontWeight: 600, color: "#78716c", display: "block", marginBottom: 3 }}>{t("page.team_people.title")}</label>
-                          <input className="manor-input" value={goalForm.title} onChange={(e) => setGoalForm({ ...goalForm, title: e.target.value })} />
-                        </div>
-                        <div>
-                          <label style={{ fontSize: 11, fontWeight: 600, color: "#78716c", display: "block", marginBottom: 3 }}>{t("page.workspace_detail.target_value")}</label>
-                          <input className="manor-input" type="number" value={goalForm.target_value} onChange={(e) => setGoalForm({ ...goalForm, target_value: e.target.value })} />
-                        </div>
+                      <div className="workspace-goal-editor-grid" style={{ marginBottom: 12 }}>
+                        <Input
+                          label={t("page.team_people.title")}
+                          value={goalForm.title || ""}
+                          onChange={(e) => setGoalForm({ ...goalForm, title: e.target.value })}
+                        />
+                        <Input
+                          label={t("page.workspace_detail.target_value")}
+                          type="number"
+                          step="any"
+                          value={String(goalForm.target_value ?? "")}
+                          onChange={(e) => setGoalForm({ ...goalForm, target_value: e.target.value })}
+                        />
                       </div>
-                      <div style={{ marginBottom: 10 }}>
-                        <label style={{ fontSize: 11, fontWeight: 600, color: "#78716c", display: "block", marginBottom: 3 }}>{t("page.task_collections.description")}</label>
-                        <textarea className="manor-input" rows={2} value={goalForm.description} onChange={(e) => setGoalForm({ ...goalForm, description: e.target.value })} />
+                      <div style={{ marginBottom: 12 }}>
+                        <Textarea
+                          label={t("page.task_collections.description")}
+                          rows={2}
+                          value={goalForm.description || ""}
+                          onChange={(e) => setGoalForm({ ...goalForm, description: e.target.value })}
+                        />
                       </div>
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 10, marginBottom: 12 }}>
+
+                      <div className="workspace-goal-editor-measurement" style={{ marginBottom: 12 }}>
+                        <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+                          {t("page.workspace_stats.measure_with")}
+                        </label>
+                        <Select
+                          value={goalForm.stat_id || ""}
+                          onChange={(value) => setGoalForm({ ...goalForm, stat_id: value })}
+                          options={[
+                            { value: "", label: t("page.workspace_stats.goal_collector") },
+                            ...measurementStats.map((stat) => ({ value: stat.id, label: stat.name })),
+                          ]}
+                          filterable={measurementStats.length > 6}
+                          ariaLabel={t("page.workspace_stats.measure_with")}
+                          style={{ width: "100%" }}
+                        />
+                        <p className="workspace-goal-editor-hint">
+                          {goalForm.stat_id
+                            ? t("page.workspace_stats.stat_controls_measurement")
+                            : t("page.workspace_stats.goal_collector_description")}
+                        </p>
+                      </div>
+
+                      <div className="workspace-goal-editor-grid" style={{ marginBottom: 12 }}>
+                        <Input
+                          label={t("page.workspace_detail.deadline")}
+                          type="date"
+                          value={goalForm.deadline || ""}
+                          onChange={(e) => setGoalForm({ ...goalForm, deadline: e.target.value })}
+                        />
                         <div>
-                          <label style={{ fontSize: 11, fontWeight: 600, color: "#78716c", display: "block", marginBottom: 3 }}>{t("page.workspace_detail.deadline")}</label>
-                          <input className="manor-input" type="date" value={goalForm.deadline} onChange={(e) => setGoalForm({ ...goalForm, deadline: e.target.value })} />
+                          <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">{t("page.workspace_detail.cadence_2")}</label>
+                          <Select
+                            disabled={Boolean(goalForm.stat_id)}
+                            value={goalForm.measurement_cadence || ""}
+                            onChange={(value) => setGoalForm({ ...goalForm, measurement_cadence: value })}
+                            options={[
+                              { value: "", label: t("page.workspace_detail.none") },
+                              { value: "hourly", label: t("page.workspace_detail.hourly") },
+                              { value: "daily", label: t("page.workspace_detail.daily") },
+                              { value: "weekly", label: t("page.workspace_detail.weekly") },
+                              { value: "monthly", label: t("page.workspace_detail.monthly") },
+                            ]}
+                            ariaLabel={t("page.workspace_detail.cadence_2")}
+                            style={{ width: "100%" }}
+                          />
                         </div>
                         <div>
-                          <label style={{ fontSize: 11, fontWeight: 600, color: "#78716c", display: "block", marginBottom: 3 }}>{t("page.workspace_detail.cadence_2")}</label>
-                          <select className="manor-input" value={goalForm.measurement_cadence} onChange={(e) => setGoalForm({ ...goalForm, measurement_cadence: e.target.value })}>
-                            <option value="">{t("page.workspace_detail.none")}</option>
-                            <option value="hourly">{t("page.workspace_detail.hourly")}</option>
-                            <option value="daily">{t("page.workspace_detail.daily")}</option>
-                            <option value="weekly">{t("page.workspace_detail.weekly")}</option>
-                            <option value="monthly">{t("page.workspace_detail.monthly")}</option>
-                          </select>
-                        </div>
-                        <div>
-                          <label style={{ fontSize: 11, fontWeight: 600, color: "#78716c", display: "block", marginBottom: 3 }}>{t("page.agent_dashboard.status")}</label>
-                          <select className="manor-input" value={goalForm.status} onChange={(e) => setGoalForm({ ...goalForm, status: e.target.value })}>
-                            <option value="active">{t("page.workspaces.filter_active")}</option>
-                            <option value="paused">{t("page.workspaces.filter_paused")}</option>
-                            <option value="achieved">{t("page.workspace_detail.achieved")}</option>
-                            <option value="abandoned">{t("page.workspace_detail.abandoned")}</option>
-                          </select>
+                          <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">{t("page.agent_dashboard.status")}</label>
+                          <Select
+                            value={goalForm.status || "active"}
+                            onChange={(value) => setGoalForm({ ...goalForm, status: value })}
+                            options={[
+                              { value: "active", label: t("page.workspaces.filter_active") },
+                              { value: "paused", label: t("page.workspaces.filter_paused") },
+                              { value: "achieved", label: t("page.workspace_detail.achieved") },
+                              { value: "abandoned", label: t("page.workspace_detail.abandoned") },
+                            ]}
+                            ariaLabel={t("page.agent_dashboard.status")}
+                            style={{ width: "100%" }}
+                          />
                         </div>
                       </div>
                       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
@@ -5988,6 +6054,7 @@ export default function WorkspaceDetail() {
                             if (String(goalForm.target_value) !== String(g.target_value ?? "")) payload.target_value = Number(goalForm.target_value);
                             if (goalForm.deadline !== (g.deadline || "")) payload.deadline = goalForm.deadline || null;
                             if (goalForm.status !== g.status) payload.status = goalForm.status;
+                            if ((goalForm.stat_id || "") !== (g.stat_id || "")) payload.stat_id = goalForm.stat_id || null;
                             if (goalForm.measurement_cadence !== (g.measurement_cadence || "")) payload.measurement_cadence = goalForm.measurement_cadence || null;
                             if (Object.keys(payload).length === 0) { setEditingGoal(null); return; }
                             updateGoalMut.mutate({ id: g.id, data: payload });
@@ -6000,6 +6067,36 @@ export default function WorkspaceDetail() {
               );
             })}
           </div>
+        )}
+
+        {workspaceId && (
+          <GlassCard hoverable={false}>
+            <div className="workspace-goal-graph-header">
+              <div style={{ minWidth: 0 }}>
+                <div style={{ ...SECTION_TITLE, marginBottom: 4 }}>{t("page.workspace_detail.goal_execution_canvas")}</div>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.55, maxWidth: 760 }}>
+                  {goalGraphExpanded
+                    ? t("page.workspace_detail.goal_execution_canvas_desc")
+                    : t("page.workspace_detail.goal_execution_canvas_collapsed")}
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                ariaExpanded={goalGraphExpanded}
+                onClick={() => setGoalGraphExpanded((expanded) => !expanded)}
+              >
+                {goalGraphExpanded
+                  ? t("page.workspace_detail.hide_execution_map")
+                  : t("page.workspace_detail.show_execution_map")}
+              </Button>
+            </div>
+            {goalGraphExpanded && (
+              <div style={{ marginTop: 16 }}>
+                <WorkspaceGoalGraph workspaceId={workspaceId} />
+              </div>
+            )}
+          </GlassCard>
         )}
       </div>
     );
@@ -7222,7 +7319,11 @@ export default function WorkspaceDetail() {
         </GlassCard>
 
         {/* ── Approval automation (standing grants) ── */}
-        <GlassCard hoverable={false}>
+        <GlassCard
+          id="workspace-approval-automation"
+          className="workspace-settings-anchor"
+          hoverable={false}
+        >
           <div style={SECTION_TITLE}>{t("page.workspace_detail.approval_automation")}</div>
           <p style={{ fontSize: 12, color: "#78716c", marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
             {t("page.workspace_detail.approval_automation_desc")}
@@ -7591,21 +7692,42 @@ export default function WorkspaceDetail() {
         >
           {t("page.workspace_detail.back_to_workspaces")}
         </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setExportOpen(true)}
-        >
-          {t("page.workspace_detail.export_as_blueprint")}
-        </Button>
+        {canManageWs && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setExportOpen(true)}
+          >
+            {t("page.workspace_detail.export_as_blueprint")}
+          </Button>
+        )}
+        {canManageWs && ws.blueprint_update?.blueprint_id && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowBlueprintUpgrade(true)}
+          >
+            {t("page.workspaces.blueprint_check_updates")}
+          </Button>
+        )}
       </PageHeader>
 
-      <ExportBlueprintModal
-        open={exportOpen}
-        onClose={() => setExportOpen(false)}
-        workspaceId={ws.id}
-        workspaceName={ws.name}
-      />
+      {canManageWs && (
+        <ExportBlueprintModal
+          open={exportOpen}
+          onClose={() => setExportOpen(false)}
+          workspaceId={ws.id}
+          workspaceName={ws.name}
+        />
+      )}
+      {showBlueprintUpgrade && (
+        <BlueprintUpgradeDialog
+          open
+          onClose={() => setShowBlueprintUpgrade(false)}
+          workspaceId={ws.id}
+          workspaceName={ws.name}
+        />
+      )}
 
       <Modal
         open={showWorkspaceWelcome}

@@ -43,6 +43,244 @@ def _clean_plan():
     return Plan(steps=[_llm_step("a", output_shape="TextResult")])
 
 
+def test_required_plan_steps_reject_a_plan_missing_the_upload_step():
+    task = _FakeTask()
+    task.details = {
+        "required_plan_steps": [
+            {
+                "key": "produce_video",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+            },
+            {
+                "key": "upload_to_youtube",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+                "depends_on": ["produce_video"],
+                "prompt_substrings": ["Chrome", "YouTube Studio"],
+                "required_refs": ["produce_video"],
+            },
+        ],
+    }
+    plan = Plan(steps=[
+        PlanStep(
+            key="produce_video",
+            kind="subagent",
+            service_key="stickman.production",
+            output_shape="ArtifactResult",
+            params={"prompt": "Produce the finished MP4."},
+        ),
+    ])
+
+    assert planner_mod._required_plan_step_errors(task, plan) == [
+        "missing required step 'upload_to_youtube'",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_required_plan_steps_trigger_one_replan_before_persisting(monkeypatch):
+    persisted = _patch_common(monkeypatch)
+    monkeypatch.setattr(planner_mod, "_enforce_allowlists", lambda plan, ctx: None)
+
+    task = _FakeTask()
+    task.details = {
+        "required_plan_steps": [
+            {
+                "key": "produce_video",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+            },
+            {
+                "key": "upload_to_youtube",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+                "depends_on": ["produce_video"],
+                "prompt_substrings": ["Chrome", "YouTube Studio"],
+                "required_refs": ["produce_video"],
+            },
+        ],
+    }
+
+    first = Plan(steps=[
+        PlanStep(
+            key="produce_video",
+            kind="subagent",
+            service_key="stickman.production",
+            output_shape="ArtifactResult",
+            params={"prompt": "Produce the finished MP4."},
+        ),
+    ])
+    second = Plan(steps=[
+        PlanStep(
+            key="produce_video",
+            kind="subagent",
+            service_key="stickman.production",
+            output_shape="ArtifactResult",
+            params={"prompt": "Produce the finished MP4."},
+        ),
+        PlanStep(
+            key="upload_to_youtube",
+            kind="subagent",
+            service_key="stickman.production",
+            output_shape="ArtifactResult",
+            depends_on=["produce_video"],
+            params={
+                "prompt": "Use Chrome to upload the exact MP4 to YouTube Studio.",
+                "video": "${{ steps.produce_video.result }}",
+            },
+        ),
+    ])
+    calls = {"count": 0}
+
+    async def fake_generate(_task, _context):
+        calls["count"] += 1
+        return first if calls["count"] == 1 else second
+
+    monkeypatch.setattr(planner_mod, "_generate_plan", fake_generate)
+    db = _FakeDB(task)
+
+    await planner_mod.plan_task(db, "task_1", execution_mode="live")
+
+    assert calls["count"] == 2
+    assert [step.key for step in persisted["plan"].steps] == [
+        "produce_video", "upload_to_youtube",
+    ]
+    assert task.details["_replan_context"]["required_plan_step_errors"] == [
+        "missing required step 'upload_to_youtube'",
+    ]
+
+
+def test_required_plan_steps_reject_upload_without_producer_reference():
+    task = _FakeTask()
+    task.details = {
+        "required_plan_steps": [
+            {
+                "key": "produce_video",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+            },
+            {
+                "key": "upload_to_youtube",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+                "depends_on": ["produce_video"],
+                "required_refs": ["produce_video"],
+            },
+        ],
+    }
+    plan = Plan(steps=[
+        PlanStep(
+            key="produce_video",
+            kind="subagent",
+            service_key="stickman.production",
+            params={"prompt": "Produce the finished MP4."},
+        ),
+        PlanStep(
+            key="upload_to_youtube",
+            kind="subagent",
+            service_key="stickman.production",
+            depends_on=["produce_video"],
+            params={"prompt": "Use Chrome to upload the MP4 to YouTube Studio."},
+        ),
+    ])
+
+    assert planner_mod._required_plan_step_errors(task, plan) == [
+        "required step 'upload_to_youtube' must reference required step 'produce_video'",
+    ]
+
+
+def test_required_plan_steps_reject_video_producer_without_artifact_contract():
+    task = _FakeTask()
+    task.details = {
+        "required_plan_steps": [
+            {
+                "key": "produce_video",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+                "output_shape": "ArtifactResult",
+                "expects": ["files"],
+            },
+            {
+                "key": "upload_to_youtube",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+                "depends_on": ["produce_video"],
+                "required_refs": ["produce_video"],
+                "required_ref_fields": {"produce_video": ["files"]},
+            },
+        ],
+    }
+    plan = Plan(steps=[
+        PlanStep(
+            key="produce_video",
+            kind="subagent",
+            service_key="stickman.production",
+            params={"prompt": "Produce the finished MP4."},
+        ),
+        PlanStep(
+            key="upload_to_youtube",
+            kind="subagent",
+            service_key="stickman.production",
+            depends_on=["produce_video"],
+            params={
+                "prompt": "Use Chrome to upload the MP4 to YouTube Studio.",
+                "video": "${{ steps.produce_video.result }}",
+            },
+        ),
+    ])
+
+    assert planner_mod._required_plan_step_errors(task, plan) == [
+        "required step 'produce_video' must have output_shape='ArtifactResult'",
+        "required step 'produce_video' must declare expects=['files']",
+        "required step 'upload_to_youtube' must reference produce_video.files",
+    ]
+
+
+def test_required_plan_steps_accept_exact_video_artifact_handoff():
+    task = _FakeTask()
+    task.details = {
+        "required_plan_steps": [
+            {
+                "key": "produce_video",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+                "output_shape": "ArtifactResult",
+                "expects": ["files"],
+            },
+            {
+                "key": "upload_to_youtube",
+                "kind": "subagent",
+                "service_key": "stickman.production",
+                "depends_on": ["produce_video"],
+                "required_refs": ["produce_video"],
+                "required_ref_fields": {"produce_video": ["files"]},
+            },
+        ],
+    }
+    plan = Plan(steps=[
+        PlanStep(
+            key="produce_video",
+            kind="subagent",
+            service_key="stickman.production",
+            output_shape="ArtifactResult",
+            expects=["files"],
+            params={"prompt": "Produce the finished MP4."},
+        ),
+        PlanStep(
+            key="upload_to_youtube",
+            kind="subagent",
+            service_key="stickman.production",
+            depends_on=["produce_video"],
+            params={
+                "prompt": "Use Chrome to upload the MP4 to YouTube Studio.",
+                "video": "${{ steps.produce_video.result.files }}",
+            },
+        ),
+    ])
+
+    assert planner_mod._required_plan_step_errors(task, plan) == []
+
+
 class _FakeResult:
     def __init__(self, task):
         self._task = task

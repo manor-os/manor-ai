@@ -37,6 +37,12 @@ def _bundle_name(name: str, prompt: str) -> str:
     basename = os.path.basename(requested)
     if os.path.splitext(basename)[1]:
         requested = os.path.dirname(requested) or os.path.splitext(basename)[0]
+    # An explicit name is kept verbatim on purpose: recipes address their own
+    # bundles by literal path ("Product Videos/product-video-<id>" and the
+    # ledger/manifest paths beside it), so slugifying here would point the
+    # follow-up steps at a directory that does not exist. Spaces are a display
+    # problem, and chat fixes them where they are rendered - see
+    # normalizeFileMarkdownLink in apps/web/src/lib/fileReferences.ts.
     return requested or _DEFAULT_BUNDLE_NAME
 
 
@@ -215,6 +221,20 @@ async def handle_code(
             user_id=user_id or runtime_context.user_id,
             tool_name="generate_file",
         )
+        if not sync.synced or not sync.document_id:
+            return json.dumps(
+                {
+                    "error": (
+                        f"Code artifact '{rel_target}' was written but could not be "
+                        "registered in Knowledge: "
+                        f"{sync.reason or 'missing_document_id'}"
+                    ),
+                    "created": False,
+                    "unregistered_path": rel_target,
+                    "knowledge_sync_reason": sync.reason,
+                },
+                ensure_ascii=False,
+            )
         meta = await runtime_generated_file_metadata(abs_target)
         written.append(
             {
@@ -225,6 +245,7 @@ async def handle_code(
                 "mtime_ns": meta["mtime_ns"],
                 "knowledge_synced": sync.synced,
                 "document_id": sync.document_id,
+                "viewer_url": f"/viewer/{sync.document_id}",
                 "knowledge_sync_reason": sync.reason,
             }
         )

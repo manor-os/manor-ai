@@ -14,6 +14,7 @@ from packages.core.constants.execution import (
     ExecutionPlanStatus,
     ExecutionStepStatus,
 )
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.constants.task_actors import TaskActor
@@ -36,7 +37,6 @@ from packages.core.services.task_comment_mentions import (
     validate_mentions,
 )
 from packages.core.services.task_state_machine import (
-    TERMINAL_STATUSES,
     TaskStatusTransitionError,
 )
 from packages.core.services.settings_service import update_user_preferences
@@ -50,16 +50,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
-_APPROVAL_ACCEPT_CHOICES = {"approve", "approved", "yes", "accept"}
-_APPROVAL_REVISION_CHOICES = {
-    "reject",
-    "rejected",
-    "no",
-    "decline",
-    "changes",
-    "request_changes",
-}
-_APPROVAL_CHOICES = _APPROVAL_ACCEPT_CHOICES | _APPROVAL_REVISION_CHOICES
 _TASK_BOARD_COLUMNS = ("todo", "scheduled", "in_progress", "review", "done")
 _TASK_BOARD_PREFERENCES_KEY = "task_board"
 
@@ -99,24 +89,6 @@ def _is_attachment_only_comment(content: str | None, attachments: list[dict] | N
         return False
     text = (content or "").strip().lower()
     return bool(text) and text.startswith("attached ") and " file" in text
-
-
-def _is_approval_task(task) -> bool:
-    if getattr(task, "task_type", None) == "approval":
-        return True
-    details = task.details if isinstance(task.details, dict) else {}
-    runtime_context = details.get("runtime_context") if isinstance(details, dict) else {}
-    instructions = (
-        str(runtime_context.get("instructions") or "")
-        if isinstance(runtime_context, dict) else ""
-    )
-    text = " ".join([
-        str(task.title or ""),
-        str(task.description or ""),
-        str(details.get("approval_decision") or ""),
-        instructions,
-    ]).lower()
-    return "approval" in text or "approve" in text or "pending_founder_review" in text
 
 
 async def _record_task_user_decision_evidence(
@@ -1040,158 +1012,58 @@ async def retry_task_endpoint(
     For plan-backed tasks, reset failed or waiting steps and re-enqueue
     the plan runner. For legacy agent tasks, re-dispatch TaskRunner.
     """
-    from datetime import datetime, timezone
-
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
     await require_workspace_writable(db, user, task.workspace_id)
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED,):
-        raise HTTPException(409, f"Task is {task.status} and cannot be retried")
-    if task.status == TaskStatus.IN_PROGRESS:
-        raise HTTPException(409, "Task is already in progress")
-
-    note = (req.note if req else None) or None
-    now = datetime.now(timezone.utc)
-    details = dict(task.details or {})
-    retry_meta = {
-        "requested_by": user.id,
-        "requested_at": now.isoformat(),
-    }
-    if note:
-        retry_meta["note"] = note
-    retry_count = int(details.get("manual_retry_count") or 0) + 1
-    details["manual_retry"] = retry_meta
-    details["manual_retry_count"] = retry_count
-
-    from packages.core.services.task_dependencies import dependency_ids_from_details, details_with_dependency_state
-    dep_ids = dependency_ids_from_details(details)
-    if dep_ids:
-        details = await details_with_dependency_state(db, task, details)
-        if details.get("dependency_status") != "completed":
-            raise HTTPException(
-                409,
-                "Task dependencies are not completed yet; waiting for predecessor outputs.",
-            )
-
-    mode = ""
-    plan_id: str | None = None
-    reset_steps = 0
-    reset_step_ids: list[str] = []
-    dispatch = None
-
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-
-    plan = (await db.execute(
-        select(ExecutionPlan).where(
-            ExecutionPlan.task_id == task.id,
-            ExecutionPlan.entity_id == user.entity_id,
-        ).order_by(ExecutionPlan.created_at.desc()).limit(1)
-    )).scalar_one_or_none()
-
-    if plan and plan.status not in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.CANCELLED,):
-        mode = "plan"
-        plan_id = plan.id
-        steps = list((await db.execute(
-            select(ExecutionStep).where(ExecutionStep.plan_id == plan.id)
-        )).scalars().all())
-        retryable_statuses = {"failed", "skipped", "waiting_human", "paused", "cancelled"}
-        for step in steps:
-            if step.step_status in retryable_statuses:
-                step.step_status = ExecutionStepStatus.PENDING.value
-                step.current_lease_id = None
-                step.human_input_prompt = None
-                step.human_input_response = (
-                    {"response": note, "user": user.display_name or user.email}
-                    if note else None
-                )
-                step.error = None
-                step.finished_at = None
-                step.attempt_count = 0
-                reset_steps += 1
-                reset_step_ids.append(step.id)
-        if plan.status in (ExecutionPlanStatus.FAILED, ExecutionPlanStatus.NEEDS_ATTENTION, ExecutionPlanStatus.PAUSED,):
-            plan.status = ExecutionPlanStatus.DRAFT.value
-            plan.completed_at = None
-            plan.last_error = None
-        dispatch = ("plan", plan.id)
-    elif task.owner_subscription_id or task.owner_service_key:
-        mode = "plan_new"
-        dispatch = ("plan_new", task.id)
-    else:
-        from packages.core.constants.agents import MANOR_AGENT_ID, is_master_agent
-        if task.agent_id or is_master_agent(task.agent_id, task.agent_type):
-            mode = "agent"
-            if note:
-                details["_hitl_response"] = note
-                details["_hitl_responded_by"] = user.display_name or user.email
-            dispatch = ("agent", task.agent_id or MANOR_AGENT_ID)
-        else:
-            raise HTTPException(409, "Task has no plan, owner subscription, or assigned agent to retry")
-
-    from packages.core.services.task_state_machine import apply_task_status_transition
-    await apply_task_status_transition(
-        task, "in_progress", now=now, db=db, actor_kind="user", actor_id=user.id,
+    from packages.core.services.task_retry_service import (
+        TaskRetryError,
+        dispatch_task_retry,
+        prepare_task_retry,
     )
-    task.started_at = now
-    task.completed_at = None
-    task.details = details
-    task.actual_output = None
-    await add_task_log(
-        db, task.id, TaskLogType.MANUAL_RETRY,
-        "Manual retry requested" + (f": {note}" if note else ""),
-        actor=TaskActor.USER,
-        created_by=user.display_name or user.email,
-        metadata={
-            "mode": mode,
-            "plan_id": plan_id,
-            "step_ids": reset_step_ids,
-            "reset_steps": reset_steps,
-            "retry_count": retry_count,
-            "requested_by": user.id,
-        },
-    )
-    from packages.core.services import event_emitter
-    event_emitter.emit(
-        user.entity_id,
-        "task.retried",
-        source="tasks_api",
-        payload={
-            "task_id": task.id,
-            "plan_id": plan_id,
-            "step_ids": reset_step_ids,
-            "mode": mode,
-            "reset_steps": reset_steps,
-            "retry_count": retry_count,
-            "requested_by": user.id,
-        },
+
+    try:
+        retry_result = await prepare_task_retry(
+            db,
+            task=task,
+            user_id=user.id,
+            user_label=user.display_name or user.email,
+            note=req.note if req else None,
+        )
+    except TaskRetryError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+    from packages.core.services.task_chat_hitl import resolve_task_hitl
+
+    await resolve_task_hitl(
+        db,
+        task=task,
+        kind=PendingActionKind.TASK_RECOVERY,
+        choice="retry",
+        user_id=user.id,
+        note=req.note if req else None,
     )
     await db.commit()
     await db.refresh(task)
 
     dispatched = False
     try:
-        kind, value = dispatch
-        if kind == "plan":
-            from packages.core.tasks.ai_tasks import run_plan
-            run_plan.delay(value)
-        elif kind == "plan_new":
-            from packages.core.tasks.ai_tasks import plan_and_run_task
-            plan_and_run_task.delay(value)
-        elif kind == "agent":
-            from packages.core.tasks.ai_tasks import run_agent_task
-            run_agent_task.delay(task.id, value)
-        dispatched = True
+        dispatched = dispatch_task_retry(retry_result)
     except Exception as exc:
-        logger.warning("Task retry dispatch failed: task=%s mode=%s error=%s", task.id, mode, exc)
+        logger.warning(
+            "Task retry dispatch failed: task=%s mode=%s error=%s",
+            task.id,
+            retry_result.mode,
+            exc,
+        )
 
     users, agents, staff, workspaces = await _resolve_lookups(db, [task])
     return RetryTaskResponse(
         task=_to_response(task, users, agents, staff, workspaces),
         dispatched=dispatched,
-        mode=mode,
-        plan_id=plan_id,
-        reset_steps=reset_steps,
+        mode=retry_result.mode,
+        plan_id=retry_result.plan_id,
+        reset_steps=retry_result.reset_steps,
     )
 
 
@@ -1441,62 +1313,42 @@ async def decide_approval_task(
     db: AsyncSession = Depends(get_db),
 ):
     """Record a user's decision on an approval task and notify workspace AI."""
-    from datetime import datetime, timezone
-
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    if not _is_approval_task(task):
-        raise HTTPException(400, "Task is not an approval task")
-    if task.status in TERMINAL_STATUSES:
-        raise HTTPException(409, "Approval task is already closed")
-
-    choice = (req.choice or "").strip().lower()
-    if choice not in _APPROVAL_CHOICES:
-        raise HTTPException(400, "choice must be approve, reject, or request_changes")
-    approved = choice in _APPROVAL_ACCEPT_CHOICES
-    decision = "approved" if approved else "changes_requested"
-    note = (req.note or "").strip()
     actor = user.display_name or user.email
-    decided_at = datetime.now(timezone.utc).isoformat()
-    details = dict(task.details or {})
-    details["approval_decision"] = {
-        "decision": decision,
-        "choice": choice,
-        "approved": approved,
-        "note": note,
-        "decided_by": user.id,
-        "decided_by_label": actor,
-        "decided_at": decided_at,
-    }
-    actual_output = {
-        "summary": (
-            f"Approval task {decision.replace('_', ' ')}"
-            + (f": {note}" if note else "")
-        ),
-        "approval": details["approval_decision"],
-    }
-
-    updated = await update_task(
-        db,
-        task.id,
-        user.entity_id,
-        status="completed",
-        details=details,
-        actual_output=actual_output,
+    from packages.core.services.task_approval_service import (
+        TaskApprovalDecisionError,
+        apply_task_approval_decision,
     )
-    log = await add_task_log(
+
+    try:
+        result = await apply_task_approval_decision(
+            db,
+            task=task,
+            user_id=user.id,
+            actor=actor,
+            choice=req.choice,
+            note=req.note,
+        )
+    except TaskApprovalDecisionError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    updated = result.task
+    log = result.log
+    decision = result.decision
+    choice = result.choice
+    approved = result.approved
+    note = result.note
+
+    from packages.core.services.task_chat_hitl import resolve_task_hitl
+
+    await resolve_task_hitl(
         db,
-        task.id,
-        TaskLogType.APPROVAL_DECISION,
-        (
-            f"{actor} approved this task."
-            if approved else
-            f"{actor} requested changes for this approval task."
-        ) + (f"\n\n{note}" if note else ""),
-        actor=TaskActor.USER,
-        created_by=actor,
-        metadata=details["approval_decision"],
+        task=updated,
+        kind=PendingActionKind.TASK_APPROVAL,
+        choice=choice,
+        user_id=user.id,
+        note=note,
     )
     if updated.workspace_id:
         try:
@@ -1579,6 +1431,7 @@ async def get_one_task(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_readable(db, user, task.workspace_id)
     try:
         from packages.core.services.task_execution_reconcile import reconcile_task_from_latest_completed_plan
 
@@ -1717,6 +1570,7 @@ async def get_task_history(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_readable(db, user, task.workspace_id)
     from packages.core.services.change_tracker import get_change_history
     history = await get_change_history(db, user.entity_id, "task", task_id, limit=limit)
     return history
@@ -1732,6 +1586,7 @@ async def get_logs(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_readable(db, user, task.workspace_id)
     logs = await get_task_logs(db, task_id)
     return [
         TaskLogResponse(
@@ -1758,6 +1613,7 @@ async def add_log(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_writable(db, user, task.workspace_id)
     meta = {}
     if req.attachments:
         meta["attachments"] = req.attachments
@@ -1922,10 +1778,21 @@ async def upload_task_attachment(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_writable(db, user, task.workspace_id)
 
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, "File too large (max 10 MB)")
+
+    from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+    try:
+        trusted_content_type = await inspect_upload_content(
+            data,
+            filename=file.filename,
+            declared_content_type=file.content_type,
+        )
+    except UploadSecurityError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
     filename = file.filename or "attachment"
     safe_name = filename.replace("/", "_").replace("\\", "_")
@@ -1967,7 +1834,7 @@ async def upload_task_attachment(
         "filename": final_name,
         "original_name": filename,
         "size": len(data),
-        "content_type": file.content_type or "application/octet-stream",
+        "content_type": trusted_content_type,
         "url": url,
     }
 
@@ -1977,11 +1844,17 @@ async def download_task_attachment(
     task_id: str,
     filename: str,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Download a task attachment."""
     from pathlib import Path
     from fastapi.responses import FileResponse
     from packages.core.services.entity_fs import is_fs_enabled, get_entity_root
+
+    task = await get_task(db, task_id, user.entity_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await require_workspace_readable(db, user, task.workspace_id)
 
     if not is_fs_enabled():
         raise HTTPException(503, "Filesystem not configured")

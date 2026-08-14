@@ -80,6 +80,8 @@ import {
   IconTwilio,
   IconEmail,
   IconCode,
+  IconChevronDown,
+  IconChevronRight,
   IconLinkedIn,
   IconTwitter,
   IconFacebook,
@@ -92,7 +94,9 @@ import {
   IconGoogle,
   IconCloud,
   IconExcelGrid,
+  IconMoreHorizontal,
   IconGlobe,
+  IconEdit,
   type IconProps,
 } from "../components/icons";
 
@@ -105,7 +109,6 @@ type Tab = "agents" | "channels";
 type IntegrationAudience =
   | "all"
   | "cloud"
-;
 type IntegrationDisplayCategoryKey =
   | "communication"
   | "work_apps"
@@ -515,22 +518,14 @@ function MoreMenu<K extends string = string>({
     <Dropdown
       align="right"
       trigger={
-        <span
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 24,
-            height: 24,
-            borderRadius: 4,
-            color: "#a8a29e",
-            fontSize: 14,
-            fontWeight: 700,
-            lineHeight: 1,
-          }}
+        <button
+          type="button"
+          className="integration-row-menu-trigger"
+          aria-label={t("action.more")}
+          title={t("action.more")}
         >
-          ⋯
-        </span>
+          <IconMoreHorizontal size={16} aria-hidden="true" />
+        </button>
       }
       items={items}
       onSelect={(k) => onSelect(k as K)}
@@ -543,12 +538,12 @@ function InfoAlert({
   tone = "teal",
   children,
 }: {
-  tone?: "teal" | "amber";
+  tone?: "teal" | "amber" | "red";
   children: React.ReactNode;
 }) {
   const palette =
-    tone === "amber"
-      ? { bg: "#fafaf9", border: "#e7e5e4", color: "#57534e" }
+    tone === "red"
+      ? { bg: "#fef2f2", border: "#fecaca", color: "#b91c1c" }
       : { bg: "#fafaf9", border: "#e7e5e4", color: "#57534e" };
   return (
     <div
@@ -1177,8 +1172,11 @@ function MCPAgentsPanel({
   let localAudienceCount = 0;
   const allAudienceCount = cloudAudienceCount + localAudienceCount;
 
-  const renderServerCard = (s: McpServerRow) =>
-    s.server_key === "_google_workspace" ? (
+  const renderServerCard = (s: McpServerRow) => {
+    const targetWorkerId =
+      s.cli_workers?.length === 1 ? s.cli_workers[0]?.id : undefined;
+    const localStateKey = localWorkerProviderKey(s.server_key, targetWorkerId);
+    return s.server_key === "_google_workspace" ? (
       <GoogleWorkspaceCard
         key="_google_workspace"
         subs={(s as any)._googleSubs as McpServerRow[]}
@@ -1199,7 +1197,11 @@ function MCPAgentsPanel({
           void startOAuth(s.server_key, s.name, connectionId)
         }
         onConfigureOAuth={() =>
-          setOAuthConfigFor({ key: s.server_key, name: s.name, scopes: s.scopes })
+          setOAuthConfigFor({
+            key: s.server_key,
+            name: s.name,
+            scopes: s.scopes,
+          })
         }
         onAddApiKey={() => {
           // Email has its own multi-section modal (IMAP + SMTP
@@ -1240,6 +1242,7 @@ function MCPAgentsPanel({
         onScanQr={(accountId) => setWechatScanFor(accountId)}
       />
     );
+  };
 
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: 0 }}>
@@ -1391,8 +1394,6 @@ function MCPAgentsPanel({
         accountId={wechatScanFor}
         onClose={() => setWechatScanFor(null)}
       />
-
-
 
     </div>
   );
@@ -1611,11 +1612,7 @@ function GoogleWorkspaceCard({
 }: {
   subs: McpServerRow[];
   canManage: boolean;
-  onConnect: (
-    serverKey: string,
-    name: string,
-    connectionId?: string,
-  ) => void;
+  onConnect: (serverKey: string, name: string, connectionId?: string) => void;
   onConfigureOAuth: (
     serverKey: string,
     name: string,
@@ -1687,12 +1684,12 @@ function GoogleWorkspaceCard({
     : hasAuthFailure
       ? t("page.integrations.reconnect_required")
       : connectedCount === total
-      ? t("page.integrations.ready")
-      : connectedCount > 0
-        ? t("page.integrations.connected_count_of_total")
-            .replace("{count}", String(connectedCount))
-            .replace("{total}", String(total))
-        : t("page.integrations.not_connected");
+        ? t("page.integrations.ready")
+        : connectedCount > 0
+          ? t("page.integrations.connected_count_of_total")
+              .replace("{count}", String(connectedCount))
+              .replace("{total}", String(total))
+          : t("page.integrations.not_connected");
 
   return (
     <CompactCard
@@ -1814,9 +1811,7 @@ function GoogleWorkspaceCard({
                       >
                         {acct.label}
                       </span>
-                      <div
-                        style={{ display: "flex", gap: 4, flexShrink: 0 }}
-                      >
+                      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
                         {acct.services.map((svc) => (
                           <Chip key={svc} size="sm" variant="slate">
                             {svc}
@@ -1910,10 +1905,10 @@ function GoogleWorkspaceCard({
                             : subAuthFailed
                               ? t("page.integrations.reconnect_required")
                               : hasConn
-                              ? t("status.connected")
-                              : s.oauth_configured
-                                ? t("page.integrations.ready_to_connect")
-                                : t("page.integrations.oauth_not_configured")}
+                                ? t("status.connected")
+                                : s.oauth_configured
+                                  ? t("page.integrations.ready_to_connect")
+                                  : t("page.integrations.oauth_not_configured")}
                         </div>
                       </div>
                       {isComingSoon ? (
@@ -2041,6 +2036,7 @@ function ServerCard({
   let showManagedSessionCapabilities = false;
   let managedSessionNeedsLoginSave = false;
   let managedSessionBusy = false;
+  let managedSessionActionKey = server.server_key;
   const isEntityLevel = !!server.required_permission;
   const Icon = MCP_ICON[server.server_key];
   const monogram =
@@ -2064,14 +2060,21 @@ function ServerCard({
   const configureNoun =
     authEntry?.configureVerb || t("page.integrations.credentials");
 
-  // Status indicator: green when connected/ready, gray when disconnected.
-  const statusColor = isReadyConnection ? "#168a5b" : "#d6d3d1";
+  // Green only when agents can actually use it. A provider whose stored
+  // credentials the upstream has refused reports agent_can_use=false and
+  // reads "needs attention" below — the dot follows that, instead of
+  // showing a green light next to a warning.
+  const statusColor = server.agent_can_use
+    ? "#168a5b"
+    : hasPartialConnection
+      ? "#cf9b44"
+      : "#d6d3d1";
   const statusLabel = server.agent_can_use
     ? t("page.integrations.ready")
     : hasPartialConnection
       ? t("page.integrations.needs_attention")
       : t("page.integrations.not_connected");
-  const detailKey = `integration:${server.server_key}`;
+  const detailKey = `integration:${managedSessionActionKey}`;
   const currentDetailKey = useDetailStore((s) => s.payload?.key);
 
   function openIntegrationDetail() {
@@ -2181,9 +2184,7 @@ function ServerCard({
                     connection={c}
                     serverKey={server.server_key}
                     showActions={canManage}
-                    onReconnect={
-                      isOAuth ? () => onConnect(c.id) : undefined
-                    }
+                    onReconnect={isOAuth ? () => onConnect(c.id) : undefined}
                   />
                 ))}
                 {server.entity_accounts.map((account) => (
@@ -2230,7 +2231,6 @@ function ServerCard({
               variant="outline"
               size="sm"
             />
-          ) :
           isCredentials ? (
             <Button
               variant={hasEntityAccounts ? "outline" : "primary"}
@@ -2298,7 +2298,9 @@ function ServerCard({
     detailKey,
     server.agent_can_use,
     server.category,
+    server.connections,
     server.description,
+    server.entity_accounts,
     server.entity_connected,
     server.user_connected,
     server.setup_hint,
@@ -2325,17 +2327,27 @@ function ServerCard({
       title={server.name}
       subtitle={server.tagline || server.category || ""}
       meta={
-        <span
-          title={statusLabel}
-          style={{
-            width: 7,
-            height: 7,
-            borderRadius: "50%",
-            background: "currentColor",
-          }}
-        />
+        isManagedSessionCard ? (
+          <LocalToolStatusMeta label={statusLabel} color={statusColor} />
+        ) : (
+          <span
+            title={statusLabel}
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: "50%",
+              background: "currentColor",
+            }}
+          />
+        )
       }
-      metaTone={isReadyConnection ? "connected" : "muted"}
+      metaTone={
+        isManagedSessionCard
+          ? "muted"
+          : isReadyConnection
+            ? "connected"
+            : "muted"
+      }
       onClick={openIntegrationDetail}
     />
   );
@@ -2428,7 +2440,14 @@ function EmailConfigModal({
   const [password, setPassword] = useState("");
   const [fromAddress, setFromAddress] = useState("");
   const [presetHint, setPresetHint] = useState<string | null>(null);
-  const editing = !!accountId;
+  // When a create succeeds but the live connection test fails, we keep
+  // the modal open and flip into edit mode on the just-created row so
+  // the next Save updates it instead of creating a duplicate.
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testFailure, setTestFailure] = useState<string | null>(null);
+  const effectiveAccountId = accountId || createdId;
+  const editing = !!effectiveAccountId;
 
   const { data: existingRow } = useQuery({
     queryKey: ["email-integration-row", accountId],
@@ -2480,8 +2499,11 @@ function EmailConfigModal({
       };
       if (accountName.trim()) config.name = accountName.trim();
 
-      if (editing && accountId) {
-        return api.integrations.update(accountId, { credentials, config });
+      if (editing && effectiveAccountId) {
+        return api.integrations.update(effectiveAccountId, {
+          credentials,
+          config,
+        });
       }
       return api.integrations.create({
         provider: serverKey!,
@@ -2489,12 +2511,43 @@ function EmailConfigModal({
         credentials,
       });
     },
-    onSuccess: () => {
+    onSuccess: async (row: any) => {
       queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      const savedId = (row && row.id) || effectiveAccountId;
+      if (savedId && !accountId) setCreatedId(savedId);
+
+      // Live IMAP+SMTP login test right after save — a bad password or
+      // ssl/port mismatch should surface here, not at the first send.
+      let health: { ok?: boolean | null; detail?: string | null } | null = null;
+      if (savedId) {
+        setTesting(true);
+        try {
+          health = await api.integrations.testEntityAccount(savedId);
+        } catch {
+          health = null; // test endpoint unreachable ≠ bad credentials
+        }
+        setTesting(false);
+        queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      }
+
+      if (health && health.ok === false) {
+        const detail = health.detail || t("page.integrations.unknown_error");
+        setTestFailure(detail);
+        toast.error(
+          t("page.integrations.email_connection_test_failed"),
+          detail,
+        );
+        return; // keep the modal open so the user can correct and re-save
+      }
+
+      setTestFailure(null);
       toast.success(
         editing
           ? t("page.integrations.email_account_updated")
           : t("page.integrations.email_account_added"),
+        health?.ok
+          ? t("page.integrations.email_connection_test_passed")
+          : undefined,
       );
       reset();
       onClose();
@@ -2517,6 +2570,9 @@ function EmailConfigModal({
     setPassword("");
     setFromAddress("");
     setPresetHint(null);
+    setCreatedId(null);
+    setTesting(false);
+    setTestFailure(null);
   }
 
   function applyPreset(p: EmailPreset) {
@@ -2531,7 +2587,11 @@ function EmailConfigModal({
 
   // When editing, password may stay empty (we send UNCHANGED sentinel).
   const canSave =
-    smtpHost && username && (editing || password) && !mutation.isPending;
+    smtpHost &&
+    username &&
+    (editing || password) &&
+    !mutation.isPending &&
+    !testing;
 
   return (
     <Modal
@@ -2561,12 +2621,25 @@ function EmailConfigModal({
             disabled={!canSave}
             onClick={() => mutation.mutate()}
           >
-            {mutation.isPending ? t("page.agents.saving") : t("action.save")}
+            {testing
+              ? t("page.integrations.email_testing_connection")
+              : mutation.isPending
+                ? t("page.agents.saving")
+                : t("action.save")}
           </Button>
         </>
       }
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        {testFailure && (
+          <InfoAlert tone="red">
+            {t("page.integrations.email_saved_but_test_failed")}
+            <br />
+            <span style={{ fontFamily: "var(--font-mono, monospace)" }}>
+              {testFailure}
+            </span>
+          </InfoAlert>
+        )}
         <p
           style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, margin: 0 }}
         >
@@ -2681,6 +2754,7 @@ function EmailConfigModal({
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           placeholder={t("page.integrations.user_example_com")}
+          hint={t("page.integrations.email_username_hint")}
         />
         <Input
           label={t("page.team_people.password")}
@@ -2695,6 +2769,7 @@ function EmailConfigModal({
               ? t("page.integrations.leave_blank_to_keep_existing")
               : t("page.integrations.app_password_or_api_key")
           }
+          hint={t("page.integrations.email_password_hint")}
         />
         <Input
           label={t("page.integrations.from_address_optional")}
@@ -2783,19 +2858,35 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
   whatsapp: {
     fields: [
       {
-        key: "api_key",
-        label: t("page.api_keys.api_key"),
+        key: "access_token",
+        label: t("page.integrations.access_token"),
         type: "password",
-        placeholder: t(
-          "page.integrations.your_twilio_auth_token_or_provider_api_key",
-        ),
+        placeholder: "EAAG…",
         required: true,
       },
       {
-        key: "phone_id",
-        label: t("page.integrations.phone_number_sender_id"),
-        placeholder: t("page.integrations.whatsapp_14155238886"),
+        key: "phone_number_id",
+        label: t("page.integrations.phone_number_id"),
+        placeholder: "123456789012345",
         required: true,
+      },
+      {
+        key: "waba_id",
+        label: t("page.integrations.whatsapp_business_account_id"),
+        placeholder: "123456789012345",
+        required: true,
+      },
+      {
+        key: "verify_token",
+        label: t("page.integrations.webhook_verify_token_optional"),
+        type: "password",
+        help: t("page.integrations.whatsapp_verify_token_help"),
+      },
+      {
+        key: "app_secret",
+        label: t("page.integrations.meta_app_secret_optional"),
+        type: "password",
+        help: t("page.integrations.whatsapp_app_secret_help"),
       },
     ],
     docs_hint: t("page.integrations.docs_hint_03"),
@@ -2964,6 +3055,52 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
     ],
     docs_hint: t("page.integrations.docs_hint_18"),
   },
+  twelve_data: {
+    fields: [
+      {
+        key: "api_key",
+        label: "API key",
+        type: "password",
+        placeholder: "Twelve Data API key",
+        required: true,
+      },
+    ],
+    docs_hint:
+      "This card exposes market-data tools only. It cannot view your account or place orders.",
+  },
+  alpha_vantage: {
+    fields: [
+      {
+        key: "api_key",
+        label: "API key",
+        type: "password",
+        placeholder: "Alpha Vantage API key",
+        required: true,
+      },
+    ],
+    docs_hint:
+      "This card exposes market-data tools only. It cannot view your account or place orders.",
+  },
+  alpaca_market_data: {
+    fields: [
+      {
+        key: "api_key",
+        label: "API key ID",
+        type: "password",
+        placeholder: "Alpaca API key ID",
+        required: true,
+      },
+      {
+        key: "api_secret",
+        label: "API secret key",
+        type: "password",
+        placeholder: "Alpaca API secret key",
+        required: true,
+      },
+    ],
+    docs_hint:
+      "This card exposes market-data tools only. It cannot view your account or place orders.",
+  },
 };
 
 function OAuthClientConfigModal({
@@ -3081,7 +3218,9 @@ function OAuthClientConfigModal({
           label={t("page.integrations.scopes_optional")}
           value={scopes}
           onChange={(e) => setScopes(e.target.value)}
-          placeholder={target.scopes || t("page.integrations.use_provider_defaults")}
+          placeholder={
+            target.scopes || t("page.integrations.use_provider_defaults")
+          }
         />
 
         <InfoAlert>
@@ -3293,6 +3432,7 @@ function ApiKeyConfigModal({
           value={accountName}
           onChange={(e) => setAccountName(e.target.value)}
           placeholder={t("page.integrations.e_g_support_inbox_or_sales_bot")}
+          autoComplete="nickname"
         />
 
         {spec.fields.map((f) => {
@@ -3353,6 +3493,7 @@ function ApiKeyConfigModal({
                 if (isSecret) setTouched((t) => ({ ...t, [f.key]: true }));
               }}
               placeholder={placeholder}
+              autoComplete={isSecret ? "new-password" : "off"}
             />
           );
         })}
@@ -3811,10 +3952,12 @@ function IntegrationSectionHeader({
   categoryKey,
   readyCount,
   totalCount,
+  countLabel,
 }: {
   categoryKey: IntegrationDisplayCategoryKey;
   readyCount: number;
   totalCount: number;
+  countLabel?: string;
 }) {
   const meta = INTEGRATION_DISPLAY_CATEGORIES[categoryKey];
   const Icon = meta.Icon;
@@ -3825,7 +3968,8 @@ function IntegrationSectionHeader({
       </span>
       <span className="integration-section-title">{t(meta.labelKey)}</span>
       <span className="integration-section-count">
-        {readyCount} / {totalCount} {t("page.integrations.ready")}
+        {readyCount} / {totalCount}{" "}
+        {countLabel || t("page.integrations.ready")}
       </span>
     </div>
   );
@@ -3979,12 +4123,19 @@ function EntityAccountRow({
     },
   ];
 
+  // "AUTH FAILED" says something broke; this says what. The health check
+  // spells out the cause (wrong app password, username missing its
+  // domain, STARTTLS on the wrong port) and it has to be readable
+  // without hovering — tooltips do not exist on touch.
+  const failureDetail =
+    account.health?.ok === false ? account.health?.detail || null : null;
+
   return (
     <div
       style={{
         display: "flex",
-        alignItems: "center",
-        gap: 8,
+        flexDirection: "column",
+        gap: 4,
         padding: "6px 10px",
         borderRadius: 8,
         background: account.is_default
@@ -3994,69 +4145,80 @@ function EntityAccountRow({
         fontSize: 12,
       }}
     >
-      <span
-        style={{
-          width: 8,
-          height: 8,
-          borderRadius: "50%",
-          background: account.status === "active" ? "#54a176" : "#d6d3d1",
-          flexShrink: 0,
-        }}
-      />
-      <span
-        style={{
-          flex: 1,
-          minWidth: 0,
-          color: "#44403c",
-          fontWeight: 500,
-          whiteSpace: "nowrap" as const,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-        }}
-      >
-        {label}
-        {account.name &&
-          account.display_name &&
-          account.display_name !== account.name && (
-            <span style={{ color: "#a8a29e", fontWeight: 400, marginLeft: 6 }}>
-              · {account.display_name}
-            </span>
-          )}
-      </span>
-      <HealthPip health={account.health} busy={testNow.isPending} />
-      {account.is_default && <DefaultBadge />}
-      {showActions && (
-        <MoreMenu
-          items={items}
-          onSelect={(key) => {
-            if (key === "edit") onEdit();
-            else if (key === "scan") onScanQr?.(account.id);
-            else if (key === "test") testNow.mutate();
-            else if (key === "register-webhook") registerWebhook.mutate();
-            else if (key === "default") setDefault.mutate();
-            else if (key === "remove") {
-              if (
-                confirm(
-                  t("page.integrations.remove_account_confirm").replace(
-                    "{name}",
-                    label,
-                  ),
-                )
-              )
-                remove.mutate();
-            }
-          }}
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <ConnectionStatusPip
+          connected={account.status === "active"}
+          health={account.health}
+          busy={testNow.isPending}
         />
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            color: "#44403c",
+            fontWeight: 500,
+            whiteSpace: "nowrap" as const,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {label}
+          {account.name &&
+            account.display_name &&
+            account.display_name !== account.name && (
+              <span
+                style={{ color: "#a8a29e", fontWeight: 400, marginLeft: 6 }}
+              >
+                · {account.display_name}
+              </span>
+            )}
+        </span>
+        {account.is_default && <DefaultBadge />}
+        {showActions && (
+          <MoreMenu
+            items={items}
+            onSelect={(key) => {
+              if (key === "edit") onEdit();
+              else if (key === "scan") onScanQr?.(account.id);
+              else if (key === "test") testNow.mutate();
+              else if (key === "register-webhook") registerWebhook.mutate();
+              else if (key === "default") setDefault.mutate();
+              else if (key === "remove") {
+                if (
+                  confirm(
+                    t("page.integrations.remove_account_confirm").replace(
+                      "{name}",
+                      label,
+                    ),
+                  )
+                )
+                  remove.mutate();
+              }
+            }}
+          />
+        )}
+      </div>
+      {failureDetail && (
+        <div
+          style={{
+            fontSize: 11,
+            lineHeight: 1.5,
+            color: "#9f4a45",
+            whiteSpace: "normal" as const,
+            wordBreak: "break-word" as const,
+            paddingLeft: 16,
+          }}
+        >
+          {failureDetail}
+        </div>
       )}
     </div>
   );
 }
 
-/** Small dot showing credential health. */
-/** Combined status pip — merges credential health + inbound wiring into
- *  ONE indicator. Dot colour reflects the worst of the two: green when
- *  everything's fine, amber for degraded (creds OK but wiring off), red
- *  for outright credential failure. Tooltip has the full breakdown. */
+/** One account status indicator, combining the connection record, credential
+ *  health, and inbound wiring. A connected-but-untested account stays green;
+ *  the tooltip explains that its deeper health check has not run yet. */
 type HealthShape = {
   ok: boolean | null;
   detail: string | null;
@@ -4072,23 +4234,28 @@ type HealthShape = {
   } | null;
 } | null;
 
-function StatusPip({ health, busy }: { health: HealthShape; busy?: boolean }) {
+function ConnectionStatusPip({
+  connected,
+  health,
+  busy,
+}: {
+  connected: boolean;
+  health: HealthShape;
+  busy?: boolean;
+}) {
   const wiring = health?.wiring || null;
   const credOk = health?.ok;
   const wireOk = wiring?.ok;
+  const untested = !health || credOk === null || credOk === undefined;
 
-  // Colour = worst of credentials + wiring.
-  // - busy          → amber (pulsing)
-  // - untested      → grey
-  // - cred fail     → red
-  // - wire fail     → amber (credentials work, delivery path broken)
-  // - all good      → green
+  // The connection record is the baseline. Health checks only override it
+  // when they find a real problem; "not tested" is not a disconnection.
   const color = busy
     ? "#cf9b44"
-    : !health || credOk === null || credOk === undefined
-      ? "#d6d3d1"
-      : credOk === false
-        ? "#d65f59"
+    : credOk === false
+      ? "#d65f59"
+      : !connected
+        ? "#d6d3d1"
         : wiring && wireOk === false
           ? "#cf9b44"
           : "#54a176";
@@ -4096,8 +4263,8 @@ function StatusPip({ health, busy }: { health: HealthShape; busy?: boolean }) {
   // Short inline label shown only when there's something worth flagging.
   let label: string | null = null;
   if (busy) label = t("page.integrations.testing");
-  else if (!health) label = t("page.integrations.untested");
   else if (credOk === false) label = t("page.integrations.auth_failed");
+  else if (!connected) label = t("page.integrations.not_connected");
   else if (wiring && wireOk === false)
     label =
       wiring.mode === "polling"
@@ -4108,15 +4275,21 @@ function StatusPip({ health, busy }: { health: HealthShape; busy?: boolean }) {
   const lines: string[] = [];
   if (busy) {
     lines.push(t("page.integrations.running_connection_test"));
-  } else if (!health) {
-    lines.push(t("page.integrations.not_tested_yet_use_menu_test_connection"));
+  } else if (credOk === false) {
+    lines.push(t("page.integrations.credentials_failed"));
+    if (health?.detail) lines.push("  " + health.detail);
+  } else if (!connected) {
+    lines.push(t("page.integrations.not_connected"));
   } else {
-    lines.push(
-      credOk
-        ? t("page.integrations.credentials_reach_provider")
-        : t("page.integrations.credentials_failed"),
-    );
-    if (health.detail) lines.push("  " + health.detail);
+    lines.push(t("status.connected"));
+    if (untested) {
+      lines.push(
+        t("page.integrations.not_tested_yet_use_menu_test_connection"),
+      );
+    } else {
+      lines.push(t("page.integrations.credentials_reach_provider"));
+      if (health?.detail) lines.push("  " + health.detail);
+    }
     if (wiring) {
       const mode =
         wiring.mode === "polling"
@@ -4150,7 +4323,7 @@ function StatusPip({ health, busy }: { health: HealthShape; busy?: boolean }) {
           ),
         );
     }
-    if (health.checked_at)
+    if (health?.checked_at)
       lines.push(
         `  ${t("page.integrations.last_check_label")} ` +
           new Date(health.checked_at).toLocaleString(),
@@ -4160,6 +4333,8 @@ function StatusPip({ health, busy }: { health: HealthShape; busy?: boolean }) {
   return (
     <span
       title={lines.join("\n")}
+      role="status"
+      aria-label={lines.join(". ")}
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -4171,6 +4346,7 @@ function StatusPip({ health, busy }: { health: HealthShape; busy?: boolean }) {
       }}
     >
       <span
+        aria-hidden="true"
         style={{
           width: 8,
           height: 8,
@@ -4197,11 +4373,6 @@ function StatusPip({ health, busy }: { health: HealthShape; busy?: boolean }) {
     </span>
   );
 }
-
-// Backwards-compat aliases — HealthPip now takes health+wiring via the
-// merged StatusPip. WiringPip is a no-op since StatusPip absorbs both.
-const HealthPip = StatusPip;
-const WiringPip = (_props: { wiring?: unknown }) => null;
 
 function ConnectionRow({
   connection,
@@ -4274,13 +4445,14 @@ function ConnectionRow({
         : t("status.connected"),
   );
   const needsReconnect = Boolean(onReconnect && (authFailed || expired));
+  const failureDetail = authFailed ? connection.health?.detail || null : null;
 
   return (
     <div
       style={{
         display: "flex",
-        alignItems: "center",
-        gap: 8,
+        flexDirection: "column",
+        gap: 4,
         padding: "6px 10px",
         borderRadius: 8,
         background: connection.is_default
@@ -4290,91 +4462,101 @@ function ConnectionRow({
         fontSize: 12,
       }}
     >
-      <span
-        style={{
-          width: 8,
-          height: 8,
-          borderRadius: "50%",
-          background: authFailed ? "#d65f59" : expired ? "#a8a29e" : "#54a176",
-          flexShrink: 0,
-        }}
-      />
-      <span
-        style={{
-          flex: 1,
-          minWidth: 0,
-          color: "#44403c",
-          fontWeight: 500,
-          whiteSpace: "nowrap" as const,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-        }}
-      >
-        {label}
-      </span>
-      {connection.is_default && <DefaultBadge />}
-      {expired && <ExpiredBadge />}
-      <HealthPip health={connection.health || null} busy={testNow.isPending} />
-      <WiringPip wiring={connection.health?.wiring || null} />
-      {showActions && needsReconnect && (
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => onReconnect?.()}
-          style={{ flexShrink: 0 }}
-        >
-          {t("page.integrations.reconnect")}
-        </Button>
-      )}
-      {showActions && (
-        <MoreMenu
-          items={[
-            ...(onReconnect
-              ? [
-                  {
-                    key: "reconnect",
-                    label: t("page.integrations.reconnect"),
-                  },
-                ]
-              : []),
-            {
-              key: "test",
-              label: testNow.isPending
-                ? t("page.integrations.testing")
-                : t("page.integrations.test_connection"),
-            },
-            ...(!connection.is_default
-              ? [
-                  {
-                    key: "default",
-                    label: t("page.integrations.set_as_default"),
-                  },
-                ]
-              : []),
-            {
-              key: "disconnect",
-              label: t("page.integrations.disconnect"),
-              danger: true,
-            },
-          ]}
-          onSelect={(key) => {
-            if (key === "reconnect") onReconnect?.();
-            else if (key === "test") testNow.mutate();
-            else if (key === "default") setDefault.mutate();
-            else if (key === "disconnect") {
-              if (
-                confirm(
-                  t("page.integrations.disconnect_account_confirm").replace(
-                    "{name}",
-                    label,
-                  ),
-                )
-              ) {
-                disconnect.mutate();
-              }
-            }
-          }}
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <ConnectionStatusPip
+          connected={!expired}
+          health={connection.health || null}
+          busy={testNow.isPending}
         />
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            color: "#44403c",
+            fontWeight: 500,
+            whiteSpace: "nowrap" as const,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {label}
+        </span>
+        {connection.is_default && <DefaultBadge />}
+        {expired && <ExpiredBadge />}
+        {showActions && needsReconnect && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onReconnect?.()}
+            style={{ flexShrink: 0 }}
+          >
+            {t("page.integrations.reconnect")}
+          </Button>
+        )}
+        {showActions && (
+          <MoreMenu
+            items={[
+              ...(onReconnect
+                ? [
+                    {
+                      key: "reconnect",
+                      label: t("page.integrations.reconnect"),
+                    },
+                  ]
+                : []),
+              {
+                key: "test",
+                label: testNow.isPending
+                  ? t("page.integrations.testing")
+                  : t("page.integrations.test_connection"),
+              },
+              ...(!connection.is_default
+                ? [
+                    {
+                      key: "default",
+                      label: t("page.integrations.set_as_default"),
+                    },
+                  ]
+                : []),
+              {
+                key: "disconnect",
+                label: t("page.integrations.disconnect"),
+                danger: true,
+              },
+            ]}
+            onSelect={(key) => {
+              if (key === "reconnect") onReconnect?.();
+              else if (key === "test") testNow.mutate();
+              else if (key === "default") setDefault.mutate();
+              else if (key === "disconnect") {
+                if (
+                  confirm(
+                    t("page.integrations.disconnect_account_confirm").replace(
+                      "{name}",
+                      label,
+                    ),
+                  )
+                ) {
+                  disconnect.mutate();
+                }
+              }
+            }}
+          />
+        )}
+      </div>
+      {failureDetail && (
+        <div
+          style={{
+            fontSize: 11,
+            lineHeight: 1.5,
+            color: "#9f4a45",
+            whiteSpace: "normal" as const,
+            wordBreak: "break-word" as const,
+            paddingLeft: 16,
+          }}
+        >
+          {failureDetail}
+        </div>
       )}
     </div>
   );

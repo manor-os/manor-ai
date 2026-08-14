@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
@@ -142,7 +142,10 @@ async def connected_integration_provider_keys(
         oauth_rows = (await db.execute(
             select(OAuthAccount.provider).where(
                 OAuthAccount.user_id == user_id,
-                OAuthAccount.access_token.is_not(None),
+                or_(
+                    OAuthAccount.credential_ref.is_not(None),
+                    OAuthAccount.access_token.is_not(None),
+                ),
             )
         )).scalars().all()
         keys.update(canonical_provider_key(provider) for provider in oauth_rows)

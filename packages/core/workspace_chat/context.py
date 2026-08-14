@@ -534,6 +534,7 @@ async def _search_knowledge(
     public_agent_visible_only: bool = False,
     user_id: str | None = None,
 ) -> str:
+    from packages.core.ai.runtime.document_actions import runtime_document_markdown_link
     from packages.core.models.document import DocumentGroup, Document, DocumentGroupMember
     from packages.core.models.workspace import Workspace
     from packages.core.services.document_access import (
@@ -661,11 +662,17 @@ async def _search_knowledge(
         for doc in docs:
             status = f", vector={doc.vector_status}" if doc.vector_status else ""
             location = "" if client_visible_only else f", path={doc.fs_path}" if doc.fs_path else ""
-            lines.append(f"  - {doc.name} ({doc.file_type or 'file'}{status}{location})")
+            reference = (
+                doc.name
+                if client_visible_only
+                else runtime_document_markdown_link(doc.name, doc.id) or doc.name
+            )
+            lines.append(f"  - {reference} ({doc.file_type or 'file'}{status}{location})")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
 async def _search_artifacts(db: AsyncSession, ws_id: str, entity_id: str, q: str, limit: int) -> str:
+    from packages.core.ai.runtime.document_actions import runtime_document_markdown_link
     from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
     from packages.core.services.document_metadata import metadata_artifact, metadata_origin
 
@@ -717,8 +724,9 @@ async def _search_artifacts(db: AsyncSession, ws_id: str, entity_id: str, q: str
         role = artifact.get("role") or "artifact"
         task_id = origin.get("task_id")
         tool = origin.get("tool_name")
+        markdown_link = runtime_document_markdown_link(doc.name, doc.id) or doc.name
         line = (
-            f"- document_id={doc.id} **{doc.name}** "
+            f"- document_id={doc.id} {markdown_link} "
             f"({doc.file_type or doc.mime_type or 'file'}, source={doc.source}, role={role})"
         )
         if task_id:

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" fill="none">
+  <rect width="720" height="360" rx="28" fill="#F5F4F1"/>
+  <path d="M150 180H236" stroke="#B8B3AC" stroke-width="4" stroke-linecap="round"/>
+  <path d="M350 180H434" stroke="#B8B3AC" stroke-width="4" stroke-linecap="round"/>
+  <path d="M548 180H610" stroke="#B8B3AC" stroke-width="4" stroke-linecap="round"/>
+  <path d="M223 180l-13-9v18l13-9Z" fill="#8C8780"/><path d="M421 180l-13-9v18l13-9Z" fill="#8C8780"/><path d="M597 180l-13-9v18l13-9Z" fill="#8C8780"/>
+  <g filter="url(#c)">
+    <rect x="50" y="124" width="100" height="112" rx="22" fill="white"/>
+    <rect x="236" y="124" width="114" height="112" rx="22" fill="white"/>
+    <rect x="434" y="124" width="114" height="112" rx="22" fill="white"/>
+    <rect x="610" y="124" width="64" height="112" rx="22" fill="white"/>
+  </g>
+  <circle cx="100" cy="171" r="27" fill="#E9DDC7"/>
+  <path d="M100 156v16l11 7" stroke="#926D36" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="260" y="151" width="14" height="45" rx="7" fill="#DCEAE7"/>
+  <rect x="282" y="164" width="14" height="32" rx="7" fill="#AFCFC9"/>
+  <rect x="304" y="141" width="14" height="55" rx="7" fill="#6E9C94"/>
+  <circle cx="491" cy="171" r="27" fill="#E8E3F1"/>
+  <path d="M472 180l12-12 9 7 16-19" stroke="#756C8E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M505 156h4v13" stroke="#756C8E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="625" y="148" width="34" height="48" rx="7" fill="#E4ECE9"/>
+  <rect x="633" y="159" width="18" height="4" rx="2" fill="#557A73"/>
+  <rect x="633" y="170" width="14" height="4" rx="2" fill="#7B9B95"/>
+  <rect x="633" y="181" width="17" height="4" rx="2" fill="#A4B7B3"/>
+  <text x="100" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Schedule</text>
+  <text x="293" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Collect</text>
+  <text x="491" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Compare</text>
+  <text x="642" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="13" font-weight="700">Brief</text>
+  <defs><filter id="c" x="38" y="116" width="648" height="136" filterUnits="userSpaceOnUse"><feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#332C26" flood-opacity=".09"/></filter></defs>
+</svg>

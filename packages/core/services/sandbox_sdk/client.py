@@ -74,6 +74,23 @@ def _raise_for_status(resp: httpx.Response) -> None:
     raise SandboxError(detail, status_code=resp.status_code)
 
 
+def _parse_sandbox_info(d: dict) -> SandboxInfo:
+    """Parse the shared status/list/touch response shape."""
+
+    return SandboxInfo(
+        sandbox_id=d["sandbox_id"],
+        container_name=d["container_name"],
+        status=d["status"],
+        skill_name=d["skill_name"],
+        workdir=d["workdir"],
+        created_at=d["created_at"],
+        last_used_at=d["last_used_at"],
+        config=d.get("config", {}),
+        active_command=d.get("active_command"),
+        expires_at=d.get("expires_at"),
+    )
+
+
 class SandboxClient:
     """Async HTTP client for the Sandbox Service."""
 
@@ -221,19 +238,14 @@ class SandboxClient:
     async def status(self, sandbox_id: str) -> SandboxInfo:
         resp = await self._http.get(f"/api/v1/sandbox/{sandbox_id}")
         _raise_for_status(resp)
-        d = resp.json()
-        return SandboxInfo(
-            sandbox_id=d["sandbox_id"],
-            container_name=d["container_name"],
-            status=d["status"],
-            skill_name=d["skill_name"],
-            workdir=d["workdir"],
-            created_at=d["created_at"],
-            last_used_at=d["last_used_at"],
-            config=d.get("config", {}),
-            active_command=d.get("active_command"),
-            expires_at=d.get("expires_at"),
-        )
+        return _parse_sandbox_info(resp.json())
+
+    async def touch(self, sandbox_id: str) -> SandboxInfo:
+        """Refresh a sandbox idle lease without executing a command."""
+
+        resp = await self._http.post(f"/api/v1/sandbox/{sandbox_id}/touch")
+        _raise_for_status(resp)
+        return _parse_sandbox_info(resp.json())
 
     async def destroy(self, sandbox_id: str) -> None:
         resp = await self._http.delete(f"/api/v1/sandbox/{sandbox_id}")

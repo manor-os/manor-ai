@@ -160,29 +160,17 @@ async def exchange_code_for_token(
     if not user:
         raise ValueError("invalid_grant")
 
-    # Mint a Manor JWT — use the client's configured TTL if set
-    from packages.core.config import get_settings
-    settings = get_settings()
-    # create_access_token uses JWT_EXPIRE_MINUTES env. For client-specific TTL we override here.
-    if client.access_token_ttl_minutes:
-        from jose import jwt
-        payload = {
-            "sub": user.id,
-            "entity_id": user.entity_id,
-            "role": user.role,
-            "email": user.email,
-            "name": user.display_name or user.email,
-            "aud": client.client_id,
-            "iss": "manor",
-            "exp": datetime.now(timezone.utc) + timedelta(minutes=client.access_token_ttl_minutes),
-        }
-        access_token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
-        expires_in = client.access_token_ttl_minutes * 60
-    else:
-        # Default Manor JWT (24h)
-        access_token = create_access_token(user.id, user.entity_id, user.role)
-        import os
-        expires_in = int(os.getenv("JWT_EXPIRE_MINUTES", "1440")) * 60
+    # OAuth clients receive the same short-lived, revocable API token as the
+    # first-party web app. Access-token TTLs are capped at 60 minutes.
+    ttl_minutes = min(max(1, client.access_token_ttl_minutes or 60), 60)
+    access_token = create_access_token(
+        user.id,
+        user.entity_id,
+        user.role,
+        token_version=user.token_version,
+        expires_minutes=ttl_minutes,
+    )
+    expires_in = ttl_minutes * 60
 
     return {
         "access_token": access_token,

@@ -5,6 +5,13 @@ import { IconCheck, IconCheckCircle, IconChevronRight, IconClock, IconCode, Icon
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingStructuredText } from "../../lib/taskDisplay";
 import UserAvatar from "../ui/UserAvatar";
+import InlineFileReferenceCard from "../InlineFileReferenceCard";
+import {
+  dedupeGeneratedFileRecords,
+  generatedFileIdentity,
+  generatedFileLabel,
+  generatedFileOpenReference,
+} from "../../lib/fileReferences";
 
 
 const FAILED_RETRYABLE_STEP_STATUSES = new Set(["failed", "skipped", "cancelled"]);
@@ -160,8 +167,8 @@ function collectOutputFiles(value: any, depth = 0): any[] {
 
 function extractOutputSummary(result?: Record<string, any> | null) {
   if (!result) return null;
-  const summary = textFromResult(result) || compactStructuredPreview(result);
   const files = dedupeOutputFiles(collectOutputFiles(result));
+  const summary = textFromResult(result) || (files.length ? "" : compactStructuredPreview(result));
   return {
     summary,
     files: files
@@ -329,35 +336,19 @@ function LocalCodeRunPanel({ step }: { step: ExecutionStep }) {
 }
 
 function outputFileIdentity(file: any): string {
-  if (!file || typeof file !== "object") return String(file || "");
-  const value = file.fs_path || file.saved_to || file.path || file.file_url || file.document_url || file.url || file.public_url || file.document_id || file.name || file.filename || file.original_name;
-  return String(value || JSON.stringify(file));
+  return generatedFileIdentity(file);
 }
 
-function outputFileHref(file: any): string {
-  if (!file || typeof file !== "object") return "";
-  if (file.document_id) return `/viewer/${encodeURIComponent(String(file.document_id))}`;
-  const external = file.url || file.public_url || file.file_url || file.document_url || file.path;
-  if (/^https?:\/\//i.test(String(external || "")) || String(external || "").startsWith("blob:") || String(external || "").startsWith("data:")) {
-    return String(external);
-  }
-  return "";
+function outputFileReference(file: any): string {
+  return generatedFileOpenReference(file);
 }
 
 function outputFileLabel(file: any): string {
-  return String(file?.name || file?.filename || file?.original_name || file?.fs_path || file?.saved_to || file?.path || file?.file_url || file?.document_url || file?.url || t("component.task_execution_timeline.file"));
+  return generatedFileLabel(file, t("component.task_execution_timeline.file"));
 }
 
 function dedupeOutputFiles(files: any[]): any[] {
-  const seen = new Set<string>();
-  const out: any[] = [];
-  for (const file of Array.isArray(files) ? files : []) {
-    const key = outputFileIdentity(file);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(file);
-  }
-  return out;
+  return dedupeGeneratedFileRecords(files);
 }
 
 interface TaskExecutionTimelineProps {
@@ -644,7 +635,7 @@ export default function TaskExecutionTimeline({
                         {output.files.length > 0 && (
                           <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: output.summary ? 6 : 0 }}>
                             {output.files.map((file: any, fileIndex: number) => {
-                              const href = outputFileHref(file);
+                              const reference = outputFileReference(file);
                               const fileLabel = outputFileLabel(file);
                               const chipStyle = {
                                 padding: "2px 6px", borderRadius: 7,
@@ -652,16 +643,16 @@ export default function TaskExecutionTimeline({
                                 color: "#436b65", fontSize: 10, fontWeight: 750,
                                 textDecoration: "none",
                               } as const;
-                              return href ? (
-                                <a
+                              return reference ? (
+                                <InlineFileReferenceCard
                                   key={`${outputFileIdentity(file) || fileIndex}`}
-                                  href={href}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  style={chipStyle}
-                                >
-                                  {fileLabel}
-                                </a>
+                                  reference={reference}
+                                  label={fileLabel}
+                                  fileType={file.file_type || file.fileType}
+                                  mimeType={file.mime_type || file.mimeType}
+                                  compact
+                                  trustedReference
+                                />
                               ) : (
                                 <span
                                   key={`${outputFileIdentity(file) || fileIndex}`}

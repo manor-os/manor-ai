@@ -1,45 +1,49 @@
 import { useState } from "react";
-import { Link, useSearchParams, useNavigate } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
+import AuthShell, { AuthBrand } from "../components/auth/AuthShell";
+import { IconCheckCircle, IconEye, IconEyeOff, IconInfo, IconWarning } from "../components/icons";
 import { api, ApiError } from "../lib/api";
 import { t } from "../lib/i18n";
 
 export default function ResetPassword() {
   const [searchParams] = useSearchParams();
-  const navigate = useNavigate();
   const token = searchParams.get("token") || "";
 
-  const [newPwd, setNewPwd] = useState("");
-  const [confirmPwd, setConfirmPwd] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
+  const [tokenInvalid, setTokenInvalid] = useState(!token);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
     setError("");
 
     if (!token) {
-      setError(t("page.reset_password.invalid_or_missing_reset_token"));
+      setTokenInvalid(true);
       return;
     }
-    if (newPwd !== confirmPwd) {
+    if (newPassword !== confirmPassword) {
       setError(t("page.reset_password.passwords_do_not_match"));
       return;
     }
-    if (newPwd.length < 8) {
-      setError(t("page.reset_password.password_must_be_at_least_8_characters"));
+    if (newPassword.length < 12) {
+      setError(t("page.reset_password.password_must_be_at_least_12_characters"));
       return;
     }
 
     setLoading(true);
     try {
-      await api.auth.resetPassword(token, newPwd);
+      await api.auth.resetPassword(token, newPassword);
       setSuccess(true);
     } catch (err) {
-      if (err instanceof ApiError) {
-        setError(err.message);
+      if (err instanceof ApiError && err.status === 400) {
+        setTokenInvalid(true);
       } else {
-        setError(t("page.reset_password.failed_to_reset_password_the_link_may_have_expir"));
+        setError(t("page.forgot_password.server_error"));
       }
     } finally {
       setLoading(false);
@@ -47,158 +51,183 @@ export default function ResetPassword() {
   };
 
   return (
-    <div className="min-h-screen flex relative overflow-hidden">
-      {/* Aurora background */}
-      <div className="aurora-bg">
-        <div className="aurora-blob aurora-blob-1" />
-        <div className="aurora-blob aurora-blob-2" />
-        <div className="aurora-blob aurora-blob-3" />
+    <AuthShell>
+      <div className="sticky top-0 z-20 flex items-center justify-between p-8 bg-transparent">
+        <AuthBrand />
+        <Link
+          to="/login"
+          style={{ fontSize: 13, fontWeight: 600, color: "var(--accent)", textDecoration: "none" }}
+        >
+          {t("page.forgot_password.back_login")}
+        </Link>
       </div>
 
-      <div className="flex-1 flex items-center justify-center relative z-10 px-4">
-        <div
-          className="w-full animate-fade-in"
-          style={{
-            maxWidth: 440,
-            borderRadius: 40,
-            background: "rgba(255,255,255,0.7)",
-            backdropFilter: "blur(24px)",
-            WebkitBackdropFilter: "blur(24px)",
-            boxShadow: "0 25px 50px -12px rgba(0,0,0,0.15), 0 0 0 1px rgba(255,255,255,0.5)",
-            padding: "40px 36px",
-          }}
-        >
-          {/* Logo */}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 32 }}>
-            <div style={{
-              width: 40,
-              height: 40,
-              borderRadius: 12,
-              background: "linear-gradient(135deg, #436b65, #4f7d75)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}>
-              <svg style={{ width: 22, height: 22, color: "#fff" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
-              </svg>
-            </div>
-            <span style={{ fontSize: 20, fontWeight: 800, color: "#292524" }}>{t("page.chat_history.manor_ai")}</span>
-          </div>
-
-          {success ? (
-            <div style={{ textAlign: "center" }}>
-              <div style={{
+      <main
+        className="flex-1 flex flex-col justify-center px-8 pb-8"
+        style={{ maxWidth: 420, width: "100%", margin: "0 auto" }}
+      >
+        {success ? (
+          <div role="status" aria-live="polite">
+            <div
+              className="flex items-center justify-center"
+              style={{
                 width: 52,
                 height: 52,
-                margin: "0 auto 16px",
-                borderRadius: "50%",
-                background: "#e4efe8",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}>
-                <svg style={{ width: 24, height: 24, color: "#44895f" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-                </svg>
-              </div>
-              <h2 style={{ fontSize: 20, fontWeight: 900, color: "#292524", marginBottom: 4 }}>{t("page.reset_password.title")}</h2>
-              <p style={{ fontSize: 14, color: "#78716c", marginBottom: 24 }}>
-                {t("page.reset_password.success")}
-              </p>
-              <button
-                onClick={() => navigate("/login")}
-                className="btn-manor"
-                style={{ padding: "10px 24px", fontSize: 14, fontWeight: 700 }}
-              >
-                {t("page.reset_password.go_login")}
-              </button>
+                marginBottom: 20,
+                borderRadius: 16,
+                background: "var(--accent-soft)",
+                color: "var(--accent)",
+              }}
+            >
+              <IconCheckCircle size={24} />
             </div>
-          ) : (
-            <>
-              <h2 style={{ fontSize: 24, fontWeight: 900, color: "#292524", textAlign: "center", marginBottom: 4 }}>
-                {t("page.reset_password.set_new")}
-              </h2>
-              <p style={{ fontSize: 14, color: "#78716c", textAlign: "center", marginBottom: 28 }}>
-                {t("page.reset_password.subtitle")}
-              </p>
+            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+              {t("page.reset_password.title")}
+            </h1>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>
+              {t("page.reset_password.success")}
+            </p>
+            <Link
+              to="/login"
+              className="login-submit-btn"
+              style={{ display: "block", textAlign: "center", textDecoration: "none" }}
+            >
+              {t("page.reset_password.go_login")}
+            </Link>
+          </div>
+        ) : tokenInvalid ? (
+          <div role="alert" aria-live="assertive">
+            <div
+              className="flex items-center justify-center"
+              style={{
+                width: 52,
+                height: 52,
+                marginBottom: 20,
+                borderRadius: 16,
+                background: "var(--surface-sunken)",
+                color: "var(--text-muted)",
+              }}
+            >
+              <IconWarning size={24} />
+            </div>
+            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+              {t("page.reset_password.link_invalid_title")}
+            </h1>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>
+              {t("page.reset_password.link_invalid_description")}
+            </p>
+            <Link
+              to="/forgot-password"
+              className="login-submit-btn"
+              style={{ display: "block", textAlign: "center", textDecoration: "none" }}
+            >
+              {t("page.reset_password.request_new_link")}
+            </Link>
+            <div style={{ textAlign: "center", marginTop: 20 }}>
+              <Link
+                to="/login"
+                style={{ fontSize: 14, fontWeight: 600, color: "var(--accent)", textDecoration: "none" }}
+              >
+                {t("page.forgot_password.back_login")}
+              </Link>
+            </div>
+          </div>
+        ) : (
+          <>
+            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+              {t("page.reset_password.set_new")}
+            </h1>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>
+              {t("page.reset_password.subtitle")}
+            </p>
 
-              {!token && (
-                <div style={{
+            {error && (
+              <div
+                role="alert"
+                style={{
                   marginBottom: 20,
-                  padding: "10px 16px",
+                  padding: 12,
                   borderRadius: 12,
-                  background: "rgba(243,236,214,0.8)",
-                  border: "1px solid rgba(207,155,68,0.2)",
+                  background: "rgba(248,240,239,0.8)",
+                  border: "1px solid rgba(214,95,89,0.2)",
+                  color: "#a23e38",
                   fontSize: 13,
-                  color: "#76502c",
-                  textAlign: "center" as const,
-                }}>
-                  {t("page.reset_password.no_token")}
-                </div>
-              )}
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <IconInfo size={16} className="shrink-0" />
+                {error}
+              </div>
+            )}
 
-              <form onSubmit={handleSubmit}>
-                <div style={{ marginBottom: 20 }}>
-                  <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#57534e", marginBottom: 6 }}>
-                    {t("page.reset_password.new_password")}
-                  </label>
+            <form onSubmit={handleSubmit}>
+              <div style={{ marginBottom: 20 }}>
+                <label htmlFor="new-password" className="login-label">
+                  {t("page.reset_password.new_password")}
+                </label>
+                <div className="login-input-wrap">
                   <input
-                    type="password"
-                    value={newPwd}
-                    onChange={(e) => setNewPwd(e.target.value)}
-                    className="manor-input"
-                    placeholder={t("page.reset_password.placeholder_min8")}
+                    id="new-password"
+                    type={showNewPassword ? "text" : "password"}
+                    value={newPassword}
+                    onChange={(event) => setNewPassword(event.target.value)}
+                    className="login-input"
+                    style={{ paddingRight: 42 }}
+                    placeholder={t("page.reset_password.placeholder_min12")}
+                    autoComplete="new-password"
+                    minLength={12}
+                    maxLength={72}
                     required
                   />
-                </div>
-                <div style={{ marginBottom: 20 }}>
-                  <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#57534e", marginBottom: 6 }}>
-                    {t("page.reset_password.confirm_password")}
-                  </label>
-                  <input
-                    type="password"
-                    value={confirmPwd}
-                    onChange={(e) => setConfirmPwd(e.target.value)}
-                    className="manor-input"
-                    placeholder={t("page.reset_password.placeholder_reenter")}
-                    required
-                  />
-                </div>
-
-                {error && (
-                  <p style={{ fontSize: 13, color: "#c14a44", textAlign: "center", marginBottom: 16 }}>{error}</p>
-                )}
-
-                <button
-                  type="submit"
-                  disabled={loading || !token}
-                  className="btn-manor"
-                  style={{
-                    width: "100%",
-                    padding: "10px 0",
-                    fontSize: 14,
-                    fontWeight: 700,
-                    justifyContent: "center",
-                    opacity: loading || !token ? 0.5 : 1,
-                  }}
-                >
-                  {loading ? t("page.reset_password.resetting") : t("page.reset_password.reset")}
-                </button>
-
-                <div style={{ textAlign: "center", marginTop: 20 }}>
-                  <Link
-                    to="/login"
-                    style={{ fontSize: 14, fontWeight: 600, color: "#4f7d75", textDecoration: "none" }}
+                  <button
+                    type="button"
+                    onClick={() => setShowNewPassword((visible) => !visible)}
+                    className="login-pw-toggle"
+                    aria-label={showNewPassword ? t("page.login.hide_password") : t("page.login.show_password")}
                   >
-                    {t("page.forgot_password.back_login")}
-                  </Link>
+                    {showNewPassword ? <IconEyeOff size={18} /> : <IconEye size={18} />}
+                  </button>
                 </div>
-              </form>
-            </>
-          )}
-        </div>
-      </div>
-    </div>
+              </div>
+
+              <div style={{ marginBottom: 24 }}>
+                <label htmlFor="confirm-password" className="login-label">
+                  {t("page.reset_password.confirm_password")}
+                </label>
+                <div className="login-input-wrap">
+                  <input
+                    id="confirm-password"
+                    type={showConfirmPassword ? "text" : "password"}
+                    value={confirmPassword}
+                    onChange={(event) => setConfirmPassword(event.target.value)}
+                    className="login-input"
+                    style={{ paddingRight: 42 }}
+                    placeholder={t("page.reset_password.placeholder_reenter")}
+                    autoComplete="new-password"
+                    minLength={12}
+                    maxLength={72}
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowConfirmPassword((visible) => !visible)}
+                    className="login-pw-toggle"
+                    aria-label={showConfirmPassword ? t("page.login.hide_password") : t("page.login.show_password")}
+                  >
+                    {showConfirmPassword ? <IconEyeOff size={18} /> : <IconEye size={18} />}
+                  </button>
+                </div>
+              </div>
+
+              <button type="submit" disabled={loading} className="login-submit-btn">
+                {loading ? t("page.reset_password.resetting") : t("page.reset_password.reset")}
+              </button>
+            </form>
+          </>
+        )}
+      </main>
+    </AuthShell>
   );
 }

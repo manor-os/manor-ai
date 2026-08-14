@@ -42,10 +42,12 @@ from packages.core.models.participant import (
 from packages.core.models.automation_revision import AutomationRevision
 from packages.core.models.experiment import Experiment
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
+from packages.core.models.workspace_stat import WorkspaceStat, WorkspaceStatObservation
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun, AgentExecution
 from packages.core.models.webhook import WebhookEndpoint, WebhookDelivery
 from packages.core.models.api_key import ApiKey
 from packages.core.models.conversation_share import ConversationShare
+from packages.core.models.site import Site, SiteEvent
 from packages.core.models.chat_feedback import ChatMessageFeedback
 from packages.core.models.skill import Skill, AgentSkillBinding
 from packages.core.models.custom_field import CustomFieldDefinition
@@ -61,6 +63,7 @@ from packages.core.models.workflow import (
     WorkflowDefinition,
     WorkflowProject,
     WorkflowRun,
+    WorkflowTemplateInstallation,
 )
 from packages.core.models.billing import SubscriptionPlan, CreditReservation, CreditUsageAllocation, CreditUsageLog, PaymentLog, Order
 from packages.core.models.order import BusinessOrder, BusinessOrderItem
@@ -138,11 +141,12 @@ __all__ = [
     "AutomationRevision",
     "Experiment",
     "ParticipantProfile", "HumanCommitment", "HumanContribution",
-    "Goal", "GoalMeasurement", "GoalTaskLink",
+    "Goal", "GoalMeasurement", "GoalTaskLink", "WorkspaceStat", "WorkspaceStatObservation",
     "ScheduledJob", "ScheduledJobRun", "AgentExecution",
     "WebhookEndpoint", "WebhookDelivery",
     "ApiKey",
     "ConversationShare",
+    "Site", "SiteEvent",
     "Skill",
     "CustomFieldDefinition",
     "AgentMemory",
@@ -152,6 +156,7 @@ __all__ = [
     "Favorite",
     "Tag", "ResourceTag",
     "WorkflowActionGrant", "WorkflowBinding", "WorkflowDefinition", "WorkflowProject", "WorkflowRun",
+    "WorkflowTemplateInstallation",
     "SubscriptionPlan", "CreditReservation", "CreditUsageAllocation", "CreditUsageLog", "PaymentLog", "Order",
     "ChannelConfig", "MessageLog", "PhoneNumber", "Announcement", "AnnouncementRecipient",
     "Feature", "FeaturePackage", "EntityFeature",

@@ -38,6 +38,13 @@ class MessageResponse(BaseModel):
     limit_detail: dict | None = None
     hitl_requests: list[dict] | None = None
     attachments: list[dict] | dict | None = None
+    message_kind: str | None = None
+    refs: list[dict] | None = None
+    meta: dict | None = None
+    pending_action: dict | None = None
+    resolved_at: str | None = None
+    resolution: dict | None = None
+    workflow_result: dict | None = None
     created_at: str | None = None
 
 

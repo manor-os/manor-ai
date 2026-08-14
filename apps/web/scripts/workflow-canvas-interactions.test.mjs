@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
+import { transform } from "esbuild";
 
 const canvasSource = await readFile(
   new URL("../src/components/workflows/WorkflowCanvas.tsx", import.meta.url),
@@ -12,6 +13,10 @@ const panelSource = await readFile(
 );
 const mediaPreviewSource = await readFile(
   new URL("../src/components/workflows/MediaPreview.tsx", import.meta.url),
+  "utf8",
+);
+const workflowMediaSource = await readFile(
+  new URL("../src/lib/workflowMedia.ts", import.meta.url),
   "utf8",
 );
 const flowsSource = await readFile(
@@ -38,6 +43,26 @@ const confirmDialogSource = await readFile(
   new URL("../src/components/ui/ConfirmDialog.tsx", import.meta.url),
   "utf8",
 );
+const integrationCatalogSource = await readFile(
+  new URL("../../../packages/core/services/integration_operation_catalog.py", import.meta.url),
+  "utf8",
+);
+const integrationsRouterSource = await readFile(
+  new URL("../../api/routers/integrations.py", import.meta.url),
+  "utf8",
+);
+
+async function compilePureModule(source) {
+  const compiled = await transform(source, {
+    loader: "ts",
+    format: "esm",
+    target: "es2020",
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(compiled.code).toString("base64")}`);
+}
+
+const workflowMediaModule = await compilePureModule(workflowMediaSource);
+const workflowValidateModule = await compilePureModule(validateSource);
 
 test("the visible node plus is a real source connection handle", () => {
   assert.match(canvasSource, /<Handle[\s\S]*?type="source"[\s\S]*?className="workflow-source-handle"/);
@@ -95,37 +120,97 @@ test("note deletion persists and notes stay out of run progress", () => {
   assert.match(validateSource, /for \(const s of executableSteps\)/);
 });
 
+test("intentional stop nodes and Workspace-bound agents validate cleanly", () => {
+  const issues = workflowValidateModule.validateWorkflow([
+    { id: "start", type: "trigger", next: ["publisher"] },
+    {
+      id: "publisher",
+      type: "agent",
+      config: { service_key: "distribution.linkedin.chrome" },
+      next: ["unsupported"],
+    },
+    { id: "unsupported", type: "stop", config: { message: "Unsupported platform" } },
+  ]);
+
+  assert.deepEqual(issues, []);
+});
+
+test("subworkflow configuration links to the referenced publishing workflow", () => {
+  assert.match(panelSource, /className="workflow-reference-card"/);
+  assert.match(panelSource, /Open publishing workflow/);
+  assert.match(panelSource, /openReferencedWorkflow/);
+  assert.match(panelSource, /state: \{ returnTo \}/);
+  assert.match(stylesSource, /\.workflow-reference-card:focus-visible/);
+});
+
 test("standalone node results persist to the canvas and reveal the result panel", () => {
   assert.match(flowsSource, /setConfigStepId\(stepId\)/);
   assert.match(flowsSource, /onRunResult=\{recordSingleResult\}/);
   assert.match(panelSource, /onRunResult\?\.\(step\.id, res\)/);
   assert.match(panelSource, /scrollIntoView\(\{ behavior:/);
+  assert.match(panelSource, /if \(running \|\| !liveResult\?\.status \|\| !resultRef\.current\) return/);
   assert.match(panelSource, /aria-live="polite"/);
-  assert.match(panelSource, />Execution result</);
+  assert.match(panelSource, />Test & result</);
   assert.match(panelSource, />Result output</);
   assert.match(panelSource, /JSON\.stringify\(result, null, 2\)/);
   assert.match(panelSource, /Trigger test completed\. This node only starts the flow; it does not produce business data\./);
   assert.match(panelSource, /className="workflow-node-config-layout"/);
   assert.match(panelSource, /className="workflow-node-execution-result"/);
-  assert.ok(panelSource.indexOf("<ExecutionResultPanel") < panelSource.indexOf('className="workflow-node-config-fields"'));
+  assert.ok(panelSource.indexOf('className="workflow-node-config-fields"') < panelSource.indexOf("<ExecutionResultPanel"));
   assert.match(panelSource, /maxWidth="960px"/);
   assert.match(panelSource, /Test this node to see its result/);
   assert.match(stylesSource, /grid-template-areas: "config result"/);
-  assert.match(stylesSource, /@media \(max-width: 760px\)[\s\S]*?"result"[\s\S]*?"config"/);
+  assert.match(stylesSource, /@media \(max-width: 760px\)[\s\S]*?"config"[\s\S]*?"result"/);
   assert.match(canvasSource, /data\.status === "failed" \? "Error" : "Output"/);
 });
 
-test("workflow editor header keeps identity, status, and actions consistent", () => {
+test("connector nodes choose live MCP operations and render typed arguments", () => {
+  assert.match(panelSource, /api\.integrations\.mcpServers\(\)/);
+  assert.match(panelSource, /api\.integrations\.operations\(connectorServer\)/);
+  assert.match(panelSource, /label="Account"/);
+  assert.match(panelSource, /label="Resource"/);
+  assert.match(panelSource, /filterable[\s\S]*?ariaLabel="Integration operation"/);
+  assert.match(panelSource, /function ConnectorArgumentField/);
+  assert.match(panelSource, /selectedOperation\?\.input_schema\?\.properties/);
+  assert.match(panelSource, /This operation can remove or irreversibly change external data/);
+  assert.match(panelSource, /className="workflow-connector-advanced"/);
+  assert.match(panelSource, /k\.startsWith\("__raw_"\) \|\| k\.startsWith\("__connector_"\)/);
+  assert.match(apiSource, /integrations\/mcp-servers\/\$\{encodeURIComponent\(serverKey\)\}\/tools/);
+  assert.match(integrationsRouterSource, /async def list_mcp_server_tools/);
+  assert.match(integrationCatalogSource, /module\.list_tools\(\)/);
+  assert.match(integrationCatalogSource, /tools_cached/);
+  assert.match(stylesSource, /\.workflow-connector-effect\.is-destructive/);
+});
+
+test("node dialog prioritizes configuration and keeps diagnostics compact", () => {
+  assert.match(panelSource, /className="workflow-node-dialog"/);
+  assert.match(panelSource, /bodyClassName="workflow-node-dialog-body"/);
+  assert.match(panelSource, /title=\{name \|\| `\$\{m\.label\} node`\}/);
+  assert.match(panelSource, />Configuration</);
+  assert.match(panelSource, />Data mapping</);
+  assert.match(panelSource, /<details className="workflow-node-settings">/);
+  assert.match(panelSource, /aria-expanded=\{testInputsOpen\}/);
+  assert.match(panelSource, /className="workflow-node-result-inputs"/);
+  assert.match(stylesSource, /\.workflow-node-dialog \{[\s\S]*?border: 0 !important/);
+  assert.match(stylesSource, /\.workflow-node-test-inputs-toggle:focus-visible/);
+  assert.match(stylesSource, /\.workflow-node-settings > summary:focus-visible/);
+});
+
+test("workflow editor header keeps the shared AI edit control and one accessible action toolbar", () => {
   assert.match(flowsSource, /className="workflow-editor-header"/);
   assert.match(flowsSource, /className="workflow-editor-identity"/);
   assert.match(flowsSource, /aria-label="Edit workflow name, description, and icon"/);
   assert.match(flowsSource, /className="workflow-editor-heading"/);
   assert.match(flowsSource, /className="workflow-editor-meta" aria-label="Workflow status"/);
-  assert.match(flowsSource, /className="workflow-editor-actions" aria-label="Workflow actions"/);
+  assert.match(flowsSource, /className="workflow-editor-actions" role="toolbar" aria-label="Workflow actions"/);
   assert.match(flowsSource, /className=\{`workflow-editor-validation is-\$\{state\}`\}/);
   assert.match(flowsSource, /<StatusBadge type=\{flow\.status === "active" \? "active" : "gray"\} dot>/);
-  assert.match(flowsSource, /className="workflow-editor-action workflow-editor-action-history"/);
-  assert.match(flowsSource, /className="workflow-editor-action workflow-editor-action-delete"/);
+  assert.match(flowsSource, /<AiEditButton[\s\S]*?className="workflow-editor-action workflow-editor-action-ai"[\s\S]*?onClick=\{openWorkflowAiEdit\}/);
+  assert.match(flowsSource, /ariaLabel="Add node"/);
+  assert.match(flowsSource, /ariaLabel="Deploy workflow"/);
+  assert.match(flowsSource, /<IconPlus size=\{17\}/);
+  assert.match(flowsSource, /<IconUpload size=\{16\}/);
+  assert.match(flowsSource, /<IconClock size=\{16\}/);
   assert.match(flowsSource, /title=\{t\("page\.flows\.delete_flow"\)\}/);
   assert.match(flowsSource, /loading=\{deleteMutation\.isPending\}/);
   assert.match(flowsSource, /closeOnConfirm=\{false\}/);
@@ -133,11 +218,13 @@ test("workflow editor header keeps identity, status, and actions consistent", ()
   assert.match(flowsSource, /const triggerKind = flow\.trigger \|\| flow\.trigger_type \|\| "manual"/);
   assert.match(flowsSource, /t\(TRIGGER_LABELS\[triggerKind\] \|\| triggerKind\)/);
   assert.match(stylesSource, /\.workflow-editor-header \{[\s\S]*?grid-template-columns: 36px minmax\(260px, 1fr\)/);
-  assert.match(stylesSource, /\.workflow-editor-actions \.workflow-editor-action \{[\s\S]*?height: 36px/);
+  assert.match(stylesSource, /\.workflow-editor-actions \{[\s\S]*?flex-wrap: nowrap[\s\S]*?overflow-x: auto/);
+  assert.match(stylesSource, /\.workflow-editor-actions \.workflow-editor-action \{[\s\S]*?width: 36px[\s\S]*?height: 36px/);
+  assert.match(stylesSource, /\.workflow-editor-actions \.workflow-editor-action\.workflow-editor-action-ai \{[\s\S]*?width: auto[\s\S]*?flex: 0 0 auto/);
   assert.match(stylesSource, /@media \(max-width: 1120px\)[\s\S]*?\.workflow-editor-controls \{[\s\S]*?grid-column: 2/);
-  assert.match(stylesSource, /@media \(max-width: 720px\)[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
-  assert.match(stylesSource, /\.workflow-editor-action-history \{[\s\S]*?grid-column: 1 \/ -1/);
-  assert.match(stylesSource, /\.workflow-editor-action-delete \{[\s\S]*?grid-column: 1 \/ -1/);
+  assert.match(stylesSource, /@media \(max-width: 720px\)[\s\S]*?\.workflow-editor-actions \{[\s\S]*?justify-content: flex-start/);
+  assert.doesNotMatch(flowsSource, /onAddNode=/);
+  assert.doesNotMatch(canvasSource, />\s*Add node\s*</);
 });
 
 test("workflow cards support direct open, contextual editing, and real metadata", () => {
@@ -189,8 +276,15 @@ test("inputs select connected upstream outputs and autocomplete in prompts", () 
   assert.match(panelSource, />Test inputs</);
   assert.match(panelSource, /Provide a value before testing this node\./);
   assert.match(panelSource, /resolveTestInputDefault\(input\.value, runVariables\)/);
+  assert.match(panelSource, /source: formatTestInputSource\(input\.value\)/);
+  assert.match(panelSource, /return "structured JSON"/);
+  assert.ok(
+    panelSource.indexOf("const mappedValue = resolveTestInputDefault(input.value, runVariables)")
+      < panelSource.indexOf("const previousValue = lastResult?.inputs?.[key]"),
+    "complete run variables must win over truncated step-input previews",
+  );
   assert.match(panelSource, /config: \{ \.\.\.cleaned, inputs: testBindings\.length \? testBindings : undefined \}/);
-  assert.match(panelSource, /Not saved/);
+  assert.match(panelSource, /not saved/);
   assert.match(panelSource, /setForId\(undefined\)/);
   assert.match(flowsSource, /silently reusing stale workflow data/);
   assert.match(flowsSource, /resolveWorkflowFinalResult/);
@@ -212,13 +306,42 @@ test("inputs select connected upstream outputs and autocomplete in prompts", () 
 
 test("full workflow runs collect trigger inputs and submit them to the stream", () => {
   assert.match(flowsSource, /function workflowRunInputs/);
+  assert.match(flowsSource, /!key \|\| row\?\.hidden \|\| seen\.has\(key\)/);
   assert.match(flowsSource, /Provide the entry data for this run/);
   assert.match(flowsSource, /Provide a value before running this workflow\./);
   assert.match(flowsSource, /\{ trigger_data: triggerData \}/);
   assert.match(flowsSource, /requestWorkflowRun\(flow\)/);
   assert.match(apiSource, /body: JSON\.stringify\(data \|\| \{\}\)/);
   assert.match(apiSource, /trigger_data\?: Record<string, any>/);
-  assert.match(validateSource, /s\.type === "agent".*!isEmpty\(s\.config\?\.prompt\)/);
+  assert.match(flowsSource, /rawType === "integer"/);
+  assert.match(flowsSource, /input\.integer && !Number\.isInteger\(parsed\)/);
+  assert.match(flowsSource, /min=\{input\.minimum\}/);
+  assert.match(flowsSource, /max=\{input\.maximum\}/);
+  assert.match(validateSource, /s\.type === "agent"[\s\S]*?!isEmpty\(s\.config\?\.prompt\)/);
+});
+
+test("ordinary research links stay in structured workflow results", () => {
+  assert.deepEqual(workflowMediaModule.extractMediaRefs({
+    canonical_url: "https://example.com/article",
+    public_signal_refs: [
+      "https://news.ycombinator.com/item?id=1 — public signal only",
+      { url: "https://www.reddit.com/r/startups/comments/example" },
+    ],
+  }), []);
+  assert.deepEqual(workflowMediaModule.extractMediaRefs({
+    image_url: "https://cdn.example.com/approved-image.png",
+  }), [{
+    url: "https://cdn.example.com/approved-image.png",
+    type: "image",
+    name: "approved-image.png",
+  }]);
+  assert.deepEqual(workflowMediaModule.extractMediaRefs({
+    url: "/api/v1/fs/download/approved-asset",
+  }), [{
+    url: "/api/v1/fs/download/approved-asset",
+    type: "file",
+    name: undefined,
+  }]);
 });
 
 test("workflow start edits the run contract and exposes its outputs", () => {
@@ -231,4 +354,15 @@ test("workflow start edits the run contract and exposes its outputs", () => {
   assert.match(panelSource, /Schema \(JSON\)/);
   assert.match(panelSource, /row\.schema/);
   assert.match(panelSource, /k === "run_inputs"/);
+});
+
+test("terminal nodes expose explicit structured input and output mappings", () => {
+  assert.match(panelSource, /Terminal node — map the Workflow result below\./);
+  assert.match(panelSource, /step\.type !== "unsupported"/);
+  assert.doesNotMatch(panelSource, /step\.type !== "end" && step\.type !== "unsupported"/);
+  assert.match(panelSource, /workflow-binding-structured-value/);
+  assert.match(panelSource, /JSON\.parse\(raw\)/);
+  assert.match(panelSource, /hasBindingValueErrors/);
+  assert.match(panelSource, /"image", "video", "audio"/);
+  assert.match(stylesSource, /\.workflow-binding-structured-value \{/);
 });

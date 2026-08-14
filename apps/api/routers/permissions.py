@@ -450,7 +450,12 @@ async def _redeem_staff_invite_for_user(
         name=name,
         phone=phone,
     )
-    access_token = create_access_token(user.id, user.entity_id, user.role)
+    access_token = create_access_token(
+        user.id,
+        user.entity_id,
+        user.role,
+        token_version=user.token_version,
+    )
 
     return AcceptInviteResponse(
         access_token=access_token,

@@ -56,6 +56,7 @@ ITEM_KINDS: tuple[str, ...] = (
     "workflow_change",
     "goal_change",
     "experiment",
+    "workflow_run",
 )
 
 # proposal item statuses (lifecycle vocabulary; v1 uses the first three)
@@ -89,9 +90,11 @@ ACTION_KEY_BY_KIND: dict[str, str | None] = {
     "goal_change.pause": "workspace.proposal.goal_change.pause",
     "goal_change.archive": "workspace.proposal.goal_change.archive",
     "experiment": "workspace.proposal.experiment",
+    "workflow_run": "workspace.proposal.workflow_run",
 }
 
 TASK_ACTION_KEY = ACTION_KEY_BY_KIND["task"]
+EXTERNAL_TASK_ACTION_KEY = ACTION_KEY_BY_KIND["task.external"]
 
 # Every distinct governance action_key a Strategist proposal can mint, in
 # catalog order (tasks → automation → workflow → goal → experiment). The
@@ -121,6 +124,7 @@ STRATEGIST_ACTION_LABELS: dict[str, str] = {
     "workspace.proposal.goal_change.pause": "Pause goals",
     "workspace.proposal.goal_change.archive": "Archive goals",
     "workspace.proposal.experiment": "Start experiments",
+    "workspace.proposal.workflow_run": "Run Workspace Flows",
 }
 
 
@@ -251,6 +255,7 @@ def change_action_key(kind: str, operation: str) -> str:
     return action_key
 
 EXPERIMENT_ACTION_KEY = ACTION_KEY_BY_KIND["experiment"]
+WORKFLOW_RUN_ACTION_KEY = ACTION_KEY_BY_KIND["workflow_run"]
 
 # M8 catalog: guardrails.max_cost at or below this keeps an experiment item
 # at medium risk; anything above is high risk (standing grants for high-risk

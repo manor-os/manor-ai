@@ -414,6 +414,55 @@ test("History retry remains capability and intervention-schema gated", () => {
   assert.doesNotMatch(detailSource, /capabilities\?\.can_control !== false/);
 });
 
+test("History exposes cancellation for the latest controllable problem run", () => {
+  assert.equal(displayModule.canCancelWorkflowRun({
+    status: "failed",
+    capabilities: { can_control: true },
+  }), true);
+  assert.equal(displayModule.canCancelWorkflowRun({
+    status: "completed",
+    business_outcome: "needs_input",
+    capabilities: { can_control: true },
+  }), true);
+  assert.equal(displayModule.canCancelWorkflowRun({
+    status: "completed",
+    business_outcome: "completed",
+    capabilities: { can_control: true },
+  }), false);
+  assert.equal(displayModule.canCancelWorkflowRun({
+    status: "failed",
+    capabilities: { can_control: false },
+  }), false);
+
+  assert.match(workspaceSource, /className="workflow-run-history-row-cancel"/);
+  assert.match(workspaceSource, /<span>\{t\("component\.workflow_run\.action\.cancel"\)\}<\/span>/);
+  assert.match(workspaceSource, /api\.workflows\.cancelRun\(runId\)/);
+  assert.match(workspaceSource, /cancelTarget/);
+  assert.match(workspaceSource, /<ConfirmDialog/);
+  assert.match(detailSource, /className="workflow-run-history-detail-cancel"/);
+  assert.match(detailSource, /onRequestCancel\(controlRun\)/);
+  assert.match(detailSource, /<span>\{t\("component\.workflow_run\.action\.cancel"\)\}<\/span>/);
+  assert.match(
+    cssSource,
+    /\.workflow-run-history-row-cancel,\s*\.workflow-run-history-detail-cancel\s*\{[^}]*width:\s*auto[^}]*padding:\s*0 9px/,
+  );
+});
+
+test("History artifact labels prefer names and paths over opaque document IDs", () => {
+  assert.equal(displayModule.workflowArtifactLabel({
+    document_id: "01KZOPAQUE",
+    name: "final-video.mp4",
+  }, "Artifact 1"), "final-video.mp4");
+  assert.equal(displayModule.workflowArtifactLabel({
+    document_id: "01KZOPAQUE",
+    fs_path: "Product Videos/project/final/final-video.mp4",
+  }, "Artifact 1"), "final-video.mp4");
+  assert.equal(displayModule.workflowArtifactLabel({
+    document_id: "01KZOPAQUE",
+  }, "Artifact 1"), "Artifact 1");
+  assert.match(detailSource, /workflowArtifactLabel\(\s*ref/);
+});
+
 test("History retry accepts only compatible editable schemas and explicit no-input schemas", () => {
   assert.equal(displayModule.workflowRetrySchemaIsCompatible({
     truncated: true,

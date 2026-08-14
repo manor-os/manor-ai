@@ -80,7 +80,7 @@ logger = logging.getLogger(__name__)
 # Type for the tool executor callback
 ToolExecutor = Callable[[str, Dict[str, Any]], Awaitable[str]]
 
-DEFAULT_MAX_ROUNDS = 100
+DEFAULT_MAX_ROUNDS = 200
 TOOL_RESULT_MAX_CHARS = 4000
 CHROME_TOOL_RESULT_MAX_CHARS = 12000
 MAX_BROWSER_SCREENSHOT_DATA_URL_CHARS = 20_000_000
@@ -106,6 +106,8 @@ FINAL_RESPONSE_SENTINEL = "<manor-final-response>"
 FINAL_RESPONSE_SENTINELS = (
     FINAL_RESPONSE_SENTINEL,
     "</manor-final-response>",
+    "<final>",
+    "</final>",
 )
 
 _BROWSER_SCREENSHOT_DATA_URL_RE = re.compile(
@@ -796,6 +798,34 @@ def _credit_exhausted_result(
     )
 
 
+def _billing_settlement_failed_result(
+    error: Exception,
+    *,
+    messages: List[Dict[str, Any]],
+    usage: Dict[str, Any],
+    rounds: int,
+    tool_calls_made: List[str],
+) -> AgenticResult:
+    return AgenticResult(
+        content=(
+            "We could not record the usage for this response safely. "
+            "Further AI work has been paused; please contact support."
+        ),
+        messages=messages,
+        usage=usage,
+        rounds=rounds,
+        tool_calls_made=tool_calls_made,
+        stop_reason="billing_settlement_failed",
+        error=str(error),
+    )
+
+
+async def _invoke_llm_callback(callback: Callable[..., Any], *args: Any) -> None:
+    result = callback(*args)
+    if inspect.isawaitable(result):
+        await result
+
+
 def _usage_total(usage: Dict[str, Any] | None) -> int:
     if not usage:
         return 0
@@ -900,7 +930,8 @@ def _retry_call_after_tool_continuation(
         else {}
     )
     retry_args = dict(args)
-    retry_args[str(continuation.get("argument_token_key"))] = token
+    argument_token_key = str(continuation.get("argument_token_key"))
+    retry_args[argument_token_key] = token
     return {"name": name, "arguments": retry_args}
 
 
@@ -1218,6 +1249,7 @@ def _chrome_task_ledger_from_messages(messages: list[dict]) -> str:
             ("target_tab_id", "tab_id"),
             ("groupId", "group_id"),
             ("group_id", "group_id"),
+            ("control_epoch", "control_epoch"),
             ("url", "url"),
             ("snapshot_id", "snapshot_id"),
         ):
@@ -1250,6 +1282,14 @@ def _chrome_task_ledger_from_messages(messages: list[dict]) -> str:
 
         status = str(payload.get("status") or "").strip()
         reason = str(payload.get("reason") or "").strip()
+        if status == "interrupted":
+            pending_action = ""
+            ledger.pop("pending_action", None)
+            ledger.pop("approval_id", None)
+            ledger["stage"] = "interrupted"
+            ledger["reason"] = reason or "user_takeover"
+            ledger["next"] = "report_user_takeover"
+            continue
         approval_required = status == "approval_required" or reason in {
             "side_effect_action_requires_confirmation",
             "sensitive_input_requires_confirmation",
@@ -2217,6 +2257,16 @@ def _compact_chrome_browser_result_for_context(
     compacted_str = json.dumps(compacted, ensure_ascii=False, default=str)
     if len(compacted_str) <= max_chars:
         return compacted_str
+    if semantic_ref_floor > 0:
+        compacted = _build_minimal_chrome_browser_result(
+            tool_name,
+            parsed,
+            digest=digest,
+            semantic_ref_floor=0,
+        )
+        compacted_str = json.dumps(compacted, ensure_ascii=False, default=str)
+        if len(compacted_str) <= max_chars:
+            return compacted_str
     compacted = _build_ultra_minimal_chrome_action_result(tool_name, parsed, digest=digest)
     if compacted is not None:
         compacted_str = json.dumps(compacted, ensure_ascii=False, default=str)
@@ -3271,12 +3321,15 @@ async def agentic_loop(
     on_tool_start: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     on_tool_end: Optional[Callable[..., Any]] = None,
     on_llm_call: Optional[Callable] = None,
+    on_llm_call_before: Optional[Callable[..., Any]] = None,
+    on_llm_usage_settled: Optional[Callable[..., Any]] = None,
     stream_handler: Optional[Callable] = None,
     metadata: Optional[Dict[str, Any]] = None,
     tool_schema_resolver: Optional[Callable[[str], Optional[dict]]] = None,
     forced_tool_calls: Optional[List[Dict[str, Any]]] = None,
     terminal_tool_result_policy: Optional[Dict[str, Any]] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    is_cancelled: Optional[Callable[[], Any]] = None,
 ) -> AgenticResult:
     """
     Run an agentic loop: call the LLM with tools, execute any requested tools,
@@ -3310,6 +3363,12 @@ async def agentic_loop(
     on_llm_call : callable, optional
         Hook called after each LLM API call with per-round telemetry:
         (round_num, duration_ms, usage, tool_calls_requested, finish_reason).
+    on_llm_call_before : callable, optional
+        Awaited immediately before each LLM request with
+        (round_num, model, messages, max_tokens).
+    on_llm_usage_settled : callable, optional
+        Awaited after each successful LLM response, before tools or a later
+        LLM request can run: (round_num, duration_ms, usage).
     stream_handler : callable, optional
         Async callback for per-token streaming from LLM. Passed through to
         Runtime-owned agentic LLM helpers.
@@ -3365,13 +3424,38 @@ async def agentic_loop(
             tool_calls_made=tool_calls_made,
         )
 
+    async def _cancel_requested() -> bool:
+        if is_cancelled is None:
+            return False
+        try:
+            result = is_cancelled()
+            return bool(await result) if inspect.isawaitable(result) else bool(result)
+        except Exception:
+            logger.warning("[agentic_loop] cancellation check failed", exc_info=True)
+            return False
+
+    def _cancelled_result() -> AgenticResult:
+        return AgenticResult(
+            content="",
+            messages=messages,
+            usage=total_usage,
+            rounds=rounds,
+            tool_calls_made=tool_calls_made,
+            stop_reason="cancelled",
+            error="chat_turn_cancelled",
+        )
+
     while rounds < max_rounds:
+        if await _cancel_requested():
+            return _cancelled_result()
         rounds += 1
 
         if forced_tool_calls:
             assistant_tool_calls = []
             forced_results = []
             for idx, forced in enumerate(forced_tool_calls):
+                if await _cancel_requested():
+                    return _cancelled_result()
                 name = str(forced.get("name") or "").strip()
                 args = forced.get("arguments") or forced.get("args") or {}
                 if not name:
@@ -3382,7 +3466,7 @@ async def agentic_loop(
                     args = dict(args)
                 tool_continuation = _pop_tool_continuation(args)
                 tool_call = {
-                    "id": f"auto_{rounds}_{idx}_{hashlib.sha1(name.encode('utf-8')).hexdigest()[:10]}",
+                    "id": f"auto_{rounds}_{idx}_{hashlib.sha1(name.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]}",
                     "name": name,
                     "arguments": args,
                 }
@@ -3515,6 +3599,34 @@ async def agentic_loop(
                 )
             if pending_browser_visual_observations:
                 llm_messages = [*llm_messages, *pending_browser_visual_observations]
+            if on_llm_call_before:
+                try:
+                    await _invoke_llm_callback(
+                        on_llm_call_before,
+                        rounds,
+                        model,
+                        llm_messages,
+                        max_tokens,
+                    )
+                except CreditExhaustedError as exc:
+                    return _credit_exhausted_result(
+                        exc,
+                        messages=messages,
+                        usage=total_usage,
+                        rounds=rounds,
+                        tool_calls_made=tool_calls_made,
+                    )
+                except Exception:
+                    logger.error("Unable to reserve credits for LLM round %d", rounds, exc_info=True)
+                    return _credit_exhausted_result(
+                        CreditExhaustedError(
+                            "Unable to reserve credits for this request. Please try again shortly."
+                        ),
+                        messages=messages,
+                        usage=total_usage,
+                        rounds=rounds,
+                        tool_calls_made=tool_calls_made,
+                    )
             if force_output_schema_repair:
                 content, usage = await runtime_execute_agentic_round_text_completion(
                     llm_messages,
@@ -3566,6 +3678,24 @@ async def agentic_loop(
 
         _add_usage(total_usage, usage)
 
+        if on_llm_usage_settled:
+            try:
+                await _invoke_llm_callback(
+                    on_llm_usage_settled,
+                    rounds,
+                    _llm_duration_ms,
+                    usage,
+                )
+            except Exception as exc:
+                logger.error("Unable to settle credits for LLM round %d", rounds, exc_info=True)
+                return _billing_settlement_failed_result(
+                    exc,
+                    messages=messages,
+                    usage=total_usage,
+                    rounds=rounds,
+                    tool_calls_made=tool_calls_made,
+                )
+
         # Report per-round telemetry
         if on_llm_call:
             try:
@@ -3574,6 +3704,12 @@ async def agentic_loop(
                 on_llm_call(rounds, _llm_duration_ms, usage, _tc_names, _finish)
             except Exception:
                 pass
+
+        # An explicit Chat stop may arrive while the provider is completing
+        # this request. Do not turn that final provider response into a normal
+        # ``done`` row; the current LLM call is settled, then the turn stops.
+        if await _cancel_requested():
+            return _cancelled_result()
 
         # -- Truncation detection: finish_reason='length' with tool_calls --
         # When max_tokens truncates a tool call, the arguments JSON is incomplete
@@ -3846,8 +3982,12 @@ async def agentic_loop(
         if any(_requires_serial_tool_execution(tc.get("name", "")) for tc in tool_calls):
             exec_results = []
             for tc in tool_calls:
+                if await _cancel_requested():
+                    return _cancelled_result()
                 exec_results.append(await _exec_one(tc))
         else:
+            if await _cancel_requested():
+                return _cancelled_result()
             exec_results = await asyncio.gather(*[_exec_one(tc) for tc in tool_calls])
         # Strip duration for downstream message-append loop — it only
         # needs (tc, result) for the messages array.
@@ -4016,7 +4156,14 @@ async def agentic_loop(
                                 if loaded_name and loaded_name not in loaded_tool_names:
                                     tools.append(schema)
                                     loaded_tool_names.add(loaded_name)
-                            pending_auto_tool_calls.extend(_auto_tool_calls_from_result(tool_result, loaded_tool_names))
+                        # Media continuations (notably pending video jobs) do
+                        # not carry MCP ``recommended_next_calls``. Evaluate
+                        # every structured tool result after any dynamic schema
+                        # loading so generate_file(kind="video") reliably
+                        # chains wait_media_jobs in ordinary LLM-driven turns.
+                        pending_auto_tool_calls.extend(
+                            _auto_tool_calls_from_result(tool_result, loaded_tool_names)
+                        )
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
 
@@ -4076,6 +4223,9 @@ async def agentic_loop(
                 forced_tool_calls = auto_calls
                 continue
 
+        if await _cancel_requested():
+            return _cancelled_result()
+
         # Context compaction check
         messages = await _compact_messages(messages, model, temperature)
 
@@ -4097,6 +4247,34 @@ async def agentic_loop(
         else messages
     )
     _llm_start = time.time()
+    if on_llm_call_before:
+        try:
+            await _invoke_llm_callback(
+                on_llm_call_before,
+                rounds + 1,
+                model,
+                final_llm_messages,
+                max_tokens,
+            )
+        except CreditExhaustedError as exc:
+            return _credit_exhausted_result(
+                exc,
+                messages=messages,
+                usage=total_usage,
+                rounds=rounds,
+                tool_calls_made=tool_calls_made,
+            )
+        except Exception:
+            logger.error("Unable to reserve credits for final LLM round", exc_info=True)
+            return _credit_exhausted_result(
+                CreditExhaustedError(
+                    "Unable to reserve credits for this request. Please try again shortly."
+                ),
+                messages=messages,
+                usage=total_usage,
+                rounds=rounds,
+                tool_calls_made=tool_calls_made,
+            )
     final_content, final_usage = await runtime_execute_agentic_final_completion(
         final_llm_messages,
         temperature=temperature,
@@ -4110,6 +4288,23 @@ async def agentic_loop(
     final_usage["context_attribution"] = _estimate_context_attribution(messages, [])
     final_reasoning_content = _pop_reasoning_content(final_usage)
     _add_usage(total_usage, final_usage)
+    if on_llm_usage_settled:
+        try:
+            await _invoke_llm_callback(
+                on_llm_usage_settled,
+                rounds + 1,
+                _llm_duration_ms,
+                final_usage,
+            )
+        except Exception as exc:
+            logger.error("Unable to settle credits for final LLM round", exc_info=True)
+            return _billing_settlement_failed_result(
+                exc,
+                messages=messages,
+                usage=total_usage,
+                rounds=rounds + 1,
+                tool_calls_made=tool_calls_made,
+            )
     final_assistant_msg: Dict[str, Any] = {
         "role": "assistant",
         "content": final_content or "",

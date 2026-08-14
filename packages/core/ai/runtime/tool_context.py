@@ -26,6 +26,9 @@ RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
         "conversation_id",
         "task_id",
         "_workflow_project_id_from_context",
+        "_workflow_run_id_from_context",
+        "_workflow_lineage_root_run_id_from_context",
+        "_workflow_project_root_from_context",
         "_workflow_action_grant_id_from_context",
         "_workflow_scene_id_from_context",
         "_workflow_batch_capture_from_context",
@@ -82,6 +85,9 @@ class RuntimeToolCallContext:
     conversation_id: str | None = None
     task_id: str | None = None
     workflow_project_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_lineage_root_run_id: str | None = None
+    workflow_project_root: str | None = None
     workflow_action_grant_id: str | None = None
     workflow_scene_id: str | None = None
     workflow_batch_capture: str | None = None
@@ -111,6 +117,13 @@ def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeTool
         conversation_id=str(kwargs.get("conversation_id") or "") or None,
         task_id=str(kwargs.get("task_id") or "") or None,
         workflow_project_id=str(kwargs.get("_workflow_project_id_from_context") or "") or None,
+        workflow_run_id=str(kwargs.get("_workflow_run_id_from_context") or "") or None,
+        workflow_lineage_root_run_id=(
+            str(kwargs.get("_workflow_lineage_root_run_id_from_context") or "") or None
+        ),
+        workflow_project_root=(
+            str(kwargs.get("_workflow_project_root_from_context") or "") or None
+        ),
         workflow_action_grant_id=(
             str(kwargs.get("_workflow_action_grant_id_from_context") or "") or None
         ),

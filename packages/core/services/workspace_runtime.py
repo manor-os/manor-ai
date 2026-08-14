@@ -184,6 +184,43 @@ async def _pending_hitl_extra_context(
     ])
 
 
+async def _open_task_blockers_extra_context(
+    db: AsyncSession | None,
+    *,
+    entity_id: str | None,
+    workspace_id: str | None,
+) -> str | None:
+    """Render open lease-origin HITL requests (paused task steps) so the
+    chat agent knows a task is waiting on the user — and routes an answer
+    back to it instead of starting a fresh delegation without the task's
+    tools. Complements ``_pending_hitl_extra_context``: that section covers
+    chat-message pending actions; this one covers the ``hitl_requests``
+    table rows minted by ``lease_needs_human``."""
+    if not db or not entity_id or not workspace_id:
+        return None
+    try:
+        from packages.core.services.task_blockers import list_open_task_blockers
+
+        blockers = await list_open_task_blockers(
+            db, entity_id=entity_id, workspace_id=workspace_id,
+        )
+    except Exception:
+        logger.warning("open task blocker context failed (ignored)", exc_info=True)
+        return None
+    if not blockers:
+        return None
+    return "\n".join([
+        "## Open Task Blockers",
+        "Paused task steps waiting on the user. When the latest user message "
+        "answers, confirms, or declines one of them, call `answer_task_blocker` "
+        "with its `request_id` — the original task then resumes with its own "
+        "tools. Do not start a new delegation for the same goal while its "
+        "blocker is open. Login-wall blockers (`needs_login`) can only be "
+        "completed from the card's sign-in flow, not by this tool.",
+        compact_runtime_json(blockers, max_chars=4000),
+    ])
+
+
 async def _load_task_for_runtime(
     db: AsyncSession,
     *,
@@ -233,14 +270,6 @@ async def load_conversation_runtime_context(
             workspace_id=conv.workspace_id,
             task_id=conv.thread_ref_id,
         )
-    elif workspace_scoped and conv.workspace_id:
-        filters = [
-            Task.conversation_id == conv.id,
-            Task.workspace_id == conv.workspace_id,
-        ]
-        if entity_id:
-            filters.append(Task.entity_id == entity_id)
-        task = (await db.execute(select(Task).where(*filters).limit(1))).scalar_one_or_none()
 
     if task:
         runtime["task_id"] = task.id
@@ -528,6 +557,16 @@ async def resolve_workspace_runtime(
             thread_ref_id = thread_ref_id or task.id
             if not extra_context:
                 extra_context = _task_extra_context(task)
+
+    task_blocker_context = await _open_task_blockers_extra_context(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+    )
+    if task_blocker_context:
+        extra_context = "\n\n".join(
+            part for part in [extra_context, task_blocker_context] if part
+        )
 
     resolved_is_master = (
         bool(is_master)
@@ -888,6 +927,14 @@ async def sync_workspace_runtime_schedules(
     workspace: Workspace,
 ) -> None:
     """Make scheduler rows match the workspace's runtime state."""
+    if workspace.deleted_at is None and workspace.status == "paused":
+        # Keep automation definitions visible and restorable while making the
+        # paused state explicit in the Automations UI. This also covers the
+        # built-in Strategist/evolution jobs instead of deleting them.
+        from packages.core.services.scheduler_service import pause_workspace_automations
+
+        await pause_workspace_automations(db, workspace.id, workspace.entity_id)
+        return
     if (
         workspace.deleted_at is None
         and workspace.status == "active"

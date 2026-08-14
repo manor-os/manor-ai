@@ -22,7 +22,7 @@
     },
     "cover_image_url": null,
     "forked_from_id": null,
-    "changelog": "Validated on 2026-06-06: added starter operating documents, batch planning workflow, acceptance criteria, and sandbox verification evidence."
+    "changelog": "Updated on 2026-08-04: workflow starter inputs now resolve from the trigger payload before downstream stages run. Validated on 2026-06-06: added starter operating documents, batch planning workflow, acceptance criteria, and sandbox verification evidence."
   },
   "contract": {
     "variables": [
@@ -725,38 +725,7 @@
         "priority": 2
       }
     ],
-    "task_categories": [
-      {
-        "key": "strategy",
-        "label": "Strategy",
-        "sort_order": 10
-      },
-      {
-        "key": "script",
-        "label": "Script",
-        "sort_order": 20
-      },
-      {
-        "key": "production",
-        "label": "Production",
-        "sort_order": 30
-      },
-      {
-        "key": "distribution",
-        "label": "Distribution",
-        "sort_order": 35
-      },
-      {
-        "key": "community",
-        "label": "Community",
-        "sort_order": 38
-      },
-      {
-        "key": "analytics",
-        "label": "Analytics",
-        "sort_order": 40
-      }
-    ],
+    "task_categories": [],
     "custom_fields": [
       {
         "name": "content_pillar",
@@ -834,14 +803,7 @@
         "sort_order": 60
       }
     ],
-    "sla_policies": [
-      {
-        "key": "operator_review",
-        "target": "task",
-        "threshold_hours": 24,
-        "description": "Review generated assets or decisions within one workday."
-      }
-    ],
+    "sla_policies": [],
     "escalation_rules": [
       {
         "key": "public_or_financial_action",

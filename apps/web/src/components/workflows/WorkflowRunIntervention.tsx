@@ -1,9 +1,13 @@
-import { useEffect, useId, useMemo, useState } from "react";
-import { IconChevronDown, IconError, IconPause } from "../icons";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { IconChevronDown, IconError, IconList, IconPause } from "../icons";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel } from "../../lib/taskDisplay";
 import Button from "../ui/Button";
-import WorkflowApprovalReview from "./WorkflowApprovalReview";
+import LoadingSpinner from "../ui/LoadingSpinner";
+import WorkflowApprovalReview, {
+  EditableWorkflowApprovalReview,
+  workflowReviewIsEditable,
+} from "./WorkflowApprovalReview";
 import {
   WorkflowSchemaFields,
   parseWorkflowSchemaDraft,
@@ -106,6 +110,11 @@ export interface WorkflowRunInterventionProps {
   disabled?: boolean;
   loading?: boolean;
   error?: unknown;
+  historyHref?: string;
+  historyReview?: unknown;
+  historyReviewTitle?: string;
+  historyReviewLoading?: boolean;
+  historyReviewError?: unknown;
 }
 
 export default function WorkflowRunIntervention({
@@ -115,6 +124,11 @@ export default function WorkflowRunIntervention({
   disabled = false,
   loading = false,
   error,
+  historyHref,
+  historyReview,
+  historyReviewTitle,
+  historyReviewLoading = false,
+  historyReviewError,
 }: WorkflowRunInterventionProps) {
   const stableActionIdentity = actionIdentity(action);
   const schema = useMemo(() => actionSchema(action), [stableActionIdentity]);
@@ -126,15 +140,25 @@ export default function WorkflowRunIntervention({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submittingOption, setSubmittingOption] = useState("");
   const [submissionError, setSubmissionError] = useState<unknown>();
+  const [reviewDraft, setReviewDraft] = useState<Record<string, unknown> | null>(null);
+  const [reviewDraftIsValid, setReviewDraftIsValid] = useState(true);
   const [expanded, setExpanded] = useState(false);
+  const [validationFocusRequest, setValidationFocusRequest] = useState(0);
   const detailsId = useId();
+  const detailsBodyRef = useRef<HTMLDivElement>(null);
   const attentionNode = run.nodes[interventionNodeIndex(run, action)];
   const retrySchemaCompatible = action.kind !== "workflow_retry"
     || workflowRetrySchemaIsCompatible(action.editable_input_schema);
   const isFailed = attentionNode?.status === "failed" || run.status === "failed";
+  const displayedReview = action.review ?? historyReview;
+  const editableReview = action.kind === "workflow_approval"
+    && workflowReviewIsEditable(displayedReview);
   const allowedOptions = (action.options || [])
     .map((option) => `${option}`.trim())
-    .filter(Boolean);
+    .filter((option) => (
+      Boolean(option)
+      && !(editableReview && option.toLowerCase().replace(/[-\s]+/g, "_") === "revise")
+    ));
   const preservedCount = Array.isArray(action.preserved_receipts)
     ? action.preserved_receipts.length
     : 0;
@@ -155,9 +179,19 @@ export default function WorkflowRunIntervention({
     truncationText,
   );
   const shownError = formatWorkflowError(submissionError ?? error, truncationText);
+  const validationErrorCount = Object.values(errors).filter(Boolean).length;
+  const previewText = validationErrorCount > 0
+    ? t("component.workflow_run.input_validation_error", { count: validationErrorCount })
+    : reasonPreview;
   const rootKey = action.kind === "workflow_retry" ? "variables" : "inputs";
   const hasFields = Boolean(Object.keys(schema.properties || {}).length);
-  const hasReview = action.kind === "workflow_approval" && action.review != null;
+  const reviewFromHistory = action.kind === "workflow_approval"
+    && action.review_location === "workflow_history";
+  const displayedReviewTitle = action.review != null
+    ? action.review_title as string | undefined
+    : historyReviewTitle || action.review_title as string | undefined;
+  const hasReview = action.kind === "workflow_approval" && displayedReview != null;
+  const reviewInHistory = reviewFromHistory && Boolean(historyHref);
   const busy = loading || Boolean(submittingOption);
   const primaryOption = allowedOptions.find((option) => {
     const normalized = option.toLowerCase().replace(/[-\s]+/g, "_");
@@ -171,6 +205,9 @@ export default function WorkflowRunIntervention({
     || preservedCount > 0
     || hasFields
     || shownError
+    || reviewFromHistory
+    || historyReviewLoading
+    || Boolean(historyReviewError)
     || secondaryOptions.length > 0
   );
 
@@ -179,8 +216,34 @@ export default function WorkflowRunIntervention({
     setErrors({});
     setSubmissionError(undefined);
     setSubmittingOption("");
+    setReviewDraft(null);
+    setReviewDraftIsValid(true);
     setExpanded(false);
+    setValidationFocusRequest(0);
   }, [stableActionIdentity]);
+
+  useEffect(() => {
+    if (!expanded || validationFocusRequest === 0) return;
+    const detailsBody = detailsBodyRef.current;
+    const firstInvalidField = detailsBody?.querySelector<HTMLElement>('[aria-invalid="true"]');
+    if (!detailsBody || !firstInvalidField) return;
+    let collapsedGroup = firstInvalidField.closest<HTMLDetailsElement>('details:not([open])');
+    while (collapsedGroup) {
+      collapsedGroup.open = true;
+      collapsedGroup = collapsedGroup.parentElement?.closest<HTMLDetailsElement>(
+        'details:not([open])',
+      ) ?? null;
+    }
+    firstInvalidField.focus({ preventScroll: true });
+    const detailsBounds = detailsBody.getBoundingClientRect();
+    const fieldBounds = firstInvalidField.getBoundingClientRect();
+    detailsBody.scrollTo({
+      top: Math.max(0, detailsBody.scrollTop + fieldBounds.top - detailsBounds.top - 12),
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }, [expanded, validationFocusRequest]);
 
   const resolve = async (option: string) => {
     const normalized = option.toLowerCase().replace(/[-\s]+/g, "_");
@@ -196,11 +259,22 @@ export default function WorkflowRunIntervention({
       setErrors(nextErrors);
       if (Object.keys(nextErrors).length) {
         setExpanded(true);
+        setValidationFocusRequest((current) => current + 1);
         return;
       }
       payload = action.kind === "workflow_retry"
         ? { variables: parsed }
         : { inputs: parsed };
+    } else if (
+      action.kind === "workflow_approval"
+      && editableReview
+      && !["cancel", "reject", "revise"].includes(normalized)
+    ) {
+      if (!reviewDraftIsValid) {
+        setExpanded(true);
+        return;
+      }
+      payload = { review: reviewDraft ?? displayedReview };
     }
     setSubmittingOption(option);
     setSubmissionError(undefined);
@@ -232,11 +306,25 @@ export default function WorkflowRunIntervention({
             : t("component.workflow_run.attention_required")}
         </span>
 
-        {reasonPreview && (
-          <p className="workflow-run-intervention-preview">{reasonPreview}</p>
+        {previewText && (
+          <p
+            className={`workflow-run-intervention-preview${validationErrorCount > 0 ? " is-error" : ""}`}
+            role={validationErrorCount > 0 ? "alert" : undefined}
+          >
+            {previewText}
+          </p>
         )}
 
         <div className="workflow-run-intervention-summary-actions">
+          {reviewInHistory && (
+            <a
+              className="approval-action-bar__review-link workflow-run-intervention-history-link"
+              href={historyHref}
+            >
+              <IconList size={13} aria-hidden="true" />
+              {t("component.workflow_run.review_in_history")}
+            </a>
+          )}
           {hasDetails && (
             <Button
               size="sm"
@@ -270,12 +358,42 @@ export default function WorkflowRunIntervention({
       </div>
 
       {expanded && (
-        <div className="workflow-run-intervention-body" id={detailsId}>
-          {hasReview && (
-            <WorkflowApprovalReview
-              review={action.review}
-              reviewTitle={action.review_title as string | undefined}
+        <div
+          ref={detailsBodyRef}
+          className="workflow-run-intervention-body"
+          id={detailsId}
+        >
+          {hasReview && editableReview && (
+            <EditableWorkflowApprovalReview
+              key={stableActionIdentity}
+              review={displayedReview}
+              reviewTitle={displayedReviewTitle}
+              disabled={disabled || busy}
+              onDraftState={(draft, valid) => {
+                setReviewDraft(draft);
+                setReviewDraftIsValid(valid);
+              }}
             />
+          )}
+
+          {hasReview && !editableReview && (
+            <WorkflowApprovalReview
+              review={displayedReview}
+              reviewTitle={displayedReviewTitle}
+            />
+          )}
+
+          {!hasReview && historyReviewLoading && (
+            <div className="workspace-workflow-run-query-state" role="status">
+              <LoadingSpinner size={13} />
+              <span>{t("component.workflow_run.loading_review")}</span>
+            </div>
+          )}
+
+          {!hasReview && Boolean(historyReviewError) && (
+            <p className="workflow-run-intervention-error" role="alert">
+              {t("component.workflow_run.review_load_error")}
+            </p>
           )}
 
           {(reason || requiredChange || preservedCount > 0) && (

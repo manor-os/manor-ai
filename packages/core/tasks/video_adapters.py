@@ -6,8 +6,11 @@ artifact storage; adapters own provider routing and payload semantics.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+import json
 import logging
+import time
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import urlsplit
 
@@ -21,6 +24,8 @@ VIDEO_NATIVE_MODEL_MAP = {
     "bytedance/seedance-2.0-fast": "doubao-seedance-2-0-fast-260128",
     "kwaivgi/kling-v3.0-std": "kling-v3.0-std",
     "kwaivgi/kling-v3.0-pro": "kling-v3.0-pro",
+    # Atlas Cloud model ids are three-part vendor/model/route paths.
+    "atlascloud/wan-2.2-turbo-spicy": "atlascloud/wan-2.2-turbo-spicy/image-to-video",
 }
 
 
@@ -320,7 +325,7 @@ class OpenRouterVideoAdapter(VideoGenerationAdapter):
             "HTTP-Referer": "https://manor.ai",
             "X-Title": "Manor AI",
         }
-        api_base = "https://openrouter.ai/api/v1"
+        api_base = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
         async with runtime.http_client_cls(timeout=runtime.media_api_timeout) as client:
             resp = await client.post(f"{api_base}/videos", headers=headers, json=payload)
             data = resp.json()
@@ -365,6 +370,215 @@ class OpenRouterVideoAdapter(VideoGenerationAdapter):
             resolution,
             auth_headers={"Authorization": headers["Authorization"], "HTTP-Referer": "https://manor.ai"},
         )
+
+
+class VercelGatewayVideoAdapter(VideoGenerationAdapter):
+    """AI Gateway v4 async video-model adapter."""
+
+    adapter_name = "vercel_gateway"
+    provider = "vercel"
+    route = "vercel"
+    poll_provider = "vercel"
+
+    def metadata(self, model: str) -> VideoAdapterMetadata:
+        return VideoAdapterMetadata(
+            adapter=self.adapter_name,
+            provider=self.provider,
+            route=self.route,
+            native_model=model,
+        )
+
+    async def submit(
+        self,
+        job: _JobLike,
+        api_key: str,
+        base_url: str | None,
+        runtime: VideoAdapterRuntime,
+    ) -> dict[str, Any]:
+        from packages.core.services.vercel_ai_gateway import (
+            vercel_gateway_endpoint,
+            vercel_gateway_post,
+        )
+
+        model = job.model or "bytedance/seedance-2.0"
+        params = job.params or {}
+        duration = runtime.normalize_duration(params.get("duration", 5))
+        resolution = runtime.normalize_resolution(model, params.get("resolution", "720p"))
+        aspect_ratio = str(params.get("aspect_ratio") or "16:9")
+        public_base_url = str(params.get("public_base_url") or "").strip()
+
+        payload: dict[str, Any] = {
+            "prompt": job.prompt,
+            "n": 1,
+            "duration": duration,
+            "aspectRatio": aspect_ratio,
+            "resolution": _vercel_video_resolution(resolution, aspect_ratio),
+            "generateAudio": seedance_bool(params.get("generate_audio", False)),
+        }
+        if params.get("seed") is not None:
+            payload["seed"] = params["seed"]
+
+        frame_images: list[dict[str, Any]] = []
+        for frame_type, value in (
+            ("first_frame", params.get("first_frame_url")),
+            ("last_frame", params.get("last_frame_url")),
+        ):
+            if not value:
+                continue
+            frame_images.append(
+                {
+                    "frameType": frame_type,
+                    "image": await _vercel_video_url_file(
+                        str(value),
+                        job.entity_id,
+                        runtime=runtime,
+                        public_base_url=public_base_url,
+                    ),
+                }
+            )
+        if frame_images:
+            payload["frameImages"] = frame_images
+
+        input_references: list[dict[str, Any]] = []
+        for value in [
+            *(params.get("reference_urls") or []),
+            *(params.get("reference_video_urls") or []),
+        ]:
+            input_references.append(
+                await _vercel_video_url_file(
+                    str(value),
+                    job.entity_id,
+                    runtime=runtime,
+                    public_base_url=public_base_url,
+                )
+            )
+        if input_references:
+            payload["inputReferences"] = input_references
+
+        auth_method = str(params.get("vercel_auth_method") or "api-key")
+        try:
+            started = await vercel_gateway_post(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                protocol="video",
+                payload=payload,
+                auth_method=auth_method,
+                endpoint_suffix="start",
+                timeout=180.0,
+            )
+        except Exception as exc:
+            return {"error": str(exc)}
+
+        operation = started.get("operation")
+        if operation is None:
+            return {"error": "Vercel AI Gateway video start response omitted operation state."}
+
+        status_url = f"{vercel_gateway_endpoint(base_url, 'video')}/status"
+        operation_json = json.dumps(operation, separators=(",", ":"))
+        await runtime.remember_provider_poll(
+            job.id,
+            self.poll_provider,
+            status_url,
+            operation_json,
+        )
+
+        deadline = time.monotonic() + 720.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(5.0)
+            try:
+                status = await vercel_gateway_post(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    protocol="video",
+                    payload={"operation": operation},
+                    auth_method=auth_method,
+                    endpoint_suffix="status",
+                    timeout=60.0,
+                )
+            except Exception as exc:
+                logger.debug("Video job %s Vercel status poll failed: %s", job.id, exc)
+                continue
+
+            state = str(status.get("status") or "").strip().lower()
+            if state == "completed":
+                video_url = _vercel_video_result_url(status)
+                if not video_url:
+                    return {"error": "Vercel completed without video data."}
+                return await _download_adapter_result(
+                    runtime,
+                    job,
+                    video_url,
+                    model,
+                    duration,
+                    resolution,
+                )
+            if state in {"error", "cancelled"}:
+                return {
+                    "error": str(
+                        status.get("error")
+                        or "Vercel video generation was cancelled."
+                    )
+                }
+
+        raise TimeoutError("Vercel video generation is still pending after 720 seconds")
+
+
+def _vercel_video_resolution(resolution: str, aspect_ratio: str) -> str:
+    height = {"480p": 480, "720p": 720, "1080p": 1080}.get(resolution, 720)
+    width_ratio, height_ratio = {
+        "21:9": (21, 9),
+        "16:9": (16, 9),
+        "9:16": (9, 16),
+        "1:1": (1, 1),
+        "4:3": (4, 3),
+        "3:4": (3, 4),
+    }.get(aspect_ratio, (16, 9))
+    width = max(1, round(height * width_ratio / height_ratio))
+    return f"{width}x{height}"
+
+
+async def _vercel_video_url_file(
+    value: str,
+    entity_id: str,
+    *,
+    runtime: VideoAdapterRuntime,
+    public_base_url: str,
+) -> dict[str, str]:
+    url = await runtime.ensure_public_url(
+        value,
+        entity_id,
+        **runtime.public_url_kwargs(public_base_url),
+    )
+    lowered = urlsplit(url).path.lower()
+    media_type = (
+        "video/webm"
+        if lowered.endswith(".webm")
+        else "video/quicktime"
+        if lowered.endswith(".mov")
+        else "video/mp4"
+        if lowered.endswith(".mp4")
+        else "image/webp"
+        if lowered.endswith(".webp")
+        else "image/png"
+        if lowered.endswith(".png")
+        else "image/jpeg"
+    )
+    return {"type": "url", "url": url, "mediaType": media_type}
+
+
+def _vercel_video_result_url(payload: dict[str, Any]) -> str:
+    videos = payload.get("videos") or []
+    first = videos[0] if isinstance(videos, list) and videos else None
+    if not isinstance(first, dict):
+        return ""
+    if first.get("type") == "url" and first.get("url"):
+        return str(first["url"])
+    if first.get("type") == "base64" and first.get("data"):
+        media_type = str(first.get("mediaType") or "video/mp4")
+        return f"data:{media_type};base64,{str(first['data'])}"
+    return ""
 
 
 class VolcengineSeedanceAdapter(VideoGenerationAdapter):
@@ -544,19 +758,29 @@ class AtlasCloudVideoAdapter(VideoGenerationAdapter):
         public_base_url = str(params.get("public_base_url") or "").strip()
         base = (base_url or ATLASCLOUD_API_BASE).rstrip("/")
 
+        first_frame = params.get("first_frame_url")
+        if not first_frame:
+            # Verified against the live API: this route rejects prompt-only
+            # requests with "image is required for i2v".
+            return {
+                "error": (
+                    "Wan 2.2 Turbo (Atlas) is an image-to-video model — it needs a "
+                    "source image. Generate or attach an image first and pass it as "
+                    "the first frame, or switch to a text-to-video model."
+                )
+            }
+
         payload: dict[str, Any] = {
             "model": native_model,
             "prompt": job.prompt,
             "duration": duration,
             "resolution": resolution,
-        }
-        first_frame = params.get("first_frame_url")
-        if first_frame:
-            payload["image"] = await runtime.ensure_public_url(
+            "image": await runtime.ensure_public_url(
                 first_frame,
                 job.entity_id,
                 **runtime.public_url_kwargs(public_base_url),
-            )
+            ),
+        }
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         async with runtime.http_client_cls(timeout=runtime.media_api_timeout) as client:
@@ -568,13 +792,23 @@ class AtlasCloudVideoAdapter(VideoGenerationAdapter):
         logger.info(
             "Video job %s Atlas Cloud response (%d): %s", job.id, resp.status_code, str(data)[:500],
         )
-        if resp.status_code not in (200, 201, 202):
-            err = data.get("error") or data.get("message") or data
-            msg = err.get("message", "") if isinstance(err, dict) else str(err)
+        # Atlas wraps errors as {"code": N, "msg"|"message": "..."} and can
+        # return HTTP 200 with a non-200 inner code.
+        inner_code = data.get("code")
+        failed = resp.status_code not in (200, 201, 202) or (
+            isinstance(inner_code, int) and inner_code >= 400
+        )
+        if failed:
+            err = data.get("error") or data.get("message") or data.get("msg") or data
+            if isinstance(err, dict):
+                msg = str(err.get("message") or err.get("msg") or "")
+            else:
+                msg = str(err)
+            status = inner_code if isinstance(inner_code, int) and inner_code >= 400 else resp.status_code
             return {
                 "error": (
-                    f"Atlas Cloud generation failed ({resp.status_code}): {msg}"
-                    f"{provider_error_hint(resp.status_code, msg)}"
+                    f"Atlas Cloud generation failed ({status}): {msg}"
+                    f"{provider_error_hint(status, msg)}"
                 )
             }
 
@@ -777,6 +1011,8 @@ def select_video_generation_adapter(
     # even when the resolved key is an OpenRouter key.
     if selected_provider == "atlascloud":
         return AtlasCloudVideoAdapter()
+    if selected_provider == "vercel":
+        return VercelGatewayVideoAdapter()
     if (api_key or "").startswith("sk-or-"):
         return OpenRouterVideoAdapter()
     if selected_provider == "bytedance":
@@ -789,6 +1025,7 @@ def select_video_generation_adapter(
 def video_adapter_by_name(name: str) -> VideoGenerationAdapter | None:
     adapters: dict[str, VideoGenerationAdapter] = {
         OpenRouterVideoAdapter.adapter_name: OpenRouterVideoAdapter(),
+        VercelGatewayVideoAdapter.adapter_name: VercelGatewayVideoAdapter(),
         VolcengineSeedanceAdapter.adapter_name: VolcengineSeedanceAdapter(),
         KlingVideoAdapter.adapter_name: KlingVideoAdapter(),
         AtlasCloudVideoAdapter.adapter_name: AtlasCloudVideoAdapter(),

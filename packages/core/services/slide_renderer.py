@@ -14,6 +14,11 @@ import tempfile
 from pathlib import Path
 
 
+# Bump when rendering dependencies or font substitution rules change so stale
+# previews are not served from an older, visually incompatible cache.
+SLIDE_RENDER_CACHE_VERSION = "v2-office-font-aliases"
+
+
 async def render_slides(
     pptx_path: str, cache_dir: str, *, dpi: int = 150,
 ) -> list[str]:
@@ -133,6 +138,7 @@ def _prepare_soffice_input(file_path: str, tmp_dir: str, source_ext: str) -> str
 
 def _file_hash(path: str) -> str:
     h = hashlib.sha256()
+    h.update(SLIDE_RENDER_CACHE_VERSION.encode("utf-8"))
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)

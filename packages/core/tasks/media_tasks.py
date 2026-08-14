@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -653,12 +654,29 @@ async def _resume_video_job_from_provider(job) -> dict[str, Any]:
             "Authorization": headers["Authorization"],
             "HTTP-Referer": "https://manor.ai",
         }
+    elif credentials.provider == "vercel":
+        from packages.core.services.vercel_ai_gateway import vercel_gateway_headers
+
+        provider = "vercel"
+        headers = vercel_gateway_headers(
+            api_key=api_key,
+            model=model,
+            protocol="video",
+            auth_method=params.get("vercel_auth_method") or "api-key",
+        )
+        download_headers = None
     else:
         provider = credentials.provider
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         download_headers = None
 
-    poll_result = await _check_provider_poll_once(poll_url, headers, provider=provider)
+    poll_result = await _check_provider_poll_once(
+        poll_url,
+        headers,
+        provider=provider,
+        generation_id=str(poll_state.get("generation_id") or ""),
+        base_url=credentials.base_url_override if provider == "openrouter" else None,
+    )
     if poll_result.get("status") == "pending" or "error" in poll_result:
         return poll_result
 
@@ -703,32 +721,55 @@ def _provider_error_message(data: Any) -> str:
     return "Unknown error"
 
 
-def _video_adapter_runtime() -> video_adapters.VideoAdapterRuntime:
+def _video_adapter_runtime(
+    *, openrouter_base_url: str | None = None,
+) -> video_adapters.VideoAdapterRuntime:
+    resolved_openrouter_base = (openrouter_base_url or OPENROUTER_API_BASE_URL).rstrip("/")
     return video_adapters.VideoAdapterRuntime(
         http_client_cls=httpx.AsyncClient,
         media_api_timeout=MEDIA_API_TIMEOUT,
         ensure_public_url=_ensure_public_url,
         public_url_kwargs=_public_url_kwargs,
         remember_provider_poll=_remember_provider_poll,
-        poll_openrouter_generation=_poll_video_generation,
+        poll_openrouter_generation=lambda poll_url, headers: _poll_video_generation(
+            poll_url, headers, base_url=resolved_openrouter_base,
+        ),
         poll_volcengine_task=_poll_volcengine_task,
         poll_generic_video_task=_poll_generic_video_task,
         download_and_save=_download_and_save,
         extract_video_url=_extract_video_url,
         extract_task_id=_extract_task_id,
         provider_error_message=_provider_error_message,
-        openrouter_api_url=_openrouter_api_url,
+        openrouter_api_url=lambda value: _openrouter_api_url(value, resolved_openrouter_base),
         normalize_duration=normalize_video_duration,
         normalize_resolution=normalize_video_resolution,
     )
 
 
-async def _check_provider_poll_once(poll_url: str, headers: dict, *, provider: str) -> dict[str, Any]:
+async def _check_provider_poll_once(
+    poll_url: str,
+    headers: dict,
+    *,
+    provider: str,
+    generation_id: str = "",
+    base_url: str | None = None,
+) -> dict[str, Any]:
     """Read one provider poll endpoint and normalize pending/success/failure."""
-    request_url = _openrouter_api_url(poll_url) if provider == "openrouter" else poll_url
+    request_url = _openrouter_api_url(poll_url, base_url) if provider == "openrouter" else poll_url
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(request_url, headers=headers)
+            if provider == "vercel":
+                try:
+                    operation = json.loads(generation_id)
+                except (TypeError, ValueError):
+                    return {"error": "Vercel video recovery state is invalid"}
+                resp = await client.post(
+                    request_url,
+                    headers=headers,
+                    json={"operation": operation},
+                )
+            else:
+                resp = await client.get(request_url, headers=headers)
         try:
             data = resp.json()
         except Exception:
@@ -740,7 +781,11 @@ async def _check_provider_poll_once(poll_url: str, headers: dict, *, provider: s
     if resp.status_code >= 400:
         return {"error": f"Provider poll failed ({resp.status_code}): {_provider_error_message(data)}"}
 
-    video_url = _extract_video_url(data)
+    video_url = (
+        video_adapters._vercel_video_result_url(data)
+        if provider == "vercel"
+        else _extract_video_url(data)
+    )
     status = str(
         data.get("status")
         or (data.get("data") or {}).get("status")
@@ -752,7 +797,7 @@ async def _check_provider_poll_once(poll_url: str, headers: dict, *, provider: s
     if video_url and (not status or provider_status == MediaJobStatus.COMPLETED):
         return {"video_url": video_url}
     if provider == "openrouter" and provider_status == MediaJobStatus.COMPLETED:
-        return {"video_url": video_url or _openrouter_video_content_url(data, request_url)}
+        return {"video_url": video_url or _openrouter_video_content_url(data, request_url, base_url)}
     if provider_status == MediaJobStatus.COMPLETED:
         return {"video_url": video_url} if video_url else {"error": "Provider completed without a video URL"}
     if provider_status == MediaJobStatus.FAILED:
@@ -888,6 +933,7 @@ async def _call_video_api(job_id: str) -> dict:
         model=model,
         stored_adapter_name=stored_adapter_name,
         openrouter_adapter_name=video_adapters.OpenRouterVideoAdapter.adapter_name,
+        vercel_adapter_name=video_adapters.VercelGatewayVideoAdapter.adapter_name,
     )
     provider = credentials.provider
     api_key = credentials.api_key
@@ -936,7 +982,14 @@ async def _call_video_api(job_id: str) -> dict:
         and api_key.startswith("sk-or-")
     ):
         return {"error": f"Stored {adapter.adapter_name} video route requires a native provider API key."}
-    return await adapter.submit(job, api_key, base_url_override, _video_adapter_runtime())
+    return await adapter.submit(
+        job,
+        api_key,
+        base_url_override,
+        _video_adapter_runtime(
+            openrouter_base_url=base_url_override if provider == "openrouter" else None,
+        ),
+    )
 
 
 def _media_provider_model(model: str) -> str:
@@ -1022,14 +1075,15 @@ def _extract_task_id(data: dict) -> str:
     )
 
 
-def _openrouter_api_url(path_or_url: str) -> str:
+def _openrouter_api_url(path_or_url: str, base_url: str | None = None) -> str:
     """Normalize OpenRouter relative polling/content paths to absolute URLs."""
     value = str(path_or_url or "").strip()
     if value.startswith("http://") or value.startswith("https://"):
         return value
-    if value.startswith("/api/v1/"):
+    api_base = (base_url or OPENROUTER_API_BASE_URL).rstrip("/")
+    if value.startswith("/api/v1/") and api_base == OPENROUTER_API_BASE_URL:
         return f"https://openrouter.ai{value}"
-    return f"{OPENROUTER_API_BASE_URL}/{value.lstrip('/')}"
+    return f"{api_base}/{value.lstrip('/')}"
 
 
 def _openrouter_video_job_id(data: dict[str, Any], poll_url: str) -> str:
@@ -1045,12 +1099,15 @@ def _openrouter_video_job_id(data: dict[str, Any], poll_url: str) -> str:
     return str(data.get("id") or (data.get("data") or {}).get("id") or "").strip()
 
 
-def _openrouter_video_content_url(data: dict[str, Any], poll_url: str) -> str:
+def _openrouter_video_content_url(
+    data: dict[str, Any], poll_url: str, base_url: str | None = None,
+) -> str:
     """Fallback download URL for completed OpenRouter jobs without unsigned URLs."""
     job_id = _openrouter_video_job_id(data, poll_url)
     if not job_id:
         return ""
-    return f"{OPENROUTER_API_BASE_URL}/videos/{job_id}/content?index=0"
+    api_base = (base_url or OPENROUTER_API_BASE_URL).rstrip("/")
+    return f"{api_base}/videos/{job_id}/content?index=0"
 
 
 def _normalize_kling_base_url(base_url: str | None) -> str:
@@ -1220,16 +1277,25 @@ async def _download_and_save(
     """Download video from URL, save to entity FS, register as KB document."""
     from packages.core.services.entity_fs import get_entity_root, write_entity_file_atomic
 
-    dl_headers = auth_headers or {}
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-        resp = await client.get(video_url, headers=dl_headers)
-        resp.raise_for_status()
-        video_bytes = resp.content
+    content_type = ""
+    if video_url.startswith("data:"):
+        try:
+            header, encoded = video_url.split(",", 1)
+            content_type = header[5:].split(";", 1)[0].strip().lower()
+            video_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("Provider returned invalid base64 video data") from exc
+    else:
+        dl_headers = auth_headers or {}
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(video_url, headers=dl_headers)
+            resp.raise_for_status()
+            video_bytes = resp.content
+            content_type = resp.headers.get("content-type", "")
     if not video_bytes:
         raise RuntimeError("Provider returned an empty video file")
 
-    ct = resp.headers.get("content-type", "")
-    ext = ".webm" if "webm" in ct else ".mp4"
+    ext = ".webm" if "webm" in content_type else ".mp4"
 
     entity_root = get_entity_root(entity_id)
     from packages.core.services.generated_media_naming import (
@@ -1360,10 +1426,14 @@ async def _download_and_save(
 
 
 async def _poll_video_generation(
-    poll_url: str, headers: dict, *, timeout: float = 300.0
+    poll_url: str,
+    headers: dict,
+    *,
+    timeout: float = 300.0,
+    base_url: str | None = None,
 ) -> str:
     """Poll OpenRouter video generation URL until the video is ready."""
-    poll_url = _openrouter_api_url(poll_url)
+    poll_url = _openrouter_api_url(poll_url, base_url)
     deadline = time.monotonic() + timeout
     poll_interval = 5.0
 
@@ -1398,7 +1468,7 @@ async def _poll_video_generation(
                     or data.get("video_url")
                     or (data.get("output", {}) or {}).get("url")
                     or _extract_video_url(data)
-                    or _openrouter_video_content_url(data, poll_url)
+                    or _openrouter_video_content_url(data, poll_url, base_url)
                     or ""
                 )
             elif coerce_provider_media_status(status) == MediaJobStatus.FAILED:

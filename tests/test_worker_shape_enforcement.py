@@ -16,6 +16,12 @@ def test_enforce_genuine_empty_becomes_failure():
     assert "fs_path" in result.reason or "files" in result.reason
 
 
+def test_enforce_empty_artifact_list_becomes_failure():
+    result = enforce_output_shape("ArtifactResult", {"files": []})
+    assert isinstance(result, Failure)
+    assert "files" in result.reason
+
+
 def test_enforce_workspace_default_path():
     raw = {"files": [{"name": "RULES.md"}]}
     result = enforce_output_shape("ArtifactResult", raw, workspace_base_dir="Workspaces/Demo")

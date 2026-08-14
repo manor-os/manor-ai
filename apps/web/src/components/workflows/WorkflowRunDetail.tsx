@@ -13,14 +13,17 @@ import {
   IconEye,
   IconFlow,
   IconRefresh,
+  IconStop,
 } from "../icons";
 import Button from "../ui/Button";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import MediaPreview from "./MediaPreview";
+import PublicationReceiptCards from "./PublicationReceiptCards";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
 import {
   buildWorkflowSnapshotNodes,
   buildWorkflowRunTimeline,
+  canCancelWorkflowRun,
   canRetryWithoutCorrection,
   formatWorkflowDuration,
   formatWorkflowError,
@@ -29,6 +32,7 @@ import {
   isWorkflowRunActive,
   normalizeWorkflowArtifactRefs,
   workflowRetrySchemaIsCompatible,
+  workflowArtifactLabel,
   workflowRunDurationMs,
   workflowRunIsLegacy,
   workflowRunStatusPresentation,
@@ -56,6 +60,8 @@ interface WorkflowRunDetailProps {
   workflow?: WorkflowDefinition;
   onBack: () => void;
   onSelectRun: (runId: string) => void;
+  onRequestCancel: (run: WorkflowHistoryRun) => void;
+  cancellingRunId?: string;
 }
 
 const RUN_STATUSES = new Set<WorkflowRunStatus>([
@@ -97,13 +103,6 @@ function artifactReference(ref: WorkflowArtifactRef): string {
   return ref.fs_path || "";
 }
 
-function artifactLabel(ref: WorkflowArtifactRef, index: number): string {
-  const reference = artifactReference(ref);
-  return ref.name
-    || reference.split(/[\\/]/).filter(Boolean).pop()
-    || t("component.workflow_run_history.artifact_number", { count: index + 1 });
-}
-
 function mediaTypeFor(ref: WorkflowArtifactRef, reference: string): MediaType {
   const mime = (ref.mime_type || "").toLowerCase();
   if (mime.startsWith("image/")) return "image";
@@ -124,7 +123,14 @@ function artifactMediaRef(ref: WorkflowArtifactRef, index: number): MediaRef | n
     || reference.startsWith("blob:");
   if (!canPreview) return null;
   const type = mediaTypeFor(ref, reference);
-  return type === "file" ? null : { url: reference, type, name: artifactLabel(ref, index) };
+  return type === "file" ? null : {
+    url: reference,
+    type,
+    name: workflowArtifactLabel(
+      ref,
+      t("component.workflow_run_history.artifact_number", { count: index + 1 }),
+    ),
+  };
 }
 
 function ArtifactReferences({ refs }: { refs?: WorkflowArtifactRef[] }) {
@@ -135,17 +141,21 @@ function ArtifactReferences({ refs }: { refs?: WorkflowArtifactRef[] }) {
       {safeRefs.map((ref, index) => {
         const reference = artifactReference(ref);
         const media = artifactMediaRef(ref, index);
+        const label = workflowArtifactLabel(
+          ref,
+          t("component.workflow_run_history.artifact_number", { count: index + 1 }),
+        );
         return (
           <div className="workflow-run-history-artifact" key={`${reference || ref.name || "artifact"}-${index}`}>
             {reference ? (
               <InlineFileReferenceCard
                 reference={reference}
-                label={artifactLabel(ref, index)}
+                label={label}
                 compact
               />
             ) : (
               <span className="workflow-run-history-artifact-label">
-                {artifactLabel(ref, index)}
+                {label}
               </span>
             )}
             {(ref.mime_type || ref.status) && (
@@ -411,6 +421,8 @@ export default function WorkflowRunDetail({
   workflow,
   onBack,
   onSelectRun,
+  onRequestCancel,
+  cancellingRunId,
 }: WorkflowRunDetailProps) {
   const queryClient = useQueryClient();
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -467,6 +479,7 @@ export default function WorkflowRunDetail({
       ))
     : undefined;
   const controlRun = latestDetailedRun || family?.latestRun;
+  const canCancel = Boolean(controlRun && canCancelWorkflowRun(controlRun));
   const canControl = controlRun?.capabilities?.can_control === true;
   const canHaveRetry = controlRun?.status === "failed" || controlRun?.status === "completed";
   const controlQuery = useQuery({
@@ -598,10 +611,27 @@ export default function WorkflowRunDetail({
             {formatUserFacingText(workflowName)}
           </h2>
         </div>
-        <span className="workflow-run-history-status" data-status={familyStatusPresentation.iconStatus}>
-          <span aria-hidden="true" />
-          {t(`component.workflow_run.status.${familyStatusPresentation.labelKey}`)}
-        </span>
+        <div className="workflow-run-history-detail-actions">
+          <span className="workflow-run-history-status" data-status={familyStatusPresentation.iconStatus}>
+            <span aria-hidden="true" />
+            {t(`component.workflow_run.status.${familyStatusPresentation.labelKey}`)}
+          </span>
+          {canCancel && (
+            <button
+              type="button"
+              className="workflow-run-history-detail-cancel"
+              title={t("component.workflow_run.action.cancel")}
+              aria-label={t("component.workflow_run.action.cancel")}
+              disabled={cancellingRunId === controlRun.id}
+              onClick={() => onRequestCancel(controlRun)}
+            >
+              {cancellingRunId === controlRun.id
+                ? <LoadingSpinner size={13} />
+                : <IconStop size={13} aria-hidden="true" />}
+              <span>{t("component.workflow_run.action.cancel")}</span>
+            </button>
+          )}
+        </div>
       </header>
 
       {legacy && (
@@ -660,6 +690,8 @@ export default function WorkflowRunDetail({
         )}
         <ArtifactReferences refs={family.artifactRefs} />
       </section>
+
+      <PublicationReceiptCards receipts={run.publication_receipts} />
 
       {(Boolean(contextEntry) || hasDisplayValue(run.error)) && (
         <section className="workflow-run-history-context" data-status={runStatus(run.status)}>

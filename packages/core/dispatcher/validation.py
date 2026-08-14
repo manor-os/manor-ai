@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from jsonschema import Draft202012Validator, ValidationError
+from jsonschema import Draft202012Validator
 
 from packages.core.models.execution import ExecutionStep
 
@@ -60,19 +60,30 @@ def validate_step_output(
     _check(schema, result, side="output", step=step)
 
 
-# Free-form agent kinds (llm / subagent) receive planner-*guessed* output
-# schemas that frequently don't match the real, open-ended output — e.g. a
-# "research and draft posts" step the Planner annotated as ``{text: string}``
-# that actually returns ``{posts: [...]}``. For these kinds a schema mismatch is
-# advisory: coerce, log, and accept the real output instead of dead-failing the
-# step (3 retries → dead). Structured kinds (action / code / ...) keep hard
-# validation — their schemas are contracts with external systems.
+# Already-materialized legacy llm/subagent steps can carry unmarked guessed
+# schemas that don't match their open-ended output. Those remain advisory so an
+# upgrade cannot strand in-flight work. New PlanStep output contracts and
+# Task.expected_output schemas are provenance-marked hard contracts; structured
+# action/code schemas also remain hard contracts with external systems.
 _ADVISORY_OUTPUT_SCHEMA_KINDS = ("llm", "subagent")
 
 
-def output_schema_is_advisory(step_kind: str | None) -> bool:
+def output_schema_is_advisory(
+    step_kind: str | None,
+    schema: dict[str, Any] | None = None,
+) -> bool:
     """Whether an output-schema mismatch should be advisory (warn + accept)
-    rather than a hard step failure, based on the step ``kind``."""
+    rather than a hard step failure.
+
+    Unmarked schemas on already-materialized legacy free-form steps stay
+    advisory. New plans mark exact or canonical PlanStep output schemas, and
+    task deliverables come from Task.expected_output; both are declared before
+    execution and must fail/retry before the step can be marked done.
+    """
+    from packages.core.contracts.task_output import is_hard_output_contract_schema
+
+    if is_hard_output_contract_schema(schema):
+        return False
     return str(step_kind or "") in _ADVISORY_OUTPUT_SCHEMA_KINDS
 
 

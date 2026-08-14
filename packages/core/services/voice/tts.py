@@ -151,6 +151,62 @@ async def resolve_voice_model(entity_id: Optional[str]) -> Optional[str]:
     """
     if not entity_id:
         return None
+
+
+async def resolve_channel_tts_credentials(
+    entity_id: Optional[str], model: Optional[str],
+) -> tuple[str, str, bool]:
+    """Resolve channel TTS credentials as BYOK -> managed DB -> env.
+
+    The engine remains OpenAI-compatible; provider-specific protocol adapters
+    are used by the main media tool, while this narrow channel path only needs
+    a matching speech endpoint and its resolved base URL.
+    """
+    model_id = str(model or "openai/tts-1").strip()
+    try:
+        metadata = await _resolve_voice_metadata(entity_id)
+        byok_key = str((metadata or {}).get("llm_api_key") or "").strip()
+        if byok_key:
+            return (
+                byok_key,
+                str((metadata or {}).get("llm_base_url") or "https://api.openai.com/v1").rstrip("/"),
+                True,
+            )
+    except Exception:
+        logger.debug("Channel TTS BYOK lookup failed", exc_info=True)
+
+    try:
+        from packages.core.services.model_gateway import resolve_official_model_route
+
+        provider = model_id.split("/", 1)[0].lower() if "/" in model_id else "openai"
+        route = await resolve_official_model_route(
+            model_id,
+            reason="channel.voice.official_provider_key",
+            vercel_reason="channel.voice.vercel_gateway_key",
+            openrouter_reason="channel.voice.openrouter_fallback_key",
+            # OpenAITTS speaks the OpenAI-compatible /audio/speech protocol;
+            # Vercel's v4 speech protocol is handled by the media tool and
+            # must not receive this engine's request shape.
+            provider_chain=(provider, "openrouter"),
+        )
+        if route and route.api_key:
+            return route.api_key, route.base_url.rstrip("/"), False
+    except Exception:
+        logger.debug("Channel TTS managed credential lookup failed", exc_info=True)
+
+    return "", "", False
+
+
+async def _resolve_voice_metadata(entity_id: Optional[str]) -> dict | None:
+    if not entity_id:
+        return None
+    from packages.core.database import async_session
+    from packages.core.services.model_resolver import resolve_llm_metadata_for_user
+
+    async with async_session() as db:
+        return await resolve_llm_metadata_for_user(
+            "voice", user_id=None, entity_id=entity_id, db=db,
+        )
     try:
         from packages.core.services.model_resolver import resolve_model_for_user
         picked = await resolve_model_for_user(
@@ -165,6 +221,7 @@ async def resolve_voice_model(entity_id: Optional[str]) -> Optional[str]:
 
 def get_tts_engine(
     name: Optional[str] = None, *, model: Optional[str] = None,
+    api_key: Optional[str] = None, base_url: Optional[str] = None,
 ) -> TTSEngine:
     """Build a TTS engine, optionally pinning the model.
 
@@ -179,7 +236,12 @@ def get_tts_engine(
             f"No TTS engine registered under '{provider}'. "
             f"Available: {list(_FACTORY)}"
         )
-    return factory(**({"model": model} if model else {}))
+    kwargs = {"model": model} if model else {}
+    if api_key:
+        kwargs["api_key"] = api_key
+    if base_url:
+        kwargs["base_url"] = base_url
+    return factory(**kwargs)
 
 
 # ── Billing ──────────────────────────────────────────────────────────

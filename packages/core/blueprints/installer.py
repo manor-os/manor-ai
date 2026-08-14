@@ -19,7 +19,7 @@ Both modes:
     available unless ``create_missing_agents=true``)
   * Apply governance policy (writes a revision row)
   * Create custom field definitions
-  * Create goals (with their measurement schedules — same as
+  * Create stats and goals (with their measurement schedules — same as
     ``goals.create_goal``'s install_schedule path)
   * Create scheduled jobs
   * **Don't** create channels or browser sessions — those need
@@ -53,24 +53,36 @@ from packages.core.blueprints.freshness import (
 from packages.core.blueprints.payload import (
     PayloadError, migrate_payload, validate_payload,
 )
+from packages.core.blueprints.simulation import resolve_simulation_experience
 from packages.core.governance import WorkspacePolicy, update_policy
 from packages.core.models.base import generate_ulid
 from packages.core.models.custom_field import CustomFieldDefinition
-from packages.core.models.document import DocumentGroup
+from packages.core.models.document import (
+    Document,
+    DocumentGroup,
+    DocumentGroupMember,
+    VectorStatus,
+)
 from packages.core.models.integration_session import IntegrationSession
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
 from packages.core.models.memory import AgentMemory
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.skill import AgentSkillBinding, Skill
-from packages.core.models.workflow import WorkflowDefinition
+from packages.core.models.workflow import (
+    WorkflowBinding,
+    WorkflowDefinition,
+    WorkflowTemplateInstallation,
+)
 from packages.core.models.workspace import (
     Agent,
     AgentSubscription,
     AgentToolBinding,
     ToolDefinition,
+    Workspace,
 )
 from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 from packages.core.services.entity_service import create_workspace
+from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.workspace_access import (
     ensure_workspace_owner_membership,
     settings_with_default_workspace_access,
@@ -118,6 +130,7 @@ class InstallResult:
     mode: InstallMode
     blueprint_id: Optional[str]
     blueprint_slug: Optional[str]
+    stat_ids: list[str] = field(default_factory=list)
     goal_ids: list[str] = field(default_factory=list)
     subscription_ids: list[str] = field(default_factory=list)
     scheduled_job_ids: list[str] = field(default_factory=list)
@@ -199,6 +212,19 @@ async def install_blueprint(
         om_full["strategist"] = merged
 
     workspace_operating_model = om_full  # remaining keys (services, rules, strategist, ...)
+    # Prompts are portable workspace guidance, not executable task instances.
+    # Keep them under the operating model so export/install has one durable
+    # owner instead of accepting and silently dropping recipe.prompts.
+    if recipe.get("prompts"):
+        workspace_operating_model["blueprint_prompts"] = [dict(prompt) for prompt in recipe["prompts"]]
+    governance_rules = [
+        dict(rule) for rule in recipe.get("escalation_rules") or []
+        if isinstance(rule, dict) and not (
+            str(rule.get("sla_policy_key") or rule.get("sla_key") or "").strip()
+        )
+    ]
+    if governance_rules:
+        workspace_operating_model["blueprint_governance_rules"] = governance_rules
 
     name = workspace_name or manifest.get("title") or "Untitled workspace"
     if mode == InstallMode.SIMULATE:
@@ -225,8 +251,21 @@ async def install_blueprint(
         settings.setdefault("created_by_user_id", user_id)
     if mode == InstallMode.SIMULATE:
         settings["sandbox"] = True
+        # A simulation must actually run, not merely rename the Workspace.
+        # Auto-approve Strategist *task proposals* so the first dispatched
+        # review immediately starts Planner/Executor in sandbox mode. Runtime
+        # action governance still applies, and sandbox plans route external
+        # side effects to their simulated adapters.
+        strategist_settings = dict(settings.get("strategist") or {})
+        strategist_settings["auto_approve_proposals"] = True
+        strategist_settings["auto_approve_proposals_source"] = (
+            "blueprint_simulation"
+        )
+        settings["strategist"] = strategist_settings
+        settings["simulation_experience"] = resolve_simulation_experience(payload)
     else:
         settings.pop("sandbox", None)
+        settings.pop("simulation_experience", None)
     settings["_blueprint"] = {
         "blueprint_id": blueprint_id,
         "blueprint_slug": blueprint_slug,
@@ -245,6 +284,7 @@ async def install_blueprint(
         SECTION_FINGERPRINTS_KEY: blueprint_section_fingerprints(payload),
         "install_mode": mode.value,
         "original_kind": ws_kind,
+        "simulation_auto_run": mode == InstallMode.SIMULATE,
         # Persist requirement lists so promote() can re-check them.
         # NOTE: promote.py still reads these top-level keys for back-compat.
         "channel_requirements": list(contract.get("channels") or []),
@@ -397,12 +437,54 @@ async def install_blueprint(
         )
         result.custom_field_ids.append(cfd_id)
 
+    # ── Stats (before Goals so Goals can reference stat_key) ──
+    for stat_payload in recipe.get("stats") or []:
+        stat_id = await _install_stat(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+            payload=stat_payload,
+            mode=mode,
+        )
+        result.stat_ids.append(stat_id)
+
     # ── Goals (with measurement schedule) ──
     for g in recipe.get("goals") or []:
         gid = await _install_goal(
             db, entity_id=entity_id, workspace_id=workspace.id, g=g, mode=mode,
         )
         result.goal_ids.append(gid)
+
+    # ── Workflows ──
+    # Definitions are installed before ScheduledJobs so portable workflow_slug
+    # targets can be resolved to the concrete definition + Workspace binding.
+    workflow_source_template_id = str(
+        blueprint_id
+        or f"blueprint:{blueprint_slug or manifest.get('slug') or blueprint_content_fingerprint(payload)}"
+    )
+    workflow_source_version = str(
+        blueprint_version or manifest.get("blueprint_version") or "1.0.0"
+    )
+    for w in recipe.get("workflows") or []:
+        workflow_id = await _install_workflow(
+            db,
+            entity_id=entity_id,
+            w=w,
+            source_template_id=workflow_source_template_id,
+            source_version=workflow_source_version,
+            installed_by=user_id,
+        )
+        if workflow_id and not bool(w.get("internal")):
+            binding_id = await _install_workflow_binding(
+                db,
+                entity_id=entity_id,
+                workspace_id=workspace.id,
+                workflow_id=workflow_id,
+                w=w,
+                source_template_id=workflow_source_template_id,
+            )
+            if binding_id:
+                result.workflow_binding_ids.append(binding_id)
 
     # ── Scheduled jobs ──
     for sj in recipe.get("scheduled_jobs") or []:
@@ -411,30 +493,6 @@ async def install_blueprint(
             user_id=user_id, mode=mode,
         )
         result.scheduled_job_ids.append(sj_id)
-
-    # ── Workflows ──
-    # WorkflowDefinition is entity-scoped (no workspace_id column), so
-    # multiple workspaces in the same entity share workflow definitions
-    # by slug. WorkflowBinding is workspace-scoped, so install must attach
-    # each definition to this workspace for the Workflows tab and manual run
-    # endpoints to see it.
-    for w in recipe.get("workflows") or []:
-        workflow_id = await _install_workflow(db, entity_id=entity_id, w=w)
-        if workflow_id and not bool(w.get("internal")):
-            binding_id = await _install_workflow_binding(
-                db,
-                entity_id=entity_id,
-                workspace_id=workspace.id,
-                workflow_id=workflow_id,
-                w=w,
-            )
-            if binding_id:
-                result.workflow_binding_ids.append(binding_id)
-
-    # NOTE: v1.1-new sections that still aren't materialised:
-    # recipe.task_categories, recipe.sla_policies, recipe.escalation_rules,
-    # recipe.prompts, policy.expected_baseline. Accepted by validate_payload
-    # but skipped here. Tracked in roadmap.
 
     # ── Governance policy ──
     # The post-preset policy was already computed at the top of this
@@ -524,8 +582,9 @@ async def install_blueprint(
 
     if mode == InstallMode.SIMULATE:
         result.notes.append(
-            "Installed in SIMULATE mode — plans default to dry_run, "
-            "measurements are simulated. Promote when ready."
+            "Simulation started — the first Strategist task proposal is "
+            "auto-approved, plans default to dry_run, and measurements are "
+            "simulated. Promote when ready."
         )
     else:
         result.notes.append(
@@ -634,6 +693,7 @@ async def _install_goal(
     """Delegate to ``goals.create_goal`` so the measurement schedule
     is installed via the same path as a manual create."""
     from packages.core.goals import create_goal
+    from packages.core.stats.service import get_stat_by_key
 
     deadline = None
     if g.get("deadline"):
@@ -651,13 +711,24 @@ async def _install_goal(
         # (the existing sandbox path already honours this flag).
         measurement_source = {**measurement_source, "_simulate": True}
 
+    linked_stat = None
+    if g.get("stat_key"):
+        linked_stat = await get_stat_by_key(
+            db, workspace_id=workspace_id, key=str(g["stat_key"]),
+        )
+        if linked_stat is None:
+            raise InstallError(
+                f"goal {g.get('title')!r} references missing stat_key {g.get('stat_key')!r}"
+            )
+
     goal = await create_goal(
         db,
         entity_id=entity_id,
         workspace_id=workspace_id,
+        stat_id=linked_stat.id if linked_stat is not None else None,
         title=g["title"],
         description=g.get("description"),
-        metric_key=g["metric_key"],
+        metric_key=g.get("metric_key") or (linked_stat.key if linked_stat is not None else "completion"),
         target_value=Decimal(str(g["target_value"])),
         baseline_value=(
             Decimal(str(g["baseline_value"]))
@@ -669,6 +740,71 @@ async def _install_goal(
         priority=int(g.get("priority", 3)),
     )
     return goal.id
+
+
+async def _install_stat(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    payload: dict[str, Any],
+    mode: InstallMode,
+) -> str:
+    """Install a portable Stat definition without runtime observations."""
+    from packages.core.stats.library import get_library_entry
+    from packages.core.stats.service import create_stat, create_stat_from_library
+
+    library_key = str(payload.get("library_key") or "").strip()
+    entry = get_library_entry(library_key) if library_key else None
+    install_schedule = not (
+        mode == InstallMode.SIMULATE
+        and (
+            (entry is not None and entry.collector_type == "integration")
+            or str(payload.get("collector_type") or "").strip() == "integration"
+        )
+    )
+    if library_key:
+        if entry is None:
+            raise InstallError(f"unknown Blueprint stat library_key {library_key!r}")
+        cadence_override = (
+            {"collection_cadence": payload.get("collection_cadence")}
+            if "collection_cadence" in payload else {}
+        )
+        stat = await create_stat_from_library(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            library_key=library_key,
+            key=payload.get("key"),
+            name=payload.get("name"),
+            window=payload.get("window"),
+            collector_overrides=payload.get("collector_config"),
+            origin="blueprint",
+            install_schedule=install_schedule,
+            **cadence_override,
+        )
+    else:
+        if not payload.get("key") or not payload.get("name"):
+            raise InstallError("custom Blueprint stats require key and name")
+        stat = await create_stat(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            key=str(payload["key"]),
+            name=str(payload["name"]),
+            description=payload.get("description"),
+            value_type=str(payload.get("value_type") or "number"),
+            unit=payload.get("unit"),
+            window=str(payload.get("window") or "latest"),
+            collector_type=str(payload.get("collector_type") or "manual"),
+            collector_config=payload.get("collector_config"),
+            collection_cadence=payload.get("collection_cadence"),
+            freshness_limit_seconds=payload.get("freshness_limit_seconds"),
+            origin="blueprint",
+            goal_eligible=bool(payload.get("goal_eligible", True)),
+            install_schedule=install_schedule,
+        )
+    return stat.id
 
 
 async def _install_scheduled_job(
@@ -685,6 +821,80 @@ async def _install_scheduled_job(
     execution_type = sj.get("execution_type") or "agent"
     if execution_type == "agent_message":
         execution_type = "agent"
+
+    if execution_type == "strategist_review":
+        # Strategist cadence is Workspace-scoped. Persist the concrete
+        # Workspace id so dispatch and Automation details expose its scope.
+        execution_target["workspace_id"] = workspace_id
+
+    if execution_type == "workflow":
+        workflow_slug = str(execution_target.get("workflow_slug") or "").strip()
+        workflow_id = str(execution_target.get("workflow_id") or "").strip()
+        workflow = None
+        if workflow_slug:
+            installation = (await db.execute(
+                select(WorkflowTemplateInstallation).where(
+                    WorkflowTemplateInstallation.entity_id == entity_id,
+                    WorkflowTemplateInstallation.component_key == workflow_slug,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if installation is not None:
+                workflow = (await db.execute(
+                    select(WorkflowDefinition).where(
+                        WorkflowDefinition.entity_id == entity_id,
+                        WorkflowDefinition.id == installation.workflow_id,
+                    ).limit(1)
+                )).scalar_one_or_none()
+            if workflow is None:
+                # Backwards compatibility for manually created definitions and
+                # older Blueprint installs that predate source-component rows.
+                workflow = (await db.execute(
+                    select(WorkflowDefinition).where(
+                        WorkflowDefinition.entity_id == entity_id,
+                        WorkflowDefinition.name == workflow_slug,
+                    ).limit(1)
+                )).scalar_one_or_none()
+            if workflow is None:
+                raise InstallError(
+                    f"scheduled workflow {workflow_slug!r} was not installed"
+                )
+            workflow_id = workflow.id
+        elif workflow_id:
+            workflow = (await db.execute(
+                select(WorkflowDefinition).where(
+                    WorkflowDefinition.entity_id == entity_id,
+                    WorkflowDefinition.id == workflow_id,
+                ).limit(1)
+            )).scalar_one_or_none()
+        if workflow is None:
+            raise InstallError(
+                "scheduled workflow requires execution_target.workflow_slug"
+            )
+
+        from packages.core.services import workflow_service
+
+        bindings = await workflow_service.list_bindings(
+            db,
+            entity_id,
+            workspace_id=workspace_id,
+            workflow_id=workflow_id,
+        )
+        binding = next(
+            (
+                item for item in bindings
+                if item.enabled and item.status == "active"
+            ),
+            None,
+        )
+        if binding is None:
+            raise InstallError(
+                f"scheduled workflow {workflow.name!r} has no active Workspace binding"
+            )
+        execution_target.update({
+            "workflow_id": workflow_id,
+            "binding_id": binding.id,
+            "workspace_id": workspace_id,
+        })
 
     agent_id = sj.get("agent_id")
     service_key = execution_target.get("service_key")
@@ -1135,11 +1345,14 @@ async def _install_knowledge_pack(
     kp: dict[str, Any],
     todos: list[InstallTodo],
 ) -> Optional[str]:
-    """Create a DocumentGroup for a knowledge_pack. Document bodies (when
-    the pack opts into ``inline_text`` mode) are NOT auto-materialised —
-    the exporter is read-only and we don't have a file-storage write
-    path inside the installer. Surface them as todos so the operator (or
-    UI) can paste the bodies into actual document rows.
+    """Create a DocumentGroup and materialize its inline starter documents.
+
+    Inline Markdown does not need a filesystem object: ``Document`` already
+    supports durable text in ``metadata.content_text`` and scoped retrieval
+    reads that representation while embeddings are pending.  Keeping the
+    starter content as install todos left otherwise-complete Blueprints with
+    an empty Knowledge Net, so their first workflow run could not use the
+    policy and voice material shipped by the Blueprint.
     """
     slug = kp.get("slug")
     title = kp.get("title") or slug
@@ -1175,53 +1388,152 @@ async def _install_knowledge_pack(
         await db.flush()
         group_id = group.id
 
-    # Inline_text mode → surface starter_documents as actionable todos
-    # for the operator to paste contents into real Document rows.
+    # Inline_text mode → create real, immediately readable Knowledge rows.
+    # This is idempotent and never overwrites an existing document, so a
+    # second install cannot discard edits made after the first install.
     if kp.get("mode") == "inline_text":
         for d in kp.get("starter_documents") or []:
             if not isinstance(d, dict):
                 continue
-            todos.append(InstallTodo(
-                kind="knowledge_pack_document",
-                detail=(
-                    f"Paste the body of {d.get('path')!r} into the "
-                    f"{title!r} knowledge pack (workspace document)."
-                ),
-                payload={
-                    "knowledge_pack_slug": slug,
-                    "document_group_id": group_id,
-                    "path": d.get("path"),
-                    "body_md": d.get("body_md"),
-                },
-                blocking=False,
-            ))
+            await _materialize_knowledge_pack_document(
+                db,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                group_id=group_id,
+                knowledge_pack_slug=str(slug or ""),
+                document=d,
+            )
 
     return group_id
+
+
+async def _knowledge_pack_document_rows(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    group_id: str,
+) -> list[Document]:
+    """Return non-trashed documents already attached to a Knowledge pack."""
+    return list((await db.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .where(
+            Document.entity_id == entity_id,
+            DocumentGroupMember.group_id == group_id,
+            Document.is_trashed == False,  # noqa: E712
+        )
+    )).scalars().all())
+
+
+def _matches_blueprint_starter_document(
+    row: Document,
+    *,
+    knowledge_pack_slug: str,
+    path: str,
+) -> bool:
+    metadata = row.metadata_ if isinstance(row.metadata_, dict) else {}
+    return (
+        (
+            metadata.get("blueprint_knowledge_pack_slug") == knowledge_pack_slug
+            and metadata.get("blueprint_starter_path") == path
+        )
+        # Older/manual materializations may have no provenance marker. Treat a
+        # same-path row in this exact pack as authoritative instead of creating
+        # a duplicate beside the operator's document.
+        or row.name == path
+    )
+
+
+def _blueprint_document_template(document: dict[str, Any]) -> dict[str, Any] | None:
+    template = document.get("template")
+    if not isinstance(template, dict):
+        return None
+    return {
+        "id": str(template.get("id") or "").strip(),
+        "mode": str(template.get("mode") or "").strip(),
+        "renderer": str(template.get("renderer") or "").strip(),
+        "version": int(template.get("version") or 1),
+    }
+
+
+async def _materialize_knowledge_pack_document(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    group_id: str,
+    knowledge_pack_slug: str,
+    document: dict[str, Any],
+) -> tuple[Optional[Document], bool]:
+    """Ensure one inline Blueprint document exists without overwriting it."""
+    path = str(document.get("path") or "").strip()
+    body = str(document.get("body_md") or "")
+    if not path or not body:
+        return None, False
+
+    rows = await _knowledge_pack_document_rows(
+        db, entity_id=entity_id, group_id=group_id,
+    )
+    template = _blueprint_document_template(document)
+    for row in rows:
+        if _matches_blueprint_starter_document(
+            row, knowledge_pack_slug=knowledge_pack_slug, path=path,
+        ):
+            # A live template owns only its binding/projection metadata.  Its
+            # operator-visible body and the Workspace records it projects are
+            # deliberately not overwritten by install or upgrade.
+            if template is not None:
+                row.metadata_ = merge_document_metadata(
+                    row.metadata_ if isinstance(row.metadata_, dict) else {},
+                    origin={"workspace_id": workspace_id},
+                    extra={
+                        "blueprint_knowledge_pack_slug": knowledge_pack_slug,
+                        "blueprint_starter_path": path,
+                        "blueprint_template": template,
+                    },
+                )
+            return row, False
+
+    row = Document(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name=path,
+        file_size=len(body.encode("utf-8")),
+        file_type="md",
+        mime_type="text/markdown",
+        vector_status=VectorStatus.PENDING,
+        source="blueprint",
+        visibility="workspace",
+        classification="internal",
+        metadata_=merge_document_metadata(
+            origin={"workspace_id": workspace_id},
+            extra={
+                "content_text": body,
+                "blueprint_knowledge_pack_slug": knowledge_pack_slug,
+                "blueprint_starter_path": path,
+                **({"blueprint_template": template} if template is not None else {}),
+            },
+        ),
+    )
+    db.add(row)
+    db.add(DocumentGroupMember(document_id=row.id, group_id=group_id))
+    await db.flush()
+    return row, True
 
 
 # ── Workflows ─────────────────────────────────────────────────────────
 
 
-async def _install_workflow(
-    db: AsyncSession, *, entity_id: str, w: dict[str, Any],
-) -> Optional[str]:
-    """Translate a blueprint workflow into a WorkflowDefinition row.
+def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
+    """Translate one blueprint workflow into WorkflowDefinition values.
 
-    Blueprint format uses ``kind``/``depends_on`` (backward dependency
-    edges); the WorkflowDefinition model uses ``type``/``next`` (forward
-    next-step edges). This function inverts the dependency graph so the
-    runtime engine sees the format it expects.
-
-    Variables in blueprint are an array of ``{key, default}`` objects;
-    the model stores them as a single dict ``{key: default}``.
-
-    Idempotent: (entity_id, name) reuse. ``name`` is set to the blueprint's
-    ``slug`` so the portable handle survives.
+    Kept pure so install and blueprint-upgrade preview compare against the
+    exact same runtime graph. A second translator here would eventually make
+    an upgrade claim a Flow is current while installing something different.
     """
     slug = w.get("slug")
     if not slug:
-        logger.warning("blueprint install: workflow missing slug, skipping")
-        return None
+        raise InstallError("workflow is missing slug")
 
     # Translate blueprint workflow DSL into the canonical runtime graph:
     # kind → type, depends_on → next, and an explicit trigger entry node.
@@ -1306,6 +1618,13 @@ async def _install_workflow(
             "next": root_ids,
         })
 
+    if w.get("explicit_data_contracts"):
+        from packages.core.services.workflow_contracts import (
+            explicit_workflow_step_contracts,
+        )
+
+        runtime_steps = explicit_workflow_step_contracts(runtime_steps)
+
     from packages.core.services.workflow_service import validate_workflow_steps
 
     validation = validate_workflow_steps(runtime_steps)
@@ -1318,51 +1637,134 @@ async def _install_workflow(
     for v in w.get("variables") or []:
         if isinstance(v, dict) and v.get("key"):
             variables_dict[v["key"]] = v.get("default")
-
     trigger_config: dict[str, Any] = {}
     if w.get("trigger_ref"):
         trigger_config["trigger_ref"] = w["trigger_ref"]
 
-    existing = (await db.execute(
-        select(WorkflowDefinition).where(
-            WorkflowDefinition.entity_id == entity_id,
-            WorkflowDefinition.name == slug,
+    return {
+        # Definitions normally keep the stable slug as their technical name.
+        # A Blueprint may opt into a separate editor-facing label while source
+        # identity remains anchored by WorkflowTemplateInstallation.
+        "name": w.get("definition_name") or slug,
+        "description": w.get("description"),
+        "trigger_type": w.get("trigger_type") or "manual",
+        "trigger_config": trigger_config,
+        "steps": runtime_steps,
+        "variables": variables_dict,
+        "category": w.get("category"),
+        "tags": list(w.get("tags") or []),
+        "is_active": True,
+        "version": int(w.get("version") or 1),
+        "status": "active",
+    }
+
+
+async def _install_workflow(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    w: dict[str, Any],
+    source_template_id: str,
+    source_version: str = "1.0.0",
+    installed_by: Optional[str] = None,
+) -> Optional[str]:
+    """Translate a blueprint workflow into a WorkflowDefinition row.
+
+    Source identity is ``(template id, component key)``. The component key is
+    readable and portable, but never identifies a Marketplace item by itself.
+    A one-time adoption path preserves pre-migration installs only when the
+    matching name has no source mapping from another Blueprint.
+    """
+    slug = w.get("slug")
+    if not slug:
+        logger.warning("blueprint install: workflow missing slug, skipping")
+        return None
+    values = _blueprint_workflow_definition_values(w)
+
+    component_key = str(slug)
+    installation = (await db.execute(
+        select(WorkflowTemplateInstallation).where(
+            WorkflowTemplateInstallation.entity_id == entity_id,
+            WorkflowTemplateInstallation.template_id == source_template_id,
+            WorkflowTemplateInstallation.component_key == component_key,
         )
     )).scalar_one_or_none()
-    if existing is not None:
-        logger.info(
-            "blueprint install: workflow %r already exists in entity, reconciling",
-            slug,
+    existing = None
+    if installation is not None:
+        existing = (await db.execute(
+            select(WorkflowDefinition).where(
+                WorkflowDefinition.entity_id == entity_id,
+                WorkflowDefinition.id == installation.workflow_id,
+            )
+        )).scalar_one_or_none()
+        if existing is None:
+            await db.delete(installation)
+            await db.flush()
+            installation = None
+
+    if existing is None:
+        mapped_workflow_ids = select(WorkflowTemplateInstallation.workflow_id).where(
+            WorkflowTemplateInstallation.entity_id == entity_id,
         )
-        existing.description = w.get("description")
-        existing.trigger_type = w.get("trigger_type") or "manual"
-        existing.trigger_config = trigger_config
-        existing.steps = runtime_steps
-        existing.variables = variables_dict
-        existing.category = w.get("category")
-        existing.tags = list(w.get("tags") or [])
-        existing.version = int(w.get("version") or existing.version or 1)
-        existing.is_active = True
-        existing.status = "active"
+        # Adopt legacy rows created before source ids existed, but never steal
+        # a same-name Flow already owned by another template/Blueprint.
+        existing = (await db.execute(
+            select(WorkflowDefinition).where(
+                WorkflowDefinition.entity_id == entity_id,
+                WorkflowDefinition.name == slug,
+                WorkflowDefinition.id.not_in(mapped_workflow_ids),
+            )
+        )).scalars().first()
+
+    if existing is not None:
+        if installation is None:
+            installation = WorkflowTemplateInstallation(
+                id=generate_ulid(),
+                entity_id=entity_id,
+                template_id=source_template_id,
+                component_key=component_key,
+                workflow_id=existing.id,
+                installed_version=source_version,
+                installed_by=installed_by,
+                source_type="workspace_blueprint",
+                installation_metadata={"source_workflow_key": component_key},
+            )
+            db.add(installation)
+        else:
+            installation.installed_version = source_version
+            installation.installation_metadata = {
+                **dict(installation.installation_metadata or {}),
+                "source_workflow_key": component_key,
+            }
+        logger.info(
+            "blueprint install: workflow %r already exists for %s, reconciling",
+            slug,
+            source_template_id,
+        )
+        for field, value in values.items():
+            setattr(existing, field, value)
         await db.flush()
         return existing.id
 
     row = WorkflowDefinition(
         id=generate_ulid(),
         entity_id=entity_id,
-        name=slug,
-        description=w.get("description"),
-        trigger_type=w.get("trigger_type") or "manual",
-        trigger_config=trigger_config,
-        steps=runtime_steps,
-        variables=variables_dict,
-        category=w.get("category"),
-        tags=list(w.get("tags") or []),
-        is_active=True,
-        version=int(w.get("version") or 1),
-        status="active",
+        created_by=installed_by,
+        **values,
     )
     db.add(row)
+    await db.flush()
+    db.add(WorkflowTemplateInstallation(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        template_id=source_template_id,
+        component_key=component_key,
+        workflow_id=row.id,
+        installed_version=source_version,
+        installed_by=installed_by,
+        source_type="workspace_blueprint",
+        installation_metadata={"source_workflow_key": component_key},
+    ))
     await db.flush()
     return row.id
 
@@ -1415,6 +1817,7 @@ async def _install_workflow_binding(
     workspace_id: str,
     workflow_id: str,
     w: dict[str, Any],
+    source_template_id: Optional[str] = None,
 ) -> Optional[str]:
     """Attach a blueprint workflow definition to the installed workspace."""
     slug = w.get("slug")
@@ -1435,12 +1838,18 @@ async def _install_workflow_binding(
     binding_config = {
         **dict(w.get("binding_config") or {}),
         "source": "blueprint",
+        "source_template_id": source_template_id,
         "workspace_blueprint_workflow_slug": slug,
     }
     variables_dict: dict[str, Any] = {}
     for v in w.get("variables") or []:
         if isinstance(v, dict) and v.get("key"):
             variables_dict[v["key"]] = v.get("default")
+    deprecated_variable_keys = {
+        str(key).strip()
+        for key in w.get("deprecated_variable_keys") or []
+        if str(key or "").strip()
+    }
 
     existing = await workflow_service.list_bindings(
         db,
@@ -1448,21 +1857,54 @@ async def _install_workflow_binding(
         workspace_id=workspace_id,
         workflow_id=workflow_id,
     )
-    for binding in existing:
-        if binding.trigger_type == trigger_type:
-            binding.enabled = True
-            binding.status = "active"
-            binding.name = w.get("name") or slug
-            binding.config = {
-                **dict(binding.config or {}),
-                **binding_config,
-            }
-            binding.variables = {
-                **dict(binding.variables or {}),
-                **variables_dict,
-            }
-            await db.flush()
-            return binding.id
+    blueprint_bindings = [
+        binding
+        for binding in existing
+        if (
+            dict(binding.config or {}).get("source") == "blueprint"
+            and dict(binding.config or {}).get("workspace_blueprint_workflow_slug")
+            == slug
+        )
+    ]
+    binding = next(
+        (
+            item for item in blueprint_bindings
+            if item.trigger_type == trigger_type
+        ),
+        blueprint_bindings[0] if blueprint_bindings else None,
+    )
+    if binding is None:
+        binding = next(
+            (item for item in existing if item.trigger_type == trigger_type),
+            None,
+        )
+    if binding is not None:
+        binding.trigger_type = trigger_type
+        binding.enabled = True
+        binding.status = "active"
+        binding.name = w.get("name") or slug
+        binding.config = {
+            **dict(binding.config or {}),
+            **binding_config,
+        }
+        binding.variables = {
+            **{
+                key: value
+                for key, value in dict(binding.variables or {}).items()
+                if key not in deprecated_variable_keys
+            },
+            **variables_dict,
+        }
+        # Older installers could leave both the previous trigger binding and
+        # the replacement behind. Preserve run history but retire duplicate
+        # blueprint deployments so Agent discovery stays unambiguous.
+        for duplicate in blueprint_bindings:
+            if duplicate.id == binding.id:
+                continue
+            duplicate.enabled = False
+            duplicate.status = "inactive"
+        await db.flush()
+        return binding.id
 
     trigger_config: dict[str, Any] = {}
     if w.get("trigger_ref"):
@@ -1505,9 +1947,14 @@ async def _run_post_install_check(
       cron_scheduled   — verify a ScheduledJob whose job_id starts with
                          the blueprint's job_id (installer suffixes
                          with workspace_id[-8:] for uniqueness)
-      workflow_present — verify a WorkflowDefinition with name=slug
-                         exists (a real ``workflow_dryrun`` invocation
+      workflow_present — verify the Workspace binding's stable Blueprint
+                         workflow slug, with definition-name fallback for
+                         internal Flows (a real ``workflow_dryrun`` invocation
                          is a runtime concern, deferred)
+      blocking_setup_ready — evaluate the Workspace's declarative
+                         ``settings.blocking_setup`` gate. Integration
+                         failures already represented by a
+                         ``missing_integration`` todo are de-duplicated.
 
     Unknown check kinds are recorded as a non-blocking note so the
     operator at least sees them.
@@ -1591,12 +2038,29 @@ async def _run_post_install_check(
         slug = check.get("workflow_slug")
         if not slug:
             return
-        row = (await db.execute(
-            select(WorkflowDefinition).where(
-                WorkflowDefinition.entity_id == entity_id,
-                WorkflowDefinition.name == slug,
+        bindings = (await db.execute(
+            select(WorkflowBinding).where(
+                WorkflowBinding.entity_id == entity_id,
+                WorkflowBinding.workspace_id == workspace_id,
+                WorkflowBinding.enabled.is_(True),
+                WorkflowBinding.status == "active",
             )
-        )).scalar_one_or_none()
+        )).scalars().all()
+        workflow_id = next((
+            binding.workflow_id
+            for binding in bindings
+            if dict(binding.config or {}).get(
+                "workspace_blueprint_workflow_slug"
+            ) == slug
+        ), None)
+        row = await db.get(WorkflowDefinition, workflow_id) if workflow_id else None
+        if row is None:
+            row = (await db.execute(
+                select(WorkflowDefinition).where(
+                    WorkflowDefinition.entity_id == entity_id,
+                    WorkflowDefinition.name == slug,
+                )
+            )).scalar_one_or_none()
         if row is None:
             todos.append(InstallTodo(
                 kind="post_install_check",
@@ -1607,6 +2071,79 @@ async def _run_post_install_check(
                 payload={"check": check, "result": "missing_workflow"},
                 blocking=True,
             ))
+        return
+
+    if kind == "blocking_setup_ready":
+        workspace = await db.get(Workspace, workspace_id)
+        if workspace is None or workspace.entity_id != entity_id:
+            todos.append(InstallTodo(
+                kind="blocking_setup",
+                detail="Blocking setup check failed: Workspace could not be loaded.",
+                payload={"check": check, "result": "missing_workspace"},
+                blocking=True,
+            ))
+            return
+
+        from packages.core.services.workspace_readiness import (
+            evaluate_workspace_blocking_setup,
+        )
+
+        configured_keys = {
+            str(value or "").strip()
+            for value in check.get("check_keys") or []
+            if str(value or "").strip()
+        }
+        status = await evaluate_workspace_blocking_setup(
+            db,
+            workspace,
+            check_keys=configured_keys or None,
+        )
+        if status is None:
+            todos.append(InstallTodo(
+                kind="blocking_setup",
+                detail=(
+                    "Workspace blocking setup check is declared, but "
+                    "settings.blocking_setup has no matching checks."
+                ),
+                payload={"check": check, "result": "blocking_setup_not_configured"},
+                blocking=True,
+            ))
+            return
+        if status.status == "ready":
+            return
+
+        incomplete = list(status.details.get("incomplete_checks") or [])
+        covered_integration_providers = {
+            str(todo.payload.get("provider") or todo.payload.get("server_slug") or "").strip()
+            for todo in todos
+            if todo.blocking and todo.kind == "missing_integration"
+        }
+        uncovered = [
+            result
+            for result in incomplete
+            if not (
+                result.get("kind") == "integration_provider"
+                and str(result.get("provider") or "").strip() in covered_integration_providers
+            )
+        ]
+        if not uncovered:
+            return
+        keys = [str(result.get("key") or "setup") for result in uncovered]
+        todos.append(InstallTodo(
+            kind="blocking_setup",
+            detail=(
+                "Workspace blocking setup is incomplete: "
+                + ", ".join(keys)
+                + ". Complete these prerequisites before normal Proposals or Flows run."
+            ),
+            payload={
+                "check": check,
+                "result": "blocking_setup_incomplete",
+                "incomplete_checks": uncovered,
+                "allowed_setup_task_keys": status.details.get("allowed_setup_task_keys") or [],
+            },
+            blocking=True,
+        ))
         return
 
     # Unknown kind — surface as a note (non-blocking) so the operator

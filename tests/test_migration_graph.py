@@ -21,7 +21,21 @@ def _script_directory() -> ScriptDirectory:
 def test_alembic_revision_graph_loads_with_single_head() -> None:
     script = _script_directory()
 
-    assert script.get_heads() == ["20260802_04"]
+    assert script.get_heads() == ["20260813_02"]
+    assert script.get_revision("20260813_02").down_revision == "20260813_01"
+    assert script.get_revision("20260813_01").down_revision == "20260812_01"
+    assert set(script.get_revision("20260810_02").down_revision) == {
+        "20260805_04",
+        "20260810_01",
+    }
+    assert script.get_revision("20260810_01").down_revision == "20260804_01"
+    assert script.get_revision("20260805_04").down_revision == "20260805_03"
+    assert script.get_revision("20260805_03").down_revision == "20260805_02"
+    assert script.get_revision("20260805_02").down_revision == "20260805_01"
+    assert script.get_revision("20260805_01").down_revision == "20260804_01"
+    assert script.get_revision("20260804_01").down_revision == "20260803_01"
+    assert script.get_revision("20260803_01").down_revision == "20260802_05"
+    assert script.get_revision("20260802_05").down_revision == "20260802_04"
     assert script.get_revision("20260802_04").down_revision == "20260802_03"
     assert script.get_revision("20260802_03").down_revision == "20260802_02"
     assert script.get_revision("20260802_02").down_revision == "20260802_01"
@@ -68,6 +82,60 @@ def test_alembic_revision_graph_loads_with_single_head() -> None:
     assert script.get_revision("20260726_03").down_revision == "20260726_02"
     assert script.get_revision("20260726_04").down_revision == "20260726_03"
     assert script.get_revision("20260726_05").down_revision == "20260726_04"
+
+
+def test_workspace_event_repair_recreates_table_and_indexes(monkeypatch) -> None:
+    revision = _script_directory().get_revision("20260810_02").module
+    created_tables: list[str] = []
+    created_indexes: list[tuple[str, str, list[str], bool]] = []
+
+    monkeypatch.setattr(revision, "table_exists", lambda _table: False)
+    monkeypatch.setattr(
+        revision.op,
+        "create_table",
+        lambda name, *_columns: created_tables.append(name),
+    )
+    monkeypatch.setattr(
+        revision,
+        "create_index_if_not_exists",
+        lambda name, table, columns, **kwargs: created_indexes.append(
+            (name, table, columns, bool(kwargs.get("unique")))
+        ),
+    )
+
+    revision.upgrade()
+
+    assert created_tables == ["workspace_events"]
+    assert len(created_indexes) == 5
+    assert (
+        "uq_workspace_events_idempotency",
+        "workspace_events",
+        ["entity_id", "idempotency_key"],
+        True,
+    ) in created_indexes
+
+
+def test_workspace_event_repair_preserves_existing_table(monkeypatch) -> None:
+    revision = _script_directory().get_revision("20260810_02").module
+    created_tables: list[str] = []
+    created_indexes: list[str] = []
+
+    monkeypatch.setattr(revision, "table_exists", lambda _table: True)
+    monkeypatch.setattr(
+        revision.op,
+        "create_table",
+        lambda name, *_columns: created_tables.append(name),
+    )
+    monkeypatch.setattr(
+        revision,
+        "create_index_if_not_exists",
+        lambda name, *_args, **_kwargs: created_indexes.append(name),
+    )
+
+    revision.upgrade()
+
+    assert created_tables == []
+    assert len(created_indexes) == 5
 
 
 def test_workflow_run_lineage_migration_does_not_promote_untrusted_trigger_data(

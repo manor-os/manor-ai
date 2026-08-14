@@ -248,3 +248,86 @@ async def test_generated_scheduled_job_skill_records_source_metadata(
     assert skill.config["scheduled_job_id"] == "job_support_daily"
     assert skill.config["workspace_id"] == "ws_support"
     assert skill.config["agent_id"] == "agent_support"
+
+
+def test_generate_job_skill_credit_exhaustion_stops_before_generation(monkeypatch):
+    from packages.core.ai.llm_client import CreditExhaustedError
+    from packages.core.tasks import ai_tasks
+
+    job = SimpleNamespace(
+        id="job_pk_credit_stop",
+        job_id="job_credit_stop",
+        entity_id="ent_credit_stop",
+        workspace_id="ws_credit_stop",
+        user_id="user_credit_stop",
+        name="Credit Stop Automation",
+        payload_message="Summarize support tickets daily.",
+        agent_id="agent_credit_stop",
+        execution_type="agent",
+        execution_target={},
+    )
+
+    calls: list[dict[str, object]] = []
+
+    async def fake_assert_credit_available(entity_id, *, source, **kwargs):
+        calls.append({"handler": "credit_gate", "entity_id": entity_id, "source": source, **kwargs})
+        raise CreditExhaustedError("no credits")
+
+    async def fake_generate_skill(*args, **kwargs):
+        calls.append({"handler": "generate_skill"})
+        raise AssertionError("generate_skill should not run when credits are exhausted")
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return job
+
+    class FakeDB:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            return FakeResult()
+
+        async def commit(self):
+            calls.append({"handler": "commit"})
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return FakeDB()
+
+    monkeypatch.setattr(
+        "packages.core.database.create_worker_session",
+        lambda: FakeSessionFactory(),
+    )
+    monkeypatch.setattr(
+        ai_tasks,
+        "runtime_assert_credit_available",
+        fake_assert_credit_available,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.skill_generator.generate_skill",
+        fake_generate_skill,
+    )
+
+    ai_tasks.generate_job_skill.run(
+        job.id,
+        "Summarize support tickets daily.",
+        "Credit Stop Automation",
+    )
+
+    assert calls == [
+        {
+            "handler": "credit_gate",
+            "entity_id": "ent_credit_stop",
+            "source": "scheduled_job",
+            "user_id": "user_credit_stop",
+            "workspace_id": "ws_credit_stop",
+            "byok": False,
+        }
+    ]
+    assert job.execution_type == "agent"
+    assert job.execution_target == {}

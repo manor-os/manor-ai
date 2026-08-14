@@ -21,8 +21,8 @@ test("every flow launch surface blocks explicit-entry errors", () => {
   assert.match(flowsSource, /if \(errorCount > 0\) \{[\s\S]*?Workflow isn't deployable/);
 });
 
-test("worker-resumed runs poll and replace the initial paused result", () => {
+test("worker-resumed runs poll and merge the initial paused result", () => {
   assert.match(flowsSource, /latest\.status === "running" \|\| latest\.status === "paused"/);
   assert.match(flowsSource, /return latest .*\? 2_000 : false/);
-  assert.match(flowsSource, /setRunResult\(refreshed\)/);
+  assert.match(flowsSource, /current\?\.id === refreshed\.id \? \{ \.\.\.current, \.\.\.refreshed \} : current/);
 });

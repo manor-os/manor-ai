@@ -24,6 +24,7 @@ import pytest
 from packages.core.ai.runtime import approval_service
 from packages.core.ai.runtime.approval_service import (
     _provider_supports_always_approve,
+    _step_scoped_provider_scope_allows,
     runtime_auto_confirm_provider_approval,
 )
 
@@ -59,8 +60,10 @@ def _recorder(*, token: str | None = "approval-token-abc"):
     return execute, calls
 
 
-def _grant(monkeypatch, granted: bool):
+def _grant(monkeypatch, granted: bool, *, seen: dict | None = None):
     async def fake_grant(db, **kwargs):
+        if seen is not None:
+            seen.update(kwargs)
         return granted
 
     monkeypatch.setattr(approval_service, "_provider_standing_grant", fake_grant)
@@ -83,6 +86,79 @@ def test_every_normalized_provider_supports_always_approve():
     assert _provider_supports_always_approve("linkedin") is True
     assert _provider_supports_always_approve("") is False
     assert _provider_supports_always_approve(None) is False
+
+
+def test_proposal_always_approve_is_limited_to_blueprint_uploader_step_categories():
+    settings = {
+        "strategist": {"auto_approve_proposals": True},
+        "runtime_approval_scope_grants": [
+            {
+                "owner_service_key": "stickman.production",
+                "provider": "chrome",
+                "policy_categories": ["youtube_upload_start", "file_upload"],
+                "step_key": "upload_to_youtube",
+                "step_kind": "subagent",
+                "enabled": True,
+            },
+        ],
+    }
+
+    assert _step_scoped_provider_scope_allows(
+        workspace_settings=settings,
+        step_owner_service_key="stickman.production",
+        step_key="upload_to_youtube",
+        step_kind="subagent",
+        provider="chrome",
+        policy_category="youtube_upload_start",
+    ) is True
+    assert _step_scoped_provider_scope_allows(
+        workspace_settings=settings,
+        step_owner_service_key="stickman.production",
+        step_key="upload_to_youtube",
+        step_kind="subagent",
+        provider="chrome",
+        policy_category="representational_communication",
+    ) is False
+    assert _step_scoped_provider_scope_allows(
+        workspace_settings=settings,
+        step_owner_service_key="stickman.production",
+        step_key="produce_video",
+        step_kind="subagent",
+        provider="chrome",
+        policy_category="youtube_upload_start",
+    ) is False
+
+
+def test_proposal_always_approve_requires_the_producer_upload_step():
+    settings = {
+        "runtime_approval_scope_grants": [
+            {
+                "owner_service_key": "stickman.production",
+                "provider": "chrome",
+                "policy_categories": ["youtube_upload_start", "file_upload"],
+                "step_key": "upload_to_youtube",
+                "step_kind": "subagent",
+                "enabled": True,
+            },
+        ],
+    }
+
+    assert _step_scoped_provider_scope_allows(
+        workspace_settings=settings,
+        step_owner_service_key="stickman.production",
+        step_key="upload_to_youtube",
+        step_kind="subagent",
+        provider="chrome",
+        policy_category="youtube_upload_start",
+    ) is True
+    assert _step_scoped_provider_scope_allows(
+        workspace_settings=settings,
+        step_owner_service_key="stickman.production",
+        step_key="produce_video",
+        step_kind="subagent",
+        provider="chrome",
+        policy_category="youtube_upload_start",
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -110,6 +186,67 @@ async def test_standing_grant_confirms_and_retries_with_the_token(monkeypatch):
     assert calls[1][1]["ref"] == "e1"
     # the model sees the completed action, not the approval demand
     assert json.loads(out)["status"] == "filled"
+
+
+@pytest.mark.asyncio
+async def test_standing_grant_retries_the_exact_action_once(monkeypatch):
+    """Always approve cannot alter the approved tab/ref/payload or loop."""
+    _grant(monkeypatch, True)
+    execute, calls = _recorder()
+
+    payload = json.loads(_approval_required_result())
+    payload["confirmation_mode"] = "preapproval_allowed"
+    payload["policy_category"] = "youtube_upload_start"
+    out = await runtime_auto_confirm_provider_approval(
+        tool_name="mcp__chrome__fill_or_select",
+        arguments={**_ARGS, "approvalToken": "stale-token"},
+        result=json.dumps(payload),
+        execute=execute,
+        entity_id="ENT",
+        user_id="USR",
+        workspace_id="WS",
+    )
+
+    assert json.loads(out)["status"] == "filled"
+    assert [name for name, _ in calls] == [
+        "mcp__chrome__confirm_action",
+        "mcp__chrome__fill_or_select",
+    ]
+    assert calls[1][1] == {**_ARGS, "approvalToken": "approval-token-abc"}
+    assert calls[0][1] == {
+        "approvalId": "approval-1785183097747913000-90e0",
+        "confirmation_mode": "preapproval_allowed",
+        "policy_category": "youtube_upload_start",
+        "preapproved": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_step_id_and_provider_category_reach_standing_grant(monkeypatch):
+    seen: dict = {}
+    _grant(monkeypatch, False, seen=seen)
+    execute, calls = _recorder()
+
+    payload = json.loads(_approval_required_result())
+    payload["confirmation_mode"] = "preapproval_allowed"
+    payload["policy_category"] = "youtube_upload_start"
+    original = json.dumps(payload)
+    out = await runtime_auto_confirm_provider_approval(
+        tool_name="mcp__chrome__fill_or_select",
+        arguments={"ref": "e1", "tabId": 1, "value": "x"},
+        result=original,
+        execute=execute,
+        entity_id="ENT",
+        user_id="USR",
+        workspace_id="WS",
+        step_id="STEP-UPLOAD",
+    )
+
+    assert out == original
+    assert calls == []
+    assert seen["step_id"] == "STEP-UPLOAD"
+    assert seen["provider"] == "chrome"
+    assert seen["policy_category"] == "youtube_upload_start"
 
 
 @pytest.mark.asyncio

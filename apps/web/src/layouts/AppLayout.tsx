@@ -7,10 +7,11 @@ import {
   type ReactNode,
 } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "../stores/auth";
 import { usePageViewTracking, useWebSocket } from "../lib/websocket";
 import { useConfigStore } from "../stores/config";
+import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import {
   t,
   getLocale,
@@ -19,7 +20,7 @@ import {
   type Locale,
 } from "../lib/i18n";
 import { api } from "../lib/api";
-import type { Workspace, Agent } from "../lib/types";
+import type { Workspace, Agent, Conversation } from "../lib/types";
 import EmbeddedChat from "../components/EmbeddedChat";
 import FloatingChat from "../components/FloatingChat";
 import TextSelectionToolbar from "../components/TextSelectionToolbar";
@@ -31,15 +32,30 @@ import SupportPanel, {
 import UserAvatar from "../components/ui/UserAvatar";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
+import HoverMarqueeText from "../components/ui/HoverMarqueeText";
+import AgentActivityOrb, {
+  inferAgentActivity,
+  type AgentActivity,
+} from "../components/ui/AgentActivityOrb";
+import { IconMoreHorizontal } from "../components/icons";
+import Button from "../components/ui/Button";
+import ConfirmDialog from "../components/ui/ConfirmDialog";
+import Dropdown from "../components/ui/Dropdown";
+import Input from "../components/ui/Input";
+import { InlineRowsSkeleton } from "../components/ui/Skeleton";
 import { PageHeaderBoundary } from "../components/ui/PageHeader";
 import { useWorkspaceFilter } from "../stores/workspace";
 import OnboardingTour, { isTourSuppressedPath } from "../components/OnboardingTour";
 import { getAgentDescription } from "../lib/localizedContent";
 import { parseAppLayoutChatTarget } from "./appLayoutChatQuery";
+import { relativeTime } from "../lib/format";
+import { isChatRunActive } from "../lib/chatStream";
+import { useChatStreamStore } from "../stores/chatStream";
 
 type AppMode = "workspace" | "chat";
 
 const EMPTY_WORKSPACES: Workspace[] = [];
+const EMPTY_CONVERSATIONS: Conversation[] = [];
 
 function positiveStat(value: unknown) {
   const count = Number(value || 0);
@@ -693,18 +709,18 @@ const IconWorkflow = () => (
 
 const baseConfigurationItems: NavItem[] = [
   {
-    path: "/agents",
-    label: "Agents",
-    i18nKey: "nav.agents",
-    icon: <IconAgent />,
-    tourKey: "nav-agents",
-  },
-  {
     path: "/integrations",
     label: "Integrations",
     i18nKey: "nav.integrations",
     icon: <IconConnection />,
     tourKey: "nav-integrations",
+  },
+  {
+    path: "/agents",
+    label: "Agents",
+    i18nKey: "nav.agents",
+    icon: <IconAgent />,
+    tourKey: "nav-agents",
   },
   // Blueprints — temporarily hidden from nav until the feature is ready
   // for users. Pages, routes, and APIs all stay so deep links keep working.
@@ -717,13 +733,16 @@ const baseConfigurationItems: NavItem[] = [
   },
 ];
 
-const flowsConfigurationItem = (enabled: boolean): NavItem => ({
+const flowsConfigurationItem = (
+  enabled: boolean,
+  comingSoon: boolean,
+): NavItem => ({
   path: "/flows",
   label: "Workflows",
   i18nKey: "nav.flows",
   icon: <IconWorkflow />,
   disabled: !enabled,
-  badge: enabled ? undefined : "Soon",
+  badge: comingSoon ? "Soon" : undefined,
 });
 
 
@@ -1709,6 +1728,49 @@ export default function AppLayout() {
     Record<string, string>
   >({});
   const [convSearchQuery, setConvSearchQuery] = useState("");
+  const [manorSessionsOpen, setManorSessionsOpen] = useState(false);
+  const [renamingManorSessionId, setRenamingManorSessionId] = useState<
+    string | null
+  >(null);
+  const [manorSessionTitleDraft, setManorSessionTitleDraft] = useState("");
+  const [manorSessionRenameError, setManorSessionRenameError] = useState("");
+  const [deleteManorSessionTarget, setDeleteManorSessionTarget] =
+    useState<Conversation | null>(null);
+  const [deleteManorSessionError, setDeleteManorSessionError] = useState("");
+  const runningManorSessionActivitiesKey = useChatStreamStore((state) =>
+    JSON.stringify(
+      Object.values(state.sessions)
+        .flatMap((session) => {
+          if (!session.streaming || !session.convId) return [];
+          const latestAssistantMessage = [...session.messages]
+            .reverse()
+            .find((message) => message.role === "assistant");
+          return [
+            [
+              session.convId,
+              inferAgentActivity(latestAssistantMessage),
+            ] satisfies [string, AgentActivity],
+          ];
+        })
+        .sort(([leftId], [rightId]) => leftId.localeCompare(rightId)),
+    ),
+  );
+  const runningManorSessionActivities = useMemo(
+    () =>
+      new Map<string, AgentActivity>(
+        JSON.parse(runningManorSessionActivitiesKey) as Array<
+          [string, AgentActivity]
+        >,
+      ),
+    [runningManorSessionActivitiesKey],
+  );
+  const activeManorSessionActivity = useChatStreamStore((state) => {
+    if (!isChatRunActive(state.messages, state.streaming)) return null;
+    const latestAssistantMessage = [...state.messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    return inferAgentActivity(latestAssistantMessage);
+  });
   // Counts shown in chat rows: unresolved chat actions (proposal cards + HITL).
   const [actionCounts, setActionCounts] = useState<Record<string, number>>({});
 
@@ -1718,7 +1780,10 @@ export default function AppLayout() {
   }, []);
   const deploymentMode = useConfigStore((s) => s.deployment_mode);
   const configLoaded = useConfigStore((s) => s.loaded);
-  const flowsAvailable = useConfigStore((s) => s.flows_available);
+  const {
+    enabled: flowsAvailable,
+    released: flowsReleased,
+  } = usePreviewFeatureAccess("flows");
   const supportTicketsEnabled = useConfigStore(
     (s) => s.support_tickets_enabled,
   );
@@ -1726,17 +1791,92 @@ export default function AppLayout() {
     useSupportUnreadCount(supportTicketsEnabled).data?.count || 0;
   const configurationItems = useMemo(() => {
     const items = [...baseConfigurationItems];
-    // Keep Flows directly after Agents; production defaults to a disabled
-    // "Soon" entry until FLOWS_AVAILABLE is explicitly enabled.
-    items.splice(1, 0, flowsConfigurationItem(flowsAvailable));
+    // Flows follows Skills. Account preview access turns the disabled "Soon"
+    // entry into the real destination without changing the global release.
+    items.push(flowsConfigurationItem(flowsAvailable, !flowsReleased));
     return items;
   }, [
     flowsAvailable,
+    flowsReleased,
   ]);
-  const { data: workspaceList = EMPTY_WORKSPACES } = useQuery({
+  const {
+    data: workspaceList = EMPTY_WORKSPACES,
+    isSuccess: workspaceListReady,
+  } = useQuery({
     queryKey: ["workspaces"],
     queryFn: () => api.workspaces.list(),
     staleTime: 60_000,
+  });
+  const {
+    data: chatConversations = EMPTY_CONVERSATIONS,
+    isLoading: chatConversationsLoading,
+    isError: chatConversationsError,
+  } = useQuery({
+    queryKey: ["conversations"],
+    queryFn: () => api.chat.listConversations(),
+    enabled: mode === "chat",
+    staleTime: 30_000,
+  });
+  const manorChatSessions = useMemo(
+    () =>
+      chatConversations.filter(
+        (conversation) =>
+          !conversation.agent_id && !conversation.workspace_id,
+      ),
+    [chatConversations],
+  );
+  const conversationSearch = convSearchQuery.trim().toLocaleLowerCase();
+  const isSearchingConversations = conversationSearch.length > 0;
+  const filteredManorChatSessions = useMemo(() => {
+    if (!conversationSearch) return manorChatSessions;
+    return manorChatSessions.filter((conversation) =>
+      (conversation.title || t("page.chat_history.untitled"))
+        .toLocaleLowerCase()
+        .includes(conversationSearch),
+    );
+  }, [conversationSearch, manorChatSessions]);
+  const manorIdentityMatchesSearch = !conversationSearch || [
+    "manor ai",
+    t("page.app_layout.your_ai_chief_of_staff").toLocaleLowerCase(),
+  ].some((label) => label.includes(conversationSearch));
+  const manorSearchHasResults =
+    manorIdentityMatchesSearch || filteredManorChatSessions.length > 0;
+
+  useEffect(() => {
+    if (conversationSearch) setManorSessionsOpen(true);
+  }, [conversationSearch]);
+  const renameManorSession = useMutation({
+    mutationFn: ({ id, title }: { id: string; title: string }) =>
+      api.chat.renameConversation(id, title),
+    onSuccess: () => {
+      setRenamingManorSessionId(null);
+      setManorSessionTitleDraft("");
+      setManorSessionRenameError("");
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+    onError: () => {
+      setManorSessionRenameError(
+        t("page.app_layout.rename_manor_session_failed"),
+      );
+    },
+  });
+  const deleteManorSession = useMutation({
+    mutationFn: (id: string) => api.chat.deleteConversation(id),
+    onSuccess: (_data, deletedId) => {
+      setDeleteManorSessionTarget(null);
+      setDeleteManorSessionError("");
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      if (activeConvType === "manor" && activeConvId === deletedId) {
+        setActiveConvId(`manor-new:${Date.now()}`);
+        setActiveDmAgentId(null);
+        navigate("/chat", { replace: true });
+      }
+    },
+    onError: () => {
+      setDeleteManorSessionError(
+        t("page.app_layout.delete_manor_session_failed"),
+      );
+    },
   });
 
   /* Load workspaces for sidebar context switcher (both modes) */
@@ -1763,6 +1903,32 @@ export default function AppLayout() {
     });
   }, [workspaceList]);
   useEffect(() => {
+    if (
+      !workspaceListReady
+      || mode !== "chat"
+      || activeConvType !== "operation"
+      || workspaceList.some((workspace) => workspace.id === activeConvId)
+    ) {
+      return;
+    }
+    setActiveConvId("manor-ai");
+    setActiveConvType("manor");
+    setActiveDmAgentId(null);
+    setConvSearchQuery("");
+    if (location.pathname === "/chat" && location.search) {
+      navigate("/chat", { replace: true });
+    }
+  }, [
+    activeConvId,
+    activeConvType,
+    location.pathname,
+    location.search,
+    mode,
+    navigate,
+    workspaceList,
+    workspaceListReady,
+  ]);
+  useEffect(() => {
     const onRefresh = () => refreshWorkspaces();
     window.addEventListener("manor:workspace-actions-refresh", onRefresh);
     return () =>
@@ -1780,41 +1946,39 @@ export default function AppLayout() {
       .list()
       .then(setChatAgentsList)
       .catch(() => {});
-    // DM agents: only show agents user has an active conversation with
-    api.chat
-      .listConversations()
-      .then((convs: any[]) => {
-        const dmAgentIds = new Set<string>();
-        const dmConversations: Record<string, string> = {};
-        convs
-          .filter((c: any) => c.agent_id && !c.workspace_id)
-          .forEach((c: any) => {
-            dmAgentIds.add(c.agent_id);
-            if (!dmConversations[c.agent_id])
-              dmConversations[c.agent_id] = c.id;
-          });
-        setDmConversationByAgentId(dmConversations);
-        if (dmAgentIds.size > 0) {
-          api.agents
-            .list()
-            .then((agents: any[]) => {
-              const persistedDmAgents = agents.filter(
-                (a: any) => a && a.id && a.name && dmAgentIds.has(a.id),
-              );
-              setHiredAgents((prev) => {
-                const merged = new Map<string, Agent>();
-                prev
-                  .filter((a) => a && a.id && a.name)
-                  .forEach((a) => merged.set(a.id, a));
-                persistedDmAgents.forEach((a: Agent) => merged.set(a.id, a));
-                return Array.from(merged.values());
-              });
-            })
-            .catch(() => {});
-        }
-      })
-      .catch(() => {});
   }, [mode]);
+
+  // DM agents are the agents that already own at least one personal
+  // conversation. The same canonical conversation query also powers the
+  // expandable Manor AI session list below.
+  useEffect(() => {
+    if (mode !== "chat") return;
+    const dmAgentIds = new Set<string>();
+    const dmConversations: Record<string, string> = {};
+    chatConversations
+      .filter((conversation) => conversation.agent_id && !conversation.workspace_id)
+      .forEach((conversation) => {
+        const agentId = conversation.agent_id;
+        if (!agentId) return;
+        dmAgentIds.add(agentId);
+        if (!dmConversations[agentId]) {
+          dmConversations[agentId] = conversation.id;
+        }
+      });
+    setDmConversationByAgentId(dmConversations);
+    if (dmAgentIds.size === 0 || chatAgentsList.length === 0) return;
+    const persistedDmAgents = chatAgentsList.filter(
+      (agent) => agent?.id && agent?.name && dmAgentIds.has(agent.id),
+    );
+    setHiredAgents((prev) => {
+      const merged = new Map<string, Agent>();
+      prev
+        .filter((agent) => agent?.id && agent?.name)
+        .forEach((agent) => merged.set(agent.id, agent));
+      persistedDmAgents.forEach((agent) => merged.set(agent.id, agent));
+      return Array.from(merged.values());
+    });
+  }, [mode, chatConversations, chatAgentsList]);
 
   // During development/HMR or from older state, activeConvId may still be an
   // agent id. Normalize it to the new DM shape so EmbeddedChat never requests
@@ -1903,8 +2067,6 @@ export default function AppLayout() {
    * them. The workspace-mode context filter is intentionally ignored here too;
    * otherwise chat mode can look empty because of a hidden selection elsewhere.
    */
-  const conversationSearch = convSearchQuery.trim().toLowerCase();
-  const isSearchingConversations = conversationSearch.length > 0;
   const matchesConversationSearch = (agent: {
     name?: string;
     category?: string;
@@ -1918,6 +2080,55 @@ export default function AppLayout() {
     return (
       name.includes(conversationSearch) || category.includes(conversationSearch)
     );
+  };
+  const openManorChat = () => {
+    setActiveConvId("manor-ai");
+    setActiveConvType("manor");
+    setActiveDmAgentId(null);
+    setConvSearchQuery("");
+    if (location.pathname !== "/chat" || location.search) {
+      navigate("/chat");
+    }
+  };
+  const openManorSession = (conversationId: string) => {
+    setActiveConvId(conversationId);
+    setActiveConvType("manor");
+    setActiveDmAgentId(null);
+    setConvSearchQuery("");
+    navigate(`/chat?conversation=${encodeURIComponent(conversationId)}`);
+  };
+  const startNewManorSession = () => {
+    setActiveConvId(`manor-new:${Date.now()}`);
+    setActiveConvType("manor");
+    setActiveDmAgentId(null);
+    setConvSearchQuery("");
+    setManorSessionsOpen(true);
+    navigate("/chat");
+  };
+  const handleManorConversationResolved = (conversationId: string) => {
+    setActiveConvId(conversationId);
+    void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    navigate(`/chat?conversation=${encodeURIComponent(conversationId)}`, {
+      replace: true,
+    });
+  };
+  const beginRenameManorSession = (conversation: Conversation) => {
+    setRenamingManorSessionId(conversation.id);
+    setManorSessionTitleDraft(
+      conversation.title || t("page.chat_history.untitled"),
+    );
+    setManorSessionRenameError("");
+  };
+  const cancelRenameManorSession = () => {
+    setRenamingManorSessionId(null);
+    setManorSessionTitleDraft("");
+    setManorSessionRenameError("");
+  };
+  const submitRenameManorSession = () => {
+    if (!renamingManorSessionId) return;
+    const title = manorSessionTitleDraft.trim();
+    if (!title) return;
+    renameManorSession.mutate({ id: renamingManorSessionId, title });
   };
   const openAgentDm = (agent: Agent) => {
     const convId = dmConversationByAgentId[agent.id] || `agent:${agent.id}`;
@@ -2021,6 +2232,10 @@ export default function AppLayout() {
     (data: Record<string, any>) => {
       const wsId = data.workspace_id as string;
       if (!wsId) return;
+      if (data.history_reset === true) {
+        refreshWorkspaces();
+        return;
+      }
       // If this workspace isn't in our list yet, refetch
       if (!chatWorkspaces.find((w) => w.id === wsId)) {
         refreshWorkspaces();
@@ -2062,12 +2277,32 @@ export default function AppLayout() {
     },
     [chatWorkspaces, refreshWorkspaces],
   );
+  const onConversationMessage = useCallback(
+    (data: Record<string, any>) => {
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      window.dispatchEvent(
+        new CustomEvent("manor:conversation-message", { detail: data }),
+      );
+    },
+    [queryClient],
+  );
+  const onChatStreamSnapshot = useCallback((data: Record<string, any>) => {
+    // Deliberately no query invalidation: these arrive about once a second for
+    // the length of a turn, and invalidateQueries refetches active observers
+    // immediately regardless of staleTime. The payload already carries the
+    // reply, so the chat surface renders from it directly.
+    window.dispatchEvent(
+      new CustomEvent("manor:chat-stream-snapshot", { detail: data }),
+    );
+  }, []);
   const { connectedRef: _connectedRef, unreadCount: wsUnread } = useWebSocket({
     onNotification,
     onTaskUpdate,
     onJobUpdate,
     onVideoReady,
     onWorkspaceChatMessage,
+    onConversationMessage,
+    onChatStreamSnapshot,
   });
   usePageViewTracking();
   useEffect(
@@ -2150,6 +2385,10 @@ export default function AppLayout() {
     location.pathname === "/tasks" ||
     (location.pathname.startsWith("/tasks/") &&
       !location.pathname.startsWith("/tasks/collections"));
+  const isEditorShellRoute =
+    location.pathname.startsWith("/viewer/") ||
+    location.pathname.startsWith("/editor/") ||
+    location.pathname === "/diagram-canvas";
   const sidebarCollapsed = collapsed && !mobileOpen;
 
   const switchMode = useCallback(
@@ -2809,30 +3048,31 @@ export default function AppLayout() {
                       </svg>
                       <input
                         type="text"
+                        className="chat-sidebar-global-search"
                         value={convSearchQuery}
                         onChange={(e) => setConvSearchQuery(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key !== "Enter") return;
+                          if (!conversationSearch) return;
+                          const firstSession = filteredManorChatSessions[0];
+                          if (firstSession) {
+                            e.preventDefault();
+                            openManorSession(firstSession.id);
+                            return;
+                          }
+                          if (manorIdentityMatchesSearch) {
+                            e.preventDefault();
+                            openManorChat();
+                            return;
+                          }
                           const firstMatch =
                             filteredDmAgents[0] || filteredSearchAgents[0];
                           if (!firstMatch) return;
                           e.preventDefault();
                           openAgentDm(firstMatch);
                         }}
-                        placeholder={t("page.app_layout.search_agent_to_dm")}
-                        style={{
-                          width: "100%",
-                          height: 34,
-                          borderRadius: 10,
-                          border: "1px solid var(--sidebar-control-border)",
-                          background: "var(--sidebar-control-bg)",
-                          paddingLeft: 30,
-                          paddingRight: 10,
-                          fontSize: 11.5,
-                          fontWeight: 500,
-                          color: "var(--text-default)",
-                          outline: "none",
-                        }}
+                        placeholder={t("page.app_layout.search_chats_and_agents")}
+                        aria-label={t("page.app_layout.search_chats_and_agents")}
                       />
                     </div>
                   </div>
@@ -2844,43 +3084,302 @@ export default function AppLayout() {
                     </div>
                   )}
 
-                  {/* Manor AI conversation (always visible) */}
-                  {!isSearchingConversations && (
-                    <div
-                      className={`conv-row ${activeConvId === "manor-ai" ? "conv-row--active" : ""}`}
-                      onClick={() => {
-                        setActiveConvId("manor-ai");
-                        setActiveConvType("manor");
-                        setActiveDmAgentId(null);
-                      }}
-                    >
-                      {activeConvId === "manor-ai" && (
-                        <span className="conv-active-bar" />
-                      )}
+                  {/* Manor AI conversation and its sessions share the global search. */}
+                  {(!isSearchingConversations || manorSearchHasResults) && (
+                    <div className="manor-session-group">
                       <div
-                        className="conv-avatar"
-                        style={{ background: "#1c1917", borderRadius: "50%" }}
+                        className={`conv-row conv-row--manor ${activeConvType === "manor" ? "conv-row--active" : ""}`}
                       >
-                        <ManorLogo />
-                      </div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div className="conv-name">
-                          Manor AI
+                        {activeConvType === "manor" && (
+                          <span className="conv-active-bar" />
+                        )}
+                        <button
+                          type="button"
+                          className="conv-row-main"
+                          onClick={openManorChat}
+                        >
                           <span
-                            style={{ marginLeft: 4, fontSize: 10 }}
-                            title={t("page.app_layout.pinned")}
+                            className="conv-avatar"
+                            style={{ background: "#1c1917", borderRadius: "50%" }}
                           >
-                            {"\uD83D\uDCCC"}
+                            <ManorLogo />
                           </span>
-                        </div>
-                        <div className="conv-preview">
-                          {t("page.app_layout.your_ai_chief_of_staff")}
-                        </div>
+                          <span className="conv-row-copy">
+                            <span className="conv-name">
+                              Manor AI
+                              <span
+                                style={{ marginLeft: 4, fontSize: 10 }}
+                                title={t("page.app_layout.pinned")}
+                              >
+                                {"\uD83D\uDCCC"}
+                              </span>
+                            </span>
+                            <span className="conv-preview">
+                              {t("page.app_layout.your_ai_chief_of_staff")}
+                            </span>
+                          </span>
+                        </button>
+                        {(actionCounts["manor-ai"] || 0) > 0 && (
+                          <span className="conv-badge">
+                            {actionCounts["manor-ai"]}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          className={`manor-session-toggle ${manorSessionsOpen ? "manor-session-toggle--open" : ""}`}
+                          aria-expanded={manorSessionsOpen}
+                          aria-controls="manor-chat-sessions"
+                          aria-label={t(
+                            manorSessionsOpen
+                              ? "page.app_layout.collapse_manor_sessions"
+                              : "page.app_layout.expand_manor_sessions",
+                          )}
+                          onClick={() => setManorSessionsOpen((open) => !open)}
+                        >
+                          <svg
+                            width="14"
+                            height="14"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth={2}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="m9 18 6-6-6-6" />
+                          </svg>
+                        </button>
                       </div>
-                      {(actionCounts["manor-ai"] || 0) > 0 && (
-                        <span className="conv-badge">
-                          {actionCounts["manor-ai"]}
-                        </span>
+
+                      {manorSessionsOpen && (
+                        <div
+                          id="manor-chat-sessions"
+                          className="manor-session-panel"
+                        >
+                          {chatConversationsLoading && (
+                            <div className="manor-session-loading">
+                              <InlineRowsSkeleton rows={3} dense />
+                            </div>
+                          )}
+                          {!chatConversationsLoading &&
+                            !chatConversationsError &&
+                            filteredManorChatSessions.length > 0 && (
+                              <div className="manor-session-list">
+                                {filteredManorChatSessions.map((conversation) => {
+                                  const isActive =
+                                    activeConvType === "manor" &&
+                                    activeConvId === conversation.id;
+                                  const isRenaming =
+                                    renamingManorSessionId === conversation.id;
+                                  const runningActivity =
+                                    runningManorSessionActivities.get(
+                                      conversation.id,
+                                    ) ||
+                                    (isActive
+                                      ? activeManorSessionActivity
+                                      : undefined);
+                                  const isRunning = Boolean(runningActivity);
+                                  if (isRenaming) {
+                                    return (
+                                      <form
+                                        key={conversation.id}
+                                        className="manor-session-rename"
+                                        onSubmit={(event) => {
+                                          event.preventDefault();
+                                          submitRenameManorSession();
+                                        }}
+                                      >
+                                        <Input
+                                          value={manorSessionTitleDraft}
+                                          onChange={(event) =>
+                                            setManorSessionTitleDraft(
+                                              event.target.value,
+                                            )
+                                          }
+                                          ariaLabel={t(
+                                            "component.session_switcher.rename_chat_label",
+                                            {
+                                              title:
+                                                conversation.title ||
+                                                t("page.chat_history.untitled"),
+                                            },
+                                          )}
+                                          className="manor-session-rename-input"
+                                          error={manorSessionRenameError || undefined}
+                                          autoFocus
+                                          disabled={renameManorSession.isPending}
+                                        />
+                                        <div className="manor-session-rename-actions">
+                                          <Button
+                                            type="submit"
+                                            variant="ghost"
+                                            size="sm"
+                                            className="manor-session-icon-action"
+                                            title={t("action.save")}
+                                            ariaLabel={t("action.save")}
+                                            loading={renameManorSession.isPending}
+                                            disabled={!manorSessionTitleDraft.trim()}
+                                          >
+                                            <svg
+                                              width="14"
+                                              height="14"
+                                              viewBox="0 0 24 24"
+                                              fill="none"
+                                              stroke="currentColor"
+                                              strokeWidth={2}
+                                              strokeLinecap="round"
+                                              strokeLinejoin="round"
+                                              aria-hidden="true"
+                                            >
+                                              <path d="m5 12 4 4L19 6" />
+                                            </svg>
+                                          </Button>
+                                          <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            className="manor-session-icon-action"
+                                            onClick={cancelRenameManorSession}
+                                            title={t("action.cancel")}
+                                            ariaLabel={t("action.cancel")}
+                                            disabled={renameManorSession.isPending}
+                                          >
+                                            <svg
+                                              width="14"
+                                              height="14"
+                                              viewBox="0 0 24 24"
+                                              fill="none"
+                                              stroke="currentColor"
+                                              strokeWidth={2}
+                                              strokeLinecap="round"
+                                              strokeLinejoin="round"
+                                              aria-hidden="true"
+                                            >
+                                              <path d="m18 6-12 12" />
+                                              <path d="m6 6 12 12" />
+                                            </svg>
+                                          </Button>
+                                        </div>
+                                      </form>
+                                    );
+                                  }
+                                  return (
+                                    <div
+                                      key={conversation.id}
+                                      className={`manor-session-row ${isActive ? "manor-session-row--active" : ""}`}
+                                    >
+                                      <button
+                                        type="button"
+                                        className="manor-session-row-main"
+                                        aria-current={isActive ? "page" : undefined}
+                                        onClick={() =>
+                                          openManorSession(conversation.id)
+                                        }
+                                      >
+                                        <HoverMarqueeText
+                                          className="manor-session-title"
+                                          text={
+                                            conversation.title ||
+                                            t("page.chat_history.untitled")
+                                          }
+                                        />
+                                        <span className="manor-session-time">
+                                          {relativeTime(
+                                            conversation.updated_at ||
+                                              conversation.created_at,
+                                          )}
+                                        </span>
+                                      </button>
+                                      <Dropdown
+                                        align="right"
+                                        trigger={
+                                          <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            className={`manor-session-more ${isRunning ? "manor-session-more--running" : ""}`}
+                                            title={t(
+                                              isRunning
+                                                ? "page.app_layout.running_manor_session_menu"
+                                                : "action.more",
+                                            )}
+                                            ariaLabel={t(
+                                              isRunning
+                                                ? "page.app_layout.running_manor_session_menu"
+                                                : "action.more",
+                                            )}
+                                          >
+                                            <span
+                                              className="manor-session-more__orb"
+                                              aria-hidden="true"
+                                            >
+                                              <AgentActivityOrb
+                                                activity={
+                                                  runningActivity || "working"
+                                                }
+                                                size={20}
+                                                displaySize={16}
+                                                iconOnly
+                                              />
+                                            </span>
+                                            <span
+                                              className="manor-session-more__dots"
+                                              aria-hidden="true"
+                                            >
+                                              <IconMoreHorizontal size={18} />
+                                            </span>
+                                          </Button>
+                                        }
+                                        items={[
+                                          {
+                                            key: "rename",
+                                            label: t(
+                                              "component.session_switcher.rename_chat",
+                                            ),
+                                          },
+                                          {
+                                            key: "delete",
+                                            label: t(
+                                              "component.session_switcher.delete_chat",
+                                            ),
+                                            danger: true,
+                                          },
+                                        ]}
+                                        onSelect={(key) => {
+                                          if (key === "rename") {
+                                            beginRenameManorSession(conversation);
+                                            return;
+                                          }
+                                          setDeleteManorSessionError("");
+                                          setDeleteManorSessionTarget(conversation);
+                                        }}
+                                      />
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          {!chatConversationsLoading &&
+                            !chatConversationsError &&
+                            manorChatSessions.length === 0 && (
+                              <div className="manor-session-empty">
+                                {t("page.app_layout.no_manor_sessions")}
+                              </div>
+                            )}
+                          {!chatConversationsLoading &&
+                            !chatConversationsError &&
+                            manorChatSessions.length > 0 &&
+                            filteredManorChatSessions.length === 0 &&
+                            !manorIdentityMatchesSearch && (
+                              <div className="manor-session-empty">
+                                {t("page.app_layout.no_matching_manor_sessions")}
+                              </div>
+                            )}
+                          {chatConversationsError && (
+                            <div className="manor-session-empty">
+                              {t("page.app_layout.manor_sessions_unavailable")}
+                            </div>
+                          )}
+                        </div>
                       )}
                     </div>
                   )}
@@ -2894,14 +3393,26 @@ export default function AppLayout() {
                         </div>
                         {filteredWorkspaces.map((ws) => {
                           const isActive = activeConvId === ws.id;
+                          const openWorkspace = () => {
+                            setActiveConvId(ws.id);
+                            setActiveConvType("operation");
+                            setActiveDmAgentId(null);
+                          };
                           return (
                             <div
+                              role="button"
+                              tabIndex={0}
                               key={ws.id}
-                              className={`conv-row ${isActive ? "conv-row--active" : ""}`}
-                              onClick={() => {
-                                setActiveConvId(ws.id);
-                                setActiveConvType("operation");
-                                setActiveDmAgentId(null);
+                              className={`conv-row conv-row--button ${isActive ? "conv-row--active" : ""}`}
+                              onClick={openWorkspace}
+                              onKeyDown={(event) => {
+                                if (
+                                  event.key === "Enter" ||
+                                  event.key === " "
+                                ) {
+                                  event.preventDefault();
+                                  openWorkspace();
+                                }
                               }}
                             >
                               {isActive && <span className="conv-active-bar" />}
@@ -2912,16 +3423,18 @@ export default function AppLayout() {
                                 style={{ borderRadius: 9, flexShrink: 0 }}
                               />
                               <div style={{ flex: 1, minWidth: 0 }}>
-                                <div
+                                <HoverMarqueeText
                                   className="conv-name"
+                                  text={ws.name}
                                   style={
                                     (actionCounts[ws.id] || 0) > 0
-                                      ? { fontWeight: 800, color: "var(--text-strong)" }
+                                      ? {
+                                          fontWeight: 800,
+                                          color: "var(--text-strong)",
+                                        }
                                       : undefined
                                   }
-                                >
-                                  {ws.name}
-                                </div>
+                                />
                                 <div className="conv-preview">
                                   {workspaceStatusLabel(ws.status)}
                                 </div>
@@ -3026,6 +3539,7 @@ export default function AppLayout() {
                   )}
 
                   {convSearchQuery.trim() &&
+                    !manorSearchHasResults &&
                     filteredDmAgents.length === 0 &&
                     filteredSearchAgents.length === 0 && (
                       <div
@@ -3036,9 +3550,7 @@ export default function AppLayout() {
                           textAlign: "center",
                         }}
                       >
-                        {t(
-                          "page.app_layout.no_matching_direct_messages_or_agents",
-                        )}
+                        {t("page.app_layout.no_matching_chats_or_agents")}
                       </div>
                     )}
                 </div>
@@ -3966,17 +4478,12 @@ export default function AppLayout() {
 
           {mode === "chat" ? (
             <div
+              className="app-chat-shell"
               style={{
                 flex: 1,
                 minWidth: 0,
                 display: "flex",
                 flexDirection: "column",
-                background: "var(--chrome-surface)",
-                backdropFilter: "blur(14px) saturate(1.04)",
-                WebkitBackdropFilter: "blur(14px) saturate(1.04)",
-                border: "1px solid var(--chrome-border)",
-                boxShadow:
-                  "var(--glass-highlight), 0 1px 2px rgba(49,75,78,0.012)",
                 height: "100%",
                 borderRadius: 24,
                 overflow: "hidden",
@@ -3984,9 +4491,16 @@ export default function AppLayout() {
             >
               {activeConvType === "operation" ? (
                 (() => {
-                  const activeWorkspace = chatWorkspaces.find(
+                  const activeWorkspace = workspaceList.find(
                     (w) => w.id === activeConvId,
                   );
+                  if (!activeWorkspace) {
+                    return (
+                      <div className="flex-1 min-h-0 p-4" aria-busy="true">
+                        <InlineRowsSkeleton rows={3} dense />
+                      </div>
+                    );
+                  }
                   return (
                     <WorkspaceChat
                       key={activeConvId}
@@ -4013,6 +4527,16 @@ export default function AppLayout() {
                       agents={info.agents}
                       avatarUrl={dmAgent?.avatar_url}
                       agentId={dmAgent?.id}
+                      onConversationResolved={
+                        activeConvType === "manor"
+                          ? handleManorConversationResolved
+                          : undefined
+                      }
+                      onNewConversation={
+                        activeConvType === "manor"
+                          ? startNewManorSession
+                          : undefined
+                      }
                     />
                   );
                 })()
@@ -4021,7 +4545,13 @@ export default function AppLayout() {
           ) : (
             <div className={`app-content-panel glass-panel flex h-full min-w-0 flex-col overflow-hidden p-0 ${isSettingsRoute ? "app-content-panel--settings" : ""} ${isTasksRoute ? "app-content-panel--flush" : ""}`}>
               <PageHeaderBoundary>
-                <div className={`app-route-content min-h-0 min-w-0 flex-1 overflow-auto ${isSettingsRoute ? "app-route-content--settings p-0" : "px-6 pb-6 pt-2"}`}>
+                <div className={`app-route-content min-h-0 min-w-0 flex-1 ${
+                  isSettingsRoute
+                    ? "app-route-content--settings overflow-auto p-0"
+                    : isEditorShellRoute
+                      ? "app-route-content--editor overflow-hidden p-0"
+                      : "overflow-auto px-6 pb-6 pt-2"
+                }`}>
                   <Outlet />
                 </div>
               </PageHeaderBoundary>
@@ -4059,6 +4589,32 @@ export default function AppLayout() {
             Mounted here (inside the Router tree, under AppLayout) rather
             than in main.tsx because it calls useNavigate(). */}
         <AgentEditModal />
+
+        <ConfirmDialog
+          open={Boolean(deleteManorSessionTarget)}
+          onClose={() => {
+            if (deleteManorSession.isPending) return;
+            setDeleteManorSessionTarget(null);
+            setDeleteManorSessionError("");
+          }}
+          onConfirm={() => {
+            if (deleteManorSessionTarget) {
+              deleteManorSession.mutate(deleteManorSessionTarget.id);
+            }
+          }}
+          title={t("page.chat_history.delete_title")}
+          message={t("page.app_layout.delete_manor_session_message", {
+            title:
+              deleteManorSessionTarget?.title ||
+              t("page.chat_history.untitled"),
+          })}
+          confirmLabel={t("action.delete")}
+          cancelLabel={t("action.cancel")}
+          danger
+          loading={deleteManorSession.isPending}
+          closeOnConfirm={false}
+          error={deleteManorSessionError || undefined}
+        />
 
 
         {helpOpen && (

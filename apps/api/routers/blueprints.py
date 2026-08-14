@@ -23,14 +23,14 @@ import os
 import secrets
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.deps import get_current_user
+from apps.api.deps import get_current_user, require_workspace_writable
 from packages.core.constants.blueprints import (
     BLUEPRINT_EDITABLE_STATUSES,
     BlueprintStatus,
@@ -45,7 +45,6 @@ from packages.core.blueprints import (
     SimulationReport,
     export_workspace,
     get_solo_company_blueprint,
-    get_solo_company_blueprints,
     install_blueprint,
     preflight_promote,
     promote_workspace,
@@ -60,6 +59,9 @@ from packages.core.models.blueprint import (
     WorkspaceBlueprint,
 )
 from packages.core.models.user import User
+from packages.core.services.blueprint_cover_service import (
+    build_blueprint_cover_template,
+)
 from packages.core.services.entity_fs import (
     EntityFilesystemError,
     assert_entity_filesystem_ready,
@@ -101,12 +103,24 @@ class ExportBlueprintRequest(BaseModel):
     # Section toggles — pass overrides only if you want to drop something
     include_subscriptions: bool = True
     include_goals: bool = True
+    include_stats: bool = True
     include_scheduled_jobs: bool = True
+    include_workflows: bool = True
     include_custom_fields: bool = True
     include_governance: bool = True
     include_channel_requirements: bool = True
     include_session_requirements: bool = True
+    include_embedded_agents: bool = True
+    include_embedded_skills: bool = True
+    include_knowledge_packs: bool = True
+    knowledge_pack_mode: Optional[Literal["skeleton", "inline_text"]] = None
+    include_starter_memory: bool = False
+    # Deprecated alias retained for existing clients. True maps to
+    # knowledge_pack_mode=inline_text when the explicit mode is omitted.
     include_memory_files: bool = False
+    # Re-freeze the editable Blueprint with this slug when it came from the
+    # same Workspace. Reviewed/published payloads remain immutable.
+    replace_existing: bool = False
 
 
 class BlueprintSetupItem(BaseModel):
@@ -131,6 +145,8 @@ class BlueprintSetupPreview(BaseModel):
     optional_channels: list[BlueprintSetupItem] = Field(default_factory=list)
     required_sessions: list[BlueprintSetupItem] = Field(default_factory=list)
     optional_sessions: list[BlueprintSetupItem] = Field(default_factory=list)
+    required_integrations: list[BlueprintSetupItem] = Field(default_factory=list)
+    optional_integrations: list[BlueprintSetupItem] = Field(default_factory=list)
     first_week_outputs: list[str] = Field(default_factory=list)
     validation_evidence: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
@@ -150,6 +166,21 @@ class BlueprintShowcaseAsset(BaseModel):
     uploaded_at: Optional[datetime] = None
 
 
+class BlueprintCoverTemplateSpec(BaseModel):
+    motif: Literal[
+        "analytics",
+        "commerce",
+        "content",
+        "distribution",
+        "service",
+        "video",
+        "workspace",
+    ]
+    palette: Literal["blue", "peach", "sage", "stone"]
+    variant: int = Field(ge=0, le=2)
+    seed: int = Field(ge=0)
+
+
 class BlueprintSummary(BaseModel):
     id: str
     slug: str
@@ -162,6 +193,7 @@ class BlueprintSummary(BaseModel):
     source_workspace_id: Optional[str] = None
     cover_image_url: Optional[str] = None
     showcase_assets: list[BlueprintShowcaseAsset] = Field(default_factory=list)
+    cover_template: BlueprintCoverTemplateSpec
     author_handle: Optional[str] = None
     author_display_name: Optional[str] = None
     author_avatar_url: Optional[str] = None
@@ -260,6 +292,7 @@ class InstallResponse(BaseModel):
     mode: str
     blueprint_id: Optional[str]
     blueprint_slug: Optional[str]
+    stat_ids: list[str] = Field(default_factory=list)
     goal_ids: list[str]
     subscription_ids: list[str]
     scheduled_job_ids: list[str]
@@ -401,6 +434,24 @@ def _setup_item_from_session(item: Any) -> BlueprintSetupItem | None:
     )
 
 
+def _setup_item_from_integration(item: Any) -> BlueprintSetupItem | None:
+    row = _as_record(item)
+    provider = _string_or_none(row.get("slug"))
+    if not provider:
+        return None
+    label = (
+        _string_or_none(row.get("display_name"))
+        or _string_or_none(row.get("name"))
+        or provider.replace("_", " ").title()
+    )
+    return BlueprintSetupItem(
+        label=label,
+        kind=provider,
+        required=bool(row.get("required", True)),
+        purpose=_string_or_none(row.get("purpose")),
+    )
+
+
 def _setup_item_from_service(item: Any) -> BlueprintSetupItem | None:
     row = _as_record(item)
     label = _string_or_none(row.get("name")) or _string_or_none(row.get("key"))
@@ -427,46 +478,50 @@ def _payload_setup_preview(payload: dict[str, Any] | None) -> BlueprintSetupPrev
     policy = _as_record(p.get("policy"))
     recipe = _as_record(p.get("recipe"))
     operating_model = _as_record(recipe.get("operating_model"))
+    requirements = _as_record(contract.get("requires"))
     expected = _as_record(policy.get("expected_baseline"))
 
     variables = [
-        item for item in (
-            _setup_item_from_variable(raw)
-            for raw in _as_list(contract.get("variables"))
-        )
+        item
+        for item in (_setup_item_from_variable(raw) for raw in _as_list(contract.get("variables")))
         if item is not None
     ]
     channels = [
-        item for item in (
+        item
+        for item in (
             _setup_item_from_channel(raw)
             for raw in (_as_list(contract.get("channels")) or _as_list(p.get("channel_requirements")))
         )
         if item is not None
     ]
     sessions = [
-        item for item in (
+        item
+        for item in (
             _setup_item_from_session(raw)
             for raw in (_as_list(contract.get("sessions")) or _as_list(p.get("session_requirements")))
         )
         if item is not None
     ]
+    integrations = [
+        item
+        for item in (_setup_item_from_integration(raw) for raw in _as_list(requirements.get("mcp_servers")))
+        if item is not None
+    ]
     services = [
-        item for item in (
-            _setup_item_from_service(raw)
-            for raw in _as_list(operating_model.get("services"))
-        )
+        item
+        for item in (_setup_item_from_service(raw) for raw in _as_list(operating_model.get("services")))
         if item is not None
     ]
     required_variables, optional_variables = _split_required(variables)
     required_channels, optional_channels = _split_required(channels)
     required_sessions, optional_sessions = _split_required(sessions)
+    required_integrations, optional_integrations = _split_required(integrations)
     blocking = expected.get("blocking_todos_expected")
 
     return BlueprintSetupPreview(
         use_when=_string_or_none(manifest.get("use_when")),
         maturity_level=(
-            _string_or_none(expected.get("maturity_level"))
-            or _string_or_none(manifest.get("maturity_level"))
+            _string_or_none(expected.get("maturity_level")) or _string_or_none(manifest.get("maturity_level"))
         ),
         validation_summary=_string_or_none(expected.get("validation_summary")),
         primary_work=_string_or_none(operating_model.get("primary_work")),
@@ -478,6 +533,8 @@ def _payload_setup_preview(payload: dict[str, Any] | None) -> BlueprintSetupPrev
         optional_channels=optional_channels,
         required_sessions=required_sessions,
         optional_sessions=optional_sessions,
+        required_integrations=required_integrations,
+        optional_integrations=optional_integrations,
         first_week_outputs=_string_list(expected.get("first_week_outputs")),
         validation_evidence=_string_list(expected.get("validation_evidence")),
         acceptance_criteria=_string_list(expected.get("acceptance_criteria")),
@@ -504,6 +561,23 @@ def _payload_author(payload: dict[str, Any] | None) -> dict[str, Any]:
     return author if isinstance(author, dict) else {}
 
 
+def _cover_template(
+    *,
+    title: str,
+    description: str | None,
+    tags: list[str],
+    identity: str,
+) -> BlueprintCoverTemplateSpec:
+    return BlueprintCoverTemplateSpec.model_validate(
+        build_blueprint_cover_template(
+            title=title,
+            description=description,
+            tags=tags,
+            identity=identity,
+        )
+    )
+
+
 def _summary(
     b: WorkspaceBlueprint,
     viewer_entity_id: str,
@@ -527,6 +601,12 @@ def _summary(
         source_workspace_id=b.source_workspace_id,
         cover_image_url=b.cover_image_url,
         showcase_assets=_showcase_assets(b.showcase_assets),
+        cover_template=_cover_template(
+            title=b.title,
+            description=b.description or b.summary,
+            tags=list(b.tags or []),
+            identity=b.id,
+        ),
         author_handle=b.author_handle or _string_or_none(author.get("handle")),
         author_display_name=(
             b.author_display_name
@@ -603,6 +683,20 @@ def _builtin_summary(payload: dict[str, Any]) -> BlueprintSummary:
             else None
         ),
         showcase_assets=_showcase_assets(manifest.get("showcase_assets")),
+        cover_template=_cover_template(
+            title=str(manifest.get("title") or slug),
+            description=(
+                str(manifest["description"])
+                if isinstance(manifest.get("description"), str)
+                else (
+                    str(manifest["summary"])
+                    if isinstance(manifest.get("summary"), str)
+                    else None
+                )
+            ),
+            tags=tags,
+            identity=_builtin_id(slug),
+        ),
         author_handle=_string_or_none(author.get("handle")),
         author_display_name=(
             _string_or_none(author.get("display_name")) or "Manor"
@@ -911,6 +1005,7 @@ def _install_response(r: InstallResult) -> InstallResponse:
         mode=r.mode.value,
         blueprint_id=r.blueprint_id,
         blueprint_slug=r.blueprint_slug,
+        stat_ids=list(r.stat_ids),
         goal_ids=list(r.goal_ids),
         subscription_ids=list(r.subscription_ids),
         scheduled_job_ids=list(r.scheduled_job_ids),
@@ -933,16 +1028,45 @@ async def _commit_and_start_installed_workspace(
     result: InstallResult,
     entity_id: str,
 ) -> None:
-    """Commit a blueprint install, then start its normal workspace jobs.
+    """Commit a blueprint install, then start its appropriate runtime.
 
-    Workspace setup and blueprint installation both materialize the same
-    runnable object. Keep their post-commit behavior aligned so an installed
-    template immediately queues greetings, any requested starter documents,
-    and the first Strategist proposal instead of waiting for the next cadence.
+    A live install follows normal Workspace startup. A simulation install runs
+    the Blueprint-owned persisted Chat scenario instead; dispatching the live
+    Strategist there would mix real proposals into the training walkthrough.
     Startup dispatch is best-effort because the durable install has already
     committed by the time a broker or worker failure can occur.
     """
     await db.commit()
+    if result.mode == InstallMode.SIMULATE:
+        from packages.core.blueprints.simulation_runtime import (
+            start_simulation_run,
+        )
+        from packages.core.models.workspace import Workspace
+
+        try:
+            workspace = (await db.execute(
+                select(Workspace).where(
+                    Workspace.id == result.workspace_id,
+                    Workspace.entity_id == entity_id,
+                    Workspace.deleted_at.is_(None),
+                )
+            )).scalar_one()
+            await start_simulation_run(db, workspace=workspace)
+            await db.commit()
+            result.notes.append(
+                "Blueprint simulation started in Workspace Chat."
+            )
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            logger.exception(
+                "workspace %s was installed but its simulation did not start",
+                result.workspace_id,
+            )
+            result.notes.append(
+                "Simulation installed; open Workspace Chat to retry the run."
+            )
+        return
+
     from packages.core.services.workspace_setup_service import (
         dispatch_workspace_post_commit,
         record_workspace_post_commit_dispatch_failure,
@@ -998,25 +1122,41 @@ async def export_workspace_as_blueprint(
     ws = await get_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
+    await require_workspace_writable(db, user, workspace_id)
 
-    # Slug uniqueness — surface as 409 with a useful message.
+    # Slug uniqueness — or an explicit re-freeze of an editable Blueprint
+    # previously exported from this same Workspace.
     existing = (await db.execute(
         select(WorkspaceBlueprint).where(
             WorkspaceBlueprint.entity_id == user.entity_id,
             WorkspaceBlueprint.slug == req.slug,
         )
     )).scalar_one_or_none()
-    if existing is not None:
+    if existing is not None and not req.replace_existing:
         raise HTTPException(409, f"blueprint slug {req.slug!r} already used")
+    if existing is not None:
+        _require_blueprint_content_editable(existing)
+        if existing.source_workspace_id != workspace_id:
+            raise HTTPException(
+                409,
+                "an existing blueprint with this slug came from another workspace",
+            )
 
     ctx = ExportContext(
         include_subscriptions=req.include_subscriptions,
         include_goals=req.include_goals,
+        include_stats=req.include_stats,
         include_scheduled_jobs=req.include_scheduled_jobs,
+        include_workflows=req.include_workflows,
         include_custom_fields=req.include_custom_fields,
         include_governance=req.include_governance,
         include_channel_requirements=req.include_channel_requirements,
         include_session_requirements=req.include_session_requirements,
+        include_embedded_agents=req.include_embedded_agents,
+        include_embedded_skills=req.include_embedded_skills,
+        include_knowledge_packs=req.include_knowledge_packs,
+        knowledge_pack_mode=req.knowledge_pack_mode,
+        include_starter_memory=req.include_starter_memory,
         include_memory_files=req.include_memory_files,
     )
     author_display_name = req.author_display_name or _user_display_name(user)
@@ -1045,37 +1185,56 @@ async def export_workspace_as_blueprint(
         if source_slug:
             remixed_from_id = _builtin_id(source_slug)
     manifest = dict(_manifest(payload))
+    cover_image_url = (
+        req.cover_image_url
+        if req.cover_image_url is not None
+        else (existing.cover_image_url if existing is not None else None)
+    )
     manifest.update({
         "slug": req.slug,
-        "cover_image_url": req.cover_image_url,
+        "cover_image_url": cover_image_url,
         "forked_from_id": remixed_from_id,
     })
     payload = {**payload, "manifest": manifest}
 
-    row = WorkspaceBlueprint(
-        entity_id=user.entity_id,
-        slug=req.slug,
-        source_workspace_id=workspace_id,
-        title=req.title,
-        summary=req.summary,
-        description=req.description,
-        cover_image_url=req.cover_image_url,
-        showcase_assets=[],
-        tags=list(req.tags),
-        author_user_id=user.id,
-        author_handle=req.author_handle,
-        author_display_name=author_display_name,
-        remixed_from_id=remixed_from_id,
-        payload=payload,
-        # v1.1 nests the version under manifest; v1.0 had it top-level.
-        # Read both shapes so older stored payloads keep working.
-        payload_version=(
-            (payload.get("manifest") or {}).get("blueprint_version")
-            or payload.get("blueprint_version")
-        ),
-        status=BlueprintStatus.DRAFT.value,
+    payload_version = (
+        (payload.get("manifest") or {}).get("blueprint_version")
+        or payload.get("blueprint_version")
     )
-    db.add(row)
+    if existing is None:
+        row = WorkspaceBlueprint(
+            entity_id=user.entity_id,
+            slug=req.slug,
+            source_workspace_id=workspace_id,
+            title=req.title,
+            summary=req.summary,
+            description=req.description,
+            cover_image_url=cover_image_url,
+            showcase_assets=[],
+            tags=list(req.tags),
+            author_user_id=user.id,
+            author_handle=req.author_handle,
+            author_display_name=author_display_name,
+            remixed_from_id=remixed_from_id,
+            payload=payload,
+            payload_version=payload_version,
+            status=BlueprintStatus.DRAFT.value,
+        )
+        db.add(row)
+    else:
+        row = existing
+        row.title = req.title
+        row.summary = req.summary
+        row.description = req.description
+        row.cover_image_url = cover_image_url
+        row.tags = list(req.tags)
+        row.author_handle = req.author_handle
+        row.author_display_name = author_display_name
+        row.remixed_from_id = remixed_from_id
+        row.payload = payload
+        row.payload_version = payload_version
+        row.status = BlueprintStatus.DRAFT.value
+        row.published_at = None
     await db.flush()
     await db.refresh(row)
     detail = BlueprintDetail(
@@ -1121,19 +1280,12 @@ async def list_blueprints(
         WorkspaceBlueprint.created_at.desc(),
     )
     rows = list((await db.execute(stmt)).scalars().all())
-    builtins = []
-    if status in (None, BlueprintStatus.PUBLISHED):
-        builtins = [
-            _builtin_summary(payload)
-            for payload in get_solo_company_blueprints()
-        ]
-    blueprint_ids = [builtin.id for builtin in builtins] + [row.id for row in rows]
+    # Platform blueprints are seeded into workspace_blueprints at startup.
+    # Appending the frozen configs here as well returns every platform entry
+    # twice (with the same id), so the table is the list's single source.
+    blueprint_ids = [row.id for row in rows]
     signals = await _marketplace_signals(db, blueprint_ids, user.id)
     author_avatars = await _author_avatars(db, rows)
-    builtin_summaries = [
-        builtin.model_copy(update=signals.get(builtin.id, {}))
-        for builtin in builtins
-    ]
     summaries = [
         _summary(
             row,
@@ -1143,7 +1295,7 @@ async def list_blueprints(
         )
         for row in rows
     ]
-    return [*builtin_summaries, *summaries]
+    return summaries
 
 
 # Literal-path routes MUST come before the parameterised /{blueprint_id}
@@ -1545,6 +1697,26 @@ async def install(
     builtin = _builtin_payload_for_id(blueprint_id)
     if builtin is not None:
         slug, payload = builtin
+        # Platform blueprints are published rows now. The compatibility
+        # branch still accepts their historical ``builtin:<slug>`` handles,
+        # but it must record that durable id and the row's content version;
+        # otherwise the installed workspace can never discover an update.
+        from packages.core.blueprints.freshness import FIRST_CONTENT_VERSION
+        from packages.core.blueprints.seed import platform_blueprint_id
+
+        durable_id = platform_blueprint_id(slug)
+        published = await db.get(WorkspaceBlueprint, durable_id)
+        if published is None:
+            published = (await db.execute(
+                select(WorkspaceBlueprint).where(
+                    WorkspaceBlueprint.entity_id.is_(None),
+                    WorkspaceBlueprint.slug == slug,
+                )
+            )).scalars().first()
+        if published is not None:
+            durable_id = published.id
+        if published is not None and isinstance(published.payload, dict):
+            payload = published.payload
         try:
             result = await install_blueprint(
                 db,
@@ -1553,7 +1725,12 @@ async def install(
                 mode=req.mode,
                 workspace_name=req.workspace_name,
                 user_id=user.id,
+                blueprint_id=durable_id,
                 blueprint_slug=slug,
+                blueprint_version=(
+                    published.content_version if published is not None
+                    else FIRST_CONTENT_VERSION
+                ),
                 create_missing_agents=req.create_missing_agents,
                 governance_preset=req.governance_preset,
             )

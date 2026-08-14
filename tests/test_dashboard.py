@@ -173,7 +173,15 @@ async def test_dashboard_layout_defaults_and_persists(client: AsyncClient):
         "workspaces",
         "task_trend",
     ]
-    assert all(widget["visible"] for widget in defaults["widgets"])
+    assert [widget["visible"] for widget in defaults["widgets"]] == [
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    ]
 
     customized = [
         {"id": "daily_brief", "visible": True},
@@ -201,7 +209,15 @@ async def test_dashboard_layout_defaults_and_persists(client: AsyncClient):
         "/api/v1/dashboard/layout", headers=other_headers
     )
     assert other_response.status_code == 200
-    assert all(widget["visible"] for widget in other_response.json()["widgets"])
+    assert [widget["visible"] for widget in other_response.json()["widgets"]] == [
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    ]
     assert other_response.json()["widgets"] != customized
 
 

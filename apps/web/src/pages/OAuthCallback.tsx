@@ -27,6 +27,7 @@ export default function OAuthCallback() {
   const oauthSessionRef = useRef<string>("");
   const redirectUriRef = useRef<string>("");
   const publicChatTokenRef = useRef<string | null>(null);
+  const rememberMeRef = useRef(false);
 
   useEffect(() => {
     const code = searchParams.get("code");
@@ -48,6 +49,7 @@ export default function OAuthCallback() {
     const savedTeamInvite = sessionStorage.getItem("oauth_team_invite") || undefined;
     sessionStorage.removeItem("oauth_team_invite");
     publicChatTokenRef.current = sessionStorage.getItem("oauth_public_chat_token");
+    rememberMeRef.current = sessionStorage.getItem("oauth_remember_me") === "1";
 
     const redirectUri = window.location.origin + "/oauth/callback";
     redirectUriRef.current = redirectUri;
@@ -59,10 +61,12 @@ export default function OAuthCallback() {
         invitationCode: savedInvite,
         teamInviteToken: savedTeamInvite,
         publicChatToken: publicChatTokenRef.current || undefined,
+        rememberMe: rememberMeRef.current,
       })
       .then((res) => {
         localStorage.setItem("manor_token", res.access_token);
         sessionStorage.removeItem("oauth_public_chat_token");
+        sessionStorage.removeItem("oauth_remember_me");
         return checkAuth();
       })
       .then(() => {
@@ -105,9 +109,11 @@ export default function OAuthCallback() {
         oauthSession: oauthSessionRef.current,
         invitationCode: inviteCode.trim(),
         publicChatToken: publicChatTokenRef.current || undefined,
+        rememberMe: rememberMeRef.current,
       });
       localStorage.setItem("manor_token", res.access_token);
       sessionStorage.removeItem("oauth_public_chat_token");
+      sessionStorage.removeItem("oauth_remember_me");
       await checkAuth();
       navigate(consumeOAuthNext(), { replace: true });
     } catch (err: any) {

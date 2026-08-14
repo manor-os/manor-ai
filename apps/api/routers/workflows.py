@@ -12,16 +12,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.ai.workflow_import import UnknownWorkflowFormat, import_workflow
 from packages.core.ai.workflow_runner import WorkflowRunner
 from packages.core.database import get_db
+from packages.core.models.document import Document
 from packages.core.models.permission import Capability, ResourceType, Visibility
 from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowDefinition
 from packages.core.services import workflow_service as svc
-from packages.core.services.workflow_run_trace import summarize_trace_text
+from packages.core.services.document_access import user_can_read_document
 from packages.core.services.resource_access import (
     ResourceDescriptor,
     is_read_capability,
     user_can_access_resource,
 )
+from packages.core.services.workflow_run_trace import summarize_trace_text
 from packages.core.services.workspace_access import (
     is_entity_admin_role,
     user_can_control_workspace_run,
@@ -109,6 +111,10 @@ class WorkflowUpdateRequest(BaseModel):
     tags: list[str] | None = None
     is_active: bool | None = None
     status: str | None = None
+
+
+class WorkflowTemplateInstallRequest(BaseModel):
+    workspace_id: str | None = None
 
 
 class WorkflowResponse(BaseModel):
@@ -221,6 +227,7 @@ class RunResponse(BaseModel):
     total_count: int | None = None
     artifact_count: int | None = None
     history_blocker: object | None = None
+    publication_receipts: list[dict] = []
 
 
 class ResumeRequest(BaseModel):
@@ -330,6 +337,10 @@ def _run_to_dict(
         variables = run.variables or {}
         project = variables.get("project") if isinstance(variables.get("project"), dict) else {}
         state = project.get("state") if isinstance(project.get("state"), dict) else {}
+        from packages.core.services.workflow_publication_receipts import (
+            publication_receipts_from_step_results,
+        )
+
         response_data.update({
             "variables": variables,
             "step_results": run.step_results or {},
@@ -338,6 +349,9 @@ def _run_to_dict(
                 "_workflow_definition_fingerprint"
             ),
             "business_outcome": state.get("business_outcome"),
+            "publication_receipts": publication_receipts_from_step_results(
+                run.step_results
+            ),
         })
     if can_control is not None:
         response_data["capabilities"] = {"can_control": can_control}
@@ -390,6 +404,77 @@ def _persisted_workflow_history_state(run) -> dict:
         "artifact_count": count("artifact_count"),
         "history_blocker": summary.get("blocker"),
     }
+
+
+def _run_business_outcome(run) -> str:
+    variables = run.variables if isinstance(run.variables, dict) else {}
+    project = variables.get("project") if isinstance(variables.get("project"), dict) else {}
+    state = project.get("state") if isinstance(project.get("state"), dict) else {}
+    return str(state.get("business_outcome") or "").strip().lower()
+
+
+def _response_artifact_refs(response_data: dict) -> list[dict]:
+    refs: list[dict] = []
+
+    def append_refs(value) -> None:
+        if isinstance(value, dict):
+            refs.append(value)
+        elif isinstance(value, list):
+            refs.extend(ref for ref in value if isinstance(ref, dict))
+
+    for entry in response_data.get("execution_trace") or []:
+        if not isinstance(entry, dict):
+            continue
+        append_refs(entry.get("artifact_refs"))
+    step_results = response_data.get("step_results")
+    if isinstance(step_results, dict):
+        for result in step_results.values():
+            if not isinstance(result, dict):
+                continue
+            append_refs(result.get("artifact_refs"))
+    return refs
+
+
+async def _enrich_visible_artifact_names(
+    db: AsyncSession,
+    response_data: dict,
+    *,
+    run,
+    user: User,
+) -> dict:
+    refs = _response_artifact_refs(response_data)
+    document_ids = {
+        str(ref.get("document_id") or "").strip()
+        for ref in refs
+        if str(ref.get("document_id") or "").strip()
+    }
+    if not document_ids:
+        return response_data
+
+    from sqlalchemy import select
+
+    documents = list((await db.execute(
+        select(Document).where(
+            Document.entity_id == user.entity_id,
+            Document.id.in_(document_ids),
+        )
+    )).scalars().all())
+    visible_names: dict[str, str] = {}
+    for document in documents:
+        if await user_can_read_document(
+            db,
+            document,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=user.role,
+            workspace_id=run.workspace_id,
+        ):
+            visible_names[document.id] = document.name
+    for ref in refs:
+        document_id = str(ref.get("document_id") or "").strip()
+        if document_id in visible_names:
+            ref["name"] = visible_names[document_id]
+    return response_data
 
 
 def _compact_workflow_run_state(run) -> dict:
@@ -480,6 +565,18 @@ def _compact_workflow_run_state(run) -> dict:
             "observed_problem": summarize_trace_value(observed_problem),
             "options": ["resume", "cancel"],
         }
+    elif run.status == "paused":
+        from packages.core.services.workflow_run_control import is_manually_paused
+
+        if is_manually_paused(run):
+            intervention = {
+                "kind": "workflow_resume",
+                "workflow_run_id": run.id,
+                "workflow_binding_id": run.binding_id,
+                "step_id": run.current_step_id,
+                "observed_problem": "Workflow paused by an operator.",
+                "options": ["resume", "cancel"],
+            }
     return {
         "workflow_steps": workflow_steps,
         "business_outcome": business_outcome,
@@ -492,25 +589,37 @@ async def _message_backed_workflow_intervention(
     db: AsyncSession,
     run,
 ) -> dict | None:
-    if run.trigger_source != "workspace_chat" or not run.workspace_id:
-        return None
-    from sqlalchemy import or_, select
+    from sqlalchemy import and_, or_, select
 
     from packages.core.models.task import Conversation, Message
     from packages.core.services.workflow_run_trace import summarize_trace_value
 
     trigger_data = run.trigger_data if isinstance(run.trigger_data, dict) else {}
-    context = trigger_data.get("_workspace_chat_entrypoint")
+    context = trigger_data.get("_workflow_chat_origin")
+    if not isinstance(context, dict):
+        context = trigger_data.get("_workspace_chat_entrypoint")
     if not isinstance(context, dict):
         return None
     conversation_id = str(context.get("conversation_id") or "").strip()
     if not conversation_id:
         return None
 
+    personal_conversation = and_(
+        Conversation.workspace_id.is_(None),
+        Conversation.user_id == run.started_by,
+    )
+    conversation_scope = (
+        or_(
+            Conversation.workspace_id == run.workspace_id,
+            personal_conversation,
+        )
+        if run.workspace_id
+        else personal_conversation
+    )
     conditions = (
         Conversation.id == conversation_id,
         Conversation.entity_id == run.entity_id,
-        Conversation.workspace_id == run.workspace_id,
+        conversation_scope,
         Message.conversation_id == conversation_id,
         Message.pending_action.isnot(None),
         Message.pending_action["kind"].as_string().in_(
@@ -548,6 +657,9 @@ async def _message_backed_workflow_intervention(
     sanitized = summarize_trace_value(action) if action else None
     if not isinstance(sanitized, dict):
         return None
+    action_kind = str((action or {}).get("kind") or "").strip()
+    if action_kind:
+        sanitized["kind"] = action_kind
     sanitized["message_id"] = message.id
     sanitized["source"] = "workspace_chat"
     return sanitized
@@ -659,6 +771,58 @@ async def create_workflow(
     )
     await db.commit()
     return _wf_to_dict(wf)
+
+
+@router.get("/templates")
+async def list_workflow_templates(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List verified platform Flow templates by stable catalogue id."""
+    from packages.core.services.workflow_template_service import list_flow_templates
+
+    return await list_flow_templates(db, user.entity_id)
+
+
+@router.post("/templates/{template_id}/install", status_code=201)
+async def install_workflow_template(
+    template_id: str,
+    body: WorkflowTemplateInstallRequest | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Install a portable template as an entity-owned WorkflowDefinition.
+
+    The response deliberately includes both ids: ``template.id`` remains the
+    Marketplace identity, while ``workflow.id`` is what every runtime caller
+    and optional Workspace binding executes.
+    """
+    workspace_id = body.workspace_id if body else None
+    if workspace_id and not await user_can_write_workspace_id(
+        db,
+        workspace_id=workspace_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+    ):
+        raise HTTPException(403, "Cannot attach a Flow to this Workspace")
+
+    from packages.core.services.workflow_template_service import install_flow_template
+
+    try:
+        result = await install_flow_template(
+            db,
+            template_id=template_id,
+            entity_id=user.entity_id,
+            installed_by=user.id,
+            workspace_id=workspace_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await db.commit()
+    return result
 
 
 @router.post("/ai-edit")
@@ -1156,6 +1320,8 @@ async def get_run(
             if (
                 message_intervention.get("truncated") is True
                 and isinstance(compact_intervention, dict)
+                and message_intervention.get("kind")
+                == compact_intervention.get("kind")
             ):
                 compact_state["intervention"] = {
                     **compact_intervention,
@@ -1164,13 +1330,21 @@ async def get_run(
                 }
             else:
                 compact_state["intervention"] = message_intervention
-    return _run_to_dict(
+    response_data = _run_to_dict(
         run,
         include_detail=detail,
         summary=not detail,
         can_control=await _run_can_control(db, run, user),
         compact_state=compact_state,
     )
+    if detail:
+        await _enrich_visible_artifact_names(
+            db,
+            response_data,
+            run=run,
+            user=user,
+        )
+    return response_data
 
 
 @router.get("/runs/{run_id}/family")
@@ -1234,12 +1408,62 @@ async def cancel_run(
     if not run:
         raise HTTPException(404, "Run not found")
     await _require_run_control(db, run, user)
-    if run.status in ("completed", "cancelled"):
-        raise HTTPException(400, f"Run already {run.status}")
-    run.status = "cancelled"
-    await db.flush()
+    latest_attempt = await svc.latest_workflow_run_family_attempt(
+        db,
+        run,
+        lock_root=True,
+    )
+    if latest_attempt.id != run.id:
+        await _require_run_control(db, latest_attempt, user)
+        run = latest_attempt
+    business_outcome = _run_business_outcome(run)
+    actionable_completed = (
+        run.status == "completed"
+        and business_outcome in {"needs_input", "revision_required"}
+    )
+    from packages.core.services.workflow_chat_projection import project_workflow_run_status
+
+    if run.status == "cancelled":
+        await project_workflow_run_status(db, run=run)
+        await db.commit()
+        return _run_to_dict(run, can_control=True)
+    if run.status == "completed" and not actionable_completed:
+        raise HTTPException(400, "Run already completed")
+    from packages.core.services.workflow_run_control import cancel_run as cancel_workflow_run
+
+    try:
+        cancel_workflow_run(
+            run,
+            actor_id=user.id,
+            allow_problem_terminal=(run.status == "failed" or actionable_completed),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await project_workflow_run_status(db, run=run)
     await db.commit()
-    return _run_to_dict(run)
+    return _run_to_dict(run, can_control=True)
+
+
+@router.post("/runs/{run_id}/pause")
+async def pause_run(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    run = await svc.get_run(db, run_id, user.entity_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+    await _require_run_control(db, run, user)
+    from packages.core.services.workflow_run_control import pause_run as pause_workflow_run
+    from packages.core.services.workflow_chat_projection import project_workflow_run_status
+
+    try:
+        pause_workflow_run(run, actor_id=user.id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await project_workflow_run_status(db, run=run)
+    await db.commit()
+    return _run_to_dict(run, can_control=True)
 
 
 @router.post("/runs/{run_id}/resume")

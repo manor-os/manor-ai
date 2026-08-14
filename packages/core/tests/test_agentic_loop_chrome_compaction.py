@@ -187,6 +187,43 @@ def test_chrome_screenshot_rejects_invalid_webp_without_leaking_base64():
     }
 
 
+def test_chrome_task_ledger_preserves_user_takeover_interruption() -> None:
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    messages = [
+        {"role": "user", "content": "Use Chrome to update the draft."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "takeover-1",
+                "type": "function",
+                "function": {"name": "mcp__chrome__click_element", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "takeover-1",
+            "content": json.dumps({
+                "ok": False,
+                "status": "interrupted",
+                "reason": "user_takeover",
+                "group_id": "group-a",
+                "control_epoch": "epoch-1",
+                "action_executed": False,
+                "retryable": False,
+            }),
+        },
+    ]
+
+    ledger_text = loop_module._chrome_task_ledger_from_messages(messages)
+    ledger = json.loads(ledger_text.split("[Chrome task ledger]\n", 1)[1])
+
+    assert ledger["stage"] == "interrupted"
+    assert ledger["reason"] == "user_takeover"
+    assert ledger["next"] == "report_user_takeover"
+    assert ledger["group_id"] == "group-a"
+
+
 @pytest.mark.asyncio
 async def test_chrome_task_ledger_survives_structural_compaction():
     loop_module = importlib.import_module("packages.core.ai.agentic_loop")
@@ -1906,3 +1943,108 @@ def test_chrome_action_compaction_preserves_wait_then_read_page_hints():
     assert parsed["state_hint"]["after_wait"] == "read_page"
     assert parsed["next_required_tool"] == "mcp__chrome__read_page"
     assert "upload may trigger" in parsed["state_hint"]["wait_reason"]
+
+
+def test_chrome_read_page_compaction_keeps_active_dialog_refs_when_semantic_floor_is_too_large():
+    semantic_refs = []
+    for index in range(1, 301):
+        role = "textbox" if 201 <= index <= 224 else "button"
+        semantic_refs.append(
+            {
+                "ref": f"e{index}",
+                "node_id": f"e{index}",
+                "role": role,
+                "label": f"YouTube control {index} " + ("x" * 400),
+                "selector": f"ytcp-field:nth-of-type({index}) [role='{role}']",
+                "description": "y" * 1000,
+                "container_label": "Upload video dialog " + ("z" * 500),
+                "editable": role == "textbox",
+                "clickable": True,
+                "in_viewport": True,
+                "bounds": {"x": index, "y": index, "width": 800, "height": 48},
+            }
+        )
+
+    fields = [
+        {
+            **semantic_refs[index - 1],
+            "required": True,
+            "valid": False,
+            "validation_message": "Required " + ("v" * 1000),
+            "validity_flags": ["valueMissing"] * 20,
+        }
+        for index in range(201, 225)
+    ]
+    next_actions = [
+        {
+            "rank": index,
+            "tool": "fill_or_select",
+            "ref": f"e{200 + index}",
+            "node_id": f"e{200 + index}",
+            "label": f"Field {index} " + ("q" * 500),
+            "reason": "r" * 1000,
+            "missing_required_fields": [
+                {"ref": f"e{200 + field_index}", "label": "m" * 500}
+                for field_index in range(1, 25)
+            ],
+        }
+        for index in range(1, 25)
+    ]
+    payload = {
+        "ok": True,
+        "status": "read_page",
+        "driver": "chrome-extension",
+        "snapshot_id": "snap-youtube-upload",
+        "tabId": 42,
+        "url": "https://studio.youtube.com/video/upload",
+        "title": "YouTube Studio",
+        "page_status": "ready",
+        "observation_quality": "medium",
+        "pageContent": "\n".join(
+            f'- {item["role"]} "{item["label"]}" [ref={item["ref"]}]'
+            for item in semantic_refs
+        ),
+        "semantic_refs": semantic_refs,
+        "input_candidates": fields,
+        "form_candidates": [
+            {
+                "rank": 1,
+                "selector": "ytcp-uploads-dialog",
+                "label": "Upload video",
+                "field_refs": [f"e{index}" for index in range(201, 225)],
+                "fields": fields,
+                "submit_refs": ["e300"],
+                "submit_candidates": [
+                    {"ref": "e300", "label": "Next", "reason": "s" * 1000}
+                ],
+                "missing_required_fields": fields,
+                "form_progress": {"missing": 24, "extra": "p" * 1000},
+            }
+        ],
+        "dialog_candidates": [
+            {
+                "rank": 1,
+                "selector": "ytcp-uploads-dialog",
+                "label": "Upload video",
+                "field_refs": [f"e{index}" for index in range(201, 225)],
+                "submit_refs": ["e300"],
+                "next_actions": next_actions,
+            }
+        ],
+        "submit_candidates": [
+            {"rank": 1, "ref": "e300", "node_id": "e300", "label": "Next"}
+        ],
+        "next_actions": next_actions,
+    }
+
+    compacted_text = _compact_tool_result_for_context(
+        "mcp__chrome__read_page",
+        json.dumps(payload),
+    )
+    compacted = json.loads(compacted_text)
+
+    assert len(compacted_text) <= 12_000
+    assert compacted["snapshot_id"] == "snap-youtube-upload"
+    assert compacted["_tool_result_truncated"]["strategy"] == "chrome_browser_minimal_context"
+    assert compacted["dialog_candidates"][0]["field_refs"][:2] == ["e201", "e202"]
+    assert compacted["next_actions"][0]["tool"] == "fill_or_select"

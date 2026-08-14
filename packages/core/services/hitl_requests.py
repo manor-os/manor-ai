@@ -96,6 +96,11 @@ def user_visible_hitl_action_text(action: str) -> str:
         return "Approved the requested action."
     if _is_rejection_action(action):
         return "Rejected the requested action."
+    normalized = str(action or "").strip().lower()
+    if normalized == "revise":
+        return "Requested revisions to the Workflow output."
+    if normalized == "cancel":
+        return "Cancelled the Workflow action."
     return "Responded to the approval request."
 
 

@@ -29,6 +29,7 @@ from packages.core.blueprints.freshness import (
     FIRST_CONTENT_VERSION,
     next_content_version,
 )
+from packages.core.blueprints.payload import detect_version
 from packages.core.blueprints.solo_company import get_solo_company_blueprints
 from packages.core.models.blueprint import WorkspaceBlueprint
 
@@ -68,6 +69,25 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
         row = (await db.execute(
             select(WorkspaceBlueprint).where(WorkspaceBlueprint.id == row_id)
         )).scalar_one_or_none()
+        if row is None:
+            # Before stable builtin:<slug> ids, official listings could be
+            # published with a generated id. Creating the stable row beside
+            # one of those collides with the platform-slug unique index and
+            # aborts the entire startup seed, leaving every later Blueprint
+            # payload stale. Reconcile that legacy row in place; its id may
+            # still be referenced by installed workspaces and purchases.
+            row = (await db.execute(
+                select(WorkspaceBlueprint).where(
+                    WorkspaceBlueprint.entity_id.is_(None),
+                    WorkspaceBlueprint.slug == slug,
+                )
+            )).scalars().first()
+            if row is not None:
+                logger.info(
+                    "platform blueprint legacy row adopted: %s (%s)",
+                    slug,
+                    row.id,
+                )
 
         version, fingerprint = next_content_version(
             current_version=getattr(row, "content_version", None) or FIRST_CONTENT_VERSION,
@@ -84,6 +104,7 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
             "cover_image_url": manifest.get("cover_image_url"),
             "tags": [str(tag) for tag in tags] if isinstance(tags, list) else [],
             "payload": payload,
+            "payload_version": detect_version(payload),
             "status": PUBLISHED,
             "content_version": version,
             "content_fingerprint": fingerprint,

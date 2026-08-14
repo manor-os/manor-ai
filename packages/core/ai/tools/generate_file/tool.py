@@ -3,6 +3,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from packages.core.contracts.audio_generation import (
+    AudioGenerationFormat,
+    AudioGenerationPurpose,
+    GenerateFileKind,
+)
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
 
 from . import common
@@ -58,8 +63,15 @@ async def _generate_file_handler(
     **kwargs: Any,
 ) -> str:
     runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
-    kind = str(kwargs.get("kind") or "").strip().lower().replace("-", "_")
-    if kind == "search":
+    raw_kind = str(kwargs.get("kind") or "").strip().lower().replace("-", "_")
+    try:
+        kind = GenerateFileKind(raw_kind)
+    except ValueError:
+        return json.dumps({
+            "error": f"Unknown generate_file kind: {raw_kind or '(empty)'}",
+            "capabilities": _CAPABILITIES,
+        }, ensure_ascii=False)
+    if kind is GenerateFileKind.SEARCH:
         return json.dumps({
             "capabilities": _CAPABILITIES,
             "parameter_options": {
@@ -89,18 +101,14 @@ async def _generate_file_handler(
                     },
                 },
                 "audio": {
-                    "purpose": [
-                        "speech",
-                        "dialogue",
-                        "narration",
-                        "music",
-                        "ambience",
-                        "soundscape",
-                        "sfx",
-                        "transition",
-                    ],
+                    "purpose": AudioGenerationPurpose.values(),
                     "duration_seconds": 12,
-                    "response_format": ["mp3", "wav", "flac", "opus", "pcm", "pcm16"],
+                    "response_format": AudioGenerationFormat.values(),
+                    "format_policy": (
+                        "response_format is the final stored artifact format. Provider "
+                        "synthesis format and conversion are automatic; if the provider "
+                        "is unavailable, retry the same request instead of changing formats."
+                    ),
                 },
                 "diagram": {
                     "file_type": "diagram.json",
@@ -113,13 +121,7 @@ async def _generate_file_handler(
                 },
             },
         }, ensure_ascii=False)
-    if kind not in _CAPABILITIES:
-        return json.dumps({
-            "error": f"Unknown generate_file kind: {kind or '(empty)'}",
-            "capabilities": _CAPABILITIES,
-        }, ensure_ascii=False)
-
-    if kind in {"video", "audio"}:
+    if kind in {GenerateFileKind.VIDEO, GenerateFileKind.AUDIO}:
         guard = await _active_document_skill_media_guard(
             runtime_context.conversation_id, kind
         )
@@ -132,8 +134,8 @@ async def _generate_file_handler(
         raw_params.get("files") is not None
         or kwargs.get("files") is not None
     )
-    if kind == "document" and has_bundle_files:
-        kind = "code"
+    if kind is GenerateFileKind.DOCUMENT and has_bundle_files:
+        kind = GenerateFileKind.CODE
     prompt = str(kwargs.get("prompt") or "").strip()
     agent_id = kwargs.get("agent_id") or runtime_context.agent_id
     name = str(
@@ -155,25 +157,25 @@ async def _generate_file_handler(
         "agent_id": agent_id,
     }
 
-    if kind == "diagram":
+    if kind is GenerateFileKind.DIAGRAM:
         return await handle_diagram(**handler_kwargs)
-    if kind == "code":
+    if kind is GenerateFileKind.CODE:
         return await handle_code(**handler_kwargs)
-    if kind == "document":
+    if kind is GenerateFileKind.DOCUMENT:
         return await handle_document(**handler_kwargs)
-    if kind == "word_document":
+    if kind is GenerateFileKind.WORD_DOCUMENT:
         return await handle_word_document(**handler_kwargs)
-    if kind == "pdf":
+    if kind is GenerateFileKind.PDF:
         return await handle_pdf(**handler_kwargs)
-    if kind == "presentation":
+    if kind is GenerateFileKind.PRESENTATION:
         return await handle_presentation(**handler_kwargs)
-    if kind == "spreadsheet":
+    if kind is GenerateFileKind.SPREADSHEET:
         return await handle_spreadsheet(**handler_kwargs)
-    if kind == "image":
+    if kind is GenerateFileKind.IMAGE:
         return await handle_image(**handler_kwargs)
-    if kind == "video":
+    if kind is GenerateFileKind.VIDEO:
         return await handle_video(**handler_kwargs)
-    if kind == "audio":
+    if kind is GenerateFileKind.AUDIO:
         return await handle_audio(**handler_kwargs)
 
     return json.dumps({"error": f"Unhandled kind: {kind}"}, ensure_ascii=False)

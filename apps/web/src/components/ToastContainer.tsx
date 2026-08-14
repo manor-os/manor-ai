@@ -195,9 +195,9 @@ export default function ToastContainer() {
         position: "fixed",
         top: 24,
         right: 24,
-        // Above modals (overlay 10000 / dialog 10001 in ui/Modal) so success
+        // Above modals (overlay 20000 / dialog 20001 in ui/Modal) so success
         // and error toasts aren't hidden behind an open popup.
-        zIndex: 10050,
+        zIndex: 20050,
         display: "flex",
         flexDirection: "column",
         gap: 12,

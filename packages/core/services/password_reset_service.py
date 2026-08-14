@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.user import User
-from packages.core.services.auth_service import hash_password
+from packages.core.services.auth_service import hash_password, validate_password_strength
 
 # Simple in-memory token store (use Redis in production)
 _reset_tokens: dict[str, dict] = {}  # token -> {user_id, email, expires_at}
@@ -43,6 +43,7 @@ async def verify_reset_token(token: str) -> dict | None:
 
 async def reset_password(db: AsyncSession, token: str, new_password: str) -> bool:
     """Reset password using a valid token. Returns True on success."""
+    validate_password_strength(new_password)
     data = await verify_reset_token(token)
     if not data:
         return False
@@ -53,6 +54,7 @@ async def reset_password(db: AsyncSession, token: str, new_password: str) -> boo
         return False
 
     user.password_hash = hash_password(new_password)
+    user.token_version = int(user.token_version or 0) + 1
     await db.flush()
     del _reset_tokens[token]
     return True

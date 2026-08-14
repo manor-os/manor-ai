@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shoot-to-Approval Demo Motion</title>
+<style data-manor-preview-src="styles.css">
+*{box-sizing:border-box}body{margin:0;background:#050812;color:white;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}#stage{position:relative;width:100vw;height:100vh;overflow:hidden;background:radial-gradient(circle at 72% 28%,#12345a 0,#091326 32%,#050812 70%)}#stage:before{content:"";position:absolute;inset:0;background:linear-gradient(120deg,transparent,rgba(87,197,255,.08),transparent);animation:sweep 6s linear infinite}.brand{position:absolute;top:40px;left:54px;color:#94a3b8;font-size:24px;z-index:10}.stars:before{content:"";position:absolute;inset:0;background-image:radial-gradient(#57c5ff 1px,transparent 1px);background-size:46px 46px;opacity:.18;animation:drift 12s linear infinite}.scene{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;opacity:0;animation-duration:31s;animation-fill-mode:both;animation-timing-function:ease-in-out}.scene h1{font-size:64px;line-height:1.05;margin:0 0 22px;text-align:center;letter-spacing:-2px}.scene h2{font-size:64px;color:#57c5ff;margin:0;text-align:center;letter-spacing:-2px}.sub{font-size:34px;color:#cbd5e1;margin:0;text-align:center}.eyebrow{font-size:34px;color:#cbd5e1;margin:0 0 18px}.scene-1{animation-name:s1}.scene-2{animation-name:s2}.scene-3{animation-name:s3}.scene-4{animation-name:s4}.scene-5{animation-name:s5}.scene-6{animation-name:s6}.scene-7{animation-name:s7}.float-card{position:absolute;padding:16px 20px;border-radius:16px;background:rgba(255,255,255,.11);border:1px solid rgba(255,255,255,.22);font-size:24px;backdrop-filter:blur(10px);box-shadow:0 20px 60px rgba(0,0,0,.28);animation:float 3s ease-in-out infinite}.c1{left:120px;top:300px}.c2{left:360px;top:385px;animation-delay:.4s}.c3{left:730px;top:305px;animation-delay:.8s}.c4{left:850px;top:420px;animation-delay:1.2s}.c5{left:250px;top:500px;animation-delay:1.6s}.product-card,.table-card,.compare>div{border-radius:28px;background:rgba(17,24,39,.88);border:1px solid rgba(87,197,255,.55);box-shadow:0 0 32px rgba(87,197,255,.16),0 30px 90px rgba(0,0,0,.45);backdrop-filter:blur(12px)}.product-card{position:relative;width:680px;margin-top:70px;padding:34px 50px}.product-card h3{font-size:34px;margin:0 0 26px}.product-card div{height:25px;border-radius:8px;background:rgba(87,197,255,.15);margin:10px 0;padding-left:14px;color:#e6f4ff;font-family:monospace;font-size:18px}.price{position:absolute;right:70px;top:75px;border:2px solid rgba(34,197,94,.75);background:rgba(34,197,94,.25);border-radius:18px;padding:35px 24px;font-size:34px}.table-card{width:980px;padding:28px;margin-top:40px}.table-card h3{font-size:34px;margin:0 0 22px}.grid{display:grid;grid-template-columns:1fr 2fr 1fr 1fr;gap:10px;margin:10px 0;padding:10px 14px;border-radius:10px;background:rgba(255,255,255,.07);font-family:monospace;font-size:22px}.grid.three{grid-template-columns:1fr 2fr 1fr}.head{background:transparent;color:#57c5ff;font-family:inherit}.purple{border-color:rgba(167,139,250,.65)}.purple .head{color:#a78bfa}.bottom{margin-top:26px}.flow{display:flex;align-items:center;gap:36px;margin-top:90px}.flow div{position:relative;text-align:center}.flow div:not(:last-child):after{content:"";position:absolute;top:39px;left:90px;width:116px;height:4px;background:#57c5ff;box-shadow:0 0 18px #57c5ff}.flow b{display:grid;place-items:center;width:80px;height:80px;border-radius:50%;background:rgba(87,197,255,.22);border:3px solid #57c5ff;font-size:34px}.flow span{display:block;width:150px;margin-left:-35px;margin-top:24px;font-size:24px}.pill{margin-top:90px;padding:16px 34px;border-radius:18px;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.65);font-size:24px;color:#dcfce7}.compare{display:grid;grid-template-columns:1fr 1fr;gap:60px;width:1100px;margin-top:45px}.compare>div{padding:40px}.compare h3{font-size:34px;margin:0 0 28px}.compare p{font-size:24px;margin:20px 0}.bad{border-color:rgba(248,113,113,.55);background:rgba(40,20,30,.82)}.bad h3{color:#f87171}.good{border-color:rgba(34,197,94,.65);background:rgba(15,35,28,.82)}.good h3{color:#22c55e}.final{margin-top:55px}.final p{font-size:24px;color:#57c5ff}button{margin-top:45px;border:0;border-radius:20px;background:#57c5ff;color:#050812;font-weight:700;font-size:24px;padding:18px 42px;box-shadow:0 0 30px rgba(87,197,255,.45)}@keyframes s1{0%,12.9%{opacity:1;transform:scale(1)}15%{opacity:0;transform:scale(.96)}100%{opacity:0}}@keyframes s2{0%,12%{opacity:0}14%,25.8%{opacity:1}28%{opacity:0;transform:translateY(-20px)}}@keyframes s3{0%,25%{opacity:0}27%,41.9%{opacity:1}44%{opacity:0}}@keyframes s4{0%,41%{opacity:0}43%,58.1%{opacity:1}60%{opacity:0}}@keyframes s5{0%,57%{opacity:0}59%,74.2%{opacity:1}76%{opacity:0}}@keyframes s6{0%,73%{opacity:0}75%,87.1%{opacity:1}89%{opacity:0}}@keyframes s7{0%,86%{opacity:0}88%,100%{opacity:1}}@keyframes float{0%,100%{transform:translateY(-5px)}50%{transform:translateY(10px)}}@keyframes drift{from{transform:translate(0,0)}to{transform:translate(46px,46px)}}@keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+
+</style>
+</head>
+<body>
+  <main id="stage" aria-label="Shoot-to-Approval demo video animation">
+    <div class="stars"></div>
+    <div class="brand">Shoot-to-Approval</div>
+
+    <section class="scene scene-1">
+      <h1>Your shoot went well.</h1>
+      <h2>The approval process didn’t.</h2>
+      <div class="float-card c1">Can we change this part?</div>
+      <div class="float-card c2">Which version is final?</div>
+      <div class="float-card c3">Approved?</div>
+      <div class="float-card c4">Can we use this for ads?</div>
+      <div class="float-card c5">Where is the final link?</div>
+    </section>
+
+    <section class="scene scene-2">
+      <p class="eyebrow">Meet the</p>
+      <h1>Shoot-to-Approval Workflow Kit</h1>
+      <p class="sub">A clean client approval system for solo videographers.</p>
+      <div class="product-card">
+        <h3>Workflow Pack</h3>
+        <div>Revision Tracker</div><div>Approval Flow</div><div>Usage Checklist</div><div>Email Scripts</div>
+        <span class="price">$19</span>
+      </div>
+    </section>
+
+    <section class="scene scene-3">
+      <h1>Track every client revision.</h1>
+      <div class="table-card">
+        <h3>Revision Tracker</h3>
+        <div class="grid head"><span>Time</span><span>Request</span><span>Scope</span><span>Status</span></div>
+        <div class="grid"><span>00:14</span><span>Trim intro</span><span>Yes</span><span>Doing</span></div>
+        <div class="grid"><span>01:22</span><span>Swap shot</span><span>Yes</span><span>Queued</span></div>
+        <div class="grid"><span>02:05</span><span>New graphic</span><span>No</span><span>Review</span></div>
+        <div class="grid"><span>Final</span><span>Client signoff</span><span>Yes</span><span>Ready</span></div>
+      </div>
+      <p class="sub bottom">One place for every timestamped change.</p>
+    </section>
+
+    <section class="scene scene-4">
+      <h1>Know exactly what’s approved.</h1>
+      <div class="flow">
+        <div><b>1</b><span>First Cut</span></div>
+        <div><b>2</b><span>Feedback</span></div>
+        <div><b>3</b><span>Revision</span></div>
+        <div><b>4</b><span>Final Approval</span></div>
+        <div><b>5</b><span>Delivery</span></div>
+      </div>
+      <p class="pill">Clear path from first cut to final signoff.</p>
+    </section>
+
+    <section class="scene scene-5">
+      <h1>Confirm usage before delivery.</h1>
+      <div class="table-card purple">
+        <h3>Usage Rights Checklist</h3>
+        <div class="grid three head"><span>Item</span><span>Answer</span><span>Status</span></div>
+        <div class="grid three"><span>Platform</span><span>Website + social</span><span>OK</span></div>
+        <div class="grid three"><span>Paid ads?</span><span>Yes</span><span>Confirm</span></div>
+        <div class="grid three"><span>Geography</span><span>US only</span><span>OK</span></div>
+        <div class="grid three"><span>Duration</span><span>12 months</span><span>OK</span></div>
+      </div>
+    </section>
+
+    <section class="scene scene-6">
+      <h1>From scattered feedback to clean final signoff.</h1>
+      <div class="compare">
+        <div class="bad"><h3>Before</h3><p>× Scattered emails</p><p>× Unclear approvals</p><p>× Endless revisions</p><p>× Missed usage details</p></div>
+        <div class="good"><h3>After</h3><p>✓ One workflow</p><p>✓ Clear next step</p><p>✓ Centralized feedback</p><p>✓ Usage confirmed</p></div>
+      </div>
+    </section>
+
+    <section class="scene scene-7">
+      <h1>Preorder the first version for $19.</h1>
+      <p class="sub">Built for solo videographers who want cleaner client approvals.</p>
+      <div class="product-card final"><h3>Shoot-to-Approval Workflow Kit</h3><p>Revision tracker · Approval flow · Usage checklist</p></div>
+      <button>Reserve early access</button>
+    </section>
+  </main>
+</body>
+</html>

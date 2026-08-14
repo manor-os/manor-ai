@@ -349,6 +349,7 @@ async def resolve_pending_action(
     message_id: str,
     user_id: str,
     resolution: dict,
+    emit_followup: bool = True,
 ) -> Optional[Message]:
     """User clicked a button on an interactive message. Records the
     resolution + emits a follow-up agent reply summarising the choice.
@@ -369,7 +370,11 @@ async def resolve_pending_action(
     msg.resolved_at = datetime.now(timezone.utc)
     msg.resolved_by_user_id = user_id
 
-    # Mirror the user choice as a system message for continuity.
+    # Workspace Chat keeps a standalone resolution receipt for continuity.
+    # Personal Chat approval handlers already persist the user's choice and an
+    # assistant continuation message, while the original card also gains its
+    # resolved badge. Emitting this receipt there would show the same outcome
+    # twice, so those callers explicitly disable it.
     choice = resolution.get("choice") or ""
     note = resolution.get("note") or ""
     is_retry = choice in ("retry", "retry_now")
@@ -384,32 +389,34 @@ async def resolve_pending_action(
         "approve" in choice
         or choice in ("yes", "accept", "confirm", "continue_after_login")
     )
-    if is_retry:
-        content = "Retry requested"
-    elif is_feedback:
-        content = "✓ Feedback sent"
-    elif is_response:
-        content = "✓ Response submitted"
-    elif is_workflow_start:
-        content = "✓ Workflow started"
-    elif is_cancelled:
-        content = "✗ Cancelled"
-    else:
-        label = "Approved" if is_approve else "Rejected" if choice else "Resolved"
-        content = f"✓ {label}" if is_approve else f"✗ {label}"
-    if note:
-        content += f" — {note}"
-    follow = Message(
-        id=generate_ulid(),
-        conversation_id=msg.conversation_id,
-        role="system",
-        content=content,
-        author_kind="system",
-        message_kind="system",
-        refs=[{"type": "message", "id": msg.id}],
-    )
-    db.add(follow)
-    await db.flush()
+    follow: Message | None = None
+    if emit_followup:
+        if is_retry:
+            content = "Retry requested"
+        elif is_feedback:
+            content = "✓ Feedback sent"
+        elif is_response:
+            content = "✓ Response submitted"
+        elif is_workflow_start:
+            content = "✓ Workflow started"
+        elif is_cancelled:
+            content = "✗ Cancelled"
+        else:
+            label = "Approved" if is_approve else "Rejected" if choice else "Resolved"
+            content = f"✓ {label}" if is_approve else f"✗ {label}"
+        if note:
+            content += f" — {note}"
+        follow = Message(
+            id=generate_ulid(),
+            conversation_id=msg.conversation_id,
+            role="system",
+            content=content,
+            author_kind="system",
+            message_kind="system",
+            refs=[{"type": "message", "id": msg.id}],
+        )
+        db.add(follow)
+        await db.flush()
 
     # Let other open clients refresh their sidebar counts. The API caller also
     # updates optimistically, but shared workspaces need a cross-tab signal.
@@ -417,7 +424,7 @@ async def resolve_pending_action(
         conv = (await db.execute(
             select(Conversation).where(Conversation.id == msg.conversation_id)
         )).scalar_one_or_none()
-        if conv and conv.workspace_id:
+        if conv and conv.workspace_id and follow is not None:
             entity_id = conv.entity_id
             workspace_id = conv.workspace_id
             await _publish_workspace_chat_event(entity_id, {

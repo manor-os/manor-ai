@@ -1,11 +1,15 @@
 """Authentication endpoints — register, login, current user, OAuth, user management."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import httpx
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -30,6 +34,7 @@ from packages.core.services.auth_service import (
     mark_user_login,
     register_user,
     update_user_role,
+    validate_password_strength,
 )
 from packages.core.services.totp_service import (
     disable_2fa,
@@ -46,6 +51,11 @@ from packages.core.permissions import (
     user_staff_role_summary,
 )
 from packages.core.services.captcha_service import CAPTCHA_ENABLED, verify_captcha
+from packages.core.services.auth_rate_limit import (
+    check_login_allowed,
+    clear_login_failures,
+    record_login_failure,
+)
 from packages.core.services.email_verification_service import (
     create_verification,
     resend_verification,
@@ -94,6 +104,10 @@ class TokenResponse(BaseModel):
     user_id: str
     entity_id: str
     role: str
+
+
+class MfaStepUpRequest(BaseModel):
+    totp_code: str
 
 
 
@@ -270,6 +284,11 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
     redemption (use-counter increment + bonus credits + plan assign)
     runs AFTER user/entity creation so it can reference the new IDs.
     """
+    try:
+        validate_password_strength(req.password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
     if CAPTCHA_ENABLED:
         if not req.captcha_token:
             raise HTTPException(400, "Captcha token is required")
@@ -280,7 +299,9 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
     if (req.invite_token or "").strip():
         user, entity = await _register_from_staff_invite(db, req=req)
         mark_user_login(user, source="auth.register_invite")
-        token = create_access_token(user.id, entity.id, user.role)
+        token = create_access_token(
+            user.id, entity.id, user.role, token_version=user.token_version,
+        )
         return TokenResponse(
             access_token=token,
             user_id=user.id,
@@ -375,7 +396,9 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
         }
 
     mark_user_login(user, source="auth.register")
-    token = create_access_token(user.id, entity.id, user.role)
+    token = create_access_token(
+        user.id, entity.id, user.role, token_version=user.token_version,
+    )
     return TokenResponse(
         access_token=token,
         user_id=user.id,
@@ -402,7 +425,7 @@ async def verify_email_endpoint(
     req: VerifyEmailRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Verify email with 6-digit code. Returns JWT on success."""
+    """Verify email with an 8-character alphanumeric code and return a JWT."""
     ok = await verify_email(db, req.email, req.code)
     if not ok:
         raise HTTPException(400, "Invalid or expired verification code")
@@ -417,7 +440,9 @@ async def verify_email_endpoint(
     await send_welcome_email(req.email, user.display_name or req.email.split("@")[0])
 
     mark_user_login(user, source="auth.verify_email")
-    token = create_access_token(user.id, user.entity_id, user.role)
+    token = create_access_token(
+        user.id, user.entity_id, user.role, token_version=user.token_version,
+    )
     return TokenResponse(
         access_token=token,
         user_id=user.id,
@@ -457,8 +482,28 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     if not login_id:
         raise HTTPException(400, "Email or username is required")
 
+    client_ip = (
+        request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    rate_decision = await check_login_allowed(login_id, client_ip)
+    if not rate_decision.allowed:
+        raise HTTPException(
+            429,
+            "Too many login attempts. Try again later.",
+            headers={"Retry-After": str(rate_decision.retry_after)},
+        )
+
     user = await authenticate_user(db, email=login_id, password=req.password)
     if not user:
+        failure_decision = await record_login_failure(login_id, client_ip)
+        if not failure_decision.allowed:
+            raise HTTPException(
+                429,
+                "Too many login attempts. Try again later.",
+                headers={"Retry-After": str(failure_decision.retry_after)},
+            )
         # If this is an OAuth-only account, provide a clear next step.
         existing = await get_user_by_login(db, login_id, include_deleted=True)
         if existing and existing.deleted_at is not None:
@@ -505,10 +550,56 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
         if not req.totp_code:
             return {"requires_2fa": True, "user_id": user.id}
         if not await verify_2fa_login(db, user.id, req.totp_code):
+            await record_login_failure(login_id, client_ip)
             raise HTTPException(401, "Invalid 2FA code")
 
+    await clear_login_failures(login_id)
     mark_user_login(user, source="auth.login")
-    token = create_access_token(user.id, user.entity_id, user.role, remember=req.remember_me)
+    token = create_access_token(
+        user.id,
+        user.entity_id,
+        user.role,
+        remember=req.remember_me,
+        token_version=user.token_version,
+        mfa_authenticated=bool(user.totp_enabled),
+    )
+    return TokenResponse(
+        access_token=token,
+        user_id=user.id,
+        entity_id=user.entity_id,
+        role=user.role,
+    )
+
+
+@router.post("/logout", status_code=204)
+async def logout(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke every bearer token issued before this logout."""
+    user.token_version = int(user.token_version or 0) + 1
+    await db.flush()
+    return Response(status_code=204)
+
+
+@router.post("/mfa/step-up", response_model=TokenResponse)
+async def mfa_step_up(
+    req: MfaStepUpRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Verify TOTP for the current session and mint an MFA-bound token."""
+    if not user.totp_enabled:
+        raise HTTPException(403, "TOTP is not enabled for this account")
+    if not await verify_2fa_login(db, user.id, req.totp_code):
+        raise HTTPException(401, "Invalid 2FA code")
+    token = create_access_token(
+        user.id,
+        user.entity_id,
+        user.role,
+        token_version=user.token_version,
+        mfa_authenticated=True,
+    )
     return TokenResponse(
         access_token=token,
         user_id=user.id,
@@ -557,7 +648,12 @@ async def switch_entity(
     if not membership or membership.status != "active":
         raise HTTPException(403, "You do not have an active membership in this company.")
     await activate_user_membership(db, user=user, membership=membership)
-    token = create_access_token(user.id, membership.entity_id, membership.role)
+    token = create_access_token(
+        user.id,
+        membership.entity_id,
+        membership.role,
+        token_version=user.token_version,
+    )
     return TokenResponse(
         access_token=token,
         user_id=user.id,
@@ -624,6 +720,17 @@ async def upload_avatar(
     raw_ext = file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "jpg"
     ext = "".join(ch for ch in raw_ext.lower() if ch.isalnum())[:10] or "jpg"
     content = await file.read()
+
+    from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
+    try:
+        await inspect_upload_content(
+            content,
+            filename=file.filename or f"avatar.{ext}",
+            declared_content_type=file.content_type,
+            allowed_extensions={".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"},
+        )
+    except UploadSecurityError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
     from packages.core.services.entity_fs import (
         EntityFilesystemError,
@@ -711,7 +818,7 @@ async def get_my_models(
 
 
 class UpdateModelsRequest(BaseModel):
-    models: dict  # {"primary": "anthropic/claude-sonnet-4.6", "worker": "openai/gpt-4", ...}
+    models: dict  # {"primary": "openai/gpt-5.6-luna", "worker": "deepseek/deepseek-v4-flash", ...}
 
 
 @router.put("/me/models")
@@ -721,7 +828,12 @@ async def update_my_models(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update the current entity's model preferences."""
+    """Update catalog model selections without changing saved BYOK credentials.
+
+    A BYOK credential is bound to the exact model it was tested with. Selecting
+    another model keeps that credential available for later, while the runtime
+    ignores it until the bound model is selected again.
+    """
     from packages.core.constants.models import DEFAULTS
     from packages.core.services.audit_service import log_action
     from packages.core.services.model_settings import (
@@ -758,7 +870,6 @@ async def update_my_models(
         for role, model_id in updates.items()
         if existing_models.get(role) != model_id
     }
-
     settings["models"] = {**existing_models, **updates}
     entity.settings = settings
 
@@ -802,6 +913,21 @@ async def _require_entity_byok_manager(db: AsyncSession, user: User) -> Entity:
     return await _load_current_entity(db, user)
 
 
+def _require_entity_byok_plan(entity: Entity) -> None:
+    """Reject new BYOK configuration when the active cloud plan locks it."""
+    from packages.core.services.model_resolver import byok_allowed_for_plan
+
+    if not byok_allowed_for_plan(getattr(entity, "plan_id", None)):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Using your own provider API key is not available on the Free "
+                "plan. Upgrade your plan to add provider keys and custom model "
+                "endpoints."
+            ),
+        )
+
+
 async def _legacy_owner_preferences(db: AsyncSession, entity_id: str) -> dict:
     from packages.core.services.model_resolver import load_entity_owner_preferences
 
@@ -815,7 +941,13 @@ async def _effective_entity_settings(db: AsyncSession, entity: Entity) -> dict:
     owner_prefs = await _legacy_owner_preferences(db, entity.id)
     if owner_prefs.get("llm_api_key") or owner_prefs.get("llm_api_keys"):
         merged = dict(settings)
-        for key in ("llm_api_key", "llm_base_url", "llm_api_keys", "llm_base_urls"):
+        for key in (
+            "llm_api_key",
+            "llm_base_url",
+            "llm_api_keys",
+            "llm_base_urls",
+            "llm_api_key_models",
+        ):
             if key in owner_prefs and key not in merged:
                 merged[key] = owner_prefs[key]
         return merged
@@ -849,6 +981,11 @@ async def get_llm_config(
         for role, url in (prefs.get("llm_base_urls") or {}).items()
         if role in masked_role_keys
     }
+    role_api_key_models = {
+        role: model
+        for role, model in (prefs.get("llm_api_key_models") or {}).items()
+        if role in masked_role_keys and str(model or "").strip()
+    }
     byok_allowed = byok_allowed_for_plan(getattr(entity, "plan_id", None))
     return {
         "has_api_key": has_key,
@@ -856,6 +993,7 @@ async def get_llm_config(
         "llm_base_url": prefs.get("llm_base_url", "") if has_key else "",
         "role_api_keys": masked_role_keys,
         "role_base_urls": role_base_urls,
+        "role_api_key_models": role_api_key_models,
         "byok_allowed": byok_allowed,
         "byok_effective": byok_allowed and (has_key or bool(masked_role_keys)),
         "can_manage_byok": _can_manage_entity_byok(user),
@@ -880,6 +1018,7 @@ class CatalogModelSettingsRequest(BaseModel):
     use_saved_api_key: bool = False
     clear_api_key: bool = False
     base_url: str = ""
+    test_token: str | None = None
 
 
 class CustomModelRequest(BaseModel):
@@ -951,6 +1090,312 @@ def _resolve_custom_model_key(req: CustomModelRequest, settings: dict | None, ro
     return key
 
 
+_MODEL_TEST_TOKEN_TTL_SECONDS = 10 * 60
+
+
+def _model_test_fingerprint(role: str, model: str, api_key: str, base_url: str) -> str:
+    normalized = "\0".join(
+        (
+            role.strip(),
+            model.strip(),
+            api_key.strip(),
+            base_url.strip().rstrip("/"),
+        )
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _create_model_test_token(
+    *,
+    user: User,
+    role: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+) -> str:
+    settings = get_settings()
+    payload = {
+        "sub": user.id,
+        "entity_id": user.entity_id,
+        "scope": "model_test",
+        "fingerprint": _model_test_fingerprint(role, model, api_key, base_url),
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=_MODEL_TEST_TOKEN_TTL_SECONDS),
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def _model_test_token_matches(
+    token: str | None,
+    *,
+    user: User,
+    role: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+) -> bool:
+    if not token:
+        return False
+    settings = get_settings()
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+        )
+    except jwt.PyJWTError:
+        return False
+    expected = _model_test_fingerprint(role, model, api_key, base_url)
+    return (
+        payload.get("scope") == "model_test"
+        and payload.get("sub") == user.id
+        and payload.get("entity_id") == user.entity_id
+        and hmac.compare_digest(str(payload.get("fingerprint") or ""), expected)
+    )
+
+
+def _provider_probe_error_detail(response: httpx.Response) -> str:
+    detail = response.text[:500]
+    try:
+        data = response.json()
+    except Exception:
+        return detail
+    if not isinstance(data, dict):
+        return detail
+    error = data.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("msg") or detail)
+    return str(data.get("message") or data.get("msg") or data.get("detail") or detail)
+
+
+async def _probe_media_role_key(
+    role: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+) -> None:
+    """Live-test a catalog media model without creating a billable asset."""
+    from packages.core.services.model_resolver import (
+        normalize_llm_model_for_provider,
+        resolve_llm_provider_base_url,
+    )
+
+    provider = _catalog_model_provider(model)
+    provider_labels = {
+        "openai": "OpenAI",
+        "google": "Google Gemini",
+        "groq": "Groq",
+        "bytedance": "Seedance",
+        "kwaivgi": "Kling",
+        "atlascloud": "Atlas Cloud",
+        "zyphra": "Zyphra",
+        "sesame": "OpenRouter / Sesame",
+    }
+    label = provider_labels.get(provider or "", provider or "provider")
+
+    if role == "video":
+        from packages.core.tasks.video_adapters import (
+            kling_base_url_candidates,
+            volcengine_base_url_candidates,
+        )
+
+        if provider == "bytedance":
+            targets = [
+                f"{base}/contents/generations/tasks?page_num=1&page_size=1"
+                for base in volcengine_base_url_candidates(base_url)
+            ]
+        elif provider == "kwaivgi":
+            targets = [
+                f"{base}/v1/videos/text2video?pageNum=1&pageSize=1"
+                for base in kling_base_url_candidates(base_url)
+            ]
+        elif provider == "atlascloud":
+            atlas_base = (base_url or "https://api.atlascloud.ai").rstrip("/")
+            targets = [
+                f"{atlas_base}/models"
+                if atlas_base.endswith("/v1")
+                else f"{atlas_base}/v1/models"
+            ]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video model {model} does not have a supported BYOK test route.",
+            )
+    elif role in {"image", "voice", "audio", "sfx", "stt"}:
+        supported_providers = {
+            "image": {"openai", "google"},
+            "voice": {"google", "zyphra", "sesame"},
+            "audio": {"google", "openai"},
+            "sfx": {"openai"},
+            "stt": {"openai", "groq"},
+        }
+        if provider not in supported_providers[role]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model {model} does not have a supported native BYOK route.",
+            )
+        resolved_base = resolve_llm_provider_base_url(model, api_key, base_url).rstrip("/")
+        if provider == "zyphra":
+            provider_model = model
+            headers = {"Authorization": f"Bearer {api_key}"}
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    account_response = await client.get(
+                        f"{resolved_base}/account",
+                        headers=headers,
+                    )
+                    models_response = await client.get(
+                        f"{resolved_base}/models",
+                        headers=headers,
+                    )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not reach Zyphra to test this model: {exc}",
+                ) from exc
+            if account_response.status_code in (401, 403):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Zyphra rejected this API key or model access.",
+                )
+            if account_response.status_code >= 400:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Zyphra account test failed ({account_response.status_code}): "
+                        f"{_provider_probe_error_detail(account_response)}"
+                    ),
+                )
+            if models_response.status_code >= 400:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Zyphra model catalog test failed ({models_response.status_code}): "
+                        f"{_provider_probe_error_detail(models_response)}"
+                    ),
+                )
+            try:
+                available_models = models_response.json()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Zyphra returned an invalid model catalog response.",
+                ) from exc
+            if not isinstance(available_models, list) or provider_model not in {
+                str(item.get("modelId") or "")
+                for item in available_models
+                if isinstance(item, dict)
+            }:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Zyphra could not find model {model}.",
+                )
+            return
+        if provider == "sesame":
+            provider_model = model
+            sesame_base = resolved_base.rstrip("/")
+            target = f"{sesame_base}/models/{quote(provider_model, safe='/')}/endpoints"
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await client.get(
+                        target,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not reach OpenRouter to test Sesame CSM: {exc}",
+                ) from exc
+            if response.status_code in (401, 403):
+                raise HTTPException(
+                    status_code=400,
+                    detail="OpenRouter rejected this API key for Sesame CSM.",
+                )
+            if response.status_code >= 400:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Sesame CSM model test failed ({response.status_code}): "
+                        f"{_provider_probe_error_detail(response)}"
+                    ),
+                )
+            return
+        provider_model = normalize_llm_model_for_provider(model, resolved_base)
+        if role == "image":
+            from packages.core.services.model_provider_handlers import (
+                native_catalog_model_id,
+            )
+
+            provider_model = native_catalog_model_id(model)
+        if provider == "google":
+            google_base = resolved_base.removesuffix("/openai")
+            targets = [f"{google_base}/models/{quote(provider_model, safe='')}"]
+        else:
+            targets = [f"{resolved_base}/models/{quote(provider_model, safe='')}"]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Live BYOK testing is not supported for role: {role}.",
+        )
+
+    response: httpx.Response | None = None
+    last_error: Exception | None = None
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            for index, target in enumerate(targets):
+                try:
+                    headers = (
+                        {"x-goog-api-key": api_key}
+                        if provider == "google"
+                        else {"Authorization": f"Bearer {api_key}"}
+                    )
+                    response = await client.get(target, headers=headers)
+                except Exception as exc:
+                    last_error = exc
+                    if index + 1 < len(targets):
+                        continue
+                    raise
+                if response.status_code in {401, 403, 404} and index + 1 < len(targets):
+                    continue
+                break
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not reach {label} to test this model: {last_error or exc}",
+        ) from exc
+    if response is None:
+        raise HTTPException(status_code=400, detail=f"Could not reach {label} to test this model.")
+    if response.status_code in (401, 403):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} rejected this API key or model access.",
+        )
+    if response.status_code == 404:
+        raise HTTPException(status_code=400, detail=f"{label} could not find model {model}.")
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} model test failed ({response.status_code}): {_provider_probe_error_detail(response)}",
+        )
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} returned a non-JSON response. Check the provider base URL.",
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} returned an invalid model-test response.",
+        )
+    if provider == "kwaivgi" and data.get("code") not in (None, 0):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Kling rejected this API key or model access: {_provider_probe_error_detail(response)}",
+        )
+
+
 async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str | None) -> tuple[str | None, int | None]:
     from packages.core.services.model_resolver import (
         adapt_llm_chat_payload_for_provider,
@@ -961,6 +1406,45 @@ async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str
     )
 
     started = time.perf_counter()
+    def _validate_chat_probe_response(response: httpx.Response, *, stage: str) -> None:
+        """Reject successful HTML/login pages and malformed API responses.
+
+        Some custom gateways return their frontend document with HTTP 200 when
+        the configured base URL omits the API prefix (commonly ``/v1``). A
+        status-only probe therefore reports success even though production
+        chat immediately fails while parsing the response.
+        """
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model {stage} test failed: the provider returned a non-JSON response. "
+                    "Check that the base URL includes the provider API path, such as /v1."
+                ),
+            ) from exc
+
+        choices = data.get("choices") if isinstance(data, dict) else None
+        first_choice = choices[0] if isinstance(choices, list) and choices else None
+        openai_message = first_choice.get("message") if isinstance(first_choice, dict) else None
+        anthropic_content = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(openai_message, dict) and not isinstance(anthropic_content, list):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model {stage} test failed: the provider response is not compatible "
+                    "with its chat API. Check the model and base URL."
+                ),
+            )
+
+    if role in {"image", "video", "voice", "audio", "sfx", "stt"}:
+        provider = _catalog_model_provider(model)
+        _validate_role_api_key_for_model(role, api_key, model)
+        await _probe_media_role_key(role, api_key, model, base_url or "")
+        return provider, int((time.perf_counter() - started) * 1000)
+
     resolved_base = resolve_llm_provider_base_url(model, api_key, base_url).rstrip("/")
     provider = (
         llm_provider_from_base_url(resolved_base)
@@ -1006,6 +1490,7 @@ async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str
                 except Exception:
                     pass
                 raise HTTPException(status_code=400, detail=f"Model test failed: {detail}")
+            _validate_chat_probe_response(resp, stage="connection")
 
             # The normal Manor chat path sends OpenAI/Anthropic-compatible tool
             # schemas. A plain ping can pass while real chat hangs or fails once
@@ -1055,14 +1540,39 @@ async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str
                 except Exception:
                     pass
                 raise HTTPException(status_code=400, detail=f"Model tool-call test failed: {detail}")
+            _validate_chat_probe_response(tool_resp, stage="tool-call")
 
     elif role == "embedding":
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": provider_model, "input": "ping"}
+        from packages.core.services.embedding_service import get_embedding_dimensions
+
+        expected_dimensions = get_embedding_dimensions()
+        payload = {
+            "model": provider_model,
+            "input": "ping",
+            "dimensions": expected_dimensions,
+        }
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(f"{resolved_base}/embeddings", json=payload, headers=headers)
             if resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail=f"Embedding test failed: {resp.text[:500]}")
+            try:
+                data = resp.json()
+                items = sorted(data.get("data") or [], key=lambda item: item["index"])
+                actual_dimensions = len(items[0]["embedding"]) if items else 0
+            except (KeyError, TypeError, ValueError, IndexError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Embedding test failed: provider returned an invalid embedding response.",
+                ) from exc
+            if actual_dimensions != expected_dimensions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Embedding test failed: provider returned "
+                        f"{actual_dimensions} dimensions; expected {expected_dimensions} dimensions."
+                    ),
+                )
     else:
         raise HTTPException(
             status_code=400,
@@ -1080,55 +1590,26 @@ def _validate_custom_model_request(
     role = _validate_model_role(req.role)
     if not role:
         raise HTTPException(status_code=400, detail="Model role is required.")
-    if role in {"image", "video", "stt"}:
-        raise HTTPException(status_code=400, detail="Custom model testing is currently supported for Primary AI, Worker AI, and Embedding.")
+    if role not in {"primary", "worker", "embedding", "image", "video", "voice", "audio", "sfx", "stt"}:
+        raise HTTPException(
+            status_code=400,
+            detail="BYOK model testing is supported for chat, embedding, image, video, voice, music, sound-effects, and speech-to-text models.",
+        )
     model = str(req.model or "").strip()
     if not model:
         raise HTTPException(status_code=400, detail="Model id is required.")
     key = _resolve_custom_model_key(req, settings, role)
-    if _is_catalog_model(role, model):
+    is_catalog_model = _is_catalog_model(role, model)
+    if is_catalog_model:
         _validate_role_api_key_for_model(role, key, model)
     base_url = str(req.base_url or "").strip().rstrip("/")
+    if is_catalog_model and base_url:
+        _validate_role_base_url_for_model(role, base_url, model)
     return role, model, key, base_url
 
 
 def _mask_key(raw: str) -> str:
     return raw[:4] + "****" + raw[-4:] if len(raw) > 8 else ("****" if raw else "")
-
-
-async def _probe_media_role_key(role: str, api_key: str, model: str, base_url: str) -> None:
-    """Live-test a media BYOK key on save where the provider makes it cheap.
-
-    Atlas Cloud exposes an OpenAI-compatible, free model listing — a bad key
-    fails here instead of on the user's first (paid) generation. Providers
-    without a free auth probe (Volcengine task API, Kling JWT) keep the
-    validate-on-first-use behavior.
-    """
-    provider = _catalog_model_provider(model)
-    if role != "video" or provider != "atlascloud":
-        return
-    base = (base_url or "https://api.atlascloud.ai").rstrip("/")
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{base}/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not reach Atlas Cloud to verify this API key: {exc}",
-        )
-    if resp.status_code in (401, 403):
-        raise HTTPException(
-            status_code=400,
-            detail="Atlas Cloud rejected this API key. Copy a valid key from the Atlas Cloud dashboard.",
-        )
-    if resp.status_code >= 400:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Atlas Cloud key check failed ({resp.status_code}): {resp.text[:300]}",
-        )
 
 
 def _validate_role_api_key_for_model(role: str, api_key: str, model: str) -> None:
@@ -1143,7 +1624,8 @@ def _validate_role_api_key_for_model(role: str, api_key: str, model: str) -> Non
         raise HTTPException(status_code=400, detail="API key is empty or malformed.")
 
     provider = detect_llm_provider_from_key(key)
-    if provider == "openrouter":
+    model_provider = _catalog_model_provider(model)
+    if provider == "openrouter" and model_provider != "sesame":
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1156,7 +1638,6 @@ def _validate_role_api_key_for_model(role: str, api_key: str, model: str) -> Non
             ),
         )
 
-    model_provider = _catalog_model_provider(model)
     if role == "image":
         if model_provider == "openai" and provider == "openai":
             return
@@ -1176,9 +1657,48 @@ def _validate_role_api_key_for_model(role: str, api_key: str, model: str) -> Non
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Video model {model} requires a native Seedance/Kling/Atlas Cloud key "
-                "for the selected video model."
+                f"Video model {model} requires a native Seedance/Kling/Atlas Cloud "
+                "key for the selected video model."
             ),
+        )
+
+    if role == "voice":
+        if model_provider == "google" and provider == "google":
+            return
+        if model_provider == "zyphra" and provider not in {
+            "anthropic",
+            "google",
+            "groq",
+            "openai",
+            "openrouter",
+        }:
+            return
+        if model_provider == "sesame" and provider == "openrouter":
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Voice model {model} requires a matching native Google Gemini "
+                "or Zyphra key, or an OpenRouter key for Sesame CSM."
+            ),
+        )
+
+    if role == "audio":
+        if model_provider == "google" and provider == "google":
+            return
+        if model_provider == "openai" and provider == "openai":
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio model {model} requires the matching native Google or OpenAI API key.",
+        )
+
+    if role == "sfx":
+        if model_provider == "openai" and provider == "openai":
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sound-effects model {model} requires the matching native OpenAI API key.",
         )
 
     if role == "stt":
@@ -1216,7 +1736,15 @@ def _validate_role_base_url_for_model(role: str, base_url: str, model: str) -> N
 
     base_provider = llm_provider_from_base_url(url)
     if not base_provider:
-        # Custom OpenAI-compatible proxies are allowed for custom model IDs.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"The selected catalog model {model} must use its official provider "
+                "endpoint. Add proxy-hosted models through Custom Model instead."
+            ),
+        )
+    model_provider = _catalog_model_provider(model)
+    if base_provider == "openrouter" and model_provider == "sesame":
         return
     if base_provider == "openrouter":
         raise HTTPException(
@@ -1227,7 +1755,6 @@ def _validate_role_base_url_for_model(role: str, base_url: str, model: str) -> N
                 else "OpenRouter base URLs are not supported in self-hosted mode; use the native provider endpoint."
             ),
         )
-    model_provider = _catalog_model_provider(model)
     if model_provider and base_provider != model_provider:
         raise HTTPException(
             status_code=400,
@@ -1259,15 +1786,32 @@ async def save_catalog_model_settings(
     if not role or not model:
         raise HTTPException(status_code=400, detail="Role and model are required.")
     catalog = effective_catalog(await get_model_settings_cached(db))
-    catalog_ids = {
-        str(item.get("id"))
+    catalog_entries = {
+        str(item.get("id")): item
         for item in catalog.get(role, [])
         if item.get("id")
     }
+    catalog_ids = set(catalog_entries)
     if model not in catalog_ids:
         raise HTTPException(
             status_code=400,
             detail=f"Model {model} is not available for role: {role}",
+        )
+    selected_entry = catalog_entries[model]
+    if selected_entry.get("deployment") == "local":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {model} runs locally and does not accept a provider API key.",
+        )
+    from packages.core.services.model_provider_handlers import catalog_provider_capability
+
+    if catalog_provider_capability(role, model) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model {model} has no supported official-provider Test/Save/runtime "
+                f"contract for role: {role}."
+            ),
         )
     if req.clear_api_key and (str(req.api_key or "").strip() or req.use_saved_api_key):
         raise HTTPException(
@@ -1276,6 +1820,8 @@ async def save_catalog_model_settings(
         )
 
     entity = await _require_entity_byok_manager(db, user)
+    if not req.clear_api_key:
+        _require_entity_byok_plan(entity)
     settings = dict(entity.settings or {})
     effective_settings = (
         await _effective_entity_settings(db, entity)
@@ -1284,6 +1830,7 @@ async def save_catalog_model_settings(
     )
     role_keys = dict(settings.get("llm_api_keys") or {})
     role_urls = dict(settings.get("llm_base_urls") or {})
+    role_key_models = dict(settings.get("llm_api_key_models") or {})
     key = sanitize_llm_api_key(str(req.api_key or ""), f"{role}.api_key")
     if not req.clear_api_key:
         if not key and req.use_saved_api_key:
@@ -1294,11 +1841,22 @@ async def save_catalog_model_settings(
                 detail="A matching native provider API key is required.",
             )
         _validate_role_api_key_for_model(role, key, model)
-        await _probe_media_role_key(role, key, model, str(req.base_url or "").strip())
 
     base_url = str(req.base_url or "").strip().rstrip("/")
     if base_url and not req.clear_api_key:
         _validate_role_base_url_for_model(role, base_url, model)
+    if not req.clear_api_key and not _model_test_token_matches(
+        req.test_token,
+        user=user,
+        role=role,
+        model=model,
+        api_key=key,
+        base_url=base_url,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Test this exact model configuration successfully before saving it.",
+        )
 
     existing_models = dict(settings.get("models") or {})
     changed: dict = {}
@@ -1312,10 +1870,12 @@ async def save_catalog_model_settings(
             changed["api_key"] = "cleared"
         role_keys.pop(role, None)
         role_urls.pop(role, None)
+        role_key_models.pop(role, None)
     else:
         if role_keys.get(role) != key:
             changed["api_key"] = "updated"
         role_keys[role] = key
+        role_key_models[role] = model
         old_base_url = str(role_urls.get(role) or "")
         if base_url:
             role_urls[role] = base_url
@@ -1328,6 +1888,7 @@ async def save_catalog_model_settings(
             }
     settings["llm_api_keys"] = role_keys
     settings["llm_base_urls"] = role_urls
+    settings["llm_api_key_models"] = role_key_models
     if role == "primary":
         if req.clear_api_key:
             settings.pop("llm_api_key", None)
@@ -1369,15 +1930,24 @@ async def test_custom_model(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Test a draft custom BYOK model configuration without saving it."""
+    """Test a draft BYOK model configuration without saving it."""
     entity = await _require_entity_byok_manager(db, user)
-    role, model, key, base_url = _validate_custom_model_request(req, entity.settings or {})
+    _require_entity_byok_plan(entity)
+    effective_settings = await _effective_entity_settings(db, entity)
+    role, model, key, base_url = _validate_custom_model_request(req, effective_settings)
     provider, latency_ms = await _probe_custom_model(role, model, key, base_url)
     return {
         "ok": True,
         "detail": "Model test passed",
         "provider": provider,
         "latency_ms": latency_ms,
+        "test_token": _create_model_test_token(
+            user=user,
+            role=role,
+            model=model,
+            api_key=key,
+            base_url=base_url,
+        ),
     }
 
 
@@ -1390,11 +1960,25 @@ async def save_custom_model(
 ):
     """Save a custom BYOK model, key, and base URL atomically."""
     entity = await _require_entity_byok_manager(db, user)
+    _require_entity_byok_plan(entity)
     settings = dict(entity.settings or {})
     role, model, key, base_url = _validate_custom_model_request(req, settings)
+    if not _model_test_token_matches(
+        req.test_token,
+        user=user,
+        role=role,
+        model=model,
+        api_key=key,
+        base_url=base_url,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Test this exact model configuration successfully before saving it.",
+        )
     existing_models = dict(settings.get("models") or {})
     role_keys = dict(settings.get("llm_api_keys") or {})
     role_urls = dict(settings.get("llm_base_urls") or {})
+    role_key_models = dict(settings.get("llm_api_key_models") or {})
 
     changed = {}
     if existing_models.get(role) != model:
@@ -1408,6 +1992,8 @@ async def save_custom_model(
     elif req.use_saved_api_key and not role_keys.get(role) and role == "primary" and settings.get("llm_api_key"):
         role_keys[role] = key
     settings["llm_api_keys"] = role_keys
+    role_key_models[role] = model
+    settings["llm_api_key_models"] = role_key_models
 
     old_base_url = role_urls.get(role, "")
     if base_url:
@@ -1460,12 +2046,16 @@ async def update_llm_api_key(
 ):
     """Save the current entity's LLM API key."""
     entity = await _require_entity_byok_manager(db, user)
+    if req.llm_api_key.strip():
+        _require_entity_byok_plan(entity)
     settings = dict(entity.settings or {})
     role = _validate_model_role(req.role)
+    role_key_models = dict(settings.get("llm_api_key_models") or {})
     if role:
         if req.llm_api_key.strip():
             model = await _resolve_role_model_for_user(db, user, role)
             _validate_role_api_key_for_model(role, req.llm_api_key, model)
+            role_key_models[role] = model
         role_keys = dict(settings.get("llm_api_keys") or {})
         if req.llm_api_key.strip():
             role_keys[role] = req.llm_api_key
@@ -1473,6 +2063,7 @@ async def update_llm_api_key(
                 settings["llm_api_key"] = req.llm_api_key
         else:
             role_keys.pop(role, None)
+            role_key_models.pop(role, None)
             if role == "primary":
                 settings.pop("llm_api_key", None)
                 settings.pop("llm_base_url", None)
@@ -1484,6 +2075,7 @@ async def update_llm_api_key(
         if req.llm_api_key.strip():
             model = await _resolve_role_model_for_user(db, user, "primary")
             _validate_role_api_key_for_model("primary", req.llm_api_key, model)
+            role_key_models["primary"] = model
             role_keys = dict(settings.get("llm_api_keys") or {})
             role_keys["primary"] = req.llm_api_key
             settings["llm_api_keys"] = role_keys
@@ -1493,10 +2085,15 @@ async def update_llm_api_key(
             settings.pop("llm_base_url", None)
             role_keys = dict(settings.get("llm_api_keys") or {})
             role_keys.pop("primary", None)
+            role_key_models.pop("primary", None)
             settings["llm_api_keys"] = role_keys
             role_urls = dict(settings.get("llm_base_urls") or {})
             role_urls.pop("primary", None)
             settings["llm_base_urls"] = role_urls
+    if role_key_models:
+        settings["llm_api_key_models"] = role_key_models
+    else:
+        settings.pop("llm_api_key_models", None)
     entity.settings = settings
     await db.flush()
     raw = req.llm_api_key.strip()
@@ -1523,6 +2120,8 @@ async def update_llm_base_url(
 ):
     """Save the current entity's LLM base URL."""
     entity = await _require_entity_byok_manager(db, user)
+    if req.llm_base_url.strip():
+        _require_entity_byok_plan(entity)
     settings = dict(entity.settings or {})
     role = _validate_model_role(req.role)
     if role:
@@ -1582,11 +2181,25 @@ async def verify_2fa_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Verify TOTP code and enable 2FA. Returns backup codes."""
+    """Verify TOTP, enable 2FA, and upgrade the current session to MFA."""
     result = await verify_and_enable_2fa(db, user.id, req.code)
     if "error" in result:
         raise HTTPException(400, result["error"])
-    return result
+    token = create_access_token(
+        user.id,
+        user.entity_id,
+        user.role,
+        token_version=user.token_version,
+        mfa_authenticated=True,
+    )
+    return {
+        **result,
+        "access_token": token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "entity_id": user.entity_id,
+        "role": user.role,
+    }
 
 
 @router.post("/2fa/disable")
@@ -1643,6 +2256,7 @@ class OAuthGoogleRequest(BaseModel):
     team_invite_token: str | None = None
     oauth_session: str | None = None  # Opaque token for retry with invite code
     public_chat_token: str | None = None
+    remember_me: bool = False
 
 
 class OAuthGoogleConfigResponse(BaseModel):
@@ -1766,7 +2380,13 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
             refresh_token=tokens.get("refresh_token"),
         )
         mark_user_login(accepted.user, source="auth.oauth.google.team_invite")
-        token = create_access_token(accepted.user.id, accepted.user.entity_id, accepted.user.role)
+        token = create_access_token(
+            accepted.user.id,
+            accepted.user.entity_id,
+            accepted.user.role,
+            remember=req.remember_me,
+            token_version=accepted.user.token_version,
+        )
         return TokenResponse(
             access_token=token,
             user_id=accepted.user.id,
@@ -1863,7 +2483,13 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
             pass  # non-fatal
 
     mark_user_login(user, source="auth.oauth.google")
-    token = create_access_token(user.id, user.entity_id, user.role)
+    token = create_access_token(
+        user.id,
+        user.entity_id,
+        user.role,
+        remember=req.remember_me,
+        token_version=user.token_version,
+    )
     return TokenResponse(
         access_token=token,
         user_id=user.id,
@@ -2157,7 +2783,12 @@ async def restore_my_account(
     if not restored:
         raise HTTPException(410, "Account already purged — no longer recoverable")
     mark_user_login(restored, source="auth.restore")
-    token = create_access_token(restored.id, restored.entity_id, restored.role)
+    token = create_access_token(
+        restored.id,
+        restored.entity_id,
+        restored.role,
+        token_version=restored.token_version,
+    )
     return {"access_token": token, "user_id": restored.id}
 
 
@@ -2176,7 +2807,10 @@ async def change_own_password(
     db: AsyncSession = Depends(get_db),
 ):
     """Change the current user's password."""
-    ok = await change_password(db, user.id, req.old_password, req.new_password)
+    try:
+        ok = await change_password(db, user.id, req.old_password, req.new_password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not ok:
         raise HTTPException(400, "Invalid old password")
     return {"detail": "Password changed"}
@@ -2218,7 +2852,10 @@ async def reset_password_endpoint(
     """Reset password using a valid reset token."""
     from packages.core.services.password_reset_service import reset_password
 
-    ok = await reset_password(db, req.token, req.new_password)
+    try:
+        ok = await reset_password(db, req.token, req.new_password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not ok:
         raise HTTPException(400, "Invalid or expired reset token")
     return {"detail": "Password has been reset"}

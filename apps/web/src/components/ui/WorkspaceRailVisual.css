@@ -1,0 +1,473 @@
+.workspace-mode-pill > .workspace-mode-pill-visual,
+html[data-theme="dark"] .workspace-mode-pill > .workspace-mode-pill-visual,
+.workspace-mode-pill--active > .workspace-mode-pill-visual,
+html[data-theme="dark"]
+  .workspace-mode-pill--active
+  > .workspace-mode-pill-visual {
+  overflow: visible;
+  isolation: isolate;
+  background: transparent;
+}
+
+.workspace-rail-visual-shell {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  filter: drop-shadow(0 3px 4px rgba(28, 25, 23, 0.16));
+  pointer-events: none;
+  transition: filter 180ms ease;
+}
+
+.workspace-rail-visual {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  object-fit: contain;
+  filter: contrast(1.04) saturate(0.92);
+  pointer-events: none;
+  user-select: none;
+  transform: scale(1.08);
+  transform-origin: 50% 52%;
+  will-change: transform;
+  transition:
+    filter 180ms ease,
+    transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.workspace-rail-visual-shell::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  display: block;
+  width: 13%;
+  aspect-ratio: 1;
+  background: color-mix(
+    in srgb,
+    var(--capability-accent, #5d7f77) 24%,
+    #ffffff
+  );
+  clip-path: polygon(
+    50% 0%,
+    60% 39%,
+    100% 50%,
+    60% 61%,
+    50% 100%,
+    40% 61%,
+    0% 50%,
+    40% 39%
+  );
+  filter: drop-shadow(0 0 2px rgba(255, 255, 255, 0.94));
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, -50%) scale(0.2) rotate(-20deg);
+}
+
+.workspace-rail-visual-shell[data-kind="new-idea"]::after {
+  top: 49%;
+  left: 50%;
+}
+
+.workspace-rail-visual-shell[data-kind="image"]::after {
+  top: 70%;
+  left: 72%;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible) .workspace-rail-visual {
+  filter: brightness(1.04) contrast(1.07) saturate(1.08);
+  transform: translateY(-1px) scale(1.13);
+}
+
+.workspace-mode-pill--active .workspace-rail-visual {
+  filter: contrast(1.06) saturate(1.02);
+  transform: scale(1.11);
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell {
+  filter: drop-shadow(0 5px 7px rgba(28, 25, 23, 0.2));
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="new-idea"]
+  .workspace-rail-visual {
+  animation: workspace-rail-star-breathe 820ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell:is([data-kind="new-idea"], [data-kind="image"])::after {
+  animation: workspace-rail-star-glint 920ms cubic-bezier(0.22, 1, 0.36, 1)
+    60ms both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="automations"]
+  .workspace-rail-visual {
+  animation: workspace-rail-mechanism-turn 760ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="flows"]
+  .workspace-rail-visual {
+  animation: workspace-rail-flow-route 840ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="research"]
+  .workspace-rail-visual {
+  animation: workspace-rail-search-tilt 680ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="agents"]
+  .workspace-rail-visual {
+  animation: workspace-rail-people-gather 760ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="validate-idea"]
+  .workspace-rail-visual {
+  animation: workspace-rail-check-confirm 760ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="workspace"]
+  .workspace-rail-visual {
+  animation: workspace-rail-window-shuffle 780ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-rail-visual-shell[data-kind="slides"] .workspace-rail-visual {
+  transform-origin: 42% 72%;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="slides"]
+  .workspace-rail-visual {
+  animation: workspace-rail-slide-fan 820ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-rail-visual-shell[data-kind="docs"] .workspace-rail-visual {
+  transform-origin: 76% 18%;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="docs"]
+  .workspace-rail-visual {
+  animation: workspace-rail-document-lift 740ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="pdf"]
+  .workspace-rail-visual {
+  animation: workspace-rail-pdf-drop 760ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="sheets"]
+  .workspace-rail-visual {
+  animation: workspace-rail-grid-tap 760ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="website"]
+  .workspace-rail-visual {
+  animation: workspace-rail-site-flow 820ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="image"]
+  .workspace-rail-visual {
+  animation: workspace-rail-image-sway 780ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+.workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell[data-kind="video"]
+  .workspace-rail-visual {
+  animation: workspace-rail-video-pulse 820ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+}
+
+@keyframes workspace-rail-star-breathe {
+  0%,
+  100% {
+    transform: scale(1.11) rotate(0deg);
+  }
+  38% {
+    transform: scale(1.2) rotate(-2deg);
+  }
+  68% {
+    transform: scale(1.14) rotate(1deg);
+  }
+}
+
+@keyframes workspace-rail-star-glint {
+  0%,
+  18%,
+  78%,
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.2) rotate(-20deg);
+  }
+  42% {
+    opacity: 0.96;
+    transform: translate(-50%, -50%) scale(1.24) rotate(18deg);
+  }
+  60% {
+    opacity: 0.42;
+    transform: translate(-50%, -50%) scale(0.72) rotate(38deg);
+  }
+}
+
+@keyframes workspace-rail-mechanism-turn {
+  0%,
+  100% {
+    transform: scale(1.08) rotate(0deg);
+  }
+  42% {
+    transform: translateY(-1px) scale(1.15) rotate(9deg);
+  }
+  72% {
+    transform: scale(1.11) rotate(-2deg);
+  }
+}
+
+@keyframes workspace-rail-flow-route {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1.08) rotate(0deg);
+  }
+  26% {
+    transform: translate(-2px, -2px) scale(1.17) rotate(-4deg);
+  }
+  52% {
+    transform: translate(2px, -1px) scale(1.21) rotate(3deg);
+  }
+  76% {
+    transform: translate(0, -1px) scale(1.14) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-search-tilt {
+  0%,
+  100% {
+    transform: scale(1.08) rotate(0deg);
+  }
+  42% {
+    transform: translate(-1px, -1px) scale(1.15) rotate(-7deg);
+  }
+  72% {
+    transform: scale(1.11) rotate(2deg);
+  }
+}
+
+@keyframes workspace-rail-people-gather {
+  0%,
+  100% {
+    transform: scale(1.08);
+  }
+  30% {
+    transform: translateX(-2px) scale(1.17) rotate(-3deg);
+  }
+  56% {
+    transform: translateX(2px) scale(1.2) rotate(3deg);
+  }
+  78% {
+    transform: scale(1.14) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-check-confirm {
+  0%,
+  100% {
+    transform: scale(1.08) rotate(0deg);
+  }
+  36% {
+    transform: translateY(-2px) scale(1.2) rotate(-7deg);
+  }
+  62% {
+    transform: scale(1.14) rotate(4deg);
+  }
+  82% {
+    transform: scale(1.17) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-window-shuffle {
+  0%,
+  100% {
+    transform: scale(1.08) translateX(0) rotate(0deg);
+  }
+  34% {
+    transform: translateX(-3px) scale(1.16) rotate(-4deg);
+  }
+  62% {
+    transform: translateX(3px) scale(1.19) rotate(2deg);
+  }
+  82% {
+    transform: scale(1.14) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-slide-fan {
+  0%,
+  100% {
+    transform: scale(1.08) rotate(0deg);
+  }
+  34% {
+    transform: translateY(-2px) scale(1.17) rotate(-8deg);
+  }
+  60% {
+    transform: scale(1.2) rotate(4deg);
+  }
+  82% {
+    transform: scale(1.14) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-document-lift {
+  0%,
+  100% {
+    transform: scale(1.08) rotate(0deg);
+  }
+  32% {
+    transform: translateY(-3px) scale(1.18) rotate(-6deg);
+  }
+  58% {
+    transform: translateY(-1px) scale(1.14) rotate(4deg);
+  }
+  82% {
+    transform: scale(1.16) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-pdf-drop {
+  0%,
+  100% {
+    transform: translateY(0) scale(1.08);
+  }
+  28% {
+    transform: translateY(2px) scale(1.12);
+  }
+  52% {
+    transform: translateY(-3px) scale(1.2);
+  }
+  78% {
+    transform: translateY(0) scale(1.14);
+  }
+}
+
+@keyframes workspace-rail-grid-tap {
+  0%,
+  100% {
+    transform: scale(1.08) rotate(0deg);
+  }
+  34% {
+    transform: scale(1.21) rotate(-3deg);
+  }
+  62% {
+    transform: scale(1.13) rotate(2deg);
+  }
+  82% {
+    transform: scale(1.17) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-site-flow {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1.08);
+  }
+  30% {
+    transform: translate(-2px, -2px) scale(1.17) rotate(-3deg);
+  }
+  58% {
+    transform: translate(2px, -1px) scale(1.2) rotate(2deg);
+  }
+  80% {
+    transform: translate(0, 0) scale(1.14);
+  }
+}
+
+@keyframes workspace-rail-image-sway {
+  0%,
+  100% {
+    transform: scale(1.08) rotate(0deg);
+  }
+  34% {
+    transform: translateY(-2px) scale(1.19) rotate(-5deg);
+  }
+  64% {
+    transform: scale(1.14) rotate(3deg);
+  }
+  82% {
+    transform: scale(1.17) rotate(-1deg);
+  }
+}
+
+@keyframes workspace-rail-video-pulse {
+  0%,
+  100% {
+    transform: scale(1.08);
+  }
+  30% {
+    transform: translateY(-2px) scale(1.2);
+  }
+  54% {
+    transform: scale(1.12);
+  }
+  76% {
+    transform: translateY(-1px) scale(1.17);
+  }
+}
+
+html[data-theme="dark"] .workspace-rail-visual-shell {
+  filter:
+    drop-shadow(0 4px 7px rgba(0, 0, 0, 0.52))
+    drop-shadow(0 0 1px rgba(255, 255, 255, 0.32));
+}
+
+html[data-theme="dark"] .workspace-rail-visual {
+  filter: brightness(1.09) contrast(1.03) saturate(0.94);
+  opacity: 0.98;
+}
+
+html[data-theme="dark"]
+  .workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual-shell {
+  filter:
+    drop-shadow(0 6px 9px rgba(0, 0, 0, 0.6))
+    drop-shadow(0 0 2px rgba(255, 255, 255, 0.28));
+}
+
+html[data-theme="dark"]
+  .workspace-mode-pill:is(:hover, :focus-visible)
+  .workspace-rail-visual {
+  filter: brightness(1.15) contrast(1.05) saturate(1.06);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-rail-visual,
+  .workspace-rail-visual-shell,
+  .workspace-rail-visual-shell::after {
+    animation: none !important;
+    transition: none;
+  }
+
+  .workspace-rail-visual-shell::after {
+    display: none;
+  }
+}

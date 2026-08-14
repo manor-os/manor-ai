@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -104,6 +104,56 @@ async def test_cache_incr_sets_prefixed_key_and_ttl():
 
 
 @pytest.mark.asyncio
+async def test_cache_touch_extends_prefixed_key_ttl():
+    mock_redis = _make_mock_redis()
+    mock_redis.expire = AsyncMock(return_value=True)
+    cache_module._redis = mock_redis
+    cache_module._redis_loop = asyncio.get_running_loop()
+
+    assert await Cache().touch("knowledge:key", 900) is True
+    mock_redis.expire.assert_awaited_once_with("manor:knowledge:key", 900)
+
+
+@pytest.mark.asyncio
+async def test_cache_get_many_and_set_many_use_single_batch_round_trip():
+    mock_redis = _make_mock_redis()
+    mock_redis.mget = AsyncMock(return_value=['{"value": 1}', None, "invalid-json"])
+
+    class FakePipeline:
+        def __init__(self):
+            self.set_calls = []
+            self.execute = AsyncMock(return_value=[])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def set(self, *args, **kwargs):
+            self.set_calls.append((args, kwargs))
+            return self
+
+    pipeline = FakePipeline()
+    mock_redis.pipeline = MagicMock(return_value=pipeline)
+    cache_module._redis = mock_redis
+    cache_module._redis_loop = asyncio.get_running_loop()
+    c = Cache()
+
+    assert await c.get_many(["one", "two", "three"]) == [{"value": 1}, None, None]
+    mock_redis.mget.assert_awaited_once_with(
+        ["manor:one", "manor:two", "manor:three"]
+    )
+
+    assert await c.set_many({"one": [1.0], "two": {"value": 2}}, ttl=60) is True
+    assert pipeline.set_calls == [
+        (("manor:one", "[1.0]"), {"ex": 60}),
+        (("manor:two", '{"value": 2}'), {"ex": 60}),
+    ]
+    pipeline.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_cache_decorator():
     """@cached decorator caches function return and serves from cache on repeat."""
     mock_redis = _make_mock_redis()
@@ -153,5 +203,8 @@ async def test_cache_graceful_when_redis_unavailable():
         c = Cache()
         assert await c.get("any") is None
         assert await c.set("any", "val") is False
+        assert await c.get_many(["one", "two"]) == [None, None]
+        assert await c.set_many({"one": 1}) is False
+        assert await c.touch("any", 60) is False
         assert await c.delete("any") is False
         assert await c.delete_pattern("any:*") == 0

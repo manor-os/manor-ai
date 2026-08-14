@@ -12,10 +12,11 @@ from .base import Base, TimestampMixin, generate_ulid
 
 
 class PlatformModelProviderKey(Base, TimestampMixin):
-    """Encrypted official API token for one model catalog provider.
+    """Official API token for one model catalog provider.
 
     These rows are global platform credentials, not tenant/user BYOK keys.
-    Plaintext is stored through CredentialService in ``credential_ref``.
+    Plaintext is stored directly in ``credential_ref`` and masked in API
+    responses.
     """
 
     __tablename__ = "platform_model_provider_keys"

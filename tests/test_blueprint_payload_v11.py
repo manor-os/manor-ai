@@ -294,6 +294,44 @@ def test_validate_accepts_v11():
     validate_payload(_v11_payload())  # should not raise
 
 
+def test_v11_task_policy_sections_are_not_portable():
+    p = _v11_payload()
+    p["recipe"]["task_categories"] = [{"key": "production", "label": "Production"}]
+    with pytest.raises(PayloadError, match="task_categories.*not portable"):
+        validate_payload(p)
+
+
+def test_v11_task_policy_rejects_source_entity_user_ids():
+    p = _v11_payload()
+    p["recipe"]["sla_policies"] = [{"key": "review", "threshold_hours": 24}]
+    p["recipe"]["escalation_rules"] = [{
+        "key": "late",
+        "sla_policy_key": "review",
+        "action": "notify",
+        "notify_user_ids": ["source-user"],
+    }]
+    with pytest.raises(PayloadError, match="sla_policies.*not portable"):
+        validate_payload(p)
+
+
+def test_v11_task_policy_rejects_unknown_sla_reference():
+    p = _v11_payload()
+    p["recipe"]["escalation_rules"] = [{
+        "key": "late",
+        "sla_policy_key": "missing",
+        "action": "notify",
+    }]
+    with pytest.raises(PayloadError, match="escalation_rules.*not portable"):
+        validate_payload(p)
+
+
+def test_v11_prompts_reject_non_object_items_instead_of_dropping_them():
+    p = _v11_payload()
+    p["recipe"]["prompts"] = [{"key": "daily", "body": "Run daily."}, "not-an-object"]
+    with pytest.raises(PayloadError, match=r"prompts\[1\].*object"):
+        validate_payload(p)
+
+
 # ── Rule 1: top-level sections must be objects ────────────────────────
 
 
@@ -564,6 +602,22 @@ def test_exempted_metric_key_passes():
         {
             "title": "T",
             "metric_key": "follower_count",
+            "target_value": 100,
+        }
+    ]
+    validate_payload(p)
+
+
+def test_workspace_stats_and_goal_stat_key_pass():
+    p = _v11_payload()
+    p["recipe"]["stats"] = [
+        {"library_key": "workspace.tasks.completed"},
+    ]
+    p["recipe"]["goals"] = [
+        {
+            "title": "T",
+            "metric_key": "workspace.tasks.completed",
+            "stat_key": "workspace.tasks.completed",
             "target_value": 100,
         }
     ]

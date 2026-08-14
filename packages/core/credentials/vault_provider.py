@@ -229,16 +229,14 @@ class VaultKeyProvider:
             if sealed:
                 return HealthResult(ok=False, detail="vault is sealed")
             try:
-                self._client.secrets.transit.read_key(
-                    name=self._key, mount_point=self._mount,
-                )
-            except self._hvac_exceptions["InvalidPath"]:
-                return HealthResult(
-                    ok=False,
-                    detail=f"vault transit key {self._key!r} is missing",
-                )
-            except self._hvac_exceptions["VaultError"] as exc:
-                return HealthResult(ok=False, detail=f"vault transit key check failed: {exc}")
+                # Dev Vault is intentionally in-memory, so its Transit mount
+                # and key disappear whenever the container restarts. Use the
+                # same idempotent bootstrap as encrypt/decrypt before probing
+                # the key. A restricted production token still fails clearly
+                # if deploy-time bootstrap was omitted.
+                self._ensure_transit_key()
+            except CredentialError as exc:
+                return HealthResult(ok=False, detail=str(exc))
             try:
                 self._client.secrets.transit.encrypt_data(
                     name=self._key,

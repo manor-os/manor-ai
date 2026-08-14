@@ -174,6 +174,31 @@ async def materialize_plan_steps(
     ordered = plan.topo_order()
     shape_by_key = _resolve_output_shapes(ordered)
 
+    # A task-authored expected-output schema is not a Planner guess.  Bind it
+    # to the one terminal agent step so the worker sees it on attempt 1 and the
+    # dispatcher validates it before declaring that step done.
+    task_output_step_key: str | None = None
+    task_output_contract_schema: dict | None = None
+    if plan_row.task_id:
+        from packages.core.contracts.task_output import (
+            task_output_envelope_schema,
+            terminal_agent_step_key,
+        )
+        from packages.core.models.task import Task
+
+        task_expected_output = (
+            await db.execute(select(Task.expected_output).where(Task.id == plan_row.task_id))
+        ).scalar_one_or_none()
+        task_output_contract_schema = task_output_envelope_schema(task_expected_output)
+        if task_output_contract_schema is not None:
+            task_output_step_key = terminal_agent_step_key(ordered)
+            if task_output_step_key is None:
+                logger.warning(
+                    "plan %s has a structured task expected_output but not exactly "
+                    "one terminal llm/subagent step; hard output contract was not bound",
+                    plan_row.id,
+                )
+
     rows: list[ExecutionStep] = []
     for ps in ordered:
         step_preview = type("_StepPreview", (), {"params": ps.params})()
@@ -182,11 +207,15 @@ async def materialize_plan_steps(
             ("plan", plan_retry_config),
             ("step", step_retry_policy_config(step_preview)),
         )
-        rows.append(_step_from_pydantic(
-            plan_row, ps,
-            max_attempts=policy.max_attempts,
-            output_shape=shape_by_key.get(ps.key),
-        ))
+        rows.append(
+            _step_from_pydantic(
+                plan_row,
+                ps,
+                max_attempts=policy.max_attempts,
+                output_shape=shape_by_key.get(ps.key),
+                task_output_contract_schema=(task_output_contract_schema if ps.key == task_output_step_key else None),
+            )
+        )
 
     db.add_all(rows)
     await db.flush()
@@ -221,7 +250,12 @@ def _linker_lite_steps(steps: list[PlanStep]) -> list[dict]:
     ]
 
 
-def plan_contract_gaps(steps: list[PlanStep]) -> list:
+def plan_contract_gaps(
+    steps: list[PlanStep],
+    *,
+    task_expected_output: dict | None = None,
+    require_explicit_agent_outputs: bool = False,
+) -> list:
     """Return the contract linker's unfixable gaps (``LinkIssue`` list) for a
     plan, after auto-repair. Empty list means the plan is contract-clean (every
     consumed value is producible, every produced value is shaped). Pure — no
@@ -229,7 +263,96 @@ def plan_contract_gaps(steps: list[PlanStep]) -> list:
     from packages.core.contracts.linker import repair_plan
 
     _repaired, remaining = repair_plan(_linker_lite_steps(steps))
-    return remaining
+    gaps = list(remaining)
+
+    from packages.core.contracts.task_output import (
+        task_expected_output_json_schema,
+        terminal_agent_step_key,
+    )
+
+    task_schema_declared = task_expected_output_json_schema(task_expected_output) is not None
+    task_terminal_key = terminal_agent_step_key(steps) if task_schema_declared else None
+    if task_schema_declared and task_terminal_key is None:
+        from packages.core.contracts.linker import LinkIssue
+
+        gaps.append(
+            LinkIssue(
+                "task_output_contract",
+                "task_expected_output",
+                ("structured Task.expected_output requires exactly one terminal llm/subagent deliverable step"),
+            )
+        )
+
+    if require_explicit_agent_outputs:
+        from packages.core.contracts.linker import LinkIssue
+        from packages.core.contracts.shapes import get_shape
+        from jsonschema import Draft202012Validator
+
+        for step in steps:
+            if step.kind not in ("llm", "subagent") or step.key == task_terminal_key:
+                continue
+            has_shape = bool(step.output_shape)
+            has_schema = isinstance(step.expected_output_schema, dict)
+            if has_shape and has_schema:
+                gaps.append(
+                    LinkIssue(
+                        "conflicting_output_contract",
+                        step.key,
+                        (
+                            "declare exactly one agent output contract: either a canonical "
+                            "output_shape or an exact expected_output_schema"
+                        ),
+                    )
+                )
+                continue
+            if not has_shape and not has_schema:
+                gaps.append(
+                    LinkIssue(
+                        "missing_explicit_output_contract",
+                        step.key,
+                        (
+                            "new llm/subagent plans must declare an exact "
+                            "expected_output_schema or canonical output_shape before "
+                            "execution; Runtime must not guess a step contract"
+                        ),
+                    )
+                )
+                continue
+            if has_schema:
+                try:
+                    Draft202012Validator.check_schema(step.expected_output_schema)
+                except Exception as exc:
+                    gaps.append(
+                        LinkIssue(
+                            "invalid_output_contract",
+                            step.key,
+                            f"invalid expected_output_schema: {exc}",
+                        )
+                    )
+                continue
+            if step.output_shape == "StepResult":
+                gaps.append(
+                    LinkIssue(
+                        "generic_output_contract",
+                        step.key,
+                        (
+                            "StepResult is a legacy generic envelope, not an explicit "
+                            "payload contract; choose a concrete canonical output_shape"
+                        ),
+                    )
+                )
+                continue
+            try:
+                get_shape(step.output_shape)
+            except KeyError:
+                gaps.append(
+                    LinkIssue(
+                        "unknown_output_contract",
+                        step.key,
+                        f"unknown canonical output_shape {step.output_shape!r}",
+                    )
+                )
+    return gaps
 
 
 def _resolve_output_shapes(steps: list[PlanStep]) -> dict[str, str]:
@@ -276,6 +399,7 @@ def _step_from_pydantic(
     *,
     max_attempts: int | None = None,
     output_shape: str | None = None,
+    task_output_contract_schema: dict | None = None,
 ) -> ExecutionStep:
     # When a step resolves to a canonical shape (declared or linker-inferred),
     # derive expected_output_schema from the shape so producer/normalizer/
@@ -284,9 +408,27 @@ def _step_from_pydantic(
     # schema (e.g. {text} on a step that returns {drafts:[...]}) is exactly the
     # OutputSchemaError source. Structured kinds keep an explicit schema: it's a
     # real contract with an external system, not a guess.
+    from packages.core.contracts.task_output import (
+        PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+        is_task_output_contract_schema,
+        plan_output_contract_schema,
+    )
+
     expected_output_schema = ps.expected_output_schema
     shape_schema_applied = False
-    if output_shape:
+    embedded_task_contract = (
+        ps.expected_output_schema if is_task_output_contract_schema(ps.expected_output_schema) else None
+    )
+    if (task_output_contract_schema is not None or embedded_task_contract is not None) and ps.kind in (
+        "llm",
+        "subagent",
+    ):
+        # Runtime-authored from Task.expected_output: this is the final
+        # deliverable contract, so it wins over both the generic StepResult
+        # shape and any Planner-authored custom schema.
+        expected_output_schema = task_output_contract_schema or embedded_task_contract
+        shape_schema_applied = True
+    elif getattr(ps, "output_shape", None) and output_shape:
         from packages.core.contracts.shapes import get_shape
         try:
             shape_schema = get_shape(output_shape).json_schema()
@@ -296,7 +438,29 @@ def _step_from_pydantic(
             expected_output_schema is None or ps.kind in ("llm", "subagent")
         ):
             expected_output_schema = shape_schema
+            if ps.kind in ("llm", "subagent") and ps.output_shape:
+                expected_output_schema = plan_output_contract_schema(shape_schema)
             shape_schema_applied = True
+    elif ps.expected_output_schema is not None and ps.kind in ("llm", "subagent"):
+        # A new plan explicitly authored this step payload. Deterministically
+        # remove provider receipts that only runtime evidence can supply, then
+        # provenance-mark the remaining payload before materialization. Only
+        # already-materialized legacy schemas remain unmarked/advisory.
+        expected_output_schema = plan_output_contract_schema(
+            _strip_receipt_required_fields(ps.expected_output_schema),
+            source=PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+        )
+        shape_schema_applied = True
+    elif output_shape and (expected_output_schema is None or ps.kind in ("llm", "subagent")):
+        # Linker-inferred shape for a legacy plan. It can keep old steps
+        # executable, but it must never override a schema the Planner actually
+        # declared and it is intentionally not provenance-marked as hard.
+        from packages.core.contracts.shapes import get_shape
+        try:
+            expected_output_schema = get_shape(output_shape).json_schema()
+        except KeyError:
+            expected_output_schema = None
+        shape_schema_applied = expected_output_schema is not None
     if not shape_schema_applied and ps.kind in ("llm", "subagent"):
         # A planner-authored custom schema survived (no shape resolved):
         # de-fang its receipt requirements before it can OutputSchemaError.

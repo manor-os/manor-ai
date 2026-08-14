@@ -15,7 +15,7 @@ export default function PanelHeader({
 }: {
   avatar?: ReactNode;
   title: ReactNode;
-  /** Status line under the title (online dot, "replying…", subtitle text). */
+  /** Subtitle or real runtime status shown under the title. */
   subtitle?: ReactNode;
   /** Control rendered before the avatar — e.g. a back button. */
   leading?: ReactNode;

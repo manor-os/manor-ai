@@ -132,4 +132,11 @@ async def runtime_execute_tool(
         entity_id=str(kwargs.get("entity_id") or ""),
         user_id=kwargs.get("user_id"),
         workspace_id=kwargs.get("workspace_id"),
+        task_id=kwargs.get("task_id"),
+        runtime_metadata=(
+            getattr(kwargs.get("runtime_envelope"), "metadata", None)
+            if kwargs.get("runtime_envelope") is not None
+            else None
+        ),
+        step_id=kwargs.get("step_id"),
     )

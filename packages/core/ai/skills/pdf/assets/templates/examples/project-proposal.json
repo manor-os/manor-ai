@@ -1,0 +1,39 @@
+{
+  "brand": {
+    "name": "WILDWOOD STUDIO",
+    "descriptor": "BRAND, SPACE, AND EXPERIENCE"
+  },
+  "project_name": "Morrow Flagship Launch",
+  "client": "Morrow Coffee Roasters",
+  "date": "November 3, 2026",
+  "timeline": "10 WEEKS",
+  "budget": "USD 72,500",
+  "executive_summary": "Create a flagship identity that feels like a morning ritual made physical: warm, tactile, optimistic, and unmistakably Morrow. The engagement connects brand story, spatial moments, launch content, and staff experience into one coherent opening.",
+  "goals": [
+    "Turn the new location into a recognizable neighborhood destination.",
+    "Build a launch system that works across space, social, print, and events.",
+    "Give the team a practical toolkit they can use after opening week."
+  ],
+  "scope": [
+    "Flagship creative direction and visual story.",
+    "Environmental moments, menu language, and wayfinding concepts.",
+    "Launch campaign, opening-week programming, and content toolkit.",
+    "Staff story guide and customer-experience principles."
+  ],
+  "milestones": [
+    {"phase": "01", "title": "Find the spark", "period": "WEEKS 1-2", "description": "Immersion, audience interviews, references, and creative territories."},
+    {"phase": "02", "title": "Build the world", "period": "WEEKS 3-6", "description": "Identity system, spatial applications, campaign concept, and prototypes."},
+    {"phase": "03", "title": "Make it real", "period": "WEEKS 7-10", "description": "Production files, launch assets, staff toolkit, and opening support."}
+  ],
+  "deliverables": [
+    "Flagship creative direction deck",
+    "Spatial graphics and wayfinding toolkit",
+    "Launch campaign system and content plan",
+    "Opening-week experience playbook"
+  ],
+  "assumptions": [
+    "Client feedback is consolidated within two business days.",
+    "Fabrication and media costs are scoped separately."
+  ],
+  "contact": "hello@wildwood-studio.example"
+}

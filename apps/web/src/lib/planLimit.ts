@@ -1,5 +1,5 @@
 import type { PlanLimitKind } from "./api";
-import { t } from "./i18n";
+import { getLocale, t } from "./i18n";
 
 /**
  * Single source of truth for how a plan-limit reminder presents itself, so the
@@ -28,4 +28,23 @@ export function planLimitTitle(kind?: PlanLimitKind): string {
 /** Buying credits only resolves the credit limit; other limits need a plan change. */
 export function planLimitOffersCredits(kind?: PlanLimitKind): boolean {
   return !kind || kind === "credit";
+}
+
+/** Human-readable local timestamp for the next included-credit refill. */
+export function planLimitResetText(
+  kind?: PlanLimitKind,
+  resetsAt?: string | null,
+): string | null {
+  if ((kind && kind !== "credit") || !resetsAt) return null;
+  const resetDate = new Date(resetsAt);
+  if (Number.isNaN(resetDate.getTime())) return null;
+  const formatted = new Intl.DateTimeFormat(getLocale(), {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(resetDate);
+  return t("component.upgrade_prompt.resets_at").replace("{date}", formatted);
 }

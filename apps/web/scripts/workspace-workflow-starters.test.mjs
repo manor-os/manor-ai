@@ -7,6 +7,10 @@ const chatSource = await readFile(
   new URL("../src/components/WorkspaceChat.tsx", import.meta.url),
   "utf8",
 );
+const composerSource = await readFile(
+  new URL("../src/components/ChatInputFooter.tsx", import.meta.url),
+  "utf8",
+);
 const hostSource = await readFile(
   new URL("../src/components/workflows/WorkspaceWorkflowRunHost.tsx", import.meta.url),
   "utf8",
@@ -46,26 +50,41 @@ test("workspace workflow starters use dedicated APIs without changing the main c
   assert.doesNotMatch(apiSource, /form\.append\("workflow_intent_detection"/);
 });
 
-test("workspace chat explicitly selects one starter for one send", () => {
-  assert.match(chatSource, /const \[selectedEntrypointId, setSelectedEntrypointId\] = useState/);
+test("workspace chat explicitly invokes one Flow through the percent token", () => {
   assert.match(chatSource, /api\.workspaces\.chat\.listEntrypoints\(workspaceId\)/);
-  assert.match(chatSource, /selectedEntrypointId[\s\S]*?api\.workspaces\.chat\.streamEntrypoint/);
-  assert.match(chatSource, /setSelectedEntrypointId\(""\)/);
+  assert.match(chatSource, /workflow\?\.bindingId[\s\S]*?api\.workspaces\.chat\.streamEntrypoint/);
+  assert.match(chatSource, /workflows=\{!threadRef \? workflowInvokeOptions : \[\]\}/);
+  assert.match(composerSource, /type ComposerTrigger = "@" \| "#" \| "\/" \| "%"/);
+  assert.match(composerSource, /export function workflowInvokeToken/);
+  assert.match(
+    composerSource,
+    /onSendWorkflow\(text, snapshot, manualSkillSnapshot, workflowSnapshot\)/,
+  );
+  assert.doesNotMatch(composerSource, /const sendContext =/);
+  assert.doesNotMatch(chatSource, /selectedEntrypointId/);
 });
 
-test("workspace workflow starters use a recordable accessible menu", () => {
-  assert.match(chatSource, /import Select from "\.\/ui\/Select"/);
-  assert.match(
-    chatSource,
-    /<Select[\s\S]*?ariaLabel=\{t\("component\.workspace_chat\.workflow_starter"\)\}/,
-  );
-  assert.doesNotMatch(
-    chatSource,
-    /<select[\s\S]*?aria-label=\{t\("component\.workspace_chat\.workflow_starter"\)\}/,
-  );
-  assert.match(selectSource, /aria-haspopup="listbox"/);
-  assert.match(selectSource, /role="listbox"/);
-  assert.match(selectSource, /role="option"/);
+test("workspace Flow invocation reuses the accessible inline composer menu", () => {
+  assert.match(composerSource, /workflowDropdownOpen &&/);
+  assert.match(composerSource, /chat-composer-workflow-menu/);
+  assert.match(composerSource, /aria-label=\{t\("component\.chat_input_footer\.cancel_flow"\)\}/);
+  assert.match(composerSource, /onClick=\{\(\) => selectWorkflow\(workflow\)\}/);
+  assert.match(composerSource, /usePreviewFeatureAccess\("flows"\)/);
+  assert.match(composerSource, /disabled=\{!flowsAvailable\}/);
+  assert.match(composerSource, /if \(!flowsAvailable\) return;/);
+  assert.match(composerSource, /component\.chat_mode\.soon/);
+  assert.doesNotMatch(chatSource, /import Select from "\.\/ui\/Select"/);
+});
+
+test("personal and floating Chat invoke the selected percent Flow directly", () => {
+  assert.match(apiSource, /listFlowEntrypoints:[\s\S]*?\/chat\/flow-entrypoints/);
+  assert.match(apiSource, /streamFlowEntrypoint:[\s\S]*?flow-entrypoints\/\$\{encodeURIComponent\(bindingId\)\}\/stream/);
+  for (const source of [embeddedChatSource, floatingChatSource]) {
+    assert.match(source, /api\.chat\.listFlowEntrypoints\(\)/);
+    assert.match(source, /api\.chat\.streamFlowEntrypoint\(/);
+    assert.match(source, /onSendWorkflow=/);
+    assert.match(source, /workflows=/);
+  }
 });
 
 test("shared select keeps a portaled menu inside the viewport", () => {
@@ -89,11 +108,7 @@ test("workspace inline mentions resolve against the text being sent", () => {
   assert.match(chatSource, /const resolvedAgent = resolveInlineMention\(rawText\)/);
   assert.match(
     chatSource,
-    /atIdx === 0 \|\| \/\\s\/\.test\(val\[atIdx - 1\]\)/,
-  );
-  assert.match(
-    chatSource,
-    /atIdx > 0 && !\/\\s\/\.test\(val\[atIdx - 1\]\)/,
+    /atIdx < 0 \|\| \(atIdx > 0 && !\/\\s\/\.test\(val\[atIdx - 1\]\)\)/,
   );
   assert.doesNotMatch(chatSource, /function resolveInlineMention\(\)[\s\S]*?const val = input/);
   assert.doesNotMatch(chatSource, /val\[atIdx - 1\] !== " "/);

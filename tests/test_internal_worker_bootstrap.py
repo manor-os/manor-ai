@@ -124,12 +124,19 @@ def test_plan_artifact_refs_are_deduped_per_step_and_path():
         step_key="draft",
     )
 
+    # Exact equality on purpose: an unexpected extra key means the executor
+    # leaked producer-authored state into the stored ref.  ``open_url`` is
+    # expected — c2b04e737 routed this return through the canonical ref
+    # normalizer so each artifact carries exactly one openable address.  With
+    # no entity id in scope it falls back to the bare path, which a trusted
+    # client resolves against the active entity.
     assert refs == [
         {
             "type": "file",
             "step": "draft",
             "source": "fs_path",
             "fs_path": "Workspace Artifacts/x.md",
+            "open_url": "Workspace Artifacts/x.md",
         }
     ]
 
@@ -152,6 +159,7 @@ def test_plan_artifact_refs_include_generated_file_collections():
             "step": "assemble_draft_pack",
             "source": "path",
             "fs_path": "workspace/social_ops/draft-pack.md",
+            "open_url": "workspace/social_ops/draft-pack.md",
         }
     ]
 

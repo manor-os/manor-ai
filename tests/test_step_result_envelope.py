@@ -253,7 +253,7 @@ def test_coerce_step_output_non_envelope_schema_unchanged():
 
 # ── planner prompt + JSON hint ─────────────────────────────────────────
 
-def test_planner_prompt_describes_envelope_and_forbids_custom_schema():
+def test_planner_prompt_requires_an_explicit_output_contract_per_agent_step():
     from packages.core.ai.runtime.planning import runtime_planner_system_prompt
 
     prompt = runtime_planner_system_prompt(
@@ -262,14 +262,16 @@ def test_planner_prompt_describes_envelope_and_forbids_custom_schema():
         allowed_service_keys=[],
     )
     assert "StepResult" in prompt
-    assert "Do NOT author" in prompt
+    assert "exactly one output contract" in prompt
+    assert "expected_output_schema" in prompt
+    assert "it never guesses missing fields or shapes" in prompt
     assert "platform receipts" in prompt
     assert "steps.<key>.result.outputs.text" in prompt
     # Explicit specialized shapes remain available.
     assert "ArtifactResult" in prompt
 
 
-def test_plan_json_hint_does_not_seed_expected_output_schema():
+def test_plan_json_hint_exposes_exact_step_output_schema():
     from packages.core.ai.runtime.planning import RUNTIME_PLAN_JSON_HINT
 
-    assert "expected_output_schema" not in json.dumps(RUNTIME_PLAN_JSON_HINT)
+    assert "expected_output_schema" in json.dumps(RUNTIME_PLAN_JSON_HINT)

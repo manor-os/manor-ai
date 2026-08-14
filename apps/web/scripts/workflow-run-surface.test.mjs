@@ -23,11 +23,32 @@ const hostSource = await readFile(
   new URL("../src/components/workflows/WorkspaceWorkflowRunHost.tsx", import.meta.url),
   "utf8",
 ).catch(() => "");
+const conversationHostSource = await readFile(
+  new URL("../src/components/workflows/WorkflowRunHost.tsx", import.meta.url),
+  "utf8",
+).catch(() => "");
 const chatSource = await readFile(
   new URL("../src/components/WorkspaceChat.tsx", import.meta.url),
   "utf8",
 );
+const chatInputFooterSource = await readFile(
+  new URL("../src/components/ChatInputFooter.tsx", import.meta.url),
+  "utf8",
+);
 const apiSource = await readFile(new URL("../src/lib/api.ts", import.meta.url), "utf8");
+const chatStreamSource = await readFile(
+  new URL("../src/lib/chatStream.ts", import.meta.url),
+  "utf8",
+);
+const embeddedChatSource = await readFile(
+  new URL("../src/components/EmbeddedChat.tsx", import.meta.url),
+  "utf8",
+);
+const floatingChatSource = await readFile(
+  new URL("../src/components/FloatingChat.tsx", import.meta.url),
+  "utf8",
+);
+const flowsSource = await readFile(new URL("../src/pages/Flows.tsx", import.meta.url), "utf8");
 const schemaSource = await readFile(
   new URL("../src/components/workflows/WorkflowSchemaFields.tsx", import.meta.url),
   "utf8",
@@ -149,7 +170,14 @@ test("only recoverable completed runs present as waiting", () => {
     }),
     { labelKey: "needs_input", iconStatus: "paused", motion: "waiting" },
   );
-  for (const businessOutcome of ["revision_required", "ready_for_acceptance", "completed"]) {
+  assert.deepEqual(
+    displayModule.workflowRunStatusPresentation({
+      status: "completed",
+      businessOutcome: "revision_required",
+    }),
+    { labelKey: "revision_required", iconStatus: "paused", motion: "waiting" },
+  );
+  for (const businessOutcome of ["ready_for_acceptance", "completed"]) {
     assert.deepEqual(
       displayModule.workflowRunStatusPresentation({ status: "completed", businessOutcome }),
       { labelKey: "completed", iconStatus: "completed", motion: "static" },
@@ -396,6 +424,44 @@ test("schema parser preserves required, pattern, and enum validation", () => {
   assert.equal(enumErrors["inputs.choice"], "required");
 });
 
+test("schema drafts preserve approved upstream fields allowed by the contract", () => {
+  const schema = {
+    type: "object",
+    required: ["title"],
+    properties: { title: { type: "string" } },
+    additionalProperties: true,
+  };
+  const approvedResult = {
+    title: "Approved topic",
+    evidence_gaps: ["No customer metric yet"],
+    knowledge_refs: ["brand-voice.md"],
+  };
+  const draft = schemaModule.workflowSchemaDraft(schema, approvedResult);
+  assert.deepEqual(draft, approvedResult);
+
+  const errors = {};
+  assert.deepEqual(
+    schemaModule.parseWorkflowSchemaDraft(
+      schema,
+      draft,
+      "inputs.topic_brief",
+      true,
+      errors,
+      validationMessages,
+    ),
+    approvedResult,
+  );
+  assert.deepEqual(errors, {});
+
+  assert.deepEqual(
+    schemaModule.workflowSchemaDraft(
+      { ...schema, additionalProperties: false },
+      approvedResult,
+    ),
+    { title: "Approved topic" },
+  );
+});
+
 test("schema field IDs are namespaced and connect help and error descriptions", () => {
   const first = schemaModule.workflowSchemaFieldIds("instance-a", "inputs", ["request", "url"]);
   const second = schemaModule.workflowSchemaFieldIds("instance-b", "inputs", ["request", "url"]);
@@ -621,16 +687,15 @@ test("workflow run host is an independent compact card", () => {
 });
 
 test("workspace agent menu is a compact composer-aligned popover", () => {
-  assert.match(chatSource, /className="workspace-chat-agent-menu"/);
-  assert.match(chatSource, /className="workspace-chat-agent-menu-item"/);
-  assert.match(chatSource, /data-active=\{idx === mentionActiveIdx\}/);
+  assert.match(chatInputFooterSource, /className="chat-composer-mention-menu"/);
+  assert.match(chatInputFooterSource, /chat-composer-mention-item \$\{idx === mentionActiveIdx \? "active" : ""\}/);
   assert.match(
     cssSource,
-    /\.workspace-chat-agent-menu\s*\{[^}]*width:\s*min\(480px, calc\(100% - 48px\)\)/,
+    /\.chat-composer-mention-menu\s*\{[^}]*right:\s*0;[^}]*bottom:\s*calc\(100% \+ 8px\);[^}]*left:\s*0/,
   );
   assert.match(
     cssSource,
-    /@media\s*\(max-width:\s*640px\)[\s\S]*?\.workspace-chat-agent-menu\s*\{[^}]*width:\s*calc\(100% - 48px\)/,
+    /\.chat-composer-mention-menu\s*\{[^}]*max-height:\s*330px;[^}]*overflow-y:\s*auto/,
   );
 });
 
@@ -712,16 +777,40 @@ test("workflow intervention starts as a compact actionable blocker", () => {
   assert.match(interventionSource, /isPreviewScaffold/);
 });
 
+test("invalid workflow actions surface feedback and focus the first invalid field", () => {
+  assert.match(interventionSource, /const validationErrorCount =/);
+  assert.match(interventionSource, /component\.workflow_run\.input_validation_error/);
+  assert.match(interventionSource, /role=\{validationErrorCount > 0 \? "alert" : undefined\}/);
+  assert.match(interventionSource, /querySelector<HTMLElement>\('\[aria-invalid="true"\]'\)/);
+  assert.match(interventionSource, /focus\(\{ preventScroll: true \}\)/);
+  assert.match(interventionSource, /detailsBodyRef/);
+  assert.match(interventionSource, /validationFocusRequest/);
+  assert.match(interventionSource, /setValidationFocusRequest\(\(current\) => current \+ 1\)/);
+  assert.match(interventionSource, /closest<HTMLDetailsElement>\('details:not\(\[open\]\)'\)/);
+  assert.match(interventionSource, /collapsedGroup\.open = true/);
+  assert.match(
+    workflowCss,
+    /\.workflow-run-intervention-preview\.is-error\s*\{[^}]*color:/,
+  );
+  for (const localeSource of localeSources) {
+    assert.match(localeSource, /component\.workflow_run\.input_validation_error/);
+  }
+});
+
 test("workflow approval interventions expose their structured review in details", () => {
   assert.match(approvalReviewSource, /export default function WorkflowApprovalReview/);
-  assert.match(interventionSource, /import WorkflowApprovalReview from "\.\/WorkflowApprovalReview"/);
+  assert.match(interventionSource, /import WorkflowApprovalReview, \{[\s\S]*?\} from "\.\/WorkflowApprovalReview"/);
+  assert.match(interventionSource, /const displayedReview = action\.review \?\? historyReview/);
   assert.match(
     interventionSource,
-    /const hasReview = action\.kind === "workflow_approval" && action\.review != null/,
+    /const hasReview = action\.kind === "workflow_approval" && displayedReview != null/,
   );
   assert.match(interventionSource, /hasDetails = Boolean\([\s\S]*?hasReview/);
-  assert.match(interventionSource, /<WorkflowApprovalReview[\s\S]*?review=\{action\.review\}/);
-  assert.match(interventionSource, /reviewTitle=\{action\.review_title as string \| undefined\}/);
+  assert.match(interventionSource, /<WorkflowApprovalReview[\s\S]*?review=\{displayedReview\}/);
+  assert.match(interventionSource, /reviewTitle=\{displayedReviewTitle\}/);
+  assert.match(interventionSource, /EditableWorkflowApprovalReview/);
+  assert.match(interventionSource, /payload = \{ review: reviewDraft \?\? displayedReview \}/);
+  assert.match(interventionSource, /editableReview[\s\S]*?=== "revise"/);
   assert.ok(
     interventionSource.indexOf("<WorkflowApprovalReview")
       < interventionSource.indexOf("{hasFields && ("),
@@ -731,6 +820,69 @@ test("workflow approval interventions expose their structured review in details"
     workflowCss,
     /\.workflow-run-intervention-body \.chat-workflow-review-scroll\s*\{[^}]*max-height:\s*none[^}]*overflow:\s*visible/,
   );
+});
+
+test("history-only workflow reviews link to the run detail without embedding the plan", () => {
+  assert.match(interventionSource, /action\.review_location === "workflow_history"/);
+  assert.match(interventionSource, /historyHref/);
+  assert.match(interventionSource, /component\.workflow_run\.review_in_history/);
+  assert.match(interventionSource, /className="[^"]*workflow-run-intervention-history-link[^"]*"/);
+  assert.match(interventionSource, /approval-action-bar__review-link/);
+  assert.match(hostSource, /historyHref=\{historyHref\}/);
+  assert.match(
+    cssSource,
+    /\.approval-action-bar__review-link\s*\{[^}]*display:\s*inline-flex/,
+  );
+});
+
+test("history-only approvals hydrate the exact paused review into card details", async () => {
+  const hostModule = await loadHostHelpers();
+  const plan = {
+    product_promise: "Keep one operating context",
+    scenes: [{ scene_id: "scene-1", narration: "Show the Workspace list" }],
+  };
+  const action = {
+    kind: "workflow_approval",
+    step_id: "approve_plan",
+    review_location: "workflow_history",
+    review_title: "Product video plan",
+  };
+
+  assert.deepEqual(
+    hostModule.workflowApprovalReviewFromRunDetail({
+      step_results: {
+        approve_plan: {
+          status: "paused",
+          review: plan,
+          review_title: "Product video plan",
+        },
+      },
+      variables: { plan: { title: "Wrong fallback" } },
+    }, action),
+    { review: plan, reviewTitle: "Product video plan" },
+  );
+  assert.equal(
+    hostModule.workflowApprovalReviewFromRunDetail({
+      step_results: { another_step: { review: plan } },
+    }, action),
+    null,
+  );
+  assert.equal(
+    hostModule.workflowApprovalReviewFromRunDetail({
+      step_results: { approve_plan: { review: plan } },
+    }, { ...action, review_location: "inline" }),
+    null,
+  );
+
+  assert.match(hostSource, /queryKey:\s*\["workflow-run-review", foregroundRunId/);
+  assert.match(hostSource, /api\.workflows\.getRun\(foregroundRunId\)/);
+  assert.match(hostSource, /workflowApprovalReviewFromRunDetail/);
+  assert.match(hostSource, /historyReview=\{approvalReview\?\.review\}/);
+  assert.match(interventionSource, /historyReviewLoading/);
+  assert.match(interventionSource, /historyReviewError/);
+  assert.match(interventionSource, /displayedReview/);
+  assert.match(interventionSource, /component\.workflow_run\.loading_review/);
+  assert.match(interventionSource, /component\.workflow_run\.review_load_error/);
 });
 
 test("chat action cards and interventions share one schema implementation", () => {
@@ -893,6 +1045,33 @@ test("workspace workflow host groups only run-owned runtime rows and actions", a
   }
 });
 
+test("inaccessible workflow messages never create workflow run groups", async () => {
+  const hostModule = await loadHostHelpers();
+  const groups = hostModule.buildWorkspaceWorkflowRunGroups([
+    {
+      id: "deleted-workspace-run",
+      created_at: "2026-08-11T08:00:00Z",
+      message_kind: "workflow_activity",
+      meta: {
+        workflow_run_id: "deleted-run",
+        workflow_status: "failed",
+        workflow_run_accessible: false,
+      },
+    },
+    {
+      id: "active-workspace-run",
+      created_at: "2026-08-11T08:01:00Z",
+      message_kind: "workflow_activity",
+      meta: {
+        workflow_run_id: "active-run",
+        workflow_status: "failed",
+      },
+    },
+  ]);
+
+  assert.deepEqual(groups.map((group) => group.id), ["active-run"]);
+});
+
 test("workspace workflow host foreground selection keeps only recoverable business states", async () => {
   const hostModule = await loadHostHelpers();
   for (const status of ["queued", "pending", "running", "paused", "failed"]) {
@@ -905,11 +1084,17 @@ test("workspace workflow host foreground selection keeps only recoverable busine
     }),
     true,
   );
+  assert.equal(
+    hostModule.isWorkspaceWorkflowRunActionable({
+      status: "completed",
+      businessOutcome: "revision_required",
+    }),
+    true,
+  );
   for (const businessOutcome of [
     undefined,
     "accepted",
     "completed",
-    "revision_required",
     "ready_for_acceptance",
   ]) {
     assert.equal(
@@ -930,9 +1115,9 @@ test("workspace workflow host foreground selection keeps only recoverable busine
       actionMessage: { pending_action: { kind: "workflow_retry" } },
     },
   ];
-  assert.equal(hostModule.selectForegroundWorkflowRunId(groups, ""), "newer");
+  assert.equal(hostModule.selectForegroundWorkflowRunId(groups, ""), "revision");
   assert.equal(hostModule.selectForegroundWorkflowRunId(groups, "older"), "older");
-  assert.equal(hostModule.selectForegroundWorkflowRunId(groups, "accepted"), "newer");
+  assert.equal(hostModule.selectForegroundWorkflowRunId(groups, "accepted"), "revision");
 });
 
 test("resolved cancelled workflow retry is not selected after message reload", async () => {
@@ -1024,6 +1209,218 @@ test("workflow host resolves the full retry lineage before selecting actionable 
   assert.deepEqual(
     hostModule.actionableWorkflowRunGroups(groups).map((group) => group.id),
     [],
+  );
+});
+
+test("workflow host reconciles chat projections to the latest server family attempts", async () => {
+  const hostModule = await loadHostHelpers();
+  const groups = [
+    {
+      id: "completed-attempt-2",
+      latestIndex: 4,
+      latestCreatedAt: "2026-08-13T14:14:55Z",
+      activityMessage: null,
+      actionMessage: { pending_action: { kind: "workflow_retry" } },
+      actionMessages: [],
+      ownedMessageIds: ["message-completed"],
+      projectionUpdatedAt: null,
+      retryOfRunId: "completed-root",
+      projection: {
+        id: "completed-attempt-2",
+        title: "Create a video",
+        status: "failed",
+        nodes: [{ id: "qa", name: "QA", status: "failed", error: "old" }],
+        attemptNumber: 2,
+        action: { kind: "workflow_retry" },
+      },
+    },
+    {
+      id: "running-root",
+      latestIndex: 8,
+      latestCreatedAt: "2026-08-13T16:37:08Z",
+      activityMessage: null,
+      actionMessage: null,
+      actionMessages: [],
+      ownedMessageIds: ["message-running"],
+      projectionUpdatedAt: null,
+      retryOfRunId: null,
+      projection: {
+        id: "running-root",
+        title: "Create a video",
+        status: "failed",
+        nodes: [{ id: "render", name: "Render", status: "failed", error: "old" }],
+        attemptNumber: 1,
+        action: null,
+      },
+    },
+  ];
+  const reconciled = hostModule.reconcileWorkspaceWorkflowRunGroups(groups, {
+    "completed-attempt-2": [
+      {
+        id: "completed-attempt-12",
+        status: "completed",
+        attempt_number: 12,
+        retry_of_run_id: "completed-attempt-11",
+        current_step_id: "end",
+        workflow_name: "Create a video",
+        started_at: "2026-08-13T16:32:35Z",
+        completed_at: "2026-08-13T16:32:36Z",
+        updated_at: "2026-08-13T16:32:36Z",
+        business_outcome: "completed",
+      },
+      {
+        id: "completed-attempt-2",
+        status: "failed",
+        attempt_number: 2,
+      },
+    ],
+    "running-root": [
+      {
+        id: "running-attempt-4",
+        status: "running",
+        attempt_number: 4,
+        retry_of_run_id: "running-root",
+        current_step_id: "render",
+        workflow_name: "Create a video",
+        started_at: "2026-08-13T17:28:55Z",
+        updated_at: "2026-08-13T17:29:55Z",
+      },
+      {
+        id: "running-root",
+        status: "failed",
+        attempt_number: 1,
+      },
+    ],
+  });
+
+  assert.deepEqual(reconciled.map((group) => group.id), [
+    "completed-attempt-12",
+    "running-attempt-4",
+  ]);
+  assert.equal(reconciled[0].projection.status, "completed");
+  assert.equal(reconciled[0].projection.attemptNumber, 12);
+  assert.equal(reconciled[0].projection.action, null);
+  assert.equal(reconciled[1].projection.status, "running");
+  assert.equal(reconciled[1].projection.attemptNumber, 4);
+  assert.equal(reconciled[1].projection.nodes[0].status, "running");
+  assert.deepEqual(
+    hostModule.actionableWorkflowRunGroups(reconciled).map((group) => group.id),
+    ["running-attempt-4"],
+  );
+});
+
+test("workflow host does not reintroduce a failed ancestor after its retry family completes", async () => {
+  const hostModule = await loadHostHelpers();
+  const failedRoot = {
+    id: "failed-root",
+    latestIndex: 2,
+    latestCreatedAt: "2026-08-13T14:02:45Z",
+    activityMessage: null,
+    actionMessage: { pending_action: { kind: "workflow_retry" } },
+    actionMessages: [],
+    ownedMessageIds: ["message-root"],
+    projectionUpdatedAt: null,
+    retryOfRunId: null,
+    projection: {
+      id: "failed-root",
+      title: "Create a video",
+      status: "failed",
+      nodes: [{ id: "qa", name: "QA", status: "failed" }],
+      attemptNumber: 1,
+      action: { kind: "workflow_retry" },
+    },
+  };
+  const retryLeaf = {
+    ...failedRoot,
+    id: "retry-attempt-2",
+    latestIndex: 4,
+    latestCreatedAt: "2026-08-13T14:14:55Z",
+    ownedMessageIds: ["message-retry"],
+    retryOfRunId: "failed-root",
+    projection: {
+      ...failedRoot.projection,
+      id: "retry-attempt-2",
+      attemptNumber: 2,
+    },
+  };
+
+  const reconciled = hostModule.reconcileWorkspaceWorkflowRunGroups(
+    [failedRoot, retryLeaf],
+    {
+      "retry-attempt-2": [
+        {
+          id: "completed-attempt-12",
+          status: "completed",
+          attempt_number: 12,
+          retry_of_run_id: "retry-attempt-11",
+          current_step_id: "end",
+          workflow_name: "Create a video",
+          started_at: "2026-08-13T16:32:35Z",
+          completed_at: "2026-08-13T16:32:36Z",
+          updated_at: "2026-08-13T16:32:36Z",
+          business_outcome: "completed",
+        },
+        {
+          id: "retry-attempt-2",
+          status: "failed",
+          attempt_number: 2,
+        },
+        {
+          id: "failed-root",
+          status: "failed",
+          attempt_number: 1,
+        },
+      ],
+    },
+  );
+
+  assert.deepEqual(reconciled.map((group) => group.id), ["completed-attempt-12"]);
+  assert.equal(reconciled[0].projection.status, "completed");
+  assert.deepEqual(hostModule.actionableWorkflowRunGroups(reconciled), []);
+});
+
+test("workflow host hides stale terminal projections until their retry family is known", async () => {
+  const hostModule = await loadHostHelpers();
+  const failed = {
+    id: "failed-attempt",
+    latestIndex: 1,
+    projection: { status: "failed" },
+  };
+  const running = {
+    id: "running-attempt",
+    latestIndex: 2,
+    projection: { status: "running" },
+  };
+
+  assert.deepEqual(
+    hostModule.suppressUnverifiedWorkflowRunGroups(
+      [failed, running],
+      new Set(["failed-attempt", "running-attempt"]),
+    ).map((group) => group.id),
+    ["running-attempt"],
+  );
+  assert.deepEqual(
+    hostModule.suppressUnverifiedWorkflowRunGroups(
+      [failed, running],
+      new Set(),
+    ).map((group) => group.id),
+    ["failed-attempt", "running-attempt"],
+  );
+});
+
+test("workflow host recognizes a terminal cancel race without swallowing other errors", async () => {
+  const hostModule = await loadHostHelpers();
+  assert.equal(
+    hostModule.isWorkflowRunAlreadyTerminalError(new Error("Run already completed")),
+    true,
+  );
+  assert.equal(
+    hostModule.isWorkflowRunAlreadyTerminalError({ message: "Run already cancelled" }),
+    true,
+  );
+  assert.equal(
+    hostModule.isWorkflowRunAlreadyTerminalError(new Error("Network unavailable")),
+    false,
   );
 });
 
@@ -1305,10 +1702,12 @@ test("workflow host keeps recoverable waiting states visible without polling the
     assert.equal(hostModule.isWorkspaceWorkflowRunActionable({ status }), true);
     assert.equal(displayModule.isWorkflowRunActive({ status }), false);
   }
-  const recoverable = { status: "completed", businessOutcome: "needs_input" };
-  assert.equal(hostModule.isWorkspaceWorkflowRunActionable(recoverable), true);
-  assert.equal(displayModule.isWorkflowRunActive(recoverable), false);
-  for (const businessOutcome of ["revision_required", "ready_for_acceptance", "completed"]) {
+  for (const businessOutcome of ["needs_input", "revision_required"]) {
+    const recoverable = { status: "completed", businessOutcome };
+    assert.equal(hostModule.isWorkspaceWorkflowRunActionable(recoverable), true);
+    assert.equal(displayModule.isWorkflowRunActive(recoverable), false);
+  }
+  for (const businessOutcome of ["ready_for_acceptance", "completed"]) {
     const run = { status: "completed", businessOutcome };
     assert.equal(hostModule.isWorkspaceWorkflowRunActionable(run), false);
     assert.equal(displayModule.isWorkflowRunActive(run), false);
@@ -1322,9 +1721,11 @@ test("workflow host keeps recoverable waiting states visible without polling the
   assert.equal(displayModule.isWorkflowRunActive(normalizedQueuedRun), true);
   assert.equal(displayModule.isWorkflowRunActive({ status: "running" }), true);
 
+  const runQueryStart = hostSource.indexOf('queryKey: ["workflow-run", foregroundRunId]');
+  const intervalStart = hostSource.indexOf("refetchInterval:", runQueryStart);
   const intervalBlock = hostSource.slice(
-    hostSource.indexOf("refetchInterval:"),
-    hostSource.indexOf("\n  });", hostSource.indexOf("refetchInterval:")),
+    intervalStart,
+    hostSource.indexOf("\n  });", intervalStart),
   );
   assert.match(intervalBlock, /isWorkflowRunActive\(currentRun\) \? 1_000 : false/);
   assert.doesNotMatch(intervalBlock, /isWorkspaceWorkflowRunActionable/);
@@ -1390,13 +1791,15 @@ test("workspace workflow host renders one panel, an accessible switcher, and act
   assert.match(hostSource, /refetchInterval:[\s\S]*?isWorkflowRunActive\(currentRun\) \? 1_000 : false/);
   assert.doesNotMatch(hostSource, /refetchIntervalInBackground:\s*true/);
   assert.match(hostSource, /mergeWorkflowRunView/);
+  assert.match(hostSource, /workspace-chat-workflow-run-family/);
+  assert.match(hostSource, /reconcileWorkspaceWorkflowRunGroups/);
   assert.match(hostSource, /isLoading/);
   assert.match(hostSource, /isError/);
 });
 
 test("workflow host scopes controls and errors to the selected authorized run", () => {
   assert.match(hostSource, /const canControl = Boolean\(runCapabilities\?\.can_control\)/);
-  assert.match(hostSource, /canCancelRunningRun = canControl/);
+  assert.match(hostSource, /canCancelRun = canControl/);
   assert.match(hostSource, /disabled=\{resolving \|\| !canControl\}/);
   assert.match(hostSource, /actionMessageId === resolveMessageId/);
   assert.match(hostSource, /const actionMessageId = nonEmptyString\(interventionAction\?\.message_id\)/);
@@ -1411,13 +1814,14 @@ test("workflow run cancellation is confirmed from the compact header action", ()
   assert.doesNotMatch(hostSource, /import Button from "\.\.\/ui\/Button"/);
   assert.match(hostSource, /IconStop/);
   assert.match(hostSource, /const \[cancelConfirmationOpen, setCancelConfirmationOpen\] = useState\(false\)/);
-  assert.match(hostSource, /headerAction=\{canCancelRunningRun/);
+  assert.match(hostSource, /headerAction=\{canCancelRun/);
   assert.match(hostSource, /className="workflow-run-cancel-action"/);
   assert.match(hostSource, /title=\{cancelActionLabel\}/);
   assert.match(hostSource, /aria-label=\{cancelActionLabel\}/);
   assert.match(hostSource, /disabled=\{resolving\}/);
   assert.match(hostSource, /cancelMutation\.isPending\s*\? <LoadingSpinner size=\{13\} \/>/);
   assert.match(hostSource, /<IconStop size=\{13\}/);
+  assert.doesNotMatch(hostSource, /<span>\{cancelActionLabel\}<\/span>/);
   assert.match(hostSource, /<ConfirmDialog/);
   assert.match(hostSource, /open=\{cancelConfirmationOpen\}/);
   assert.match(hostSource, /title=\{t\("component\.workflow_run\.cancel_confirm_title"\)\}/);
@@ -1429,7 +1833,7 @@ test("workflow run cancellation is confirmed from the compact header action", ()
   assert.match(hostSource, /closeOnConfirm=\{false\}/);
   assert.match(
     workflowCss,
-    /\.workflow-run-cancel-action\s*\{[^}]*width:\s*26px[^}]*height:\s*26px/,
+    /\.workflow-run-cancel-action\s*\{[^}]*width:\s*26px[^}]*height:\s*26px[^}]*padding:\s*0/,
   );
   assert.match(
     workflowCss,
@@ -1447,13 +1851,21 @@ test("workflow run cancellation is confirmed from the compact header action", ()
   assert.doesNotMatch(workflowCss, /workspace-workflow-run-direct-actions/);
 });
 
+test("workflow card keeps cancellation in the header for failed and input-needed runs", () => {
+  assert.match(hostSource, /const canCancelRun = canControl/);
+  assert.match(hostSource, /canCancelWorkflowRun/);
+  assert.match(hostSource, /headerInterventionAction/);
+  assert.match(hostSource, /filter\(\s*\(option\) => normalizeWorkflowActionChoice\(option\) !== "cancel"/);
+  assert.match(hostSource, /action=\{headerInterventionAction\}/);
+});
+
 test("workflow cancellation confirmation tracks current eligibility before mutating", () => {
   assert.match(
     hostSource,
     /const \[cancelConfirmationRunId, setCancelConfirmationRunId\] = useState<string \| null>\(null\)/,
   );
   assert.match(hostSource, /if \(!cancelConfirmationOpen\) return/);
-  assert.match(hostSource, /!canCancelRunningRun \|\| cancelConfirmationRunId !== foregroundRunId/);
+  assert.match(hostSource, /!canCancelRun \|\| cancelConfirmationRunId !== foregroundRunId/);
   assert.match(hostSource, /setCancelConfirmationOpen\(false\)/);
 
   const eligibilityGuard = hostSource.indexOf("if (!cancelConfirmationOpen) return");
@@ -1465,10 +1877,10 @@ test("workflow cancellation confirmation tracks current eligibility before mutat
   const confirmStart = hostSource.indexOf("const confirmCancellation = async () => {");
   const confirmEnd = hostSource.indexOf("\n  };", confirmStart);
   const confirmSource = hostSource.slice(confirmStart, confirmEnd);
-  assert.match(confirmSource, /!canCancelRunningRun/);
+  assert.match(confirmSource, /!canCancelRun/);
   assert.match(confirmSource, /cancelConfirmationRunId !== foregroundRunId/);
   assert.ok(
-    confirmSource.indexOf("!canCancelRunningRun")
+    confirmSource.indexOf("!canCancelRun")
       < confirmSource.indexOf("cancelMutation.mutateAsync"),
   );
   assert.match(confirmSource, /runId: expectedConfirmation\.runId/);
@@ -1530,6 +1942,9 @@ test("workflow cancellation failure is scoped to the open confirmation", () => {
   const dialogEnd = hostSource.indexOf("/>", dialogStart);
   const dialogSource = hostSource.slice(dialogStart, dialogEnd);
   assert.doesNotMatch(dialogSource, /directActionError|resumeMutation|scopedResolveError/);
+  assert.match(hostSource, /isWorkflowRunAlreadyTerminalError\(error\)/);
+  assert.match(hostSource, /closeCancellationConfirmation\(expectedConfirmation\)/);
+  assert.match(hostSource, /await invalidateRunSurfaces\(expectedConfirmation\.runId\)/);
 });
 
 test("workspace websocket invalidates the changed Workflow Run projection", () => {
@@ -1561,12 +1976,28 @@ test("workflow detail scroll regions shrink within mobile and landscape chat spa
 test("workflow run cancellation uses the existing endpoint and invalidates run surfaces", () => {
   assert.match(
     apiSource,
-    /cancelRun:\s*\(runId: string\)\s*=>\s*request<void>\(`\/workflows\/runs\/\$\{runId\}\/cancel`,\s*\{ method: "POST" \}\)/,
+    /cancelRun:\s*\(runId: string\)\s*=>\s*request<any>\(`\/workflows\/runs\/\$\{runId\}\/cancel`,\s*\{ method: "POST" \}\)/,
+  );
+  assert.match(
+    apiSource,
+    /pauseRun:\s*\(runId: string\)\s*=>\s*request<any>\(`\/workflows\/runs\/\$\{runId\}\/pause`,\s*\{ method: "POST" \}\)/,
   );
   assert.match(hostSource, /api\.workflows\.cancelRun\(runId\)/);
+  assert.match(hostSource, /api\.workflows\.pauseRun\(foregroundRunId\)/);
+  assert.match(hostSource, /className="workflow-run-pause-action"/);
+  assert.match(hostSource, /<IconPause size=\{13\}/);
   assert.match(hostSource, /queryKey:\s*\["workflow-run", runId\]/);
   assert.match(hostSource, /queryKey:\s*\["workspace-chat", workspaceId\]/);
   assert.match(hostSource, /queryKey:\s*\["workspace-workflow-runs", workspaceId\]/);
+});
+
+test("flow editor preserves and hydrates detailed node results across compact run polling", () => {
+  assert.match(flowsSource, /api\.workflows\.getRun\(runResult\.id\)/);
+  assert.match(flowsSource, /Object\.prototype\.hasOwnProperty\.call\(refreshed, "step_results"\)/);
+  assert.match(
+    flowsSource,
+    /current\?\.id === refreshed\.id \? \{ \.\.\.current, \.\.\.refreshed \} : current/,
+  );
 });
 
 test("workspace chat mounts the workflow host in normal flow immediately before its composer", () => {
@@ -1578,4 +2009,61 @@ test("workspace chat mounts the workflow host in normal flow immediately before 
   assert.ok(footerIndex > hostIndex);
   assert.match(chatSource.slice(hostIndex, footerIndex), /workflowRunGroups/);
   assert.doesNotMatch(hostSource, /position:\s*(fixed|absolute)/);
+});
+
+test("global chat messages preserve persisted Workflow fields", () => {
+  for (const field of [
+    "message_kind",
+    "refs",
+    "meta",
+    "pending_action",
+    "resolved_at",
+    "resolution",
+  ]) {
+    assert.match(chatStreamSource, new RegExp(`\\b${field}\\?\\s*:`));
+    assert.match(embeddedChatSource, new RegExp(`\\b${field}:\\s*m\\.${field}`));
+    assert.match(floatingChatSource, new RegExp(`\\b${field}:\\s*m\\.${field}`));
+  }
+});
+
+test("global Workflow actions use the generic chat resolution endpoint", () => {
+  assert.match(apiSource, /`\/chat\/messages\/\$\{msgId\}\/resolve`/);
+  assert.match(chatStreamSource, /api\.chat\.resolveAction\(/);
+  assert.match(
+    chatStreamSource,
+    /hasOwnProperty\.call\(\s*resolved,\s*"pending_action"/,
+  );
+});
+
+test("global chat surfaces share the compact run host directly above the composer", () => {
+  assert.match(
+    conversationHostSource,
+    /export \{ default \} from "\.\/WorkspaceWorkflowRunHost"/,
+  );
+  for (const source of [embeddedChatSource, floatingChatSource]) {
+    assert.match(
+      source,
+      /import WorkflowRunHost,[\s\S]*?from "\.\/workflows\/WorkflowRunHost";/,
+    );
+    assert.match(source, /<WorkflowRunHost[\s\S]*?\/>\s*<ChatInputFooter/);
+    assert.match(source, /onResolveMessage=\{handleWorkflowMessageResolve\}/);
+    assert.match(source, /workflowHostOwnedMessageIds/);
+    assert.match(source, /visibleWorkflowMessages/);
+    assert.match(source, /<ApprovalActionBar\s+messages=\{visibleWorkflowMessages\}/);
+  }
+});
+
+test("the shared host derives global Workspace scope and dismisses terminal runs", () => {
+  assert.match(hostSource, /workspaceId\?:\s*string/);
+  assert.match(hostSource, /conversationId\?:\s*string/);
+  assert.match(hostSource, /invalidationQueryKeys\?:/);
+  assert.match(hostSource, /runDetail\?\.workspace_id/);
+  assert.match(
+    hostSource,
+    /if \(messageHandled\) \{\s*if \(conversationId\) await invalidateRunSurfaces\(foregroundRunId\);\s*return;\s*\}/,
+  );
+  assert.match(
+    hostSource,
+    /if \(!foregroundGroup \|\| !foregroundRun \|\| serverConfirmedTerminal\) return null/,
+  );
 });

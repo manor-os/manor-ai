@@ -12,7 +12,7 @@ export const NODE_GROUPS: { group: string; types: string[] }[] = [
   { group: "Media", types: ["image", "video", "audio"] },
   { group: "Logic", types: ["condition", "switch", "loop", "parallel", "merge", "transform", "filter", "aggregate", "split", "limit", "sort", "dedupe", "datetime", "wait"] },
   { group: "I/O", types: ["http", "connector", "code", "tool", "subworkflow", "extractfromfile", "respond"] },
-  { group: "Lifecycle", types: ["notify", "stop", "end"] },
+  { group: "Lifecycle", types: ["publication_receipt", "notify", "stop", "end"] },
   { group: "Annotate", types: ["note"] },
 ];
 

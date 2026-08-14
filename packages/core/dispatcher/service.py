@@ -608,13 +608,37 @@ class Dispatcher:
                     "action_link": _hint.action_link if _hint else None,
                     "is_transient": bool(_hint and _hint.is_transient),
                 }
+            proposal_high_risk_approved = False
+            if (
+                (step.risk_level or "low") == "high"
+                and plan.task_id
+                and step.workspace_id
+            ):
+                from packages.core.proposals.external_authorization import (
+                    proposal_youtube_public_step_is_authorized,
+                )
+
+                proposal_high_risk_approved = (
+                    await proposal_youtube_public_step_is_authorized(
+                        db,
+                        entity_id=step.entity_id,
+                        workspace_id=step.workspace_id,
+                        task_id=plan.task_id,
+                    )
+                )
+            approval_capability_id = step_capability_id
+            if proposal_high_risk_approved and not approval_capability_id:
+                # Planner-authored subagent steps may omit action metadata.
+                # The exact Proposal scope still identifies this as the
+                # external.social operation for governance policy evaluation.
+                approval_capability_id = "external.social"
             decision = await resolve_approval(
                 db,
                 subject=ApprovalSubject(
                     entity_id=step.entity_id,
                     workspace_id=step.workspace_id,
                     action_key=step.action_key,
-                    capability_id=step_capability_id,
+                    capability_id=approval_capability_id,
                     risk_level=step.risk_level or "low",
                     kind=step.kind,
                     requires_approval=bool(
@@ -628,6 +652,8 @@ class Dispatcher:
                     task_id=plan.task_id,
                 ),
                 spent_credits=spent_credits_per_kind,
+                intrinsic_high_risk_approved=proposal_high_risk_approved,
+                policy_hitl_preauthorized=proposal_high_risk_approved,
                 hitl_type=_hitl_type,
                 payload=_payload,
             )
@@ -662,7 +688,7 @@ class Dispatcher:
                         "type": approval_error_type,
                         "message": decision.reason,
                         "matched_rule": decision.matched_rule,
-                        "capability_id": step_capability_id,
+                        "capability_id": approval_capability_id,
                         "approval_request_id": request_id,
                     }
                     await post_hitl_card(
@@ -673,7 +699,7 @@ class Dispatcher:
                         step_key=step.step_key,
                         kind=step.kind,
                         action_key=step.action_key,
-                        capability_id=step_capability_id,
+                        capability_id=approval_capability_id,
                         matched_rule=decision.matched_rule,
                         reason=decision.reason,
                         approval_request_id=request_id,
@@ -697,7 +723,7 @@ class Dispatcher:
                         "type": "StepApprovalUnavailable",
                         "message": decision.reason,
                         "matched_rule": decision.matched_rule,
-                        "capability_id": step_capability_id,
+                        "capability_id": approval_capability_id,
                     }
                     step.finished_at = now
                 logger.info(
@@ -711,7 +737,7 @@ class Dispatcher:
                     "type": "GovernancePolicy",
                     "message": decision.reason,
                     "matched_rule": decision.matched_rule,
-                    "capability_id": step_capability_id,
+                    "capability_id": approval_capability_id,
                 }
                 step.finished_at = now
                 logger.info(
@@ -913,11 +939,11 @@ class Dispatcher:
             try:
                 validate_step_output(step, result)
             except SchemaError as exc:
-                if output_schema_is_advisory(step.kind):
-                    # Free-form agent output (llm/subagent): the Planner-guessed
-                    # output schema is advisory, not a contract. Accept the real
-                    # output instead of dead-failing the step (which otherwise
-                    # burns 3 retries and strands the whole plan).
+                if output_schema_is_advisory(step.kind, step.expected_output_schema):
+                    # Unmarked legacy free-form schema: accept the real output
+                    # instead of dead-failing an already-running old plan.
+                    # New plan step and task.expected_output contracts
+                    # are provenance-marked and never enter this branch.
                     logger.warning(
                         "[dispatcher] step %s kind=%s output failed its (advisory) "
                         "schema; accepting real output anyway: %s",
@@ -969,6 +995,54 @@ class Dispatcher:
             # what actually came back, not just the derived error.
             step.result = result
             return failed_lease
+
+        # A filesystem path is storage provenance, not a deliverable handle.
+        # Before announcing success, make every local artifact a Knowledge
+        # Document and add its canonical viewer id to the step result. This is
+        # the shared backstop for code/action/subagent producers that did not
+        # use the standard generated-file helper themselves.
+        if isinstance(result, dict):
+            from packages.core.plans.executor import _artifact_refs_from_result
+            from packages.core.services.artifact_knowledge import (
+                attach_knowledge_artifacts,
+                project_artifact_refs_to_knowledge,
+            )
+
+            artifact_refs = _artifact_refs_from_result(result, step_key=step.step_key)
+            if artifact_refs:
+                task_id = (await db.execute(
+                    select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id)
+                )).scalar_one_or_none()
+                projection = await project_artifact_refs_to_knowledge(
+                    entity_id=step.entity_id,
+                    refs=artifact_refs,
+                    workspace_id=step.workspace_id,
+                    task_id=task_id,
+                    agent_id=step.resolved_agent_id,
+                    tool_name="dispatcher.complete_lease",
+                )
+                if projection.failures:
+                    lease.result = result
+                    if cost:
+                        lease.cost = cost
+                    details = "; ".join(
+                        f"{item['fs_path']}: {item['reason']}"
+                        for item in projection.failures[:4]
+                    )
+                    return await self.fail_lease(
+                        db,
+                        lease_id,
+                        error={
+                            "type": "ArtifactKnowledgeSyncError",
+                            "message": (
+                                "The step produced a local artifact but it could not be "
+                                f"registered in Knowledge ({details})."
+                            ),
+                            "artifacts": projection.failures,
+                        },
+                        will_retry=False,
+                    )
+                result = attach_knowledge_artifacts(result, projection)
 
         # Lease side
         lease.status = WorkLeaseStatus.COMPLETED.value
@@ -1441,6 +1515,7 @@ class Dispatcher:
         db: AsyncSession,
         *,
         now: Optional[datetime] = None,
+        plan_ids: Optional[set[str]] = None,
     ) -> int:
         """Reclaim leases past lease_until. Caller commits.
 
@@ -1466,6 +1541,8 @@ class Dispatcher:
         for lease in rows:
             lease.status = WorkLeaseStatus.EXPIRED.value
             lease.credential_leases = []
+            if plan_ids is not None and lease.plan_id:
+                plan_ids.add(lease.plan_id)
 
             step = await self._get_step(db, lease.step_id)
             if step is None:

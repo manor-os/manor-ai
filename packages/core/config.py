@@ -7,7 +7,21 @@ from functools import lru_cache
 # The insecure built-in JWT signing key. Because it ships in the source, any
 # deployment left on this value has forgeable auth tokens. App startup refuses
 # to boot on it in cloud mode and warns loudly in OSS mode (see apps/api/main.py).
-INSECURE_DEFAULT_JWT_SECRET = "dev-secret-change-in-production"
+INSECURE_DEFAULT_JWT_SECRET = "dev-secret-change-in-production-32-bytes"
+_INSECURE_JWT_SECRET_PLACEHOLDERS = frozenset({
+    INSECURE_DEFAULT_JWT_SECRET,
+    "change-this-to-a-random-string",
+    "replace-with-openssl-rand-hex-32",
+})
+
+
+def is_insecure_jwt_secret(value: str) -> bool:
+    """Return true for empty, short, or shipped JWT signing secrets."""
+    return (
+        not value
+        or len(value.encode("utf-8")) < 32
+        or value in _INSECURE_JWT_SECRET_PLACEHOLDERS
+    )
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -50,7 +64,7 @@ class Settings:
     # Auth
     JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", INSECURE_DEFAULT_JWT_SECRET)
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
-    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
+    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
 
     # LLM
     LLM_MODEL: str = os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4")
@@ -88,6 +102,11 @@ class Settings:
     DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "oss")  # oss | cloud
     APP_URL: str = os.getenv("APP_URL", "")
     CLI_PUBLIC_API_URL: str = os.getenv("CLI_PUBLIC_API_URL", "")
+
+    # Public base domain for published static sites, e.g. "sites.manorai.xyz".
+    # Each site is served at {slug}.{MANOR_SITES_DOMAIN}; the domain is also the
+    # CNAME target for user-owned custom domains. Empty disables site hosting.
+    MANOR_SITES_DOMAIN: str = os.getenv("MANOR_SITES_DOMAIN", "")
 
     # Public base URL — used to construct channel webhook URLs (Telegram,
     # WhatsApp, WeChat, …). Must be an https endpoint reachable from the

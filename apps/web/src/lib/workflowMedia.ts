@@ -2,8 +2,9 @@
 
    Generated-file nodes return varied shapes (image gen → {image_url}, audio →
    {kind, mime_type, ...}, code → {url}/{entry_url}, etc.), so rather than match
-   a fixed schema we walk the whole output and collect any URL-ish string —
-   resilient to schema drift. Classified by extension / data-url mime / key. */
+   a fixed schema we walk the whole output and collect URL-ish strings that are
+   explicitly file fields or have a renderable media extension. Ordinary source
+   and citation links remain part of the structured result. */
 
 export type MediaType = "image" | "video" | "audio" | "file";
 
@@ -18,7 +19,7 @@ const VID_EXT = ["mp4", "webm", "mov", "m4v", "ogv"];
 const AUD_EXT = ["mp3", "wav", "ogg", "m4a", "flac", "aac"];
 
 const URL_KEYS = new Set([
-  "image_url", "url", "file_url", "video_url", "audio_url",
+  "image_url", "file_url", "video_url", "audio_url",
   "download_url", "src", "path", "entry_url", "thumbnail",
 ]);
 
@@ -42,6 +43,15 @@ function classify(url: string, key?: string): MediaType {
   if (VID_EXT.includes(ext)) return "video";
   if (AUD_EXT.includes(ext)) return "audio";
   return "file";
+}
+
+function isRenderableRef(url: string, key?: string): boolean {
+  if (!isUrlish(url)) return false;
+  if (key && URL_KEYS.has(key)) return true;
+  if (url.startsWith("/api/v1/fs/") || url.startsWith("data:") || url.startsWith("blob:")) {
+    return true;
+  }
+  return classify(url, key) !== "file";
 }
 
 function fileName(url: string): string | undefined {
@@ -68,7 +78,9 @@ export function extractMediaRefs(output: unknown, limit = 6): MediaRef[] {
       const re = /(https?:\/\/[^\s"')]+|\/api\/v1\/fs\/[^\s"')]+|data:[a-z]+\/[^\s"')]+)/gi;
       let m: RegExpExecArray | null;
       while ((m = re.exec(s)) && refs.length < limit) {
-        refs.push({ url: m[1], type: classify(m[1]), name: fileName(m[1]) });
+        if (isRenderableRef(m[1])) {
+          refs.push({ url: m[1], type: classify(m[1]), name: fileName(m[1]) });
+        }
       }
       return refs;
     }
@@ -79,7 +91,7 @@ export function extractMediaRefs(output: unknown, limit = 6): MediaRef[] {
   const walk = (node: unknown, key?: string) => {
     if (node == null || refs.length >= limit) return;
     if (typeof node === "string") {
-      if ((isUrlish(node) || (key && URL_KEYS.has(key) && node)) && !seen.has(node) && isUrlish(node)) {
+      if (isRenderableRef(node, key) && !seen.has(node)) {
         seen.add(node);
         refs.push({ url: node, type: classify(node, key), name: fileName(node) });
       }

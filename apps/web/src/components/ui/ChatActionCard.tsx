@@ -18,7 +18,10 @@ import {
 } from "../../lib/approvalCopy";
 import { t } from "../../lib/i18n";
 import Chip from "./Chip";
+import Input from "./Input";
 import Modal from "./Modal";
+import Select from "./Select";
+import Textarea from "./Textarea";
 import {
   APPROVAL_CHOICE_ALWAYS_APPROVE,
   APPROVAL_CHOICE_APPROVE,
@@ -40,6 +43,7 @@ import {
 } from "../workflows/WorkflowSchemaFields";
 import WorkflowApprovalReview from "../workflows/WorkflowApprovalReview";
 import {
+  proposalApprovedRowIds,
   proposalImpactExplainer,
   proposalImpactLabel,
   proposalPriorityLabel,
@@ -75,6 +79,7 @@ export interface PendingAction {
 export interface Resolution {
   choice: string;
   note?: string;
+  payload?: Record<string, any>;
 }
 
 type ApprovalTone = "approve" | "always" | "reject" | "secondary";
@@ -86,10 +91,13 @@ function normalizeChoice(choice: string): string {
 function approvalTone(choice: string): ApprovalTone {
   const normalized = normalizeChoice(choice);
   if (normalized.includes("always")) return "always";
-  if (normalized === "revise") return "secondary";
+  if (
+    normalized === "revise"
+    || normalized === "request_changes"
+    || normalized === "cancel"
+  ) return "secondary";
   if (
     normalized.includes("reject")
-    || normalized.includes("cancel")
     || normalized.includes("skip")
     || normalized === "no"
     || normalized === "deny"
@@ -107,6 +115,7 @@ function approvalLabel(choice: string): string {
   if (normalized === "provide_answers" || normalized === "submit") return t("component.chat_action_card.submit");
   if (normalized === "confirm") return t("component.chat_action_card.confirm");
   if (normalized === "revise") return t("component.chat_action_card.revise");
+  if (normalized === "request_changes") return t("page.task_detail.request_changes");
   if (normalized === "accept") return t("component.chat_action_card.accept");
   if (normalized === "cancel") return t("component.chat_action_card.cancel");
   if (normalized === "skip") return t("component.chat_action_card.skip");
@@ -538,14 +547,25 @@ function proposalRows(action?: PendingAction): ProposalRow[] {
   return [...taskRows, ...itemRows];
 }
 
-export function ProposalCard({ action, onResolve, disabled }: {
+export function ProposalCard({
+  action,
+  onResolve,
+  disabled,
+  selectedRowIds,
+  onSelectedRowIdsChange,
+  rowsRenderedElsewhere,
+}: {
   action?: PendingAction;
   onResolve: (choice: string, note?: string, payload?: Record<string, any>) => void;
   disabled?: boolean;
+  selectedRowIds?: Set<string>;
+  onSelectedRowIdsChange?: (selected: Set<string>) => void;
+  rowsRenderedElsewhere?: boolean;
 }) {
   const rows = proposalRows(action);
   const rowIds = rows.map((row) => row.id);
-  const [selected, setSelected] = useState<Set<string>>(new Set(rowIds));
+  const [internalSelected, setInternalSelected] = useState<Set<string>>(new Set(rowIds));
+  const selected = selectedRowIds || internalSelected;
   const [feedback, setFeedback] = useState("");
   const [showFeedback, setShowFeedback] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -554,15 +574,21 @@ export function ProposalCard({ action, onResolve, disabled }: {
   const [rejectComment, setRejectComment] = useState("");
   const [showAlwaysConfirm, setShowAlwaysConfirm] = useState(false);
 
-  const toggle = (id: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
+  const updateSelected = (next: Set<string>) => {
+    if (onSelectedRowIdsChange) {
+      onSelectedRowIdsChange(next);
+    } else {
+      setInternalSelected(next);
+    }
   };
-  const selectAll = () => setSelected(new Set(rowIds));
-  const selectNone = () => setSelected(new Set());
+
+  const toggle = (id: string) => {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    updateSelected(next);
+  };
+  const selectAll = () => updateSelected(new Set(rowIds));
+  const selectNone = () => updateSelected(new Set());
 
   const handleApprove = () => {
     setSubmitting(true);
@@ -608,13 +634,13 @@ export function ProposalCard({ action, onResolve, disabled }: {
     onResolve("feedback", feedback.trim());
   };
 
-  const selectedCount = selected.size;
+  const selectedCount = rows.filter((row) => selected.has(row.id)).length;
   const nothingSelected = selectedCount === 0;
 
   return (
-    <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+    <div className="chat-proposal-actions-card">
       {/* One unified list — tasks and changes/experiments, each checkable */}
-      {rows.length > 0 && (
+      {rows.length > 0 && !rowsRenderedElsewhere && (
         <div className="chat-proposal-task-list">
           {rows.length > 1 && (
             <div className="chat-proposal-select-controls">
@@ -849,7 +875,7 @@ export function ProposalCard({ action, onResolve, disabled }: {
 
 export function ApprovalCard({ options, onResolve, disabled, blockApprove }: {
   options?: string[];
-  onResolve: (choice: string) => void;
+  onResolve: (choice: string, note?: string, payload?: Record<string, any>) => void;
   disabled?: boolean;
   /** Disable only the affirmative (approve) button — e.g. when a draft has
    *  validation errors — while keeping reject/dismiss clickable. */
@@ -859,31 +885,69 @@ export function ApprovalCard({ options, onResolve, disabled, blockApprove }: {
   // the user's to give for any capability they are shown a card for; only
   // `never_allow` is a hard block, and it never produces a card at all.
   const opts = options && options.length ? options : DEFAULT_APPROVAL_OPTIONS;
+  const [showRevisionRequest, setShowRevisionRequest] = useState(false);
+  const [revisionRequest, setRevisionRequest] = useState("");
+  const submitRevision = () => {
+    const value = revisionRequest.trim();
+    if (!value || disabled) return;
+    onResolve("revise", undefined, { review: { revision_request: value } });
+  };
   return (
-    <div className="chat-hitl-actions">
-      {opts.map((opt) => {
-        const tone = approvalTone(opt);
-        const isApprove = tone === "approve" || tone === "always";
-        const className = tone === "reject"
-          ? "chat-hitl-btn-secondary chat-hitl-btn-danger"
-          : tone === "always"
-            ? "chat-hitl-btn-secondary chat-hitl-btn-quiet"
-            : tone === "secondary"
-              ? "chat-hitl-btn-secondary"
-            : "chat-hitl-btn-primary";
-        return (
-          <button
-            type="button"
-            key={opt}
-            className={className}
-            onClick={() => onResolve(opt)}
-            disabled={disabled || (blockApprove && isApprove)}
-          >
-            {approvalLabel(opt)}
-          </button>
-        );
-      })}
-    </div>
+    <>
+      <div className="chat-hitl-actions">
+        {opts.map((opt) => {
+          const tone = approvalTone(opt);
+          const isApprove = tone === "approve" || tone === "always";
+          const className = tone === "reject"
+            ? "chat-hitl-btn-secondary chat-hitl-btn-danger"
+            : tone === "always"
+              ? "chat-hitl-btn-secondary chat-hitl-btn-quiet"
+              : tone === "secondary"
+                ? "chat-hitl-btn-secondary"
+              : "chat-hitl-btn-primary";
+          return (
+            <button
+              type="button"
+              key={opt}
+              className={className}
+              onClick={() => {
+                if (normalizeChoice(opt) === "revise") {
+                  setShowRevisionRequest((current) => !current);
+                  return;
+                }
+                onResolve(opt);
+              }}
+              disabled={disabled || (blockApprove && isApprove)}
+              aria-expanded={normalizeChoice(opt) === "revise" ? showRevisionRequest : undefined}
+            >
+              {approvalLabel(opt)}
+            </button>
+          );
+        })}
+      </div>
+      {showRevisionRequest && (
+        <div className="chat-hitl-retry-guidance">
+          <Textarea
+            label={t("component.approval_action_bar.revision_instructions")}
+            value={revisionRequest}
+            onChange={(event) => setRevisionRequest(event.target.value)}
+            placeholder={t("component.approval_action_bar.revision_placeholder")}
+            rows={3}
+            disabled={disabled}
+          />
+          <div className="chat-hitl-actions">
+            <button
+              type="button"
+              className="chat-hitl-btn-primary"
+              onClick={submitRevision}
+              disabled={disabled || !revisionRequest.trim()}
+            >
+              {t("component.approval_action_bar.submit_revision")}
+            </button>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -909,9 +973,14 @@ const ERROR_CARD_CHOICES = new Set(["retry", "retry_now", "cancel", "skip"]);
 
 export function HitlErrorCard({ action, onResolve, disabled }: {
   action: PendingAction;
-  onResolve: (choice: string) => void;
+  onResolve: (choice: string, note?: string) => void;
   disabled?: boolean;
 }) {
+  // Retry without changed input re-runs the exact attempt that just failed —
+  // a deterministic blocker then fails identically forever. The guidance box
+  // lets the user say what to change; the backend writes it into the step's
+  // human_input_response so the retried model actually sees it.
+  const [guidance, setGuidance] = useState("");
   const structured = structuredApprovalCopy(action.payload);
   const headline =
     structured?.headline
@@ -922,7 +991,7 @@ export function HitlErrorCard({ action, onResolve, disabled }: {
   );
   return (
     <>
-      <div className="chat-hitl-summary chat-hitl-summary--error">
+      <div className="chat-hitl-summary">
         <div className="chat-hitl-title">{headline}</div>
         {structured?.detail && (
           <div className="chat-hitl-description">{structured.detail}</div>
@@ -942,9 +1011,18 @@ export function HitlErrorCard({ action, onResolve, disabled }: {
           <CardOriginLink taskId={action.task_id} />
         </div>
       </div>
+      <Textarea
+        ariaLabel={t("component.chat_action_card.retry_guidance_placeholder")}
+        value={guidance}
+        onChange={(e) => setGuidance(e.target.value)}
+        placeholder={t("component.chat_action_card.retry_guidance_placeholder")}
+        rows={3}
+        disabled={disabled}
+        className="chat-hitl-retry-guidance"
+      />
       <ApprovalCard
         options={options.length ? options : ERROR_CARD_OPTIONS}
-        onResolve={onResolve}
+        onResolve={(choice) => onResolve(choice, guidance.trim() || undefined)}
         disabled={disabled}
       />
     </>
@@ -1568,7 +1646,7 @@ export function NeedsInputCard({ action, onResolve, disabled }: {
           {action.context_summary && <div className="chat-hitl-description">{action.context_summary}</div>}
         </div>
       )}
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div className="chat-hitl-question-list">
         {questions.map((question, index) => {
           const key = questionKey(question, index);
           const label = questionLabel(question, index);
@@ -1576,48 +1654,57 @@ export function NeedsInputCard({ action, onResolve, disabled }: {
           const options: any[] = Array.isArray(question?.options) ? question.options : [];
           const value = answers[key] ?? "";
           return (
-            <label key={key} className="chat-hitl-field-label">
-              <span>{label}</span>
-              {options.length > 0 ? (
-                <select
-                  value={String(value)}
-                  onChange={(e) => setAnswer(key, e.target.value)}
-                  disabled={disabled || submitting}
-                  className="chat-hitl-textarea"
-                  style={{ minHeight: 34 }}
-                >
-                  <option value="" disabled>{question?.required ? t("component.chat_action_card.select") : t("component.chat_action_card.optional")}</option>
-                  {options.map((option) => (
-                    <option key={optionValue(option)} value={optionValue(option)}>{optionLabel(option)}</option>
-                  ))}
-                </select>
-              ) : type === "checkbox" || type === "boolean" ? (
-                <input
-                  type="checkbox"
-                  checked={Boolean(value)}
-                  onChange={(e) => setAnswer(key, e.target.checked)}
-                  disabled={disabled || submitting}
-                  style={{ width: 16, height: 16, accentColor: "#436b65" }}
-                />
-              ) : type === "textarea" || type === "multiline" ? (
-                <textarea
-                  value={String(value)}
-                  onChange={(e) => setAnswer(key, e.target.value)}
-                  disabled={disabled || submitting}
-                  className="chat-hitl-textarea"
-                  rows={2}
-                />
-              ) : (
-                <input
-                  type={type === "number" ? "number" : "text"}
-                  value={String(value)}
-                  onChange={(e) => setAnswer(key, e.target.value)}
-                  disabled={disabled || submitting}
-                  className="chat-hitl-textarea"
-                  style={{ minHeight: 34 }}
-                />
-              )}
-            </label>
+            <div key={key} className="chat-hitl-question-field">
+              <div className="chat-hitl-question-label">
+                {label}
+                {question?.required && (
+                  <span className="chat-hitl-question-required" aria-hidden="true">*</span>
+                )}
+              </div>
+              <div className="chat-hitl-question-control">
+                {options.length > 0 ? (
+                  <Select
+                    value={String(value)}
+                    onChange={(nextValue) => setAnswer(key, nextValue)}
+                    disabled={disabled || submitting}
+                    ariaLabel={label}
+                    placeholder={question?.required ? t("component.chat_action_card.select") : t("component.chat_action_card.optional")}
+                    options={options.map((option) => ({
+                      value: optionValue(option),
+                      label: optionLabel(option),
+                    }))}
+                    style={{ width: "100%" }}
+                    dropdownMinWidth={220}
+                  />
+                ) : type === "checkbox" || type === "boolean" ? (
+                  <input
+                    type="checkbox"
+                    checked={Boolean(value)}
+                    onChange={(e) => setAnswer(key, e.target.checked)}
+                    disabled={disabled || submitting}
+                    style={{ width: 16, height: 16, accentColor: "#436b65" }}
+                  />
+                ) : type === "textarea" || type === "multiline" ? (
+                  <Textarea
+                    value={String(value)}
+                    onChange={(e) => setAnswer(key, e.target.value)}
+                    disabled={disabled || submitting}
+                    ariaLabel={label}
+                    placeholder={String(question?.placeholder || "")}
+                    rows={3}
+                  />
+                ) : (
+                  <Input
+                    type={type === "number" ? "number" : "text"}
+                    value={String(value)}
+                    onChange={(e) => setAnswer(key, e.target.value)}
+                    disabled={disabled || submitting}
+                    ariaLabel={label}
+                    placeholder={String(question?.placeholder || "")}
+                  />
+                )}
+              </div>
+            </div>
           );
         })}
       </div>
@@ -1712,6 +1799,65 @@ export function NeedsConfirmationCard({ action, onResolve, disabled }: {
 
 /* ── Resolved Badge (shows after action taken) ── */
 
+function ResolvedActionSummary({ action }: { action: PendingAction }) {
+  if (!action?.kind || action.kind === "unknown" || action.kind === "approve_proposals") {
+    return null;
+  }
+
+  if (
+    action.review != null
+    && (action.kind === "workflow_approval" || action.hitl_type === "review")
+  ) {
+    return (
+      <WorkflowApprovalReview
+        prompt={action.prompt}
+        review={action.review}
+        reviewTitle={action.review_title}
+      />
+    );
+  }
+
+  const title = String(action.title || action.review_title || action.action_summary || "").trim();
+  const description = String(action.context_summary || action.description || "").trim();
+  if (title || description) {
+    return (
+      <div className="chat-hitl-summary">
+        {title && <div className="chat-hitl-title">{title}</div>}
+        {description && <div className="chat-hitl-description">{description}</div>}
+      </div>
+    );
+  }
+
+  if (
+    action.prompt ||
+    action.action ||
+    action.tool ||
+    action.content ||
+    action.args_preview ||
+    action.operation ||
+    action.paths ||
+    action.payload
+  ) {
+    return (
+      <ApprovalSummary
+        prompt={action.prompt}
+        action={action.action || action.kind}
+        tool={action.tool}
+        hasWorkspace={Boolean(action.workspace?.id || action.workspace?.name)}
+        paths={action.paths}
+        content={action.content}
+        argsPreview={action.args_preview}
+        operation={action.operation}
+        hitlType={action.hitl_type}
+        payload={action.payload}
+        taskId={action.task_id}
+      />
+    );
+  }
+
+  return null;
+}
+
 export function ResolvedBadge({ resolution, by }: { resolution: Resolution; by?: string }) {
   const choice = resolution.choice || "";
   const tone = approvalTone(choice);
@@ -1723,18 +1869,24 @@ export function ResolvedBadge({ resolution, by }: { resolution: Resolution; by?:
   const isFeedback = choice === "feedback";
   const isRespond = choice === "respond" || normalized === "provide_answers";
   const isReject = tone === "reject";
+  const isRevise = normalized === "revise";
 
   const label = isRetry ? t("component.chat_action_card.retry_requested")
     : isCancelled ? t("component.status.cancelled")
     : isSkipped ? t("component.chat_action_card.skipped")
+    : isRevise ? t("component.chat_action_card.revision_requested")
     : tone === "always" ? t("component.chat_action_card.always_approved")
     : isApprove ? (choice === "approve_selected" ? t("component.chat_action_card.partially_approved") : t("component.chat_action_card.approved"))
     : isFeedback ? t("component.chat_action_card.feedback_sent")
     : isRespond ? t("component.chat_action_card.responded")
     : isReject ? t("component.chat_action_card.rejected")
     : choice;
-  const variant = (isApprove || isFeedback || isRespond) ? "chat-hitl-resolved--approved" : "chat-hitl-resolved--rejected";
-  const icon = (isApprove || isFeedback || isRespond) ? "✓ " : "✗ ";
+  const variant = isRevise
+    ? "chat-hitl-resolved--revised"
+    : (isApprove || isFeedback || isRespond)
+      ? "chat-hitl-resolved--approved"
+      : "chat-hitl-resolved--rejected";
+  const icon = isRevise ? "↻ " : (isApprove || isFeedback || isRespond) ? "✓ " : "✗ ";
 
   return (
     <div className={`chat-hitl-resolved ${variant}`}>
@@ -1749,9 +1901,74 @@ export function ResolvedBadge({ resolution, by }: { resolution: Resolution; by?:
   );
 }
 
+/** A proposal can resolve several independent rows with one click. The generic
+ * status badge says who decided; this compact ledger says exactly what that
+ * decision covered, so "partially approved" is never an opaque state. */
+export function ProposalResolution({ action, resolution, by }: {
+  action: PendingAction;
+  resolution: Resolution;
+  by?: string;
+}) {
+  const rows = proposalRows(action);
+  const normalized = normalizeChoice(resolution.choice);
+  const isDecision =
+    normalized.includes("approve")
+    || normalized.includes("reject")
+    || normalized === "decline"
+    || normalized === "no";
+  if (!isDecision || rows.length === 0) {
+    return <ResolvedBadge resolution={resolution} by={by} />;
+  }
+
+  const approvedIds = proposalApprovedRowIds(
+    resolution,
+    rows.map((row) => row.id),
+  ) || new Set<string>();
+  const isApproval = normalized.includes("approve");
+
+  return (
+    <div className="chat-proposal-resolution">
+      <div className={`chat-hitl-resolved ${isApproval ? "chat-hitl-resolved--approved" : "chat-hitl-resolved--rejected"}`}>
+        {isApproval ? "✓ " : "✗ "}
+        {t("component.chat_action_card.proposal_decision")}
+        {by && (
+          <span className="chat-hitl-resolved-by">
+            {" "}{t("component.chat_action_card.resolved_by").replace("{name}", by)}
+          </span>
+        )}
+      </div>
+      <ul className="chat-proposal-resolution-details">
+        {rows.map((row) => {
+          const approved = approvedIds.has(row.id);
+          return (
+            <li key={row.id} className="chat-proposal-resolution-row">
+              <span className="chat-proposal-resolution-icon" aria-hidden="true">
+                {approved ? "✓" : "—"}
+              </span>
+              <span>
+                <span className="chat-proposal-resolution-label">
+                  {t(
+                    approved
+                      ? "component.chat_action_card.approved_items"
+                      : "component.chat_action_card.not_approved_items",
+                  )}
+                </span>
+                <span className="chat-proposal-resolution-title">{row.label}</span>
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      {resolution.note && (
+        <div className="chat-proposal-resolution-note">{resolution.note}</div>
+      )}
+    </div>
+  );
+}
+
 /* ── Composite: renders the right card based on pending_action ── */
 
-export default function ChatActionCard({ action, resolved, resolution, onResolve, disabled, resolvedByName, currentUserName, resetToken }: {
+export default function ChatActionCard({ action, resolved, resolution, onResolve, disabled, resolvedByName, currentUserName, resetToken, proposalSelectedRowIds, onProposalSelectedRowIdsChange, proposalRowsRenderedElsewhere }: {
   action: PendingAction;
   resolved?: boolean;
   resolution?: Resolution | null;
@@ -1762,6 +1979,11 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
   currentUserName?: string;
   /** Increment after a failed request so an optimistic action becomes interactive again. */
   resetToken?: number;
+  /** Workspace proposal cards render their selectable rows inside Proposed
+   * Work. Other chat surfaces keep the ProposalCard's own unified row list. */
+  proposalSelectedRowIds?: Set<string>;
+  onProposalSelectedRowIdsChange?: (selected: Set<string>) => void;
+  proposalRowsRenderedElsewhere?: boolean;
   onResolve: (
     choice: string,
     note?: string,
@@ -1790,7 +2012,7 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
   ) => {
     if (locked) return;
     submittedRef.current = true;
-    setLocalResolution({ choice, note });
+    setLocalResolution({ choice, note, payload });
     onResolve(choice, note, payload, files);
   };
 
@@ -1798,7 +2020,15 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
     // Server-provided resolver wins; an optimistic local resolution is always
     // the current viewer.
     const by = resolvedByName || (localResolution ? currentUserName : undefined);
-    return <ResolvedBadge resolution={effectiveResolution} by={by} />;
+    if (action.kind === PendingActionKind.APPROVE_PROPOSALS) {
+      return <ProposalResolution action={action} resolution={effectiveResolution} by={by} />;
+    }
+    return (
+      <div className="chat-hitl-resolved-card">
+        <ResolvedActionSummary action={action} />
+        <ResolvedBadge resolution={effectiveResolution} by={by} />
+      </div>
+    );
   }
 
   if (!action?.kind) {
@@ -1811,7 +2041,7 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
     return (
       <HitlErrorCard
         action={action}
-        onResolve={(choice) => resolveOnce(choice)}
+        onResolve={(choice, note) => resolveOnce(choice, note)}
         disabled={locked}
       />
     );
@@ -1839,35 +2069,51 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
     );
   }
 
-  if (action.kind === PendingActionKind.NEEDS_INPUT) {
+  if (action.kind === "needs_input") {
     return <NeedsInputCard action={action} onResolve={resolveOnce} disabled={locked} />;
   }
 
-  if (action.kind === PendingActionKind.NEEDS_LOGIN) {
+  if (action.kind === "needs_login") {
     return <NeedsLoginCard action={action} onResolve={(choice) => resolveOnce(choice)} disabled={locked} />;
   }
 
-  if (action.kind === PendingActionKind.NEEDS_CONFIRMATION) {
+  if (action.kind === "needs_confirmation") {
     return <NeedsConfirmationCard action={action} onResolve={(choice) => resolveOnce(choice)} disabled={locked} />;
   }
 
-  if (action.kind === PendingActionKind.APPROVE_PROPOSALS) {
-    return <ProposalCard action={action} onResolve={resolveOnce} disabled={locked} />;
+  if (action.kind === "approve_proposals") {
+    return (
+      <ProposalCard
+        action={action}
+        onResolve={resolveOnce}
+        disabled={locked}
+        selectedRowIds={proposalSelectedRowIds}
+        onSelectedRowIdsChange={onProposalSelectedRowIdsChange}
+        rowsRenderedElsewhere={proposalRowsRenderedElsewhere}
+      />
+    );
   }
 
-  if (action.kind === PendingActionKind.RETRY_STRATEGIST_REVIEW) {
+  if (action.kind === "retry_strategist_review") {
     return <RetryActionCard onResolve={() => resolveOnce("retry")} disabled={locked} />;
   }
 
-  if (action.kind === PendingActionKind.WORKSPACE_OPERATION_REVIEW) {
+  if (action.kind === "workspace_operation_review") {
     return <WorkspaceOperationReviewCard action={action} onResolve={(choice) => resolveOnce(choice)} disabled={locked} />;
   }
 
-  if (action.kind === PendingActionKind.EXTERNAL_MESSAGE_APPROVAL) {
+  if (action.kind === "external_message_approval") {
     return <ExternalMessageApprovalCard action={action} onResolve={(choice) => resolveOnce(choice)} disabled={locked} />;
   }
 
-  if (action.kind === PendingActionKind.WORKFLOW_APPROVAL && action.review != null) {
+  if (
+    action.review != null
+    && (
+      action.kind === PendingActionKind.WORKFLOW_APPROVAL
+      || action.kind === PendingActionKind.TASK_APPROVAL
+      || action.hitl_type === "review"
+    )
+  ) {
     return (
       <>
         <WorkflowApprovalReview
@@ -1875,6 +2121,11 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
           review={action.review}
           reviewTitle={action.review_title}
         />
+        {action.kind === PendingActionKind.TASK_APPROVAL && action.task_id && (
+          <div className="chat-hitl-links">
+            <CardOriginLink taskId={action.task_id} />
+          </div>
+        )}
         <ApprovalCard options={action.options} onResolve={(choice) => resolveOnce(choice)} disabled={locked} />
       </>
     );

@@ -55,6 +55,33 @@ WORKFLOW_REF = {
 LIST_WORKFLOWS_SCHEMA = _schema(
     "list_workflows",
     "List workflows published as callable Manor Agent tools through an active MCP binding.",
+    {
+        "target_workspace_id": {
+            "type": "string",
+            "description": "Optional Workspace whose published workflow tools should be listed.",
+        },
+    },
+)
+LIST_WORKSPACE_FLOWS_SCHEMA = _schema(
+    "list_workspace_flows",
+    "List user-facing Flows installed in Workspaces the current user can access.",
+    {
+        "query": {
+            "type": "string",
+            "description": "Optional Flow title, slug, or Workspace name filter.",
+        },
+    },
+)
+START_WORKSPACE_FLOW_SCHEMA = _schema(
+    "start_workspace_flow",
+    "Start one user-facing Workspace Flow. In Global Manor Chat this requires Flows mode.",
+    {
+        "binding_id": {"type": "string", "description": "Binding id returned by list_workspace_flows."},
+        "flow": {"type": "string", "description": "Flow title or stable slug when binding_id is unavailable."},
+        "target_workspace": {"type": "string", "description": "Workspace id or exact name. Required for ambiguous Flow names."},
+        "inputs": {"type": "object", "description": "Optional structured starter input values."},
+        "source_brief": {"type": "string", "description": "The complete user request and constraints."},
+    },
 )
 RUN_WORKFLOW_SCHEMA = _schema(
     "run_workflow",
@@ -62,6 +89,10 @@ RUN_WORKFLOW_SCHEMA = _schema(
     {
         **WORKFLOW_REF,
         "inputs": {"type": "object", "description": "Trigger input variables."},
+        "target_workspace_id": {
+            "type": "string",
+            "description": "Optional Workspace that supplies Knowledge, connectors, approvals, and runtime context.",
+        },
     },
     ["workflow"],
 )
@@ -328,11 +359,35 @@ async def _exposed_workflows(
     )).all()
     from packages.core.services.workspace_workflow_router import prefer_workspace_bindings
 
-    return prefer_workspace_bindings(rows, workspace_id=workspace_id)
+    preferred = prefer_workspace_bindings(rows, workspace_id=workspace_id)
+    if workspace_id is not None:
+        return preferred
+
+    # Ordinary Agent Chat has no Workspace context. Keep entity-level bindings
+    # preferred, but make a workflow published in exactly one Workspace
+    # callable without forcing the user to copy an opaque Workspace id. When a
+    # workflow is published in multiple Workspaces, selection stays explicit.
+    selected_workflow_ids = {str(workflow.id) for _, workflow in preferred}
+    workspace_candidates: dict[str, list[tuple[Any, Any]]] = {}
+    for binding, workflow in rows:
+        if binding.workspace_id is None or str(workflow.id) in selected_workflow_ids:
+            continue
+        workspace_candidates.setdefault(str(workflow.id), []).append((binding, workflow))
+    for candidates in workspace_candidates.values():
+        if len(candidates) == 1:
+            preferred.append(candidates[0])
+    return preferred
+
+
+def _requested_workspace_id(kwargs: dict[str, Any]) -> str | None:
+    """Prefer an explicit Agent choice over the conversation's implicit context."""
+    return str(
+        kwargs.get("target_workspace_id") or kwargs.get("workspace_id") or ""
+    ).strip() or None
 
 
 async def _list_workflows(entity_id: str = "", **kwargs: Any) -> str:
-    workspace_id = str(kwargs.get("workspace_id") or "").strip() or None
+    workspace_id = _requested_workspace_id(kwargs)
     async with async_session() as db:
         pairs = await _exposed_workflows(db, entity_id, workspace_id=workspace_id)
         return _dump({
@@ -344,9 +399,297 @@ async def _list_workflows(entity_id: str = "", **kwargs: Any) -> str:
                     "description": (binding.trigger_config or {}).get("description") or wf.description or "",
                     "inputs": sorted((wf.variables or {}).keys()),
                     "binding_id": binding.id,
+                    "workspace_id": binding.workspace_id,
                 }
                 for binding, wf in pairs
             ],
+        })
+
+
+async def _workspace_flow_rows(
+    db,
+    *,
+    entity_id: str,
+    user_id: str,
+    require_control: bool = False,
+) -> list[tuple[Any, Any, Any, Any]]:
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_access import (
+        user_can_read_workspace,
+        user_can_write_workspace_artifacts,
+    )
+    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+
+    user = await db.get(User, user_id) if user_id else None
+    if user is None or user.entity_id != entity_id:
+        return []
+    rows = (await db.execute(
+        select(WorkflowBinding, WorkflowDefinition, Workspace)
+        .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
+        .join(Workspace, Workspace.id == WorkflowBinding.workspace_id)
+        .where(
+            WorkflowBinding.entity_id == entity_id,
+            WorkflowBinding.enabled.is_(True),
+            WorkflowBinding.status == "active",
+            WorkflowDefinition.is_active.is_(True),
+            WorkflowDefinition.status == "active",
+            Workspace.deleted_at.is_(None),
+        )
+        .order_by(Workspace.name.asc(), WorkflowBinding.name.asc(), WorkflowBinding.id.asc())
+    )).all()
+    visible: list[tuple[Any, Any, Any, Any]] = []
+    for binding, workflow, workspace in rows:
+        entrypoint = normalize_chat_entrypoint(binding, workflow)
+        if entrypoint is None:
+            continue
+        if not await user_can_read_workspace(db, workspace=workspace, user=user):
+            continue
+        if require_control and not await user_can_write_workspace_artifacts(
+            db,
+            workspace_id=workspace.id,
+            user_id=user.id,
+            entity_role=user.role,
+        ):
+            continue
+        visible.append((entrypoint, binding, workflow, workspace))
+    return visible
+
+
+def _workspace_flow_descriptor(entrypoint, binding, workflow, workspace) -> dict[str, Any]:
+    config = dict(binding.config or {})
+    return {
+        "binding_id": binding.id,
+        "flow_id": workflow.id,
+        "flow_slug": str(config.get("workspace_blueprint_workflow_slug") or workflow.id),
+        "title": entrypoint.title,
+        "description": entrypoint.description,
+        "workspace_id": workspace.id,
+        "workspace_name": workspace.name,
+        "inputs": [dict(item) for item in entrypoint.run_inputs],
+    }
+
+
+async def _list_workspace_flows(
+    entity_id: str = "",
+    user_id: str = "",
+    **kwargs: Any,
+) -> str:
+    query = str(kwargs.get("query") or "").strip().casefold()
+    async with async_session() as db:
+        rows = await _workspace_flow_rows(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+        descriptors = [
+            _workspace_flow_descriptor(*row)
+            for row in rows
+        ]
+        if query:
+            descriptors = [
+                item for item in descriptors
+                if query in " ".join(
+                    str(item.get(key) or "").casefold()
+                    for key in ("title", "flow_slug", "workspace_name")
+                )
+            ]
+        return _dump({"ok": True, "flows": descriptors})
+
+
+def _global_flow_mode_allowed(kwargs: dict[str, Any]) -> bool:
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+
+    context = runtime_tool_call_context_from_kwargs(kwargs)
+    envelope = context.runtime_envelope
+    surface = getattr(getattr(envelope, "surface", None), "value", getattr(envelope, "surface", None))
+    if surface != ChatSurface.GLOBAL_OWNER_CHAT.value:
+        return True
+    metadata = getattr(envelope, "metadata", None)
+    return isinstance(metadata, dict) and str(metadata.get("chat_mode") or "") == "flows"
+
+
+def _global_flow_context(kwargs: dict[str, Any]) -> bool:
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+
+    envelope = runtime_tool_call_context_from_kwargs(kwargs).runtime_envelope
+    surface = getattr(getattr(envelope, "surface", None), "value", getattr(envelope, "surface", None))
+    return surface == ChatSurface.GLOBAL_OWNER_CHAT.value
+
+
+def _flow_reference_matches(descriptor: dict[str, Any], flow_ref: str) -> bool:
+    return flow_ref in {
+        str(descriptor.get("flow_id") or "").casefold(),
+        str(descriptor.get("title") or "").strip().casefold(),
+        str(descriptor.get("flow_slug") or "").strip().casefold(),
+    }
+
+
+def _same_user_facing_flow(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_refs = {
+        str(left.get("title") or "").strip().casefold(),
+        str(left.get("flow_slug") or "").strip().casefold(),
+    } - {""}
+    right_refs = {
+        str(right.get("title") or "").strip().casefold(),
+        str(right.get("flow_slug") or "").strip().casefold(),
+    } - {""}
+    return bool(left_refs & right_refs)
+
+
+def _explicit_workspace_matches(
+    matches: list[tuple[Any, Any, Any, Any, dict[str, Any]]],
+    *,
+    source_text: str,
+) -> list[tuple[Any, Any, Any, Any, dict[str, Any]]]:
+    normalized = source_text.casefold()
+    return [
+        item for item in matches
+        if str(item[4]["workspace_id"]).casefold() in normalized
+        or str(item[4]["workspace_name"]).strip().casefold() in normalized
+    ]
+
+
+async def _start_workspace_flow(
+    entity_id: str = "",
+    user_id: str = "",
+    **kwargs: Any,
+) -> str:
+    if not _global_flow_mode_allowed(kwargs):
+        return _error("flows_mode_required")
+
+    from sqlalchemy import select
+
+    from packages.core.models.task import Conversation, Message
+    from packages.core.services.workspace_flow_launcher import launch_workspace_flow
+
+    binding_id = str(kwargs.get("binding_id") or "").strip()
+    flow_ref = str(kwargs.get("flow") or "").strip().casefold()
+    workspace_ref = str(kwargs.get("target_workspace") or "").strip().casefold()
+    original_user_message = str(
+        kwargs.get("_active_user_message_from_context") or ""
+    ).strip()
+    source_brief = str(kwargs.get("source_brief") or original_user_message).strip()
+    if _global_flow_context(kwargs) and original_user_message:
+        source_brief = original_user_message
+    conversation_id = str(kwargs.get("conversation_id") or "").strip()
+    if not conversation_id:
+        return _error("conversation_required")
+    if not binding_id and not flow_ref:
+        return _error("flow_required")
+
+    async with async_session() as db:
+        rows = await _workspace_flow_rows(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            require_control=True,
+        )
+        described = [(*row, _workspace_flow_descriptor(*row)) for row in rows]
+        matches = []
+        for entrypoint, binding, workflow, workspace, descriptor in described:
+            if binding_id and binding.id != binding_id:
+                continue
+            if flow_ref and not _flow_reference_matches(descriptor, flow_ref):
+                continue
+            matches.append((entrypoint, binding, workflow, workspace, descriptor))
+
+        ambiguity_matches = matches
+        if binding_id and len(matches) == 1:
+            selected = matches[0][4]
+            ambiguity_matches = [
+                item for item in described
+                if _same_user_facing_flow(item[4], selected)
+            ]
+        if _global_flow_context(kwargs) and len(ambiguity_matches) > 1:
+            explicit = _explicit_workspace_matches(
+                ambiguity_matches,
+                source_text=str(kwargs.get("_active_user_message_from_context") or ""),
+            )
+            if len(explicit) != 1:
+                return _error(
+                    "ambiguous_workflow",
+                    candidates=[item[4] for item in ambiguity_matches],
+                )
+            explicit_binding_id = explicit[0][1].id
+            if binding_id and explicit_binding_id != binding_id:
+                return _error(
+                    "ambiguous_workflow",
+                    candidates=[item[4] for item in ambiguity_matches],
+                )
+            matches = [item for item in matches if item[1].id == explicit_binding_id]
+        if workspace_ref:
+            matches = [
+                item for item in matches
+                if workspace_ref in {
+                    str(item[3].id).casefold(),
+                    str(item[3].name).strip().casefold(),
+                }
+            ]
+        if not matches:
+            return _error("workspace_flow_not_found")
+        if len(matches) > 1:
+            return _error(
+                "ambiguous_workflow",
+                candidates=[item[4] for item in matches],
+            )
+
+        conversation = (await db.execute(
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.entity_id == entity_id,
+                Conversation.user_id == user_id,
+            )
+        )).scalar_one_or_none()
+        if conversation is None:
+            return _error("conversation_not_found")
+        context = kwargs.get("_runtime_envelope_from_context")
+        metadata = getattr(context, "metadata", None)
+        origin_message_id = str(
+            ((metadata or {}).get("origin_user_message_id") or "")
+            if isinstance(metadata, dict) else ""
+        ).strip()
+        if not origin_message_id:
+            origin_message_id = str((await db.execute(
+                select(Message.id)
+                .where(
+                    Message.conversation_id == conversation_id,
+                    Message.role == "user",
+                )
+                .order_by(Message.created_at.desc(), Message.id.desc())
+                .limit(1)
+            )).scalar_one_or_none() or "")
+        if not origin_message_id:
+            return _error("origin_message_not_found")
+
+        entrypoint, binding, _workflow, workspace, descriptor = matches[0]
+        launched = await launch_workspace_flow(
+            db,
+            source="global_chat",
+            entrypoint=entrypoint,
+            binding=binding,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=workspace.id,
+            conversation_id=conversation_id,
+            origin_message_id=origin_message_id,
+            source_brief=source_brief,
+            input_values=(
+                dict(kwargs["inputs"])
+                if isinstance(kwargs.get("inputs"), dict) else None
+            ),
+            starter_policy="always_review",
+        )
+        return _dump({
+            "ok": True,
+            "created": launched.created,
+            "flow": descriptor,
+            "run": _run_dict(launched.run),
         })
 
 
@@ -590,24 +933,66 @@ async def _execute_run(run_id: str) -> None:
 async def _run_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
     from packages.core.services import workflow_service as svc
 
+    if _global_flow_context(kwargs):
+        return _error("workspace_flow_launcher_required")
+
     target = str(kwargs.get("workflow") or "").strip()
     inputs = kwargs.get("inputs") if isinstance(kwargs.get("inputs"), dict) else {}
-    workspace_id = str(kwargs.get("workspace_id") or "").strip() or None
+    workspace_id = _requested_workspace_id(kwargs)
     if not target:
         return _error("run_workflow requires a workflow")
     async with async_session() as db:
         pairs = await _exposed_workflows(db, entity_id, workspace_id=workspace_id)
         match = next(((binding, wf) for binding, wf in pairs if wf.id == target or wf.name.lower() == target.lower()), None)
         if match is None:
+            if workspace_id is None:
+                from sqlalchemy import select
+
+                from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+
+                candidates = (await db.execute(
+                    select(WorkflowBinding, WorkflowDefinition)
+                    .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
+                    .where(
+                        WorkflowBinding.entity_id == entity_id,
+                        WorkflowBinding.enabled.is_(True),
+                        WorkflowBinding.status == "active",
+                        WorkflowBinding.trigger_type == "mcp",
+                        WorkflowDefinition.is_active.is_(True),
+                        WorkflowDefinition.status == "active",
+                    )
+                )).all()
+                target_candidates = [
+                    (binding, wf)
+                    for binding, wf in candidates
+                    if wf.id == target or wf.name.lower() == target.lower()
+                ]
+                workspace_ids = sorted({
+                    str(binding.workspace_id)
+                    for binding, _ in target_candidates
+                    if binding.workspace_id
+                })
+                if len(workspace_ids) > 1:
+                    return _error(
+                        "Workflow is published in multiple Workspaces; provide target_workspace_id",
+                        workflow=target,
+                        workspace_ids=workspace_ids,
+                        available=[wf.name for _, wf in pairs],
+                    )
             return _error("Workflow is not published as an Agent tool", available=[wf.name for _, wf in pairs])
         depth = _WORKFLOW_TOOL_DEPTH.get()
         if depth >= 3:
             return _error("Workflow nesting limit reached")
-        binding, _ = match
+        binding, workflow = match
+        execution_workspace_id = workspace_id or binding.workspace_id
         runtime_context = {
             key: value
-            for key in ("workspace_id", "conversation_id", "task_id")
-            if (value := str(kwargs.get(key) or "").strip())
+            for key, raw_value in (
+                ("workspace_id", execution_workspace_id),
+                ("conversation_id", kwargs.get("conversation_id")),
+                ("task_id", kwargs.get("task_id")),
+            )
+            if (value := str(raw_value or "").strip())
         }
         run = await svc.start_workflow_from_binding(
             db,
@@ -619,8 +1004,61 @@ async def _run_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any) -
             },
             trigger_source="mcp",
             started_by=user_id or None,
-            execution_workspace_id=workspace_id,
+            execution_workspace_id=execution_workspace_id,
         )
+        conversation_id = runtime_context.get("conversation_id")
+        if conversation_id:
+            from sqlalchemy import select
+
+            from packages.core.models.task import Conversation
+            from packages.core.services.conversation_messages import add_message
+            from packages.core.services.workflow_chat_projection import workflow_progress_steps
+
+            conversation = (await db.execute(
+                select(Conversation).where(
+                    Conversation.id == conversation_id,
+                    Conversation.entity_id == entity_id,
+                    Conversation.user_id == user_id,
+                )
+            )).scalar_one_or_none()
+            if conversation is not None:
+                origin_context = {
+                    "enabled": True,
+                    "route_source": "agent_tool",
+                    "conversation_id": conversation.id,
+                    "projection": {
+                        "progress": True,
+                        "step_outputs": "explicit",
+                        "final_output": True,
+                    },
+                    "wait_bridge": True,
+                }
+                activity_message = await add_message(
+                    db,
+                    conversation.id,
+                    role="system",
+                    content=f"Started {workflow.name}. Preparing the first workflow step.",
+                    message_kind="workflow_activity",
+                    refs=[
+                        {"type": "workflow", "id": run.workflow_id, "title": workflow.name},
+                        {"type": "workflow_run", "id": run.id},
+                    ],
+                    meta={
+                        "workflow_run_id": run.id,
+                        "workflow_binding_id": binding.id,
+                        "workflow_title": workflow.name,
+                        "workflow_status": "queued",
+                        "workflow_route_source": "agent_tool",
+                        "workflow_steps": workflow_progress_steps(
+                            run,
+                            activity_status="queued",
+                        ),
+                    },
+                )
+                origin_context["activity_message_id"] = activity_message.id
+                updated_trigger_data = dict(run.trigger_data or {})
+                updated_trigger_data["_workflow_chat_origin"] = origin_context
+                run.trigger_data = updated_trigger_data
         await db.commit()
         run_id = run.id
     depth_token = _WORKFLOW_TOOL_DEPTH.set(depth + 1)
@@ -705,22 +1143,65 @@ async def _list_workflow_runs(entity_id: str = "", **kwargs: Any) -> str:
         return _dump({"ok": True, "runs": [_run_dict(run, detailed=False) for run in runs], "count": len(runs)})
 
 
-async def _get_workflow_run(entity_id: str = "", **kwargs: Any) -> str:
+async def _user_can_read_workflow_run(db, *, run, entity_id: str, user_id: str) -> bool:
+    from packages.core.models.user import User
+    from packages.core.services.workspace_access import user_can_read_workspace_id
+
+    user = await db.get(User, user_id) if user_id else None
+    if user is None or str(user.entity_id) != entity_id:
+        return False
+    if not run.workspace_id:
+        return True
+    return await user_can_read_workspace_id(
+        db,
+        workspace_id=str(run.workspace_id),
+        entity_id=entity_id,
+        user_id=user.id,
+        role=user.role,
+    )
+
+
+async def _user_can_control_workflow_run(db, *, run, entity_id: str, user_id: str) -> bool:
+    from packages.core.models.user import User
+    from packages.core.services.workspace_access import user_can_control_workspace_run
+
+    user = await db.get(User, user_id) if user_id else None
+    if user is None or str(user.entity_id) != entity_id:
+        return False
+    return await user_can_control_workspace_run(
+        db,
+        run=run,
+        user_id=user.id,
+        entity_role=user.role,
+    )
+
+
+async def _get_workflow_run(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
     from packages.core.services import workflow_service as svc
 
     async with async_session() as db:
         run = await svc.get_run(db, str(kwargs.get("run_id") or ""), entity_id)
-        if run is None:
+        if run is None or not await _user_can_read_workflow_run(
+            db,
+            run=run,
+            entity_id=entity_id,
+            user_id=user_id,
+        ):
             return _error("Workflow run not found")
         return _dump({"ok": True, "run": _run_dict(run)})
 
 
-async def _cancel_workflow_run(entity_id: str = "", **kwargs: Any) -> str:
+async def _cancel_workflow_run(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
     from packages.core.services import workflow_service as svc
 
     async with async_session() as db:
         run = await svc.get_run(db, str(kwargs.get("run_id") or ""), entity_id)
-        if run is None:
+        if run is None or not await _user_can_control_workflow_run(
+            db,
+            run=run,
+            entity_id=entity_id,
+            user_id=user_id,
+        ):
             return _error("Workflow run not found")
         if run.status in {"completed", "cancelled", "failed"}:
             return _error(f"Run is already {run.status}", run=_run_dict(run, detailed=False))
@@ -730,14 +1211,19 @@ async def _cancel_workflow_run(entity_id: str = "", **kwargs: Any) -> str:
         return _dump({"ok": True, "run": _run_dict(run)})
 
 
-async def _resume_workflow_run(entity_id: str = "", **kwargs: Any) -> str:
+async def _resume_workflow_run(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
     from packages.core.ai.workflow_runner import WorkflowRunner
     from packages.core.services import workflow_service as svc
 
     run_id = str(kwargs.get("run_id") or "")
     async with async_session() as db:
         run = await svc.get_run(db, run_id, entity_id)
-        if run is None:
+        if run is None or not await _user_can_control_workflow_run(
+            db,
+            run=run,
+            entity_id=entity_id,
+            user_id=user_id,
+        ):
             return _error("Workflow run not found")
         if run.status != "paused":
             return _error("Workflow run is not paused", status=run.status)
@@ -745,7 +1231,7 @@ async def _resume_workflow_run(entity_id: str = "", **kwargs: Any) -> str:
         run_id,
         kwargs.get("inputs") if isinstance(kwargs.get("inputs"), dict) else None,
         entity_id=entity_id,
-        resumed_by=str(kwargs.get("user_id") or "").strip() or None,
+        resumed_by=user_id or None,
         execute=bool(kwargs.get("execute", True)),
     )
     if outcome in {"not_found", "not_paused", "invalid_approval"}:
@@ -782,6 +1268,8 @@ async def _import_workflow(entity_id: str = "", **kwargs: Any) -> str:
 def get_tools() -> list[tuple[dict, Any]]:
     """Return the complete first-party Workflow tool package."""
     return [
+        (LIST_WORKSPACE_FLOWS_SCHEMA, _list_workspace_flows),
+        (START_WORKSPACE_FLOW_SCHEMA, _start_workspace_flow),
         (LIST_WORKFLOWS_SCHEMA, _list_workflows),
         (RUN_WORKFLOW_SCHEMA, _run_workflow),
         (LIST_DEFINITIONS_SCHEMA, _list_workflow_definitions),

@@ -54,6 +54,7 @@ class GateResult:
     current: int | float | None = None
     plan: str = ""
     overage: bool = False
+    resets_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ async def _count_ai_usage(db: AsyncSession, entity_id: str) -> float:
     legacy deployments.
     """
 
-    # Fallback: legacy entity.settings
+    # Fallback: legacy entity.settings (no ledger activity at all)
     from packages.core.models.user import Entity
     r = await db.execute(select(Entity).where(Entity.id == entity_id))
     entity = r.scalar_one_or_none()

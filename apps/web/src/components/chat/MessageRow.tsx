@@ -9,10 +9,12 @@ import { type ReactNode } from "react";
  * a streaming cursor, a timestamp, etc.
  */
 export default function MessageRow({
+  id,
   role,
   avatar,
   children,
 }: {
+  id?: string;
   /** "user" = the signed-in person (right side, no avatar). */
   role: "user" | "other";
   /** Rendered on the "other" side only; omitted for the user's own rows. */
@@ -22,12 +24,13 @@ export default function MessageRow({
   const mine = role === "user";
   return (
     <div
+      id={id}
       className="chat-message-shell"
       style={{
         display: "flex",
         flexDirection: mine ? "row-reverse" : "row",
         gap: 8,
-        alignItems: "flex-end",
+        alignItems: "flex-start",
       }}
     >
       {!mine && avatar}

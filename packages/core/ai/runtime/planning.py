@@ -20,6 +20,14 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_PLANNER_SOURCE,
     RUNTIME_PLAN_SUPERVISOR_SOURCE,
 )
+from packages.core.constants.execution import ExecutionStepStatus
+from packages.core.constants.supervisor import (
+    MAX_EVIDENCE_CHARS,
+    MODEL_CHOOSABLE_VERDICTS,
+    SupervisorDecision,
+    SupervisorDecisionSource,
+    SupervisorVerdict,
+)
 
 
 @dataclass(frozen=True)
@@ -111,6 +119,14 @@ RUNTIME_PLAN_JSON_HINT = {
             "action_key": "<action name, only if kind=action>",
             "capability_id": "<runtime capability id, only if kind=action and known>",
             "params": {"prompt": "<required for llm/subagent steps>"},
+            "output_shape": (
+                "<canonical shape for llm/subagent, or omit when using an exact "
+                "expected_output_schema/task terminal contract>"
+            ),
+            "expected_output_schema": (
+                "<exact JSON Schema for this step's payload, or omit when a canonical "
+                "output_shape/task terminal contract is exact>"
+            ),
             "depends_on": ["<earlier step key>"],
             "risk_level": "low|medium|high",
             "description": "Human-readable one-liner (<=120 chars).",
@@ -228,11 +244,21 @@ def runtime_planner_system_prompt(
         "  * action steps MUST choose capability_id first, then provider+action_key from that capability's actions\n"
         "  * action steps SHOULD include capability_id whenever the capability catalog shows one\n"
         "  * llm/subagent steps MUST put the natural-language work request in params.prompt\n"
-        "  * Every llm/subagent step automatically returns the standard StepResult "
-        "envelope: {status, summary, outputs{text, files, data}, progress{done, total, unit}, "
-        "failure{reason, blockers, retryable}, next_steps}. Do NOT author "
-        "expected_output_schema for llm/subagent steps — the envelope is the contract. "
-        "Describe the desired CONTENT in the step's params.prompt prose instead.\n"
+        "  * Every llm/subagent step MUST declare exactly one output contract before "
+        "execution: use `output_shape` only when one canonical shape exactly describes "
+        "the payload (ArtifactResult, TextResult, DocumentResult, ListResult, PublishResult, "
+        "CountResult, EmptyResult, or DraftPack); otherwise author a precise "
+        "`expected_output_schema` with required fields, nested item schemas, and stated "
+        "cardinality. Do not use the generic StepResult shape. Runtime hard-validates "
+        "either declared contract; it never guesses missing fields or shapes. "
+        "The only exception is the unique terminal deliverable step when the task provides "
+        "Expected output (JSON Schema); Runtime binds that task schema directly.\n"
+        "  * When the task prompt includes an Expected output (JSON Schema), "
+        "the plan MUST end in exactly one terminal llm/subagent deliverable step. "
+        "That step's prompt must explicitly require the complete structured payload; "
+        "Runtime will bind the task schema to its StepResult.outputs.data and hard-validate "
+        "it before completion. Do not split one structured final response across multiple "
+        "terminal agent steps.\n"
         "  * Do NOT require platform receipts (tweet ids, urns, post URLs, "
         "published_at timestamps) from llm/subagent step outputs — the runtime "
         "captures those as execution evidence.\n"
@@ -242,9 +268,8 @@ def runtime_planner_system_prompt(
         "document, deck, spreadsheet, video, export, attachment, or domain-specific file), "
         "do not satisfy it with a plain text-only LLM step. Use a subagent step whose "
         "prompt explicitly instructs the agent to call an available file/media tool such as `generate_file`. "
-        "When a step's whole purpose is producing files/documents you may still set "
-        "output_shape explicitly to a specialized canonical shape — one of: "
-        "ArtifactResult, TextResult, DocumentResult, ListResult, PublishResult, CountResult, EmptyResult. "
+        "When a step's whole purpose is producing files/documents set "
+        "output_shape explicitly to ArtifactResult or DocumentResult. "
         "Do not invent output field names; the shape owns them (e.g. ArtifactResult provides files[].fs_path).\n"
         "  * For workspace tasks, do not ask the user where to save generated files. "
         "Runtime file/media tools are automatically scoped to the current workspace's "
@@ -254,6 +279,18 @@ def runtime_planner_system_prompt(
         "always-allow, and deny rules are inherited from workspace governance "
         "policy. Use a human step only when the task genuinely needs missing "
         "input or a user decision to proceed.\n"
+        "  * Do not mark free-form llm/subagent work as risk_level='high' just "
+        "because it creates an internal workspace artifact such as a saved file, "
+        "image, audio, or video. Reserve high risk for concrete external side "
+        "effects, destructive operations, or action steps whose bound capability "
+        "is governed externally.\n"
+        "  * When a human step reviews an upstream draft or artifact, do not "
+        "put only its filename in params.prompt. Set params.review_title and "
+        "params.review_artifacts to a bare upstream reference such as "
+        "${{ steps.draft.result.outputs.files }}; optionally bind "
+        "params.review to concise structured review data. The runtime routes "
+        "these fields through the typed review HITL surface (the same review "
+        "renderer used by Workflow approvals), not the free-form input card.\n"
         "  * When a step waits on an external system (rendering, batch jobs, "
         "third-party async APIs), do NOT emit one long-running step that blocks "
         "until the job finishes. Emit submit → sleep → poll: an action/subagent "
@@ -620,15 +657,6 @@ def runtime_planner_tool_message(content: str, *, tool_call_id: str | None = Non
     return payload
 
 
-from packages.core.constants.execution import ExecutionStepStatus
-from packages.core.constants.supervisor import (
-    MAX_EVIDENCE_CHARS,
-    MODEL_CHOOSABLE_VERDICTS,
-    SupervisorDecision,
-    SupervisorDecisionSource,
-    SupervisorVerdict,
-)
-
 # The verdict vocabulary is the enum in packages/core/constants/supervisor.py;
 # this tuple is the model-facing subset, kept for prompt/tests that iterate it.
 RUNTIME_PLAN_SUPERVISOR_VERDICTS = tuple(
@@ -766,9 +794,8 @@ def runtime_plan_supervisor_prompt(
         f"Task: {task_title}\n"
         f"Description: {task_description}\n\n"
         f"Latest plan result: {done_count} steps done, {failed_count} failed, "
-        f"{skipped_count} skipped\n"
-        + plan_context + history + "\n"
-        f"Steps:\n" + "\n".join(rendered_steps) + "\n\n"
+        f"{skipped_count} skipped\n" + plan_context + history + "\n"
+        "Steps:\n" + "\n".join(rendered_steps) + "\n\n"
         "Judge whether the TASK'S OWN deliverable was produced and delivered "
         "— judge the task itself, not the subject it reports on.\n\n"
         "Rules:\n"

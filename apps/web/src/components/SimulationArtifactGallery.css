@@ -1,0 +1,225 @@
+.simulation-artifact-gallery {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--surface-sunken);
+}
+
+.simulation-artifact-gallery__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.simulation-artifact-gallery__header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.simulation-artifact-gallery__header strong {
+  color: var(--text-strong);
+  font-size: 13px;
+}
+
+.simulation-artifact-gallery__header span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.simulation-artifact-gallery__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.simulation-artifact-card {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  min-height: 76px;
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: var(--surface-panel);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.simulation-artifact-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--glass-border));
+  background: var(--surface-hover);
+}
+
+.simulation-artifact-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.simulation-artifact-card__preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 74px;
+  overflow: hidden;
+  border-right: 1px solid var(--glass-border);
+  background: color-mix(in srgb, var(--surface-sunken) 82%, #4f7d75 18%);
+  color: #436b65;
+}
+
+.simulation-artifact-card__preview img {
+  width: 100%;
+  height: 100%;
+  min-height: 74px;
+  object-fit: cover;
+}
+
+.simulation-artifact-card__icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.simulation-artifact-card__play {
+  position: absolute;
+  right: -9px;
+  bottom: -7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--surface-panel);
+  border-radius: 50%;
+  background: #4f7d75;
+  color: #fff;
+}
+
+.simulation-artifact-card__copy {
+  display: grid;
+  align-content: center;
+  min-width: 0;
+  gap: 2px;
+  padding: 10px;
+}
+
+.simulation-artifact-card__copy strong,
+.simulation-artifact-card__copy span,
+.simulation-artifact-card__copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.simulation-artifact-card__copy strong {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.simulation-artifact-card__copy span,
+.simulation-artifact-card__copy small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.simulation-artifact-modal {
+  display: grid;
+  gap: 14px;
+}
+
+.simulation-artifact-modal__notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.simulation-artifact-modal__preview {
+  overflow: hidden;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: #171717;
+}
+
+.simulation-artifact-modal__preview video,
+.simulation-artifact-modal__preview img {
+  display: block;
+  width: 100%;
+  max-height: 56vh;
+  object-fit: contain;
+}
+
+.simulation-artifact-modal__preview audio {
+  display: block;
+  width: calc(100% - 32px);
+  margin: 24px 16px;
+}
+
+.simulation-artifact-preview-placeholder {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  min-height: 260px;
+  gap: 8px;
+  padding: 24px;
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.simulation-artifact-preview-placeholder strong {
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.simulation-artifact-preview-placeholder span {
+  font-size: 11px;
+}
+
+.simulation-artifact-modal__meta {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.simulation-artifact-modal__meta > div {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.simulation-artifact-modal__meta dt {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.simulation-artifact-modal__meta dd {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: var(--text-default);
+  font-size: 12px;
+}
+
+.simulation-artifact-modal > p {
+  margin: 0;
+  color: var(--text-default);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+@media (max-width: 560px) {
+  .simulation-artifact-gallery__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .simulation-artifact-modal__meta > div {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}

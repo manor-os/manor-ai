@@ -14,13 +14,17 @@ RUNTIME_WORKFLOW_CONTEXT_KEYS = (
     "conversation_id",
     "task_id",
     "workflow_project_id",
+    "workflow_project_root",
     "workflow_action_grant_id",
     "workflow_scene_id",
     "workflow_batch_capture",
     "approved_plan_version",
 )
 RUNTIME_WORKFLOW_TOOL_CONTEXT_ARGUMENTS = {
+    "workflow_run_id": "_workflow_run_id_from_context",
+    "workflow_lineage_root_run_id": "_workflow_lineage_root_run_id_from_context",
     "workflow_project_id": "_workflow_project_id_from_context",
+    "workflow_project_root": "_workflow_project_root_from_context",
     "workflow_action_grant_id": "_workflow_action_grant_id_from_context",
     "workflow_scene_id": "_workflow_scene_id_from_context",
     "workflow_batch_capture": "_workflow_batch_capture_from_context",
@@ -72,22 +76,33 @@ def runtime_workflow_run_context(run: Any) -> dict[str, str | None]:
         for key in RUNTIME_WORKFLOW_CONTEXT_KEYS
     }
     descriptive_sources = [
+        run_fields,
+        trusted,
         _runtime_workflow_mapping(trigger_data.get("runtime_context")),
         _runtime_workflow_mapping(trigger_data.get("context")),
         _runtime_workflow_mapping(trigger_data.get("execution_target")),
-        run_fields,
+        trigger_data,
         _runtime_workflow_mapping(variables.get("runtime_context")),
         _runtime_workflow_mapping(variables.get("context")),
     ]
     context = {
-        "workspace_id": _runtime_workflow_context_value(run_fields.get("workspace_id")),
-        "conversation_id": _runtime_first_workflow_context_value(
-            "conversation_id", descriptive_sources
+        "workflow_run_id": _runtime_workflow_context_value(getattr(run, "id", None)),
+        "workflow_lineage_root_run_id": _runtime_workflow_context_value(
+            getattr(run, "lineage_root_run_id", None) or getattr(run, "id", None)
         ),
-        "task_id": _runtime_first_workflow_context_value("task_id", descriptive_sources),
+        "workspace_id": _runtime_first_workflow_context_value(
+            "workspace_id", descriptive_sources
+        ),
+        "conversation_id": _runtime_first_workflow_context_value(
+            "conversation_id", descriptive_sources[1:] + [run_fields]
+        ),
+        "task_id": _runtime_first_workflow_context_value(
+            "task_id", descriptive_sources[1:] + [run_fields]
+        ),
     }
     for key in (
         "workflow_project_id",
+        "workflow_project_root",
         "workflow_action_grant_id",
         "workflow_scene_id",
         "workflow_batch_capture",

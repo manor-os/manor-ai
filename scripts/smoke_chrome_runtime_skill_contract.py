@@ -47,12 +47,12 @@ def _assert_chrome_reference_bundle(skill_path: pathlib.Path) -> dict[str, int]:
         sizes[label] = len(text)
 
     required = {
-        "runtime": ["open_or_reuse", "reused_noop", "claimToken", "finalize_tabs"],
-        "api": ["Common Returns", "mcp__chrome__open_or_reuse", "mcp__chrome__read_page"],
+        "runtime": ["open_or_reuse", "resolve_target", "expect", "control_epoch", "finalize_tabs"],
+        "api": ["Common Returns", "resolve_target", "event_receipt", "control_epoch"],
         "capabilities": ["browser-group", "native-tab-group", "action-approval"],
-        "interactions": ["Required Interaction Recipe", "Use the newest read_page", "Do not invent refs", "fallbackReason"],
-        "workflows": ["LinkedIn Draft Workflow", "YouTube Upload Workflow", "Search And Result Workflows"],
-        "confirmations": ["action-time", "approval_required", "LinkedIn", "YouTube"],
+        "interactions": ["Required Interaction Recipe", "resolve_target", "expect", "fallbackReason"],
+        "workflows": ["Composer And Publishing Workflow", "Media Upload Workflow", "Search And Result Workflows"],
+        "confirmations": ["always_action_time", "preapproval_allowed", "handoff_required", "no_confirmation"],
         "file_uploads": ["upload_candidates", "upload_targets", "shadow DOM"],
         "screenshots": ["mcp__chrome__screenshot", "visual confirmation", "read_page first"],
         "troubleshooting": ["extension reload", "native host", "stale", "mcp__chrome__status"],
@@ -63,6 +63,42 @@ def _assert_chrome_reference_bundle(skill_path: pathlib.Path) -> dict[str, int]:
             if needle not in text:
                 raise AssertionError(f"Chrome reference {label} missing phrase: {needle!r}")
     return sizes
+
+
+def _assert_semantic_strategy_contract(skill_path: pathlib.Path, config: dict) -> None:
+    contract_path = skill_path.with_name("strategy-contract.json")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if config.get("tools") != contract.get("core_tools"):
+        raise AssertionError("Chrome skill core tools drifted from strategy-contract.json")
+    for key in ("discoverable_provider_keys", "discoverable_tool_prefixes"):
+        if config.get(key) != contract.get(key):
+            raise AssertionError(f"Chrome skill {key} drifted from strategy-contract.json")
+
+    skill_text = skill_path.read_text(encoding="utf-8")
+    reference_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((skill_path.parent / "references").glob("*.md"))
+    )
+    narrative = f"{skill_text}\n{reference_text}"
+    for key in ("version", "terminal_browser_action"):
+        value = str(contract.get(key) or "")
+        if value not in narrative:
+            raise AssertionError(f"Chrome narrative docs missing canonical {key}: {value}")
+    for key in ("event_kinds", "confirmation_modes"):
+        for value in contract.get(key) or []:
+            if value not in narrative:
+                raise AssertionError(f"Chrome narrative docs missing {key} value: {value}")
+    for concept in ("resolve_target", "expected event", "action_executed", "control_epoch", "user_takeover"):
+        if concept not in narrative:
+            raise AssertionError(f"Chrome narrative docs missing strategy concept: {concept}")
+
+    prompt_source = (ROOT / "packages/core/ai/runtime/prompt_guidance.py").read_text(encoding="utf-8")
+    if "should read the runtime-contract documentation before acting" in prompt_source:
+        raise AssertionError("Chrome prompt guidance still requires obsolete documentation bootstrap")
+    for phrase in ("diagnostic", "not a bootstrap"):
+        if phrase not in prompt_source:
+            raise AssertionError(f"Chrome prompt guidance missing bootstrap policy concept: {phrase}")
+
 
 
 async def _assert_no_inline_runtime_context_block() -> None:
@@ -106,14 +142,24 @@ async def _assert_no_inline_runtime_context_block() -> None:
 
 
 def _assert_chrome_skill_tool_surface(config: dict) -> None:
+    from packages.core.ai.runtime.chrome_routing import (
+        CHROME_KNOWLEDGE_LOCAL_MCP_TOOLS,
+        CHROME_MCP_TOOLS,
+    )
     from packages.core.ai.runtime.envelope import RuntimeEnvelope
     from packages.core.ai.runtime.principals import RuntimePrincipal, RuntimePrincipalKind
     from packages.core.ai.runtime.profiles import RuntimeProfile
     from packages.core.ai.runtime.skills import runtime_prepare_prompt_skill_tool_surface
     from packages.core.ai.runtime.surfaces import ChatSurface
 
-    class FakeSkill:
-        tools = tuple(config["tools"])
+    fake_skill = type(
+        "FakeChromeSkill",
+        (),
+        {"tools": tuple(config["tools"]), "config": config},
+    )()
+
+    available_tools = set(CHROME_MCP_TOOLS | CHROME_KNOWLEDGE_LOCAL_MCP_TOOLS)
+    available_tools.add("search_tools")
 
     envelope = RuntimeEnvelope(
         surface=ChatSurface.GLOBAL_OWNER_CHAT,
@@ -128,39 +174,40 @@ def _assert_chrome_skill_tool_surface(config: dict) -> None:
         user_id="user-smoke",
         conversation_id="conv-smoke",
         tool_names=tuple(config["tools"]),
-        allowed_tool_names=tuple(config["tools"]),
+        allowed_tool_names=tuple(sorted(available_tools)),
     )
     surface = runtime_prepare_prompt_skill_tool_surface(
-        FakeSkill(),
-        allowed_tool_names=set(config["tools"]),
+        fake_skill,
+        allowed_tool_names=available_tools,
         runtime_envelope=envelope,
     )
     for tool_name in [
-        "mcp__chrome__documentation",
-        "mcp__chrome__capabilities",
+        "search_tools",
         "mcp__chrome__status",
-        "mcp__chrome__name_session",
         "mcp__chrome__open_new_tab",
         "mcp__chrome__open_or_reuse",
         "mcp__chrome__open_tabs",
-        "mcp__chrome__get_group_state",
         "mcp__chrome__finalize_tabs",
-        "mcp__chrome__close_group_tabs",
         "mcp__chrome__read_page",
         "mcp__chrome__click_element",
         "mcp__chrome__fill_or_select",
         "mcp__chrome__claim_tab",
-        "mcp__chrome__activate_tab",
+        "mcp__chrome__download",
+        "mcp__chrome__wait_download",
         "mcp__chrome__screenshot",
-        "mcp__chrome__send_cdp",
     ]:
         if tool_name not in surface.skill_tool_names:
             raise AssertionError(f"Chrome prompt skill tool surface missing {tool_name}: {surface.skill_tool_names}")
     for tool_name in [
-        "search_tools",
+        "mcp__chrome__documentation",
+        "mcp__chrome__capabilities",
+        "mcp__chrome__get_group_state",
+        "mcp__chrome__send_cdp",
     ]:
+        if tool_name not in surface.discoverable_tool_names:
+            raise AssertionError(f"Chrome optional tool is not discoverable: {tool_name}")
         if tool_name in surface.skill_tool_names:
-            raise AssertionError(f"Chrome prompt skill tool surface should expose Chrome MCP tools only: {surface.skill_tool_names}")
+            raise AssertionError(f"Chrome optional tool should not be initially visible: {tool_name}")
     if surface.harness is None:
         raise AssertionError("Chrome prompt skill tool surface must be backed by RuntimeHarness")
     decision = surface.harness.check_tool_call("mcp__chrome__read_page", {})
@@ -211,64 +258,15 @@ async def main() -> int:
         "Connection And Tabs",
         "Surface Selection",
         "Required MCP-Chrome Loop",
-        "Reading The Page",
-        "Action Rules",
-        "Additional Documentation",
-        "Additional Capabilities",
-        "API Reference",
-        "API Use",
-        "MCP API Surface",
-        "Browser-scoped capabilities",
-        "Tab-scoped capabilities",
-        "references/runtime-contract.md",
-        "references/api-reference.md",
-        "references/capabilities.md",
-        "references/interactions.md",
-        "references/workflows.md",
-        'topic="runtime-contract"',
-        'topic="api-reference"',
-        'topic="capabilities"',
-        'topic="interactions"',
-        "Do not depend on host file tools",
-        "Explicit Chrome or local-browser intent wins",
-        "A URL or already-open Chrome tab is context, not browser intent",
-        "purpose-built connector, API, CLI, or MCP package",
-        "Do not initialize Chrome just because a request contains a URL",
-        "If authentication fails in a connector, ask the user to fix auth or explicitly approve Chrome fallback",
-        "open_or_reuse -> `mcp__chrome__read_page` -> choose target ref from `pageContent` or structured candidates -> `mcp__chrome__click_element` / `mcp__chrome__fill_or_select` / `mcp__chrome__computer` -> wait if needed -> `mcp__chrome__read_page`",
-        "Use `active=false`",
-        "mcp__chrome__name_session",
-        "Visible Chrome tab group names must be human-readable task labels",
-        "short hash suffixes",
-        "neutral, friendly, task-relevant emoji",
-        "if unsure, use",
-        "🔎",
+        "resolve_target",
+        "Chrome-scoped",
+        "expected event",
+        "always_action_time",
+        "preapproval_allowed",
+        "handoff_required",
+        "no_confirmation",
+        "user_takeover",
         "mcp__chrome__finalize_tabs",
-        "Treat `mcp__chrome__finalize_tabs` as the final Chrome action",
-        "Do not call Chrome tools after finalizing",
-        "mcp__chrome__documentation",
-        "mcp__chrome__capabilities",
-        "mcp__chrome__status -> mcp__chrome__documentation -> mcp__chrome__capabilities",
-        "Before a nontrivial Chrome task",
-        "runtime-contract",
-        "Do not call activate_tab or claim_tab",
-        "Do not guess tab ids",
-        "synthesize claim tokens",
-        "snapshot_id",
-        "snapshot_id_required",
-        "snapshot_mismatch",
-        "fallback_reason_required",
-        "Confirm at action-time",
-        "sensitive_input_requires_confirmation",
-        "redacted `data_summary`",
-        "screenshots when visual fallback is explicitly needed",
-        "`active:false` is tab metadata, not a blocker",
-        "`chrome_read_page` is the page-understanding source",
-        "Do not repeat unchanged `mcp__chrome__read_page` calls",
-        "For form uploads, prefer upload candidates and upload_targets returned by read_page",
-        "Use `mcp__chrome__fill_or_select` for text inputs",
-        "Use `mcp__chrome__click_element` for buttons",
-        "Browser use was stopped in the extension",
     ]:
         _assert_contains(guidance, needle)
 
@@ -281,6 +279,7 @@ async def main() -> int:
     _assert_chrome_skill_tool_surface(config)
     _assert_chrome_skill_ranking()
     _assert_chrome_reference_bundle(skill_path)
+    _assert_semantic_strategy_contract(skill_path, config)
     await _assert_no_inline_runtime_context_block()
 
     print("ok")

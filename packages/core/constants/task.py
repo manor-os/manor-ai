@@ -5,6 +5,8 @@ Used by:
   - Frontend: should mirror these in Tasks.tsx
 """
 
+from enum import Enum
+
 # ── Statuses ──
 # Covers full lifecycle: creation → scheduling → execution → resolution
 TASK_STATUSES = {
@@ -26,9 +28,6 @@ TASK_STATUSES = {
     "cancelled":            {"label": "Cancelled",            "color": "#64748b", "order": 9},
     "failed":               {"label": "Failed",               "color": "#dc2626", "order": 10},
 }
-
-from enum import Enum
-
 
 class TaskStatus(str, Enum):
     """Every state a Task row takes — one member per TASK_STATUSES key.
@@ -124,16 +123,55 @@ TASK_CATEGORIES = [
 
 # ── Task Types ──
 # How the task was created / what kind of work it represents
-TASK_TYPES = [
-    "general",          # Manual task
-    "ai_generated",     # Created by AI agent
-    "scheduled",        # From a recurring schedule
-    "customer_request",  # Inbound from customer channel
-    "incident",         # Urgent issue / incident
-    "inspection",       # Routine inspection / audit
-    "follow_up",        # Follow-up from previous task
-    "approval",         # Requires approval workflow
-]
+class TaskType(str, Enum):
+    """Canonical task types that product behavior may branch on.
+
+    The database still accepts custom task-type slugs used by templates and
+    integrations. Product behavior must never infer one of these canonical
+    types from user-authored prose; it branches on an enum member instead.
+    """
+
+    GENERAL = "general"
+    AI_GENERATED = "ai_generated"
+    SCHEDULED = "scheduled"
+    CUSTOMER_REQUEST = "customer_request"
+    INCIDENT = "incident"
+    INSPECTION = "inspection"
+    FOLLOW_UP = "follow_up"
+    APPROVAL = "approval"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        return [member.value for member in cls]
+
+
+TASK_TYPES = TaskType.values()
+
+
+class TaskApprovalChoice(str, Enum):
+    """Decisions accepted by an explicit approval-type Task.
+
+    The first three are canonical UI values. The remaining members preserve
+    API values accepted before the vocabulary was closed.
+    """
+
+    APPROVE = "approve"
+    REJECT = "reject"
+    REQUEST_CHANGES = "request_changes"
+    APPROVED = "approved"
+    YES = "yes"
+    ACCEPT = "accept"
+    REJECTED = "rejected"
+    NO = "no"
+    DECLINE = "decline"
+    CHANGES = "changes"
+
+
+class TaskRecoveryChoice(str, Enum):
+    """Operator decisions accepted by a task recovery HITL card."""
+
+    RETRY = "retry"
+    CANCEL = "cancel"
 
 
 class TaskLogType(str, Enum):

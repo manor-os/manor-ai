@@ -546,7 +546,156 @@ class SVGQualityChecker:
                 f"Detected {len(text_matches)} potentially overly long single-line text(s) (consider using tspan for wrapping)"
             )
 
+        self._check_text_fit_in_rects(content, result)
         self._check_text_contrast(content, result)
+
+    def _check_text_fit_in_rects(self, content: str, result: Dict):
+        """Reject single-line SVG text that visibly escapes its enclosing panel.
+
+        This is deliberately conservative: it only evaluates untransformed text
+        whose anchor is inside an earlier ``rect`` element. Text in transformed
+        diagrams and text without a geometric container remain untouched.
+        """
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            return
+
+        rects = []
+        texts = []
+        order = 0
+
+        def walk(elem, inherited_style, inherited_transform=False):
+            nonlocal order
+            order += 1
+            local_order = order
+            tag = self._local_name(elem.tag)
+            transformed = inherited_transform or bool((elem.get("transform") or "").strip())
+            style = dict(inherited_style)
+            style.update(self._parse_style_attr(elem.get("style") or ""))
+            for key in (
+                "display",
+                "visibility",
+                "opacity",
+                "font-size",
+                "text-anchor",
+            ):
+                value = elem.get(key)
+                if value is not None:
+                    style[key] = value
+
+            hidden = (
+                str(style.get("display", "")).strip().lower() == "none"
+                or str(style.get("visibility", "")).strip().lower() == "hidden"
+                or self._parse_opacity(style.get("opacity"), 1.0) < 0.35
+            )
+            if not hidden and not transformed and tag == "rect":
+                rect = {
+                    "order": local_order,
+                    "x": self._coord(elem, "x", 0.0),
+                    "y": self._coord(elem, "y", 0.0),
+                    "w": self._coord(elem, "width", 0.0),
+                    "h": self._coord(elem, "height", 0.0),
+                }
+                if rect["w"] > 0 and rect["h"] > 0:
+                    rects.append(rect)
+            elif not hidden and not transformed and tag == "text":
+                label = " ".join("".join(elem.itertext()).split())
+                if label:
+                    explicit_lines = [
+                        " ".join("".join(child.itertext()).split())
+                        for child in list(elem)
+                        if self._local_name(child.tag) == "tspan"
+                        and any(child.get(attr) is not None for attr in ("x", "y", "dy"))
+                    ]
+                    explicit_lines = [line for line in explicit_lines if line]
+                    texts.append(
+                        {
+                            "order": local_order,
+                            "x": self._text_coord(elem, "x", 0.0),
+                            "y": self._text_coord(elem, "y", 0.0),
+                            "font_size": self._parse_svg_number(
+                                style.get("font-size"), 16.0
+                            ),
+                            "anchor": str(style.get("text-anchor", "start"))
+                            .strip()
+                            .lower(),
+                            "text": label,
+                            "lines": explicit_lines or [label],
+                        }
+                    )
+
+            for child in list(elem):
+                walk(child, style, transformed)
+
+        walk(root, {})
+
+        failures = []
+        for text in texts:
+            probe_points = (
+                (text["x"], text["y"]),
+                (text["x"], text["y"] - text["font_size"] * 0.55),
+            )
+            candidates = [
+                rect
+                for rect in rects
+                if rect["order"] < text["order"]
+                and any(self._point_in_box(x, y, rect) for x, y in probe_points)
+            ]
+            if not candidates:
+                continue
+            container = max(candidates, key=lambda rect: rect["order"])
+            padding = max(
+                8.0,
+                min(
+                    text["font_size"] * 0.5,
+                    min(container["w"], container["h"]) * 0.12,
+                ),
+            )
+            left = container["x"] + padding
+            right = container["x"] + container["w"] - padding
+            if text["anchor"] == "middle":
+                available = 2.0 * min(text["x"] - left, right - text["x"])
+            elif text["anchor"] == "end":
+                available = text["x"] - left
+            else:
+                available = right - text["x"]
+            required = max(
+                self._estimated_svg_text_width(line, text["font_size"])
+                for line in text["lines"]
+            )
+            if available <= 0 or required > available * 1.03:
+                failures.append(
+                    f'Text fit failure: "{self._short_text(text["text"])}" needs '
+                    f'about {required:.0f}px but only {max(0.0, available):.0f}px '
+                    "fits inside its enclosing rect; shorten, wrap, or enlarge the container"
+                )
+
+        if failures:
+            result["info"]["text_fit_failures"] = len(failures)
+            result["errors"].extend(failures[:12])
+            if len(failures) > 12:
+                result["errors"].append(
+                    f"Additional text fit failures: {len(failures) - 12}"
+                )
+
+    @staticmethod
+    def _estimated_svg_text_width(text: str, font_size: float) -> float:
+        units = 0.0
+        for character in text:
+            if re.match(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", character):
+                units += 1.0
+            elif character.isspace():
+                units += 0.28
+            elif character in "ilI1|.,:;!'’`":
+                units += 0.25
+            elif character in "MW@#%&QGOD0":
+                units += 0.80
+            elif character.isupper():
+                units += 0.66
+            else:
+                units += 0.54
+        return units * font_size
 
     def _check_text_contrast(self, content: str, result: Dict):
         """Catch unreadable text over solid SVG panels before PPT export.

@@ -103,6 +103,27 @@ class EstimatedImpact(BaseModel):
     rationale: Optional[str] = Field(default=None, max_length=400)
 
 
+class ProposedExternalAction(BaseModel):
+    """Narrow external side effect that one approved Proposal may authorize."""
+
+    provider: Literal["youtube"]
+    action: Literal["publish_video"]
+    destination: Literal["studio.youtube.com"]
+    visibility: Literal["public"]
+    intended_channel: str = Field(..., min_length=1, max_length=200)
+    predecessor_task_key: str = Field(..., min_length=1, max_length=80)
+    max_executions: Literal[1] = 1
+    expires_in_hours: int = Field(default=24, ge=1, le=168)
+
+    @field_validator("predecessor_task_key", mode="before")
+    @classmethod
+    def _normalize_predecessor_key(cls, value):
+        normalized = _normalize_task_key(value)
+        if not normalized:
+            raise ValueError("predecessor_task_key must not be blank")
+        return normalized
+
+
 class ProposedTask(BaseModel):
     """One task suggestion produced by the Strategist."""
 
@@ -146,6 +167,9 @@ class ProposedTask(BaseModel):
     These are capability ids (for example ``workspace.search``), not tool
     names. Tool expansion is handled later by the Manor Runtime Harness.
     """
+
+    external_action: Optional[ProposedExternalAction] = None
+    """Exact one-use external action approved with this Proposal task."""
 
     basis: Optional[TaskBasis] = None
     """Evidence citations (v2 briefing path). Validate-if-present in v1."""
@@ -199,6 +223,21 @@ class ProposedTask(BaseModel):
             allowed_ids=STRATEGIST_TASK_CAPABILITY_IDS,
             strict=True,
         ))
+
+    @model_validator(mode="after")
+    def _validate_external_action(self):
+        action = self.external_action
+        if action is None:
+            return self
+        if "external.social" not in self.required_capabilities:
+            raise ValueError(
+                "external_action requires the external.social runtime capability"
+            )
+        if action.predecessor_task_key not in self.depends_on_task_keys:
+            raise ValueError(
+                "external_action predecessor_task_key must be a task dependency"
+            )
+        return self
 
 
 class ProposedHumanRequest(BaseModel):
@@ -304,6 +343,27 @@ class ProposedExperiment(BaseModel):
         if not isinstance(v, dict) or not v:
             raise ValueError("overlay_patch must be a non-empty object")
         return v
+
+
+class ProposedWorkflowReference(BaseModel):
+    blueprint_slug: str = Field(..., min_length=1, max_length=120)
+    workflow_slug: str = Field(..., min_length=1, max_length=120)
+
+
+class ProposedWorkflowRun(BaseModel):
+    """Run one installed user-facing Workspace Flow deterministically."""
+
+    run_key: str = Field(..., min_length=1, max_length=80)
+    workflow_ref: ProposedWorkflowReference
+    inputs: dict = Field(default_factory=dict)
+    source_brief: str = Field(..., min_length=1, max_length=12000)
+    rationale: str = Field(..., min_length=8, max_length=1000)
+    basis: Optional[TaskBasis] = None
+
+    @field_validator("run_key", mode="before")
+    @classmethod
+    def _normalize_run_key(cls, v):
+        return _normalize_task_key(v)
 
 
 class _ProposedChangeBase(BaseModel):
@@ -445,6 +505,11 @@ class Proposal(BaseModel):
     """Bounded config experiments (M13). Only persisted on the v2
     (briefing) path; capped at 1 per review cycle per M7."""
 
+    workflow_runs: list[ProposedWorkflowRun] = Field(
+        default_factory=list, max_length=3,
+    )
+    """Installed Workspace Flows to launch after Proposal approval."""
+
     automation_changes: list[ProposedAutomationChange] = Field(
         default_factory=list, max_length=3,
     )
@@ -481,6 +546,16 @@ class Proposal(BaseModel):
         if duplicates:
             raise ValueError(
                 f"duplicate human_request request_key values: {sorted(duplicates)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_workflow_run_keys(self):
+        keys = [item.run_key for item in self.workflow_runs if item.run_key]
+        duplicates = {key for key in keys if keys.count(key) > 1}
+        if duplicates:
+            raise ValueError(
+                f"duplicate workflow_run run_key values: {sorted(duplicates)}"
             )
         return self
 

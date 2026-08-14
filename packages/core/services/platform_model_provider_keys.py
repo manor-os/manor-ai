@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -10,7 +11,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.credentials import Requester, get_credential_service
 from packages.core.models.base import generate_ulid
 from packages.core.models.model_provider import PlatformModelProviderKey
 from packages.core.services.model_provider_handlers import (
@@ -183,7 +183,8 @@ async def upsert_official_provider_key(
     row.config = cfg
     row.updated_by = actor_user_id
     row.last_rotated_at = now
-    get_credential_service().store_model_provider_key(row, {"api_key": key})
+    row.credential_ref = key
+    row.credential_scheme = "plain"
     await db.flush()
     return row
 
@@ -223,6 +224,7 @@ async def delete_official_provider_key(
         return None
     row.status = "inactive"
     row.credential_ref = None
+    row.credential_scheme = "plain"
     row.config = {
         key: value
         for key, value in dict(row.config or {}).items()
@@ -237,6 +239,7 @@ async def resolve_official_provider_credential(
     provider: str,
     *,
     reason: str = "model_provider.official_key",
+    sources: tuple[str, ...] = ("db", "env"),
 ) -> OfficialProviderCredential | None:
     """Resolve the platform official credential for a provider.
 
@@ -248,44 +251,53 @@ async def resolve_official_provider_credential(
     handler = handler_for_provider(provider)
     if not handler:
         return None
+    allowed_sources = {str(source or "").strip().lower() for source in sources}
 
-    try:
-        from packages.core.database import async_session
+    if "db" in allowed_sources:
+        try:
+            from packages.core.database import async_session
 
-        async with async_session() as db:
-            row = await _get_row(db, provider)
-            if row and row.status == "active" and row.credential_ref:
-                payload = get_credential_service().lease_model_provider_key(
-                    row,
-                    requester=Requester(kind="system", id=f"model_provider:{provider}"),
-                    reason=reason,
-                )
-                key = sanitize_provider_api_key(
-                    str(payload.get("api_key") or ""),
-                    source=f"{provider}.official_db_key",
-                )
-                if key:
-                    cfg = dict(row.config or {})
-                    return OfficialProviderCredential(
-                        provider=provider,
-                        api_key=key,
-                        base_url=str(cfg.get("base_url") or handler.base_url).rstrip("/"),
-                        source="official",
-                        source_detail="db",
-                    )
-    except SQLAlchemyError:
-        logger.debug("Official model provider key DB lookup failed for %s", provider, exc_info=True)
-    except Exception:
-        logger.warning("Official model provider key lookup failed for %s", provider, exc_info=True)
+            async with async_session() as db:
+                row = await _get_row(db, provider)
+                if row and row.status == "active" and row.credential_ref:
+                    if str(row.credential_scheme or "").lower() == "plain":
+                        key = sanitize_provider_api_key(
+                            str(row.credential_ref or ""),
+                            source=f"{provider}.official_db_key",
+                        )
+                    else:
+                        logger.warning(
+                            "Official model provider key for %s still uses legacy scheme=%s; re-save it from Admin → Models.",
+                            provider,
+                            row.credential_scheme,
+                        )
+                        key = ""
+                    if key:
+                        cfg = dict(row.config or {})
+                        return OfficialProviderCredential(
+                            provider=provider,
+                            api_key=key,
+                            base_url=str(cfg.get("base_url") or handler.base_url).rstrip("/"),
+                            source="official",
+                            source_detail="db",
+                        )
+        except SQLAlchemyError:
+            logger.debug("Official model provider key DB lookup failed for %s", provider, exc_info=True)
+        except Exception:
+            logger.warning("Official model provider key lookup failed for %s", provider, exc_info=True)
 
-    key, env_name = official_env_key(provider)
-    key = sanitize_provider_api_key(key, source=env_name or f"{provider}.env")
-    if key:
-        return OfficialProviderCredential(
-            provider=provider,
-            api_key=key,
-            base_url=handler.base_url,
-            source="official",
-            source_detail=env_name,
-        )
+    if "env" in allowed_sources:
+        key, env_name = official_env_key(provider)
+        key = sanitize_provider_api_key(key, source=env_name or f"{provider}.env")
+        if key:
+            base_url = handler.base_url
+            if provider == "openrouter":
+                base_url = (os.getenv("OPENROUTER_BASE_URL") or base_url).strip().rstrip("/")
+            return OfficialProviderCredential(
+                provider=provider,
+                api_key=key,
+                base_url=base_url,
+                source="official",
+                source_detail=env_name,
+            )
     return None

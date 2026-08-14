@@ -102,6 +102,10 @@ keys below are EXACTLY what the runner reads — use these names, not synonyms:
   tool       - call a single tool. config: {tool, args}   (args is an object)
   connector  - call an external integration / MCP server. config: {tool, args}
                (tool = resolved name e.g. "mcp__slack__post_message")
+  publication_receipt - validate an externally published result before the workflow completes.
+               config: {receipt, payload?, require_verified?, output_var?}
+               receipt must map platform, verification_status, external_id or published_url,
+               published_at, payload_hash or payload, fallback_used?, evidence?, and attempts?.
   code       - run Python / JavaScript / Bash in an ephemeral restricted sandbox.
                `inputs` contains workflow variables; print the result to stdout.
                config: {language, code, requirements?, code_timeout?, output_format?, allow_network?}

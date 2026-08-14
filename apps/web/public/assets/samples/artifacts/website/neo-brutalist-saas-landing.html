@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BoltDesk — Neo-Brutalist SaaS Landing</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Satoshi:wght@400;500;700;900&display=swap" rel="stylesheet">
+  <link href="https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@400,500,700,800,900&display=swap" rel="stylesheet">
+  <style data-manor-preview-src="styles.css">
+:root {
+  --yellow: #ffe17c;
+  --charcoal: #171e19;
+  --sage: #b7c6c2;
+  --white: #ffffff;
+  --black: #000000;
+  --dark-gray: #272727;
+  --soft-gray: #f4f4f5;
+  --star: #ffbc2e;
+  --red: #ff5f57;
+  --browser-yellow: #febc2e;
+  --green: #28c840;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  color: var(--black);
+  background: var(--white);
+  font-family: 'Satoshi', Inter, system-ui, sans-serif;
+  font-weight: 500;
+}
+
+a { color: inherit; text-decoration: none; }
+
+h1, h2, h3, h4, .logo, .marquee-track span {
+  font-family: 'Cabinet Grotesk', Impact, sans-serif;
+  letter-spacing: -0.055em;
+  line-height: 0.92;
+  margin: 0;
+}
+
+p { line-height: 1.6; }
+
+.site-header {
+  position: fixed;
+  z-index: 20;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 80px;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 24px;
+  padding: 0 clamp(18px, 4vw, 56px);
+  background: var(--yellow);
+  border-bottom: 2px solid var(--black);
+}
+
+.logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 28px;
+  font-weight: 900;
+}
+
+.logo-mark {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+  background: var(--black);
+  color: var(--yellow);
+  border: 2px solid var(--black);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 30px;
+  font-weight: 900;
+}
+
+.nav-links a { transition: transform .18s ease; }
+.nav-links a:hover { transform: translateY(-2px); }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 1rem 2rem;
+  border: 2px solid var(--black);
+  border-radius: 12px;
+  font-weight: 900;
+  line-height: 1;
+  transition: transform .2s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow .2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.btn:hover, .btn:focus-visible {
+  transform: translate(4px, 4px);
+  box-shadow: 4px 4px 0 0 var(--black);
+}
+
+.btn-dark {
+  background: var(--black);
+  color: var(--white);
+  box-shadow: 4px 4px 0 0 var(--black);
+}
+
+.btn-dark:hover, .btn-dark:focus-visible { box-shadow: 0 0 0 0 var(--black); }
+
+.btn-light {
+  background: var(--white);
+  color: var(--black);
+  box-shadow: 4px 4px 0 0 var(--black);
+}
+
+.btn-light:hover, .btn-light:focus-visible { box-shadow: 0 0 0 0 var(--black); }
+
+.btn-large {
+  min-height: 60px;
+  box-shadow: 8px 8px 0 0 var(--black);
+}
+
+.btn-large:hover, .btn-large:focus-visible { box-shadow: 4px 4px 0 0 var(--black); }
+.btn-small { justify-self: end; min-height: 44px; padding: .8rem 1.2rem; }
+
+.dot-bg {
+  background-color: var(--yellow);
+  background-image: radial-gradient(rgba(0,0,0,.1) 2px, transparent 2px);
+  background-size: 32px 32px;
+}
+
+.section-bordered { border-bottom: 2px solid var(--black); }
+
+.hero {
+  min-height: 100vh;
+  padding: 150px clamp(20px, 5vw, 72px) 86px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 560px);
+  gap: clamp(36px, 7vw, 92px);
+  align-items: center;
+}
+
+.badge, .pill {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 10px 14px;
+  background: var(--white);
+  border: 2px solid var(--black);
+  border-radius: 999px;
+  font-weight: 900;
+}
+
+.hero h1 {
+  margin-top: 28px;
+  max-width: 760px;
+  font-size: clamp(64px, 9vw, 130px);
+  font-weight: 900;
+}
+
+.hero h1 span {
+  color: transparent;
+  -webkit-text-stroke: 2px var(--black);
+  text-stroke: 2px var(--black);
+}
+
+.hero-lede {
+  max-width: 640px;
+  margin: 28px 0 34px;
+  font-size: clamp(18px, 2vw, 22px);
+  font-weight: 700;
+}
+
+.cta-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.cta-row.centered { justify-content: center; }
+
+.browser-mockup {
+  background: var(--white);
+  border: 2px solid var(--black);
+  border-radius: 16px;
+  box-shadow: 12px 12px 0 0 var(--black);
+  overflow: hidden;
+  transform: rotate(1.5deg);
+}
+
+.browser-top {
+  height: 48px;
+  background: var(--black);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px;
+  color: var(--white);
+  font-weight: 900;
+}
+
+.dot { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--black); }
+.red { background: var(--red); }
+.yellow { background: var(--browser-yellow); }
+.green { background: var(--green); }
+.browser-title { margin-left: auto; opacity: .72; }
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 20px;
+}
+
+.metric-card, .chart-card, .todo-card {
+  border: 2px solid var(--black);
+  padding: 18px;
+  border-radius: 10px;
+}
+
+.metric-card span, .chart-head span { display: block; font-size: 13px; font-weight: 900; text-transform: uppercase; }
+.metric-card strong { display: block; margin-top: 14px; font-family: 'Cabinet Grotesk'; font-size: 44px; letter-spacing: -.05em; }
+.charcoal { background: var(--charcoal); color: var(--white); }
+.sage { background: var(--sage); }
+.chart-card { grid-column: 1 / -1; background: var(--white); }
+.chart-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+.chart-head strong { font-family: 'Cabinet Grotesk'; font-size: 32px; }
+.bars { display: flex; align-items: end; gap: 14px; height: 160px; }
+.bars span { flex: 1; background: var(--yellow); border: 2px solid var(--black); }
+.todo-card { grid-column: 1 / -1; background: var(--sage); }
+.todo-card p { margin-top: 0; font-weight: 900; }
+.todo-card ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.todo-card li { display: flex; align-items: center; gap: 10px; font-weight: 800; }
+.todo-card li span { width: 14px; height: 14px; background: var(--yellow); border: 2px solid var(--black); }
+
+.marquee-bar {
+  overflow: hidden;
+  background: var(--charcoal);
+  border-bottom: 2px solid var(--black);
+  padding: 26px 0;
+}
+
+.marquee-track {
+  width: max-content;
+  display: flex;
+  gap: 72px;
+  animation: marquee 22s linear infinite;
+}
+
+.marquee-track span {
+  color: var(--sage);
+  opacity: .5;
+  font-size: clamp(42px, 6vw, 82px);
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+@keyframes marquee { to { transform: translateX(-50%); } }
+
+.section-white { background: var(--white); }
+.problem-solution, .features, .how-it-works, .personas, .testimonials, .final-cta {
+  padding: clamp(70px, 9vw, 124px) clamp(20px, 5vw, 72px);
+}
+
+.section-intro { max-width: 860px; margin-bottom: 44px; }
+.section-intro.wide { max-width: 1080px; }
+.section-intro.dark { color: var(--white); }
+.eyebrow { margin: 0 0 12px; text-transform: uppercase; font-weight: 900; letter-spacing: .08em; }
+.section-intro h2, .final-cta h2 { font-size: clamp(44px, 6.5vw, 92px); font-weight: 900; }
+
+.comparison-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.comparison-card {
+  border-radius: 28px;
+  padding: clamp(28px, 4vw, 52px);
+  border: 2px solid var(--black);
+}
+.problem-card { background: var(--soft-gray); border-style: dashed; opacity: .7; }
+.solution-card { background: var(--yellow); box-shadow: 8px 8px 0 0 var(--black); }
+.comparison-card h3 { font-size: clamp(34px, 4vw, 56px); font-weight: 900; margin-bottom: 28px; }
+.icon-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 18px; font-size: 20px; font-weight: 900; }
+.icon-list li { display: flex; gap: 12px; align-items: flex-start; }
+.x-list li::before { content: '×'; width: 28px; height: 28px; display: inline-grid; place-items: center; border: 2px solid var(--black); background: var(--white); }
+.check-list li::before { content: '✓'; width: 28px; height: 28px; display: inline-grid; place-items: center; border: 2px solid var(--black); background: var(--sage); }
+
+.features { border-top: 2px solid var(--black); border-bottom: 2px solid var(--black); }
+.feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+.feature-card {
+  background: var(--white);
+  border: 2px solid var(--black);
+  border-radius: 14px;
+  padding: 26px;
+  box-shadow: 4px 4px 0 0 var(--black);
+  transition: transform .18s ease, box-shadow .18s ease;
+}
+.feature-card:hover { transform: translate(4px, 4px); box-shadow: 0 0 0 0 var(--black); }
+.icon-box {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  background: var(--sage);
+  border: 2px solid var(--black);
+  border-radius: 4px;
+  font-weight: 900;
+  margin-bottom: 24px;
+  transition: background .18s ease;
+}
+.feature-card:hover .icon-box { background: var(--yellow); }
+.feature-card h3 { font-size: 30px; font-weight: 900; margin-bottom: 12px; }
+.feature-card p { margin-bottom: 0; font-weight: 700; }
+
+.how-it-works { background: var(--charcoal); border-bottom: 2px solid var(--black); }
+.steps { position: relative; display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
+.connector { position: absolute; left: 10%; right: 10%; top: 36px; height: 4px; background: var(--dark-gray); }
+.step { position: relative; color: var(--white); padding-top: 70px; }
+.step span {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  background: var(--charcoal);
+  border: 4px solid var(--sage);
+  border-radius: 50%;
+  color: var(--white);
+  font-weight: 900;
+}
+.step-yellow span { border-color: var(--yellow); }
+.step-white span { border-color: var(--white); }
+.step h3 { font-size: clamp(32px, 3vw, 46px); font-weight: 900; margin-bottom: 12px; }
+.step p { color: var(--sage); font-size: 18px; max-width: 330px; }
+
+.persona-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+.persona-card {
+  min-height: 360px;
+  border: 2px solid var(--black);
+  border-radius: 24px;
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+.sage-card { background: var(--sage); }
+.yellow-card { background: var(--yellow); box-shadow: 8px 8px 0 0 var(--black); }
+.dark-card { background: var(--dark-gray); color: var(--white); }
+.dark-card .pill { color: var(--black); }
+.persona-card h3 { font-size: clamp(34px, 4vw, 54px); font-weight: 900; }
+.persona-card p { font-size: 18px; font-weight: 700; margin-bottom: 0; }
+
+.testimonials { background: var(--sage); border-top: 2px solid var(--black); border-bottom: 2px solid var(--black); }
+.testimonial-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+.testimonial-card {
+  background: var(--white);
+  border: 2px solid var(--black);
+  border-radius: 2px 28px 2px 28px;
+  padding: 28px;
+  box-shadow: 4px 4px 0 0 var(--black);
+}
+.stars { color: var(--star); font-size: 24px; letter-spacing: 2px; -webkit-text-stroke: 1px var(--black); margin-bottom: 20px; }
+.testimonial-card p { font-size: 18px; font-weight: 800; }
+.testimonial-card strong { display: block; margin-top: 22px; font-weight: 900; }
+.testimonial-card span { opacity: .72; font-weight: 700; }
+
+.final-cta { text-align: center; }
+.final-cta h2 { max-width: 1000px; margin: 0 auto 20px; }
+.final-cta p { font-size: 22px; font-weight: 800; margin-bottom: 34px; }
+
+.footer {
+  display: grid;
+  grid-template-columns: 2fr repeat(3, 1fr);
+  gap: 30px;
+  padding: 54px clamp(20px, 5vw, 72px);
+  background: var(--charcoal);
+  color: var(--white);
+  border-top: 2px solid var(--black);
+}
+.footer p { color: var(--sage); max-width: 320px; }
+.footer h4 { font-size: 24px; margin-bottom: 16px; }
+.footer a:not(.logo) { display: block; color: var(--sage); margin-bottom: 10px; font-weight: 800; }
+.footer-logo .logo-mark { border-color: var(--white); }
+.socials { display: flex; gap: 10px; }
+.socials a {
+  width: 28px;
+  height: 28px;
+  background: var(--dark-gray);
+  border: 2px solid #d1d5db;
+  transition: background .18s ease, border-color .18s ease;
+}
+.socials a:hover { background: var(--yellow); border-color: var(--black); }
+
+@media (max-width: 980px) {
+  .site-header { grid-template-columns: 1fr auto; }
+  .nav-links { display: none; }
+  .hero, .comparison-grid, .feature-grid, .steps, .persona-grid, .testimonial-grid, .footer { grid-template-columns: 1fr; }
+  .browser-mockup { transform: none; }
+  .connector { display: none; }
+  .step { padding-top: 64px; }
+}
+
+@media (max-width: 620px) {
+  .site-header { height: 72px; padding-inline: 14px; }
+  .logo { font-size: 23px; }
+  .btn-small { padding: .75rem .9rem; font-size: 13px; }
+  .hero { padding-top: 118px; }
+  .hero h1 { font-size: clamp(50px, 17vw, 76px); }
+  .dashboard-grid { grid-template-columns: 1fr; }
+  .chart-card, .todo-card { grid-column: auto; }
+  .comparison-card, .persona-card { border-radius: 18px; }
+  .cta-row { flex-direction: column; }
+  .btn { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .001ms !important;
+  }
+}
+
+</style>
+</head>
+<body>
+  <header class="site-header">
+    <a class="logo" href="#top" aria-label="BoltDesk home">
+      <span class="logo-mark" aria-hidden="true">↯</span>
+      <span>BoltDesk</span>
+    </a>
+    <nav class="nav-links" aria-label="Primary navigation">
+      <a href="#features">Features</a>
+      <a href="#workflow">Workflow</a>
+      <a href="#personas">Teams</a>
+      <a href="#testimonials">Proof</a>
+    </nav>
+    <a class="btn btn-dark btn-small" href="#cta">Start Free Trial</a>
+  </header>
+
+  <main id="top">
+    <section class="hero dot-bg section-bordered">
+      <div class="hero-copy">
+        <div class="badge">NEW: AI Content Assistant 2.0</div>
+        <h1>Launch campaigns with <span>less chaos.</span></h1>
+        <p class="hero-lede">Plan, write, approve, and ship content from one loud little workspace built for teams that move fast.</p>
+        <div class="cta-row">
+          <a class="btn btn-dark btn-large" href="#cta">Start Free Trial</a>
+          <a class="btn btn-light" href="#workflow">See How It Works</a>
+        </div>
+      </div>
+
+      <div class="browser-mockup" aria-label="Dashboard preview">
+        <div class="browser-top">
+          <span class="dot red"></span>
+          <span class="dot yellow"></span>
+          <span class="dot green"></span>
+          <span class="browser-title">campaign.ops</span>
+        </div>
+        <div class="dashboard-grid">
+          <div class="metric-card charcoal">
+            <span>Revenue assisted</span>
+            <strong>$128K</strong>
+          </div>
+          <div class="metric-card sage">
+            <span>Drafts shipped</span>
+            <strong>342</strong>
+          </div>
+          <div class="chart-card">
+            <div class="chart-head">
+              <span>Pipeline velocity</span>
+              <strong>+38%</strong>
+            </div>
+            <div class="bars" aria-hidden="true">
+              <span style="height:42%"></span>
+              <span style="height:58%"></span>
+              <span style="height:35%"></span>
+              <span style="height:76%"></span>
+              <span style="height:64%"></span>
+              <span style="height:88%"></span>
+            </div>
+          </div>
+          <div class="todo-card">
+            <p>Today’s launch queue</p>
+            <ul>
+              <li><span></span> Rewrite onboarding email</li>
+              <li><span></span> Approve ad variant B</li>
+              <li><span></span> Publish LinkedIn post</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="marquee-bar" aria-label="Trusted by fast-moving teams">
+      <div class="marquee-track">
+        <span>ACME</span><span>GLOBEX</span><span>INITECH</span><span>UMBRELLA</span><span>WAYSTAR</span><span>STARK</span><span>ACME</span><span>GLOBEX</span><span>INITECH</span><span>UMBRELLA</span><span>WAYSTAR</span><span>STARK</span>
+      </div>
+    </section>
+
+    <section class="problem-solution section-white">
+      <div class="section-intro">
+        <p class="eyebrow">Problem vs solution</p>
+        <h2>Stop managing creative work in twelve cracked tabs.</h2>
+      </div>
+      <div class="comparison-grid">
+        <article class="comparison-card problem-card">
+          <h3>Before BoltDesk</h3>
+          <ul class="icon-list x-list">
+            <li>Feedback hidden in comment threads</li>
+            <li>Brand voice changes every draft</li>
+            <li>Approvals stall between tools</li>
+            <li>Reporting arrives after the launch</li>
+          </ul>
+        </article>
+        <article class="comparison-card solution-card">
+          <h3>After BoltDesk</h3>
+          <ul class="icon-list check-list">
+            <li>One brief turns into every channel</li>
+            <li>AI keeps tone and claims consistent</li>
+            <li>Approvals live beside the work</li>
+            <li>Results feed the next campaign</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="features" class="features dot-bg section-bordered">
+      <div class="section-intro wide">
+        <p class="eyebrow">Features</p>
+        <h2>Big team systems without the enterprise sludge.</h2>
+      </div>
+      <div class="feature-grid">
+        <article class="feature-card"><span class="icon-box">01</span><h3>AI campaign drafts</h3><p>Generate landing copy, email variants, ads, and social posts from a single structured brief.</p></article>
+        <article class="feature-card"><span class="icon-box">02</span><h3>Brand guardrails</h3><p>Lock in tone, forbidden claims, vocabulary, offers, and compliance notes before anyone writes.</p></article>
+        <article class="feature-card"><span class="icon-box">03</span><h3>Approval lanes</h3><p>Route work to product, legal, growth, or founders with crisp ownership and no mystery blockers.</p></article>
+        <article class="feature-card"><span class="icon-box">04</span><h3>Launch calendar</h3><p>See every asset, owner, due date, and channel in one highly opinionated production view.</p></article>
+        <article class="feature-card"><span class="icon-box">05</span><h3>Performance loops</h3><p>Turn campaign results into reusable rules so the assistant gets sharper after every launch.</p></article>
+        <article class="feature-card"><span class="icon-box">06</span><h3>Clean exports</h3><p>Ship approved assets into your CMS, CRM, ad manager, or old-school spreadsheet without drama.</p></article>
+      </div>
+    </section>
+
+    <section id="workflow" class="how-it-works">
+      <div class="section-intro dark">
+        <p class="eyebrow">How it works</p>
+        <h2>Three steps from messy brief to shipped campaign.</h2>
+      </div>
+      <div class="steps">
+        <div class="connector" aria-hidden="true"></div>
+        <article class="step step-sage"><span>1</span><h3>Drop the brief</h3><p>Add audience, offer, proof points, constraints, and channels.</p></article>
+        <article class="step step-yellow"><span>2</span><h3>Generate the system</h3><p>BoltDesk creates coordinated assets with consistent positioning.</p></article>
+        <article class="step step-white"><span>3</span><h3>Approve and ship</h3><p>Review, assign, export, and learn from performance data.</p></article>
+      </div>
+    </section>
+
+    <section id="personas" class="personas section-white">
+      <div class="section-intro wide">
+        <p class="eyebrow">Built for</p>
+        <h2>The people who have to make launches real.</h2>
+      </div>
+      <div class="persona-grid">
+        <article class="persona-card sage-card"><span class="pill">Growth teams</span><h3>More variants, less copy soup.</h3><p>Test angles across email, paid, and landing pages while keeping one source of truth.</p></article>
+        <article class="persona-card yellow-card"><span class="pill">Founders</span><h3>Turn ideas into campaigns before momentum dies.</h3><p>Go from voice note to launch-ready assets without waiting for a full production cycle.</p></article>
+        <article class="persona-card dark-card"><span class="pill">Content leads</span><h3>Protect quality at speed.</h3><p>Create reusable standards, review flows, and performance-backed content systems.</p></article>
+      </div>
+    </section>
+
+    <section id="testimonials" class="testimonials">
+      <div class="section-intro wide">
+        <p class="eyebrow">Testimonials</p>
+        <h2>Teams like it because it feels fast and serious.</h2>
+      </div>
+      <div class="testimonial-grid">
+        <article class="testimonial-card"><div class="stars">★★★★★</div><p>“The first tool our writers, PMM, and founder all agreed to keep open during launch week.”</p><strong>Rina Patel</strong><span>Head of Growth</span></article>
+        <article class="testimonial-card"><div class="stars">★★★★★</div><p>“It gave us the structure of a bigger team without making us behave like one.”</p><strong>Marcus Lee</strong><span>Founder</span></article>
+        <article class="testimonial-card"><div class="stars">★★★★★</div><p>“The approval flow alone removed hours of chasing people for tiny copy decisions.”</p><strong>Elena Brooks</strong><span>Content Director</span></article>
+      </div>
+    </section>
+
+    <section id="cta" class="final-cta dot-bg section-bordered">
+      <h2>Build your next campaign before the meeting ends.</h2>
+      <p>Start free. Invite the team. Make the messy middle visible.</p>
+      <div class="cta-row centered">
+        <a class="btn btn-dark btn-large" href="/cdn-cgi/l/email-protection#3d55585151527d58455c504d5158135e5250">Start Free Trial</a>
+        <a class="btn btn-light" href="#top">Back to Top</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div>
+      <a class="logo footer-logo" href="#top"><span class="logo-mark">↯</span><span>BoltDesk</span></a>
+      <p>Neo-brutalist campaign operations for fast SaaS teams.</p>
+    </div>
+    <div><h4>Product</h4><a href="#features">Features</a><a href="#workflow">Workflow</a><a href="#cta">Pricing</a></div>
+    <div><h4>Company</h4><a href="#testimonials">Customers</a><a href="#personas">Teams</a><a href="#top">About</a></div>
+    <div><h4>Social</h4><div class="socials"><a href="#" aria-label="X"></a><a href="#" aria-label="LinkedIn"></a><a href="#" aria-label="YouTube"></a></div></div>
+  </footer>
+
+  <script data-manor-preview-src="app.js">
+const header = document.querySelector('.site-header');
+const marquee = document.querySelector('.marquee-track');
+
+if (marquee) {
+  marquee.innerHTML += marquee.innerHTML;
+}
+
+const cards = document.querySelectorAll('.feature-card, .comparison-card, .persona-card, .testimonial-card, .browser-mockup');
+const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+if (!prefersReduced && 'IntersectionObserver' in window) {
+  cards.forEach((card) => {
+    card.style.opacity = '0';
+    card.style.transform = card.classList.contains('browser-mockup') ? 'translateY(26px) rotate(1.5deg)' : 'translateY(26px)';
+  });
+
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      entry.target.style.transition = 'opacity .45s ease, transform .45s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow .18s ease';
+      entry.target.style.opacity = '1';
+      entry.target.style.transform = entry.target.classList.contains('browser-mockup') ? 'rotate(1.5deg)' : 'translateY(0)';
+      observer.unobserve(entry.target);
+    });
+  }, { threshold: 0.14 });
+
+  cards.forEach((card) => observer.observe(card));
+}
+
+window.addEventListener('scroll', () => {
+  if (!header) return;
+  header.style.boxShadow = window.scrollY > 24 ? '0 4px 0 0 #000000' : 'none';
+}, { passive: true });
+
+</script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" fill="none">
+  <rect width="720" height="360" rx="28" fill="#F5F4F1"/>
+  <path d="M143 180H229" stroke="#B8B3AC" stroke-width="4" stroke-linecap="round"/>
+  <path d="M337 180H423" stroke="#B8B3AC" stroke-width="4" stroke-linecap="round"/>
+  <path d="M531 180H609" stroke="#B8B3AC" stroke-width="4" stroke-linecap="round"/>
+  <path d="M380 180c0 62-35 81-77 81H213" stroke="#B8B3AC" stroke-width="4" stroke-linecap="round" stroke-dasharray="8 10"/>
+  <path d="M216 180l-13-9v18l13-9Z" fill="#8C8780"/><path d="M410 180l-13-9v18l13-9Z" fill="#8C8780"/><path d="M596 180l-13-9v18l13-9Z" fill="#8C8780"/><path d="M226 261l13-9v18l-13-9Z" fill="#8C8780"/>
+  <g filter="url(#b)">
+    <rect x="48" y="124" width="95" height="112" rx="22" fill="white"/>
+    <rect x="229" y="124" width="108" height="112" rx="22" fill="white"/>
+    <rect x="423" y="124" width="108" height="112" rx="22" fill="white"/>
+    <rect x="609" y="124" width="70" height="112" rx="22" fill="white"/>
+    <rect x="111" y="237" width="102" height="50" rx="18" fill="#F0EDE8"/>
+  </g>
+  <path d="M78 151h34l12 12v43H78v-55Z" fill="#E8E3F1"/>
+  <path d="M112 151v13h12" stroke="#756C8E" stroke-width="3" stroke-linejoin="round"/>
+  <rect x="87" y="174" width="26" height="4" rx="2" fill="#756C8E" opacity=".72"/>
+  <rect x="87" y="185" width="20" height="4" rx="2" fill="#756C8E" opacity=".46"/>
+  <circle cx="283" cy="173" r="25" fill="#EAE7E1"/>
+  <path d="M271 174l8 8 17-20" stroke="#6E6961" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="477" cy="173" r="25" fill="#DCEAE7"/>
+  <path d="M465 174l8 8 17-20" stroke="#557A73" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="626" y="151" width="36" height="44" rx="8" fill="#E9DDC7"/>
+  <path d="M635 177l6 6 13-16" stroke="#926D36" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="95" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Draft</text>
+  <text x="283" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Review</text>
+  <text x="477" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">Approve</text>
+  <text x="644" y="222" text-anchor="middle" fill="#3F3A36" font-family="Inter,Arial,sans-serif" font-size="13" font-weight="700">Publish</text>
+  <text x="162" y="268" text-anchor="middle" fill="#6B655E" font-family="Inter,Arial,sans-serif" font-size="13" font-weight="700">Revise</text>
+  <defs><filter id="b" x="36" y="116" width="655" height="187" filterUnits="userSpaceOnUse"><feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#332C26" flood-opacity=".09"/></filter></defs>
+</svg>

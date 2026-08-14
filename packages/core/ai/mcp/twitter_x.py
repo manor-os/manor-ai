@@ -21,7 +21,6 @@ import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -681,6 +680,10 @@ async def _try_inline_refresh(old_token: str) -> Optional[str]:
 
         from packages.core.database import async_session
         from packages.core.models.user import OAuthAccount
+        from packages.core.services.oauth_account_credentials import (
+            lease_oauth_account_tokens,
+            store_oauth_account_tokens,
+        )
         from packages.core.services.provider_keys import provider_key_aliases
         from packages.core.tasks.oauth_refresh import refresh_token_via_provider
 
@@ -695,19 +698,32 @@ async def _try_inline_refresh(old_token: str) -> Optional[str]:
             row = (await db.execute(
                 query.order_by(OAuthAccount.updated_at.desc()).limit(1)
             )).scalar_one_or_none()
-            if not row or not row.refresh_token or row.access_token != old_token:
+            if not row:
+                return None
+            creds = lease_oauth_account_tokens(
+                row,
+                requester_id=user_id,
+                reason="oauth.twitter.inline_refresh",
+                requester_kind="user",
+            )
+            refresh_token = creds.get("refresh_token")
+            if not refresh_token or creds.get("access_token") != old_token:
                 return None
 
             data = await refresh_token_via_provider(
-                "twitter_x", row.refresh_token, db=db,
+                "twitter_x", refresh_token, db=db,
             )
             if not data or not data.get("access_token"):
                 return None
 
             new_token = data["access_token"]
-            row.access_token = new_token
-            if data.get("refresh_token"):
-                row.refresh_token = data["refresh_token"]  # X rotates these
+            store_oauth_account_tokens(
+                row,
+                access_token=new_token,
+                refresh_token=data.get("refresh_token") or refresh_token,
+                preserve_existing_refresh=False,
+                requester_id=user_id,
+            )
             if data.get("expires_in"):
                 row.token_expires_at = datetime.now(timezone.utc) + timedelta(
                     seconds=int(data["expires_in"]),

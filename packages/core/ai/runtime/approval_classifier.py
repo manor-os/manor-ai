@@ -4,16 +4,267 @@ import json
 import os
 import re
 import shlex
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 from packages.core.ai.runtime.approvals import RuntimeApprovalAction
 
 
 __all__ = [
     "bash_write_targets",
+    "ChromeConfirmationDecision",
+    "classify_chrome_confirmation",
     "classify_runtime_tool_action",
     "split_mcp_tool",
 ]
+
+
+@dataclass(frozen=True)
+class ChromeConfirmationDecision:
+    mode: str
+    policy_category: str
+    preapproved: bool = False
+    destination: str = ""
+    data_summary: str = ""
+
+
+_CHROME_ACTION_INTENT_RE = re.compile(
+    r"\b(upload|attach|allow|permit|login|log in|sign in|submit|send|share|enter|provide)\b|"
+    r"上传|附加|允许|授权|登录|提交|发送|分享|填写|提供",
+    re.IGNORECASE,
+)
+_CHROME_PERMISSION_TERMS = {
+    "camera": ("camera", "webcam", "摄像头", "相机"),
+    "microphone": ("microphone", "mic", "麦克风"),
+    "location": ("location", "geolocation", "位置", "定位"),
+    "notification": ("notification", "notifications", "通知"),
+    "clipboard": ("clipboard", "剪贴板"),
+}
+_CHROME_SENSITIVE_TERMS = {
+    "password": ("password", "passcode", "passphrase", "密码"),
+    "authentication_code": ("one-time-code", "otp", "totp", "mfa", "2fa", "verification code", "auth code", "验证码", "动态码"),
+    "secret": ("api key", "secret", "token", "密钥", "令牌"),
+    "payment": ("cvv", "cvc", "card number", "credit card", "cc-number", "payment", "银行卡", "信用卡", "安全码"),
+    "passport": ("passport", "护照"),
+    "identity": ("ssn", "social security", "national id", "tax id", "身份证", "税号"),
+    "bank_account": ("routing number", "account number", "银行账号", "银行账户"),
+}
+_CHROME_PAGE_EFFECT_ACTIONS = {
+    "click",
+    "click_element",
+    "click_point",
+    "fill",
+    "fill_or_select",
+    "type_text",
+    "press_key",
+    "press",
+    "key",
+    "keyboard",
+    "computer",
+    "js_dialog",
+    "handle_js_dialog",
+    "send_cdp",
+    "inject_script",
+}
+_CHROME_EXTERNAL_COMMIT_RE = re.compile(
+    r"^(?:(?:publish|post|send|submit|upload|delete|remove|buy|purchase|checkout|pay|allow|share|verify|schedule)(?:\b|$)|"
+    r"(?:立即|确认|定时|计划|安排)?(?:发布|发表|发送|提交|上传|删除|移除|购买|结账|支付|允许|分享|验证))",
+    re.IGNORECASE,
+)
+
+
+def classify_chrome_confirmation(
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    initial_user_message: str | None = None,
+) -> ChromeConfirmationDecision:
+    args = arguments or {}
+    action = _chrome_action_name(tool_name)
+    label = " ".join(
+        str(args.get(key) or "").strip()
+        for key in ("label", "target_label", "aria_label", "name", "text", "role")
+        if str(args.get(key) or "").strip()
+    )
+    url = str(args.get("url") or args.get("target_url") or "").strip()
+    destination = _chrome_destination(url)
+    haystack = f"{label} {url}".strip().lower()
+
+    if action in {"download", "wait_download"}:
+        return ChromeConfirmationDecision("no_confirmation", "inbound_download", destination=destination)
+    if action == "history":
+        return ChromeConfirmationDecision("always_action_time", "browser_history", destination=destination)
+    if action == "clipboard_write":
+        return ChromeConfirmationDecision("always_action_time", "browser_system_setting", destination=destination)
+    if action in {"upload", "set_files", "upload_ref"}:
+        filenames = _chrome_upload_filenames(args)
+        preapproved = bool(filenames) and _chrome_specific_preapproval(
+            initial_user_message,
+            destination=destination,
+            required_terms=filenames,
+        )
+        return ChromeConfirmationDecision(
+            "preapproval_allowed",
+            "file_upload",
+            preapproved=preapproved,
+            destination=destination,
+            data_summary=", ".join(filenames[:3]),
+        )
+    if (
+        destination == "studio.youtube.com"
+        and re.search(r"\bupload\s+videos?\b|上传视频", label, re.IGNORECASE)
+    ):
+        return ChromeConfirmationDecision(
+            "preapproval_allowed",
+            "youtube_upload_start",
+            destination=destination,
+        )
+    explicitly_requested = any(
+        args.get(key) is True
+        for key in ("requiresApproval", "requires_approval", "sideEffect", "side_effect", "sensitive")
+    )
+    if action not in _CHROME_PAGE_EFFECT_ACTIONS and not explicitly_requested:
+        return ChromeConfirmationDecision("no_confirmation", "ordinary_page_action", destination=destination)
+    if re.search(r"\b(accept|allow|agree|ok)\b.*\b(cookie|cookies)\b|接受.*Cookie|同意.*Cookie", haystack, re.IGNORECASE):
+        return ChromeConfirmationDecision("no_confirmation", "cookie_consent", destination=destination)
+    if _chrome_password_change_submit(action, haystack, args):
+        return ChromeConfirmationDecision("handoff_required", "password_change", destination=destination)
+    if args.get("unsupported_automation") is True or args.get("handoff_required") is True:
+        return ChromeConfirmationDecision("handoff_required", "unsupported_automation", destination=destination)
+
+    sensitive_category = _chrome_sensitive_category(haystack)
+    if sensitive_category == "captcha":
+        return ChromeConfirmationDecision("always_action_time", "captcha", destination=destination, data_summary="redacted captcha input")
+    if re.search(r"\b(delete|remove|erase|revoke|unsubscribe)\b|删除|移除|撤销|注销", haystack, re.IGNORECASE):
+        return ChromeConfirmationDecision("always_action_time", "deletion", destination=destination)
+    if re.search(r"\b(pay|purchase|buy|checkout|place order|confirm order)\b|支付|购买|结账|下单", haystack, re.IGNORECASE):
+        return ChromeConfirmationDecision("always_action_time", "financial_transaction", destination=destination)
+
+    permission_kind = _chrome_permission_kind(haystack)
+    if re.search(r"\b(allow|permit|grant)\b|允许|授权", haystack, re.IGNORECASE) and permission_kind:
+        preapproved = _chrome_specific_preapproval(
+            initial_user_message,
+            destination=destination,
+            required_terms=_CHROME_PERMISSION_TERMS[permission_kind],
+            match_any_term=True,
+        )
+        return ChromeConfirmationDecision(
+            "preapproval_allowed",
+            "browser_permission",
+            preapproved=preapproved,
+            destination=destination,
+            data_summary=f"{permission_kind} permission",
+        )
+
+    if sensitive_category:
+        terms = _CHROME_SENSITIVE_TERMS.get(sensitive_category, ())
+        preapproved = _chrome_specific_preapproval(
+            initial_user_message,
+            destination=destination,
+            required_terms=terms,
+            match_any_term=True,
+        )
+        return ChromeConfirmationDecision(
+            "preapproval_allowed",
+            "sensitive_data_transmission",
+            preapproved=preapproved,
+            destination=destination,
+            data_summary=f"redacted {sensitive_category.replace('_', ' ')} data",
+        )
+
+    if _CHROME_EXTERNAL_COMMIT_RE.search(label):
+        return ChromeConfirmationDecision("always_action_time", "representational_communication", destination=destination)
+    if re.search(r"\b(subscribe|enable notifications)\b|订阅|开启通知", haystack, re.IGNORECASE):
+        return ChromeConfirmationDecision("always_action_time", "notification_subscription", destination=destination)
+    if re.search(r"\b(install|execute|run downloaded)\b|安装|执行下载", haystack, re.IGNORECASE):
+        return ChromeConfirmationDecision("always_action_time", "software_installation", destination=destination)
+    if re.search(r"\b(login|log in|sign in|age verification|verify age)\b|登录|年龄验证|验证年龄", haystack, re.IGNORECASE):
+        category = "age_verification" if re.search(r"age|年龄", haystack, re.IGNORECASE) else "authentication"
+        return ChromeConfirmationDecision(
+            "preapproval_allowed",
+            category,
+            preapproved=_chrome_specific_preapproval(initial_user_message, destination=destination),
+            destination=destination,
+        )
+    if explicitly_requested:
+        return ChromeConfirmationDecision("always_action_time", "explicit_side_effect", destination=destination)
+    return ChromeConfirmationDecision("no_confirmation", "ordinary_page_action", destination=destination)
+
+
+def _chrome_action_name(tool_name: str) -> str:
+    name = str(tool_name or "").strip()
+    if name.startswith("mcp__"):
+        server, action = split_mcp_tool(name)
+        return action if server == "chrome" else ""
+    for prefix in ("chrome_", "browser_"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _chrome_destination(url: str) -> str:
+    try:
+        return str(urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _chrome_upload_filenames(args: dict[str, Any]) -> tuple[str, ...]:
+    raw = args.get("files") or args.get("paths") or []
+    values = raw if isinstance(raw, list) else [raw]
+    filenames: list[str] = []
+    for value in values:
+        filename = os.path.basename(str(value or "").replace("\\", "/")).strip()
+        if filename and filename not in filenames:
+            filenames.append(filename)
+    return tuple(filenames[:8])
+
+
+def _chrome_specific_preapproval(
+    initial_user_message: str | None,
+    *,
+    destination: str,
+    required_terms: tuple[str, ...] = (),
+    match_any_term: bool = False,
+) -> bool:
+    message = str(initial_user_message or "").strip().lower()
+    if not message or not destination or destination not in message:
+        return False
+    if not _CHROME_ACTION_INTENT_RE.search(message):
+        return False
+    terms = [str(term).lower() for term in required_terms if str(term).strip()]
+    if not terms:
+        return True
+    if match_any_term:
+        return any(term in message for term in terms)
+    return all(term in message for term in terms)
+
+
+def _chrome_permission_kind(haystack: str) -> str:
+    for kind, terms in _CHROME_PERMISSION_TERMS.items():
+        if any(term.lower() in haystack for term in terms):
+            return kind
+    return ""
+
+
+def _chrome_sensitive_category(haystack: str) -> str:
+    if re.search(r"\bcaptcha\b|人机验证", haystack, re.IGNORECASE):
+        return "captcha"
+    for category, terms in _CHROME_SENSITIVE_TERMS.items():
+        if any(term.lower() in haystack for term in terms):
+            return category
+    return ""
+
+
+def _chrome_password_change_submit(action: str, haystack: str, args: dict[str, Any]) -> bool:
+    if action not in {"click", "click_element", "click_point", "press_key", "keyboard", "computer"}:
+        return False
+    if args.get("password_change") is True:
+        return True
+    return bool(
+        re.search(r"change password|update password|save password|reset password|修改密码|更改密码|重置密码", haystack, re.IGNORECASE)
+    )
 
 
 _SOCIAL_PUBLISH_ACTIONS = {
@@ -45,7 +296,13 @@ _SOCIAL_MUTATION_ACTIONS = {
     "remove_reaction",
     "delete_instagram_comment",
 }
-_EMAIL_SEND_ACTIONS = {"send_message", "send_draft", "send_email"}
+_EMAIL_SEND_ACTIONS = {
+    "send_message",
+    "send_draft",
+    "send_email",
+    "reply_to_message",
+    "reply_all",
+}
 _MESSAGE_SEND_ACTIONS = {
     "send_text_message",
     "send_image_message",
@@ -285,6 +542,10 @@ def classify_runtime_tool_action(
         "update_workflow": ("workspace.workflow.modify", "medium", "update workflow", "modify"),
         "deploy_workflow": ("workspace.workflow.deploy", "high", "deploy workflow", "publish"),
         "delete_workflow": ("workspace.workflow.delete", "high", "delete workflow", "delete"),
+        # The launcher creates a paused Starter review card. Execution begins
+        # only after the user submits that card, so a generic high-risk
+        # approval here would duplicate the Flow's own explicit review.
+        "start_workspace_flow": ("workspace.workflow.run", "medium", "prepare Workspace Flow", "create"),
         "run_workflow": ("workspace.workflow.run", "high", "run published workflow", "execute"),
         "test_workflow": ("workspace.workflow.run", "high", "test workflow", "execute"),
         "test_workflow_node": ("workspace.workflow.run", "high", "test workflow node", "execute"),
@@ -295,7 +556,22 @@ def classify_runtime_tool_action(
         key, risk, title, operation = workflow_actions[name]
         resource_id = str(args.get("workflow") or args.get("run_id") or "").strip() or None
         return RuntimeApprovalAction(
-            "action", key, risk, title, "workflow", operation, resource_id,
+            "action",
+            key,
+            risk,
+            title,
+            "workflow",
+            operation,
+            resource_id,
+            (
+                "workflow.run"
+                if name in {
+                    "start_workspace_flow",
+                    "cancel_workflow_run",
+                    "resume_workflow_run",
+                }
+                else None
+            ),
         )
 
     if name == "write_agent_file":
@@ -335,6 +611,24 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
     server, action = split_mcp_tool(tool_name)
     if not server or not action:
         return None
+
+    if server == "chrome":
+        if action != "confirm_action":
+            return None
+        mode = str(args.get("confirmation_mode") or "").strip()
+        category = re.sub(r"[^a-z0-9_]+", "_", str(args.get("policy_category") or "browser_action").strip().lower()).strip("_") or "browser_action"
+        if mode == "preapproval_allowed" and args.get("preapproved") is True:
+            return None
+        return RuntimeApprovalAction(
+            "action",
+            f"chrome.{category}.confirm",
+            "high",
+            "confirm Chrome action",
+            "external_account",
+            "execute",
+            str(args.get("approvalId") or args.get("approval_id") or "").strip() or None,
+            "manor.composite",
+        )
 
     if server in {"twitter_x", "linkedin", "facebook"}:
         if action in _SOCIAL_PUBLISH_ACTIONS:

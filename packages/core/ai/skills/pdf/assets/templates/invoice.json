@@ -1,0 +1,32 @@
+{
+  "id": "invoice",
+  "renderer": "invoice",
+  "page_size": "A4",
+  "orientation": "P",
+  "required": ["invoice_number", "issue_date", "due_date", "seller", "customer", "currency", "items"],
+  "palette": {
+    "primary": "111111",
+    "accent": "16C7FF",
+    "ink": "111111",
+    "muted": "6A6A6A",
+    "surface": "EAF9FF",
+    "line": "B9B9B9"
+  },
+  "labels": {
+    "document": "INVOICE",
+    "number": "INVOICE NO.",
+    "issue_date": "ISSUE DATE",
+    "due_date": "DUE DATE",
+    "from": "FROM",
+    "bill_to": "BILL TO",
+    "description": "DESCRIPTION",
+    "quantity": "QTY",
+    "unit_price": "RATE",
+    "amount": "AMOUNT",
+    "subtotal": "SUBTOTAL",
+    "tax": "TAX",
+    "total": "TOTAL DUE",
+    "notes": "NOTES",
+    "payment": "PAYMENT DETAILS"
+  }
+}

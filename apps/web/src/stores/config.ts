@@ -6,6 +6,7 @@ interface AppConfig {
   email_enabled: boolean;
   fs_enabled: boolean;
   flows_available: boolean;
+  flows_released: boolean;
   support_tickets_enabled: boolean;
   loaded: boolean;
   load: () => Promise<void>;
@@ -17,6 +18,7 @@ export const useConfigStore = create<AppConfig>((set, get) => ({
   email_enabled: false,
   fs_enabled: false,
   flows_available: import.meta.env.DEV,
+  flows_released: import.meta.env.DEV,
   support_tickets_enabled: false,
   loaded: false,
 

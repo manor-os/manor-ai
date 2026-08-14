@@ -258,6 +258,8 @@ async def _upsert_oauth_account(
     access_token: str | None,
     refresh_token: str | None,
 ) -> None:
+    from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
+
     oauth = (await db.execute(
         select(OAuthAccount).where(
             OAuthAccount.provider == provider,
@@ -267,21 +269,29 @@ async def _upsert_oauth_account(
     if oauth:
         if oauth.user_id != user.id:
             raise HTTPException(409, "Google account is already linked to another user.")
-        if access_token:
-            oauth.access_token = access_token
-        if refresh_token:
-            oauth.refresh_token = refresh_token
+        store_oauth_account_tokens(
+            oauth,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            requester_id=user.id,
+        )
         await db.flush()
         return
 
-    db.add(OAuthAccount(
+    oauth = OAuthAccount(
         id=generate_ulid(),
         user_id=user.id,
         provider=provider,
         provider_user_id=provider_user_id,
+    )
+    store_oauth_account_tokens(
+        oauth,
         access_token=access_token,
         refresh_token=refresh_token,
-    ))
+        preserve_existing_refresh=False,
+        requester_id=user.id,
+    )
+    db.add(oauth)
     await db.flush()
 
 

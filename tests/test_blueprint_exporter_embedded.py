@@ -33,9 +33,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.blueprints.exporter import ExportContext, export_workspace
 from packages.core.blueprints.payload import validate_payload
 from packages.core.models.base import generate_ulid
+from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+from packages.core.models.integration_session import IntegrationSession
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
 from packages.core.models.memory import AgentMemory
 from packages.core.models.skill import AgentSkillBinding, Skill
+from packages.core.models.task import Task
+from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import (
     Agent,
     AgentSubscription,
@@ -367,6 +371,9 @@ async def test_payload_validates_against_v11_schema(
     seeded = await _seed(db_session, entity_id)
     payload = await export_workspace(db_session, seeded["workspace"].id, title="T")
     validate_payload(payload)  # should not raise
+    experience = payload["recipe"]["simulation_experience"]
+    assert experience["schema_version"] == "1.0"
+    assert experience["artifacts"]
 
 
 async def test_legacy_private_agent_and_skill_get_portable_blueprint_refs(
@@ -440,3 +447,211 @@ async def test_export_drops_source_workspace_runtime_ids(
     assert seeded["agent_a"].id not in str(payload)
     assert source_user_id not in str(payload)
     assert source_group_id not in str(payload)
+
+
+async def test_export_includes_workspace_workflow_binding(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="daily-brief",
+        description="Create the daily brief.",
+        trigger_type="manual",
+        trigger_config={},
+        steps=[
+            {
+                "id": "start",
+                "type": "trigger",
+                "name": "Start",
+                "config": {"run_inputs": [{"key": "topic", "type": "string"}]},
+                "next": ["draft"],
+            },
+            {
+                "id": "draft",
+                "type": "agent",
+                "name": "Draft",
+                "config": {
+                    "service_key": "social.x.reply",
+                    "agent_id": seeded["agent_a"].id,
+                    "credential_ref": "vault:must-not-export",
+                },
+                "next": [],
+            },
+        ],
+        variables={"tone": "concise"},
+        category="content",
+        tags=["daily"],
+        is_active=True,
+        status="active",
+    )
+    db_session.add(workflow)
+    await db_session.flush()
+    db_session.add(WorkflowBinding(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workflow_id=workflow.id,
+        workspace_id=seeded["workspace"].id,
+        name="Daily Brief",
+        trigger_type="manual",
+        trigger_config={},
+        variables={"audience": "founders"},
+        config={
+            "source": "blueprint",
+            "source_template_id": "source-row-id",
+            "workspace_blueprint_workflow_slug": "daily-brief-v1",
+            "chat_entrypoint": {"enabled": True},
+        },
+        enabled=True,
+        status="active",
+    ))
+    await db_session.commit()
+
+    payload = await export_workspace(db_session, seeded["workspace"].id, title="T")
+
+    [exported] = payload["recipe"]["workflows"]
+    assert exported["slug"] == "daily-brief-v1"
+    assert exported["name"] == "Daily Brief"
+    assert exported["binding_config"] == {"chat_entrypoint": {"enabled": True}}
+    assert exported["run_inputs"] == [{"key": "topic", "type": "string"}]
+    assert exported["variables"] == [
+        {"key": "audience", "default": "founders"},
+        {"key": "tone", "default": "concise"},
+    ]
+    assert "agent_id" not in str(exported)
+    assert "credential_ref" not in str(exported)
+
+
+async def test_knowledge_pack_modes_use_canonical_membership_and_real_text(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    group = DocumentGroup(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=seeded["workspace"].id,
+        name="Launch Notes",
+        settings={"purpose": "Reusable launch context"},
+    )
+    public_doc = Document(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="voice.md",
+        mime_type="text/markdown",
+        metadata_={"content_text": "# Voice\n\nBe direct."},
+        classification="public",
+        visibility="workspace",
+        pii_detected=False,
+        quarantine_status="clean",
+        is_trashed=False,
+    )
+    private_doc = Document(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="customer-notes.md",
+        mime_type="text/markdown",
+        metadata_={"content_text": "Never export me."},
+        classification="confidential",
+        visibility="private",
+        pii_detected=False,
+        quarantine_status="clean",
+        is_trashed=False,
+    )
+    db_session.add_all([group, public_doc, private_doc])
+    await db_session.flush()
+    db_session.add_all([
+        DocumentGroupMember(document_id=public_doc.id, group_id=group.id),
+        DocumentGroupMember(document_id=private_doc.id, group_id=group.id),
+    ])
+    await db_session.commit()
+
+    skeleton = await export_workspace(db_session, seeded["workspace"].id, title="T")
+    [skeleton_pack] = skeleton["embedded"]["knowledge_packs"]
+    assert skeleton_pack["mode"] == "skeleton"
+    assert skeleton_pack["folder_structure"] == [
+        {"path": "voice.md", "description": None},
+    ]
+    assert skeleton_pack["starter_documents"] == []
+
+    inline = await export_workspace(
+        db_session,
+        seeded["workspace"].id,
+        title="T",
+        context=ExportContext(include_memory_files=True),
+    )
+    [inline_pack] = inline["embedded"]["knowledge_packs"]
+    assert inline_pack["mode"] == "inline_text"
+    assert inline_pack["starter_documents"] == [
+        {"path": "voice.md", "body_md": "# Voice\n\nBe direct."},
+    ]
+    assert "Never export me" not in str(inline_pack)
+
+
+async def test_session_requirements_are_limited_to_workspace_references(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    workspace = seeded["workspace"]
+    workspace.settings = {
+        "session_requirements": [
+            {"provider": "x", "label": "main", "required": True},
+        ],
+    }
+    db_session.add_all([
+        IntegrationSession(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            provider="x",
+            label="main",
+            status="active",
+            health_check={"url": "https://x.com/home"},
+            metadata_json={"purpose": "Workspace publishing"},
+        ),
+        IntegrationSession(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            provider="x",
+            label="other-workspace",
+            status="active",
+            health_check={},
+            metadata_json={},
+        ),
+        IntegrationSession(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            provider="linkedin",
+            label="main",
+            status="active",
+            health_check={},
+            metadata_json={},
+        ),
+    ])
+    await db_session.commit()
+
+    payload = await export_workspace(db_session, workspace.id, title="T")
+
+    assert [
+        (item["provider"], item["label"])
+        for item in payload["contract"]["sessions"]
+    ] == [("x", "main")]
+
+
+async def test_default_export_excludes_runtime_tasks_and_entity_task_policy(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    db_session.add(Task(
+        id=generate_ulid(), entity_id=entity_id, workspace_id=seeded["workspace"].id,
+        title="Proposal generated task", status="proposed", details={},
+    ))
+    await db_session.flush()
+
+    payload = await export_workspace(db_session, seeded["workspace"].id, title="T")
+    assert payload["recipe"]["task_categories"] == []
+    assert payload["recipe"]["sla_policies"] == []
+    assert payload["recipe"]["escalation_rules"] == []

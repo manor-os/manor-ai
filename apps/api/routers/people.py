@@ -812,7 +812,12 @@ async def accept_people_invite(
     staff = await _current_user_invite(db, user=user, invite_id=invite_id)
     token = (staff.meta or {}).get("invite_token")
     await accept_team_invite_for_user(db, token=token, user=user)
-    access_token = create_access_token(user.id, user.entity_id, user.role)
+    access_token = create_access_token(
+        user.id,
+        user.entity_id,
+        user.role,
+        token_version=user.token_version,
+    )
     return PeopleContextActionResponse(
         access_token=access_token,
         context=await _people_context(db, user),
@@ -844,7 +849,12 @@ async def switch_people_membership(
     if not membership or membership.status != "active":
         raise HTTPException(403, "You do not have an active membership in this company.")
     await activate_user_membership(db, user=user, membership=membership)
-    access_token = create_access_token(user.id, membership.entity_id, membership.role)
+    access_token = create_access_token(
+        user.id,
+        membership.entity_id,
+        membership.role,
+        token_version=user.token_version,
+    )
     return PeopleContextActionResponse(
         access_token=access_token,
         context=await _people_context(db, user),
@@ -912,7 +922,12 @@ async def leave_people_membership(
     access_token = None
     if next_membership is not None:
         await activate_user_membership(db, user=user, membership=next_membership)
-        access_token = create_access_token(user.id, next_membership.entity_id, next_membership.role)
+        access_token = create_access_token(
+            user.id,
+            next_membership.entity_id,
+            next_membership.role,
+            token_version=user.token_version,
+        )
     await db.flush()
     return PeopleContextActionResponse(
         access_token=access_token,

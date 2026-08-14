@@ -203,6 +203,7 @@ async def test_chat_completion_fails_over_from_vercel_to_openrouter(monkeypatch)
     from packages.core.services.model_gateway import ModelGatewayRoute
 
     calls: list[str] = []
+    wire_models: list[str] = []
 
     async def fake_resolve_routing(*_args, **_kwargs):
         if llm_client._official_gateway_override.get("") == "openrouter":
@@ -224,6 +225,7 @@ async def test_chat_completion_fails_over_from_vercel_to_openrouter(monkeypatch)
 
     async def fake_post(url, headers, payload, *, call_type):
         calls.append(url)
+        wire_models.append(payload["model"])
         request = httpx.Request("POST", url)
         if "ai-gateway.vercel.sh" in url:
             response = httpx.Response(503, text="gateway unavailable", request=request)
@@ -248,7 +250,7 @@ async def test_chat_completion_fails_over_from_vercel_to_openrouter(monkeypatch)
 
     content, usage = await llm_client.chat_completion(
         [{"role": "user", "content": "hello"}],
-        model="anthropic/claude-sonnet-4.6",
+        model="qwen/qwen3.8-max",
     )
 
     assert content == "ok"
@@ -257,6 +259,7 @@ async def test_chat_completion_fails_over_from_vercel_to_openrouter(monkeypatch)
         "https://ai-gateway.vercel.sh/v1/chat/completions",
         "https://openrouter.ai/api/v1/chat/completions",
     ]
+    assert wire_models == ["alibaba/qwen3.8-max", "qwen/qwen3.8-max"]
     assert llm_client._official_gateway_override.get("") == ""
 
 
@@ -497,6 +500,89 @@ async def test_custom_model_probe_checks_tool_call_shape(monkeypatch) -> None:
     assert calls[1]["json"]["max_tokens"] == 32
     assert calls[1]["json"]["tool_choice"] == "auto"
     assert calls[1]["json"]["tools"][0]["function"]["name"] == "noop_probe"
+
+
+@pytest.mark.asyncio
+async def test_custom_model_probe_rejects_successful_html_page(monkeypatch) -> None:
+    from apps.api.routers import auth
+    from fastapi import HTTPException
+
+    class FakeResponse:
+        status_code = 200
+        text = "<!doctype html><title>API Gateway</title>"
+
+        def json(self):
+            raise ValueError("not json")
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def post(self, url, *, json, headers):
+            return FakeResponse()
+
+    monkeypatch.setattr(auth.httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await auth._probe_custom_model(
+            "primary",
+            "gpt-5.5",
+            "sk-test",
+            "https://example-gateway.test",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "non-JSON response" in str(exc_info.value.detail)
+    assert "/v1" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_custom_model_probe_accepts_anthropic_response_shape(monkeypatch) -> None:
+    from apps.api.routers import auth
+
+    calls: list[dict] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def post(self, url, *, json, headers):
+            calls.append({"url": url, "json": json, "headers": headers})
+            return FakeResponse()
+
+    monkeypatch.setattr(auth.httpx, "AsyncClient", FakeClient)
+
+    provider, latency_ms = await auth._probe_custom_model(
+        "primary",
+        "claude-sonnet-4-5",
+        "sk-ant-test",
+        "https://api.anthropic.com/v1",
+    )
+
+    assert provider == "anthropic"
+    assert isinstance(latency_ms, int)
+    assert len(calls) == 2
+    assert all(call["url"].endswith("/messages") for call in calls)
+    assert calls[1]["json"]["tools"][0]["input_schema"]["type"] == "object"
 
 
 @pytest.mark.asyncio

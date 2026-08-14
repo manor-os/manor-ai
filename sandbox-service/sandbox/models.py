@@ -60,6 +60,10 @@ class ContainerConfig(BaseModel):
     pids_limit: int = 256
     read_only_root: bool = True
     tmpfs: list[str] = Field(default_factory=lambda: ["/tmp", "/var/tmp"])
+    workdir_tmpfs_size: str = Field(
+        "256m",
+        description="Size of the writable tmpfs mounted at the sandbox workdir.",
+    )
     cap_drop: list[str] = Field(default_factory=lambda: ["ALL"])
     container_prefix: str = "skill-sbx-"
     workdir: str = "/skill"
@@ -112,7 +116,7 @@ class CreateSandboxResponse(BaseModel):
 
 class ExecRequest(BaseModel):
     command: str = Field(..., description="Shell command to execute inside sandbox")
-    timeout: int = Field(60, description="Timeout in seconds", ge=1, le=600)
+    timeout: int = Field(60, description="Timeout in seconds", ge=1, le=1800)
     workdir: Optional[str] = Field(None, description="Working directory override")
 
 

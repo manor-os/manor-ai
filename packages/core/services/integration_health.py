@@ -40,6 +40,13 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict
 
 from packages.core.external_api_versions import META_GRAPH as _META_PIN
+from packages.core.integrations.registry import (
+    canonical_integration_key,
+    get_integration_spec,
+    health_checker_for,
+    register_health_checker,
+    register_integration,
+)
 
 # Convenience: every Meta Graph URL in this module pulls its version
 # from the central pin so a bump in external_api_versions.py
@@ -116,29 +123,154 @@ async def test_google_userinfo(creds: dict) -> HealthResult:
     )
 
 
-async def test_email_imap(creds: dict) -> HealthResult:
-    """Try IMAP LOGIN + LOGOUT. Also confirms SMTP host is at least reachable."""
+async def test_facebook(creds: dict) -> HealthResult:
+    """Validate the Meta user token without creating or changing content."""
+    return await _test_with_bearer(
+        "Facebook",
+        f"{_META_BASE}/me?fields=id,name",
+        creds.get("access_token", ""),
+    )
+
+
+_APP_PASSWORD_HOSTS = ("gmail", "googlemail", "google", "mail.me.com", "icloud", "yahoo")
+
+# Phrases that mean "the provider looked at these credentials and said
+# no" — as opposed to "we could not reach the provider". Only the former
+# should ever cost an integration its availability: a DNS blip or a 502
+# says nothing about whether the stored secret is good, and disabling a
+# working integration over one is worse than letting a call fail.
+#
+# Keep every marker specific enough that it cannot appear in a transient
+# message. A bare "535", for instance, also matches "failed after 535 ms".
+_CREDENTIAL_REJECTION_MARKERS = (
+    "authenticationfailed",
+    "invalid credentials",
+    "username and password not accepted",
+    "authentication failed",
+    "token rejected",          # _test_with_bearer's wording for 401/403
+    "5.7.8",                   # SMTP enhanced status code for bad auth
+    "(535,",                   # smtplib's repr of a 535 reply
+    "535 5.7.8",
+)
+
+
+def is_credential_rejection(detail: str | None) -> bool:
+    """True when a failed health check means the credentials were refused.
+
+    Callers use this to decide whether a failure is the user's to fix
+    (re-enter the secret) or something that may clear on its own.
+    """
+    text = str(detail or "").lower()
+    return any(marker in text for marker in _CREDENTIAL_REJECTION_MARKERS)
+
+
+def _auth_failure_hint(exc: Exception, *, host: str, username: str) -> str:
+    """Turn a bare 'Invalid credentials' into something actionable.
+
+    These providers return the same rejection for a wrong password, a
+    normal account password used instead of an app password, and a
+    username missing its domain — so the raw error can't be acted on.
+    """
+    if not is_credential_rejection(str(exc)):
+        return ""
+    if not any(marker in host.lower() for marker in _APP_PASSWORD_HOSTS):
+        return ""
+
+    hints = []
+    if "@" not in username:
+        hints.append(
+            f"the username must be the full email address, not '{username}'"
+        )
+    hints.append(
+        "this provider rejects normal account passwords — generate an"
+        " app password (2FA must be on) and paste it without spaces"
+    )
+    return " — " + "; ".join(hints) + "."
+
+
+async def test_email_login(creds: dict) -> HealthResult:
+    """Attempt real logins on BOTH halves of the credential bundle:
+    IMAP LOGIN (read) and SMTP AUTH (send).
+
+    ``ok`` is true only when every *configured* protocol authenticates —
+    a send-only bundle (no imap_host, e.g. SendGrid) tests SMTP alone,
+    a read-only bundle tests IMAP alone. Testing SMTP AUTH for real
+    matters: a reachability-only probe hides both bad passwords and the
+    classic implicit-SSL-on-port-587 misconfig until the first send.
+    """
     t0 = time.monotonic()
-    host = creds.get("imap_host") or creds.get("host")
-    port = int(creds.get("imap_port") or 993)
     username = creds.get("username")
     password = creds.get("password")
-    if not (host and username and password):
-        return _fail("Missing host / username / password.", t0)
+    imap_host = (creds.get("imap_host") or creds.get("host") or "").strip()
+    smtp_host = (creds.get("smtp_host") or creds.get("host") or "").strip()
 
-    def _login_and_logout() -> None:
-        import imaplib
-        use_ssl = bool(creds.get("use_ssl_imap", port == 993))
-        client = imaplib.IMAP4_SSL(host, port, timeout=10) if use_ssl \
-            else imaplib.IMAP4(host, port, timeout=10)
-        client.login(username, password)
-        client.logout()
+    if not (username and password):
+        return _fail("Missing username / password.", t0)
+    if not imap_host and not smtp_host:
+        return _fail("Missing imap_host / smtp_host.", t0)
 
-    try:
-        await asyncio.to_thread(_login_and_logout)
-    except Exception as e:
-        return _fail(f"IMAP login failed: {e}", t0)
-    return _ok(f"IMAP login OK ({host}:{port})", t0)
+    parts: list[str] = []
+    ok = True
+
+    if imap_host:
+        imap_port = int(creds.get("imap_port") or 993)
+        use_ssl_imap = bool(creds.get("use_ssl_imap", imap_port == 993))
+
+        def _imap_login() -> None:
+            import imaplib
+            client = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=10) if use_ssl_imap \
+                else imaplib.IMAP4(imap_host, imap_port, timeout=10)
+            client.login(username, password)
+            client.logout()
+
+        try:
+            await asyncio.to_thread(_imap_login)
+            parts.append(f"IMAP login OK ({imap_host}:{imap_port})")
+        except Exception as e:
+            ok = False
+            parts.append(
+                f"IMAP login failed: {e}"
+                + _auth_failure_hint(e, host=imap_host, username=username)
+            )
+    else:
+        parts.append("IMAP not configured (send-only account)")
+
+    if smtp_host:
+        smtp_port = int(creds.get("smtp_port") or 587)
+        use_tls_smtp = bool(creds.get("use_tls_smtp", smtp_port == 587))
+        use_ssl_smtp = bool(creds.get("use_ssl_smtp", smtp_port == 465))
+
+        def _smtp_login() -> None:
+            import smtplib
+            if use_ssl_smtp:
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as s:
+                    s.login(username, password)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as s:
+                    s.ehlo()
+                    if use_tls_smtp:
+                        s.starttls()
+                        s.ehlo()
+                    s.login(username, password)
+
+        try:
+            await asyncio.to_thread(_smtp_login)
+            parts.append(f"SMTP login OK ({smtp_host}:{smtp_port})")
+        except Exception as e:
+            ok = False
+            msg = f"SMTP login failed: {e}"
+            if use_ssl_smtp and smtp_port == 587:
+                msg += (
+                    " — port 587 expects STARTTLS, not implicit SSL;"
+                    " disable use_ssl_smtp or switch to port 465."
+                )
+            msg += _auth_failure_hint(e, host=smtp_host, username=username)
+            parts.append(msg)
+    else:
+        parts.append("SMTP not configured (read-only account)")
+
+    detail = "; ".join(parts)
+    return _ok(detail, t0) if ok else _fail(detail, t0)
 
 
 async def test_telegram(creds: dict, wiring_ctx: dict | None = None) -> HealthResult:
@@ -732,7 +864,8 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "gmail":            test_google_userinfo,
     "google_calendar":  test_google_userinfo,
     "google_drive":     test_google_userinfo,
-    "email":            test_email_imap,
+    "facebook":         test_facebook,
+    "email":            test_email_login,
     "telegram":         test_telegram,
     "slack":            test_slack,
     "discord":          test_discord,
@@ -753,6 +886,9 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "jimeng":           test_jimeng,
 }
 
+for _provider_key, _health_checker in _TESTS.items():
+    register_health_checker(_provider_key, _health_checker)
+
 
 async def run_test(
     provider: str,
@@ -760,17 +896,25 @@ async def run_test(
     *,
     wiring_ctx: dict | None = None,
 ) -> HealthResult:
-    """Dispatch to the right test. Unknown providers get a safe "untested".
+    """Dispatch to the right test without conflating unsupported and unknown.
 
     ``wiring_ctx`` gives providers with an inbound webhook extra context
     (e.g. the expected callback URL) so they can run a second sub-check
     that verifies the upstream actually knows how to reach us.
     """
-    fn = _TESTS.get(provider)
+    fn = health_checker_for(provider)
     if not fn:
+        canonical_key = canonical_integration_key(provider)
+        known_provider = get_integration_spec(canonical_key) is not None
         return {
             "ok": None,
-            "detail": f"No health check registered for '{provider}'.",
+            "monitoring_status": "unsupported" if known_provider else "unknown_provider",
+            "provider_key": canonical_key,
+            "detail": (
+                f"No health check is available for '{canonical_key}'."
+                if known_provider
+                else f"Unknown integration provider '{canonical_key}'."
+            ),
             "latency_ms": 0.0,
             "checked_at": _now_iso(),
         }
@@ -924,6 +1068,9 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
 
     resolved_creds = await _resolve_nango_runtime_credentials(db, row, creds or {})
     wiring_ctx = await _wiring_ctx_for_integration(db, row)
+    # A persisted connection is a known Integration identity even when an
+    # extension/Nango provider has no first-party checker.
+    register_integration(canonical_integration_key(row.provider))
     result = await run_test(
         row.provider, resolved_creds or {}, wiring_ctx=wiring_ctx,
     )
@@ -983,6 +1130,7 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
     its ``profile.last_health_check``."""
     from sqlalchemy import select
     from packages.core.models.user import OAuthAccount
+    from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
 
     row = (await db.execute(
         select(OAuthAccount).where(OAuthAccount.id == oauth_account_id)
@@ -993,7 +1141,12 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
     # Feed the access_token (+ any extras already on profile) into the
     # test. Providers like email/webhook don't use oauth_accounts, so
     # they're unreachable here — fine.
-    creds = {"access_token": row.access_token}
+    creds = lease_oauth_account_tokens(
+        row,
+        requester_id="integration_health",
+        reason="oauth.integration_health",
+    )
+    register_integration(canonical_integration_key(row.provider))
     result = await run_test(row.provider, creds)
 
     profile = dict(row.profile or {})

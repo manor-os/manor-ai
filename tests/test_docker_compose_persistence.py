@@ -18,6 +18,22 @@ def test_api_and_worker_receive_cloud_model_routing_environment():
         environment = compose["services"][service_name]["environment"]
         assert environment["DEPLOYMENT_MODE"] == "${DEPLOYMENT_MODE:-oss}"
         assert environment["OPENROUTER_API_KEY"] == "${OPENROUTER_API_KEY:-}"
+        assert environment["OPENROUTER_AUDIO_TRANSCRIPTION_MODEL"] == (
+            "${OPENROUTER_AUDIO_TRANSCRIPTION_MODEL:-google/gemini-3.1-flash-lite}"
+        )
+
+
+def test_dev_api_and_workers_receive_cloud_model_routing_environment():
+    compose = yaml.safe_load((ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8"))
+
+    assert compose["services"]["api"]["environment"]["CREDENTIAL_BACKEND"] == "dev"
+    for service_name in ("worker", "worker-work"):
+        assert compose["services"][service_name]["environment"]["CREDENTIAL_BACKEND"] == "dev"
+
+
+def test_env_example_omits_dev_credential_key():
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "DEV_CREDENTIAL_KEY=" not in env_example
 
 
 def test_redis_aof_protects_juicefs_metadata():

@@ -652,7 +652,11 @@ async def test_approve_selected_mixed_subset_splits_tasks_and_items(
         },
     })
     assert resp.status_code == 200, resp.text
-    assert resp.json()["resolution"]["payload"]["approved_task_ids"] == [ctx["task_ids"][0]]
+    decision = resp.json()["resolution"]["payload"]
+    assert decision["approved_task_ids"] == [ctx["task_ids"][0]]
+    assert decision["approved_item_ids"] == [entries["goal_change"]["item_id"]]
+    assert decision["rejected_task_ids"] == [ctx["task_ids"][1]]
+    assert decision["rejected_item_ids"] == [entries["automation_change"]["item_id"]]
 
     approved_task = await _get(Task, ctx["task_ids"][0])
     assert approved_task.status == "in_progress"
@@ -745,6 +749,10 @@ async def test_card_carries_structured_priority_and_resolved_goal_impact(
         payload_for=lambda job, goal: _payload(tasks=[_task_entry(
             priority=4,
             rationale="Followers stalled for two weeks.",
+            basis={
+                "report_refs": ["goal"],
+                "evidence_refs": ["runtime_event:followers_stalled"],
+            },
             estimated_impact={"goal_id": goal.id, "metric_delta": 1},
         )]),
     )
@@ -755,6 +763,16 @@ async def test_card_carries_structured_priority_and_resolved_goal_impact(
     assert entry["title"] == "Draft source docs"
     assert entry["priority"] == 4
     assert entry["rationale"] == "Followers stalled for two weeks."
+    assert entry["basis"] == {
+        "report_refs": ["goal"],
+        "evidence_refs": ["runtime_event:followers_stalled"],
+    }
+    # Raw refs stay available for audit, while the card gets readable source
+    # categories and never has to expose a report id or ledger id.
+    assert entry["basis_display"] == {
+        "report_domains": ["goal"],
+        "signals": [],
+    }
     # The goal is resolved server-side so the card can name what moves.
     assert entry["goal_id"] == ctx["goal_id"]
     assert entry["goal_title"] == "Grow followers"
@@ -776,6 +794,30 @@ async def test_card_carries_structured_priority_and_resolved_goal_impact(
         in body
     )
     assert "[4]" not in body
+
+    # When an evidence ref matches an observation, its factual description is
+    # what the UI receives instead of the opaque ref itself.
+    readable = strategist_service._proposal_basis_display(
+        SimpleNamespace(basis=SimpleNamespace(
+            report_refs=["execution"],
+            evidence_refs=["event_42"],
+        )),
+        [SimpleNamespace(
+            id="report_1",
+            domain="execution",
+            observations=[{
+                "description": "Three production attempts failed this week.",
+                "evidence_refs": ["event_42"],
+            }],
+        )],
+    )
+    assert readable == {
+        "report_domains": ["execution"],
+        "signals": [{
+            "description": "Three production attempts failed this week.",
+            "domain": "execution",
+        }],
+    }
     assert "(~+1)" not in body
 
 

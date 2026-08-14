@@ -115,10 +115,6 @@ WRITE_FILE_SCHEMA = {
                     "type": "string",
                     "description": "Content.",
                 },
-                "save_to_knowledge": {
-                    "type": "boolean",
-                    "description": "Override Knowledge sync.",
-                },
                 "approval_token": {
                     "type": "string",
                     "description": "Approval token.",
@@ -126,6 +122,15 @@ WRITE_FILE_SCHEMA = {
                 "expected_sha256": {
                     "type": "string",
                     "description": "Previous source_sha256 guard.",
+                },
+                "storage_scope": {
+                    "type": "string",
+                    "enum": ["task", "workspace"],
+                    "default": "task",
+                    "description": (
+                        "Use workspace only for durable shared Workspace files; "
+                        "normal generated files stay task-scoped."
+                    ),
                 },
             },
             "required": ["path", "content"],
@@ -564,7 +569,7 @@ def _extract_docx_text(abs_path: str) -> str:
     except ImportError:
         # Fallback: extract raw XML text via zipfile
         import zipfile
-        import xml.etree.ElementTree as ET
+        from defusedxml import ElementTree as ET
         with zipfile.ZipFile(abs_path, "r") as z:
             with z.open("word/document.xml") as f:
                 tree = ET.parse(f)
@@ -1154,17 +1159,25 @@ async def _write_file(entity_id: str, **kwargs: Any) -> str:
     if not root:
         return _FS_DISABLED_MSG
 
+    storage_scope = str(kwargs.get("storage_scope") or "task").strip().lower()
+    if storage_scope not in {"task", "workspace"}:
+        return json.dumps({"error": "storage_scope must be task or workspace"})
+    if storage_scope == "workspace" and not runtime_context.workspace_id:
+        return json.dumps({
+            "error": "storage_scope=workspace requires an active Workspace context",
+        })
+    artifact_task_id = None if storage_scope == "workspace" else runtime_context.task_id
+
     requested_path = str(kwargs.get("path", "") or "")
     path = await _workspace_scoped_new_file_path(
         entity_id=entity_id,
         entity_root=root,
         workspace_id=runtime_context.workspace_id,
-        task_id=runtime_context.task_id,
+        task_id=artifact_task_id,
         path=requested_path,
         expected_sha256=str(kwargs.get("expected_sha256") or ""),
     )
     content = kwargs.get("content", "")
-    save_flag = kwargs.get("save_to_knowledge", None)
     abs_path = _safe_path(root, path)
     if not abs_path:
         return json.dumps({"error": "Path traversal detected"})
@@ -1228,7 +1241,7 @@ async def _write_file(entity_id: str, **kwargs: Any) -> str:
             entity_root=root,
             source="agent",
             created_by=kwargs.get("user_id") or runtime_context.user_id or "ai-agent",
-            force=save_flag,
+            force=True,
             workspace_id=runtime_context.workspace_id,
             task_id=runtime_context.task_id,
             agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
@@ -1237,14 +1250,28 @@ async def _write_file(entity_id: str, **kwargs: Any) -> str:
             tool_name="write_file",
         )
 
+        if not sync.synced or not sync.document_id:
+            return json.dumps({
+                "error": (
+                    "File was written but could not be registered in Knowledge: "
+                    f"{sync.reason or 'missing_document_id'}"
+                ),
+                "written": True,
+                "unregistered_path": path,
+                "knowledge_synced": False,
+                "knowledge_sync_reason": sync.reason,
+            })
+
         return json.dumps({
             "written": True,
             "path": path,
+            "storage_scope": storage_scope,
             "size": size,
             "source_sha256": written_meta["source_sha256"],
             "mtime_ns": written_meta["mtime_ns"],
             "knowledge_synced": sync.synced,
             "document_id": sync.document_id,
+            "viewer_url": f"/viewer/{sync.document_id}",
             "knowledge_sync_reason": sync.reason,
         })
     except Exception as e:
@@ -1294,11 +1321,12 @@ def _scan_list_files(
 
 
 async def _list_files(entity_id: str, **kwargs: Any) -> str:
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
     root = _get_entity_root(entity_id)
     if not root:
         return _FS_DISABLED_MSG
 
-    rel_path = kwargs.get("path", "")
+    rel_path = str(kwargs.get("path", "") or "")
     recursive = bool(kwargs.get("recursive", False))
     limit = _bounded_int(kwargs.get("limit"), LIST_FILES_DEFAULT_LIMIT, LIST_FILES_MAX_LIMIT, 1)
     offset = _bounded_int(kwargs.get("offset"), 0, 100_000, 0)
@@ -1306,6 +1334,32 @@ async def _list_files(entity_id: str, **kwargs: Any) -> str:
     abs_path = _safe_path(root, rel_path) if rel_path else root
     if not abs_path:
         return json.dumps({"error": "Path traversal detected"})
+
+    # New workspace writes are transparently scoped under that Workspace's
+    # artifact root. Listing must resolve the same logical directory or a
+    # write-A/list-B fork forces long-running agents to rediscover the entity
+    # root after every context compaction.
+    if not os.path.isdir(abs_path) and runtime_context.workspace_id:
+        from packages.core.services.generated_media_naming import (
+            resolve_workspace_artifact_base_dir,
+            scope_workspace_artifact_path,
+        )
+
+        workspace_base = await resolve_workspace_artifact_base_dir(
+            entity_id=entity_id,
+            workspace_id=runtime_context.workspace_id,
+            task_id=runtime_context.task_id,
+        )
+        if workspace_base:
+            scoped_rel = scope_workspace_artifact_path(
+                runtime_normalize_entity_file_path(rel_path) or rel_path,
+                workspace_base,
+                default_subdir=WorkspaceArtifactDir.DOCUMENTS.value,
+            )
+            scoped_abs = _safe_path(root, scoped_rel)
+            if scoped_abs and os.path.isdir(scoped_abs):
+                rel_path = runtime_normalize_entity_file_path(scoped_rel) or scoped_rel
+                abs_path = scoped_abs
 
     if not os.path.isdir(abs_path):
         return json.dumps({"error": f"Directory not found: {rel_path}"})

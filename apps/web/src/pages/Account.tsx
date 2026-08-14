@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
 import type { BookingLink, CalendarConnectionOption, CalendarSettings, CalendarWorkingHourWindow, PeopleContext, PeopleContextActionResponse } from "../lib/types";
 import { useToastStore } from "../stores/toast";
@@ -24,8 +24,8 @@ import {
 
 import { t } from "../lib/i18n";
 
-function leaveSessionOrLogout() {
-  localStorage.removeItem("manor_token");
+async function leaveSessionOrLogout() {
+  await useAuthStore.getState().logout();
   window.location.href = "/login";
 }
 
@@ -955,6 +955,7 @@ export function AIModelSection({
 }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const navigate = useNavigate();
   const [saving, setSaving] = useState<string | null>(null);
   const [savingCustomRole, setSavingCustomRole] = useState<string | null>(null);
   const [showApiKeyRole, setShowApiKeyRole] = useState<string | null>(null);
@@ -988,6 +989,9 @@ export function AIModelSection({
     queryFn: () => api.auth.getLlmConfig(),
   });
 
+  let byokAllowed = true;
+  let byokUpgradeRequired = false;
+
   useEffect(() => {
     if (!llmConfig) return;
     const roleBaseUrls = { ...((llmConfig as any).role_base_urls || {}) };
@@ -1011,6 +1015,7 @@ export function AIModelSection({
         };
       });
       queryClient.invalidateQueries({ queryKey: ["my-models"] });
+      queryClient.invalidateQueries({ queryKey: ["llm-config"] });
       queryClient.invalidateQueries({ queryKey: ["auth-me"] });
     } catch {
       /* */
@@ -1134,7 +1139,13 @@ export function AIModelSection({
 
   const handleSaveCatalogByok = async (role: string) => {
     const draft = drafts[role];
-    if (!draft) return;
+    const testState = testStates[role];
+    if (
+      !draft ||
+      testState?.status !== "passed" ||
+      testState.testedSignature !== draftSignature(role, draft)
+    )
+      return;
     setSavingCustomRole(role);
     setApiKeyErrors((prev) => ({ ...prev, [role]: "" }));
     try {
@@ -1144,6 +1155,7 @@ export function AIModelSection({
         api_key: draft.apiKey.trim() || undefined,
         use_saved_api_key: draft.useSavedApiKey && !draft.apiKey.trim(),
         base_url: draft.baseUrl.trim(),
+        test_token: testState.testToken,
       });
       queryClient.setQueryData(["my-models"], (prev: any) => {
         if (!prev) return prev;
@@ -1247,18 +1259,23 @@ export function AIModelSection({
     string,
     { in?: number; out?: number; unit?: "token" | "second" }
   > = {
+    // Keep in sync with OFFICIAL_TOKEN_PRICES in
+    // packages/core/services/model_pricing.py — these drive the $–$$$$ badge.
     "anthropic/claude-sonnet-4.6": { in: 3.0, out: 15.0, unit: "token" },
+    "anthropic/claude-opus-5": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-opus-4.7": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-opus-4.6": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-haiku-4.5": { in: 1.0, out: 5.0, unit: "token" },
     "openai/gpt-5.6-sol": { in: 5.0, out: 30.0, unit: "token" },
-    "openai/gpt-5.6-terra": { in: 2.5, out: 15.0, unit: "token" },
-    "openai/gpt-5.6-luna": { in: 1.0, out: 6.0, unit: "token" },
+    "openai/gpt-5.6-terra": { in: 2.0, out: 12.0, unit: "token" },
+    "openai/gpt-5.6-luna": { in: 0.2, out: 1.2, unit: "token" },
     "openai/gpt-5.5": { in: 5.0, out: 30.0, unit: "token" },
     "openai/gpt-5.5-pro": { in: 30.0, out: 180.0, unit: "token" },
     "moonshotai/kimi-k3": { in: 3.0, out: 15.0, unit: "token" },
-    "moonshotai/kimi-k2.6": { in: 0.74, out: 3.49, unit: "token" },
-    "qwen/qwen3.6-plus": { in: 0.325, out: 1.95, unit: "token" },
+    "moonshotai/kimi-k2.6": { in: 0.95, out: 4.0, unit: "token" },
+    "qwen/qwen3.8-max": { in: 2.0, out: 6.0, unit: "token" },
+    "qwen/qwen3.7-flash": { in: 0.03, out: 0.13, unit: "token" },
+    "qwen/qwen3.6-plus": { in: 0.5, out: 3.0, unit: "token" },
     "deepseek/deepseek-v4-pro": { in: 0.435, out: 0.87, unit: "token" },
     "deepseek/deepseek-v4-flash": { in: 0.14, out: 0.28, unit: "token" },
     "openai/gpt-4": { in: 30.0, out: 60.0, unit: "token" },
@@ -1266,17 +1283,17 @@ export function AIModelSection({
     "openai/gpt-4.1-mini": { in: 0.4, out: 1.6, unit: "token" },
     "openai/gpt-4o": { in: 2.5, out: 10.0, unit: "token" },
     "openai/gpt-4o-mini": { in: 0.15, out: 0.6, unit: "token" },
+    "google/gemini-3.6-flash": { in: 1.5, out: 7.5, unit: "token" },
+    "google/gemini-3.5-flash-lite": { in: 0.3, out: 2.5, unit: "token" },
     "google/gemini-2.5-pro": { in: 1.25, out: 10.0, unit: "token" },
     "google/gemini-2.5-flash": { in: 0.3, out: 2.5, unit: "token" },
     "google/gemini-2.5-flash-lite": { in: 0.1, out: 0.4, unit: "token" },
-    "openai/gpt-5-image-mini": { in: 2.5, out: 2.0, unit: "token" },
-    "google/gemini-3.1-flash-image": { in: 0.5, out: 3.0, unit: "token" },
     "google/gemini-3.1-flash-image-preview": {
       in: 0.5,
       out: 3.0,
       unit: "token",
     },
-    "openai/gpt-5.4-image-2": { in: 8.0, out: 15.0, unit: "token" },
+    "openai/gpt-image-2": { in: 5.0, out: 30.0, unit: "token" },
     "google/gemini-3.1-flash-tts-preview": {
       in: 1.0,
       out: 20.0,
@@ -1292,8 +1309,8 @@ export function AIModelSection({
     "openai/gpt-audio": { in: 2.5, out: 10.0, unit: "token" },
     "bytedance/seedance-2.0": { in: 0.134, unit: "second" },
     "bytedance/seedance-2.0-fast": { in: 0.107, unit: "second" },
-    "kwaivgi/kling-v3.0-std": { in: 0.126, unit: "second" },
-    "kwaivgi/kling-v3.0-pro": { in: 0.168, unit: "second" },
+    "kwaivgi/kling-v3.0-std": { in: 0.168, unit: "second" },
+    "kwaivgi/kling-v3.0-pro": { in: 0.224, unit: "second" },
     "mxbai-embed-large": { in: 0, out: 0, unit: "token" },
   };
   const priceTierDollar = (id: string, fallbackTier?: string) => {
@@ -1325,12 +1342,16 @@ export function AIModelSection({
       if (roleKey === "stt") {
         return "Self-hosted speech-to-text needs a matching OpenAI or Groq speech API key from your provider account.";
       }
+      if (roleKey === "audio") {
+        return "Self-hosted audio generation needs the matching Google or OpenAI API key from your provider account.";
+      }
+      if (roleKey === "sfx") {
+        return "Self-hosted sound-effects generation needs the matching OpenAI API key from your provider account.";
+      }
       return "Self-hosted model calls use the API key from your provider account for the selected model.";
   };
 
-  let visibleModelRoles = MODEL_ROLES.filter((role) =>
-    ["primary", "worker", "embedding", "image", "video", "stt"].includes(role.key),
-  );
+  let visibleModelRoles = MODEL_ROLES;
 
   const PROVIDER_BASE_URLS: Record<string, string> = {
     openai: "https://api.openai.com/v1",
@@ -1347,10 +1368,18 @@ export function AIModelSection({
     moonshot: "https://api.moonshot.ai/v1",
     moonshotai: "https://api.moonshot.ai/v1",
     qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    zyphra: "https://api.zyphracloud.com/api/v1",
+    sesame: "https://openrouter.ai/api/v1",
   };
 
-  const inferBaseUrl = (modelId: string): string => {
+  const inferBaseUrl = (modelId: string, roleKey = ""): string => {
     const prefix = modelId.split("/")[0].toLowerCase();
+    if (
+      prefix === "google" &&
+      ["image", "voice", "audio"].includes(roleKey)
+    ) {
+      return "https://generativelanguage.googleapis.com/v1beta";
+    }
     return PROVIDER_BASE_URLS[prefix] || "";
   };
 
@@ -1363,7 +1392,34 @@ export function AIModelSection({
         borderTop: settingsSurface ? "none" : "1px solid rgba(28,25,23,0.06)",
       }}
     >
-      <h3 className="manor-section-title">{t("page.account.ai_models")}</h3>
+      <div className="account-ai-section-heading">
+        <h3 className="manor-section-title">{t("page.account.ai_models")}</h3>
+        {byokUpgradeRequired && (
+          <button
+            type="button"
+            className="account-byok-upgrade-tag"
+            onClick={() => navigate("/settings?tab=plans")}
+            title={t("page.account.byok_upgrade_hint")}
+          >
+            <svg
+              width="11"
+              height="11"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"
+              />
+            </svg>
+            {t("page.account.byok_upgrade_unlock")}
+          </button>
+        )}
+      </div>
       <p className="manor-section-subtitle">
         {t("page.account.configure_which_ai_models_to_use_for_different_t")}
       </p>
@@ -1377,10 +1433,16 @@ export function AIModelSection({
           const isCustomModel = currentModel && !currentOption;
           const isOwnExpanded = expandedOwnRole === role.key;
           const roleApiKeys = (llmConfig as any)?.role_api_keys || {};
+          const roleApiKeyModels =
+            (llmConfig as any)?.role_api_key_models || {};
           const savedApiKey =
             roleApiKeys[role.key] ||
             (role.key === "primary" ? (llmConfig as any)?.llm_api_key : "");
-          const hasRoleApiKey = !!savedApiKey;
+          const savedApiKeyModel = roleApiKeyModels[role.key] || "";
+          const hasRoleApiKey =
+            byokAllowed &&
+            !!savedApiKey &&
+            (!savedApiKeyModel || savedApiKeyModel === currentModel);
           const draft = drafts[role.key] || {
             model: currentModel,
             apiKey: "",
@@ -1392,11 +1454,24 @@ export function AIModelSection({
           const canUseCustomModel = ["primary", "worker", "embedding"].includes(
             role.key,
           );
-          const canUseCatalogByok = ["image", "video", "voice", "stt"].includes(
-            role.key,
+          const isDraftCatalogModel = options.some(
+            (option: any) => option.id === draft.model.trim(),
           );
+          const canUseCatalogByok =
+            isDraftCatalogModel &&
+            [
+              "primary",
+              "worker",
+              "image",
+              "video",
+              "voice",
+              "audio",
+              "sfx",
+              "stt",
+            ].includes(role.key);
           const canUseOwnProvider = canUseCustomModel || canUseCatalogByok;
           const canSaveCustom =
+            byokAllowed &&
             canUseCustomModel &&
             !!draft.model.trim() &&
             (!!draft.apiKey.trim() || draft.useSavedApiKey) &&
@@ -1404,16 +1479,19 @@ export function AIModelSection({
             testState.testedSignature === currentSignature &&
             savingCustomRole !== role.key;
           const canSaveCatalogByok =
+            byokAllowed &&
             canUseCatalogByok &&
             !!draft.model.trim() &&
             (!!draft.apiKey.trim() || draft.useSavedApiKey || hasRoleApiKey) &&
+            testState.status === "passed" &&
+            testState.testedSignature === currentSignature &&
             savingCustomRole !== role.key;
-          const canEditModelId = canUseCustomModel || canUseCatalogByok;
-          const canEditProviderSettings = canUseCustomModel || canUseCatalogByok;
+          const canEditModelId = byokAllowed && (canUseCustomModel || canUseCatalogByok);
+          const canEditProviderSettings = byokAllowed && (canUseCustomModel || canUseCatalogByok);
           const apiKeyError = apiKeyErrors[role.key] || "";
           const showApiKey = showApiKeyRole === role.key;
           let defaultPanelTab: "openrouter" | "custom" = "custom";
-          const activePanelTab = switchModelTabs[role.key] || defaultPanelTab;
+          let activePanelTab = switchModelTabs[role.key] || defaultPanelTab;
           let modelSourceBadgeBackground = "#f3ecd6";
           let modelSourceBadgeColor = "#936027";
           let modelSourceBadgeLabel = t("page.account.byok_required");
@@ -1712,6 +1790,12 @@ export function AIModelSection({
                         <button
                           key={tab.key}
                           type="button"
+                          disabled={tab.key === "custom" && !byokAllowed}
+                          title={
+                            tab.key === "custom" && !byokAllowed
+                              ? t("page.account.byok_upgrade_hint")
+                              : undefined
+                          }
                           onClick={() =>
                             setSwitchModelTabs((prev) => ({
                               ...prev,
@@ -1722,13 +1806,18 @@ export function AIModelSection({
                             padding: "10px 14px",
                             fontSize: 12,
                             fontWeight: active ? 600 : 500,
-                            cursor: "pointer",
+                            cursor:
+                              tab.key === "custom" && !byokAllowed
+                                ? "not-allowed"
+                                : "pointer",
                             border: "none",
                             borderBottom: active
                               ? "2px solid #6d6fb2"
                               : "2px solid transparent",
                             background: "transparent",
                             color: active ? "#6d6fb2" : "#78716c",
+                            opacity:
+                              tab.key === "custom" && !byokAllowed ? 0.48 : 1,
                             display: "flex",
                             alignItems: "center",
                             gap: 5,
@@ -1793,7 +1882,7 @@ export function AIModelSection({
                                   type="button"
                                   onClick={() => {
                                     handleSelectModel(role.key, opt.id);
-                                    const autoUrl = inferBaseUrl(opt.id);
+                                    const autoUrl = inferBaseUrl(opt.id, role.key);
                                     updateDraft(role.key, {
                                       model: opt.id,
                                       ...(autoUrl && !draft.baseUrl
@@ -1940,7 +2029,7 @@ export function AIModelSection({
                               background: "#e8eff4",
                             }}
                           >
-                            {t("page.account.catalog_byok_saves_without_live_test")}
+                            {t("page.account.catalog_byok_requires_live_test")}
                           </p>
                         ) : !canUseCustomModel && (
                           <p
@@ -2008,8 +2097,8 @@ export function AIModelSection({
                             value={draft.model}
                             onChange={(e) => {
                               const newModel = e.target.value;
-                              const autoUrl = inferBaseUrl(newModel);
-                              const previousAutoUrl = inferBaseUrl(draft.model);
+                              const autoUrl = inferBaseUrl(newModel, role.key);
+                              const previousAutoUrl = inferBaseUrl(draft.model, role.key);
                               const shouldReplaceBaseUrl =
                                 !draft.baseUrl ||
                                 draft.baseUrl.replace(/\/+$/, "") ===
@@ -2195,7 +2284,7 @@ export function AIModelSection({
                                   opacity: canEditProviderSettings ? 1 : 0.55,
                                 }}
                               />
-                              {draft.model && inferBaseUrl(draft.model) && (
+                              {draft.model && inferBaseUrl(draft.model, role.key) && (
                                 <span
                                   style={{
                                     fontSize: 9,
@@ -2205,7 +2294,7 @@ export function AIModelSection({
                                   }}
                                 >
                                   {t("page.account.auto_detected_from_key")}:{" "}
-                                  {inferBaseUrl(draft.model)}
+                                  {inferBaseUrl(draft.model, role.key)}
                                 </span>
                               )}
                             </div>
@@ -2219,7 +2308,7 @@ export function AIModelSection({
                           >
                             {apiKeyHint(role.key)}{" "}
                             {canUseCatalogByok
-                              ? t("page.account.catalog_byok_saves_without_live_test")
+                              ? t("page.account.catalog_byok_requires_live_test")
                               : t("page.account.custom_model_changes_save_after_test")}
                           </p>
                           {hasRoleApiKey && !draft.apiKey && (
@@ -2252,7 +2341,7 @@ export function AIModelSection({
                             gap: 8,
                           }}
                         >
-                          {canUseCustomModel && (
+                          {canUseOwnProvider && (
                             <button
                               type="button"
                               className="btn-manor-outline"
@@ -2954,17 +3043,18 @@ export function SecuritySection() {
       setError(t("page.account.new_passwords_do_not_match"));
       return;
     }
-    if (newPwd.length < 8) {
-      setError(t("page.account.password_must_be_at_least_8_characters"));
+    if (newPwd.length < 12) {
+      setError(t("page.account.password_must_be_at_least_12_characters"));
       return;
     }
     setLoading(true);
     try {
       await api.auth.changePassword(currentPwd, newPwd);
-      setSuccess("Password changed successfully");
+      setSuccess("Password changed. Sign in again with your new password.");
       setCurrentPwd("");
       setNewPwd("");
       setConfirmPwd("");
+      await leaveSessionOrLogout();
     } catch (err) {
       setError(
         err instanceof ApiError ? err.message : "Failed to change password",
@@ -3015,6 +3105,8 @@ export function SecuritySection() {
             value={newPwd}
             onChange={(e) => setNewPwd(e.target.value)}
             className="manor-input"
+            minLength={12}
+            maxLength={72}
             required
           />
         </div>
@@ -3027,6 +3119,8 @@ export function SecuritySection() {
             value={confirmPwd}
             onChange={(e) => setConfirmPwd(e.target.value)}
             className="manor-input"
+            minLength={12}
+            maxLength={72}
             required
           />
         </div>
@@ -3497,7 +3591,7 @@ function DangerZoneSection({ user }: { user: any }) {
     try {
       await api.auth.deleteAccount();
       // Soft-deleted: clear local token, kick to login, surface restore tip there.
-      localStorage.removeItem("manor_token");
+      clearAuthBrowserState();
       const url = new URL("/login", window.location.origin);
       url.searchParams.set("account_deleted", "1");
       window.location.href = url.toString();

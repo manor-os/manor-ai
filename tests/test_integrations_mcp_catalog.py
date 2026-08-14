@@ -63,6 +63,7 @@ async def test_mcp_catalog_exposes_youtube_and_tiktok(client: AsyncClient):
     assert yt["auth_type"] == "oauth2"
     assert yt["name"] == "YouTube"
     assert "youtube.force-ssl" in (yt.get("scopes") or "")
+    assert "youtube.readonly" not in (yt.get("scopes") or "")
     # response_model contract the web client relies on
     for field in ("server_key", "name", "auth_type", "agent_can_use", "hint"):
         assert field in yt

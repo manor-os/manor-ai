@@ -1,5 +1,6 @@
 export const APPROVAL_CHOICE_APPROVE = "approve";
 export const APPROVAL_CHOICE_ALWAYS_APPROVE = "always_approve";
+export const APPROVAL_CHOICE_REVISE = "revise";
 export const APPROVAL_CHOICE_REJECT = "reject";
 
 export const DEFAULT_APPROVAL_OPTIONS = [

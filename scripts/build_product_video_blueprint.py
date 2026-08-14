@@ -186,7 +186,15 @@ def workflow_payload(spec: dict) -> dict:
                         "description": spec["description"],
                         "minimum_confidence": 0.85,
                     },
-                    "projection": {"progress": True, "step_outputs": "explicit"},
+                    "projection": {
+                        "progress": True,
+                        "step_outputs": "none",
+                        "final_output": True,
+                        "approval_review": "history",
+                        "final_output_fields": list(
+                            studio.PRODUCT_VIDEO_CHAT_FINAL_OUTPUT_FIELDS
+                        ),
+                    },
                     "wait_bridge": True,
                 }
                 if spec["user_facing"]

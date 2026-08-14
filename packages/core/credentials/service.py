@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 from packages.core.credentials.audit import AuditEvent, AuditSink, NullAuditSink
 from packages.core.credentials.base import (
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from packages.core.models.integration_session import IntegrationSession
     from packages.core.models.mcp import MCPServer
     from packages.core.models.model_provider import PlatformModelProviderKey
+    from packages.core.models.user import OAuthAccount
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,44 @@ class CredentialService:
         integration.credential_ref = ref
         integration.credential_scheme = self._kp.backend
         integration.credentials = {}
+
+    # ── OAuthAccount (personal provider tokens) ──
+
+    def lease_oauth_account(
+        self,
+        account: "OAuthAccount",
+        *,
+        requester: Requester,
+        reason: str,
+    ) -> dict:
+        scheme = (account.credential_scheme or "legacy_columns").lower()
+        legacy = {
+            "access_token": account.access_token,
+            "refresh_token": account.refresh_token,
+        }
+        return self._lease(
+            scheme="legacy_jsonb" if scheme == "legacy_columns" else scheme,
+            ref=account.credential_ref,
+            legacy_plaintext={key: value for key, value in legacy.items() if value},
+            context=self._oauth_account_context(account),
+            requester=requester,
+            reason=reason,
+        )
+
+    def store_oauth_account(
+        self,
+        account: "OAuthAccount",
+        plaintext: dict,
+    ) -> None:
+        """Encrypt provider tokens and clear the legacy plaintext columns."""
+        ref = self._kp.encrypt(
+            json.dumps(plaintext).encode("utf-8"),
+            self._oauth_account_context(account),
+        )
+        account.credential_ref = ref
+        account.credential_scheme = self._kp.backend
+        account.access_token = None
+        account.refresh_token = None
 
     # ── ChannelConfig ──
 
@@ -371,6 +410,15 @@ class CredentialService:
             "entity_id": str(integration.entity_id or ""),
             "integration_id": str(integration.id or ""),
             "provider": str(integration.provider or ""),
+        }
+
+    @staticmethod
+    def _oauth_account_context(account: "OAuthAccount") -> dict[str, str]:
+        return {
+            "kind": "oauth_account",
+            "user_id": str(account.user_id or ""),
+            "oauth_account_id": str(account.id or ""),
+            "provider": str(account.provider or ""),
         }
 
     @staticmethod

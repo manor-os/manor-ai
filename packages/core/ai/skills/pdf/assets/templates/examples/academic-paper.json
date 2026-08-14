@@ -1,0 +1,78 @@
+{
+  "journal": {
+    "name": "CIVIC ECOLOGIES REVIEW",
+    "issue": "VOLUME 12 / ISSUE 4 / 2026",
+    "article_type": "FIELD STUDY / TEMPLATE DEMONSTRATION"
+  },
+  "title": "Micro-Shade Networks and Pedestrian Heat Exposure",
+  "subtitle": "A block-level field study using synthetic observations",
+  "authors": [
+    "Elena Marrow, PhD",
+    "Thomas Vale, MSc",
+    "Priya Chen, MUD"
+  ],
+  "affiliations": [
+    "Department of Urban Systems, Alder Institute",
+    "Center for Climate Adaptation, Eastborough University"
+  ],
+  "correspondence": "Correspondence: elena.marrow@alder-institute.example",
+  "abstract": "This demonstration paper examines whether small, connected shade interventions can reduce short-duration pedestrian heat exposure at the block scale. Synthetic sensor observations were modeled across twelve street segments under matched afternoon conditions. Segments with continuous shade spacing below 35 meters showed lower mean radiant temperature and longer voluntary dwell time than unshaded controls. The layout is intended to demonstrate an academic PDF template rather than report real-world findings.",
+  "keywords": [
+    "urban heat",
+    "pedestrian comfort",
+    "shade networks",
+    "public realm",
+    "synthetic study"
+  ],
+  "sections": {
+    "introduction": [
+      "Heat exposure is often measured at district or neighborhood scale, while pedestrian decisions occur over much shorter distances. A shaded crossing, awning, or tree canopy can change route choice within a single block.",
+      "This paper tests a simple network hypothesis: frequent, modest shade may create more usable walking conditions than isolated large shade structures with long exposed gaps."
+    ],
+    "methods": [
+      "Twelve synthetic street segments were assigned to three conditions: connected shade, isolated shade, and unshaded control. Each segment represented a 180-meter commercial block with comparable orientation and surface materials.",
+      "Modeled observations were sampled at five-minute intervals from 13:00 to 17:00. Outcomes included mean radiant temperature, continuous exposed distance, walking speed, and voluntary dwell time. Values were generated solely for template demonstration."
+    ],
+    "results": [
+      "Connected-shade segments produced the lowest modeled radiant temperature and the longest median dwell time. Isolated shade reduced peak exposure but did not materially change route completion time.",
+      "The strongest association appeared when the distance between shade elements remained below 35 meters. Beyond 50 meters, simulated behavior converged with the control condition."
+    ],
+    "discussion": [
+      "The synthetic pattern suggests that continuity may matter as much as total canopy area. Small interventions can work as a sequence, allowing pedestrians to anticipate the next comfortable pause rather than evaluate each element independently.",
+      "The demonstration has no empirical validity. A real study would require calibrated sensors, preregistered analysis, seasonal replication, and controls for wind, humidity, age, and mobility."
+    ],
+    "conclusion": [
+      "For research and design communication, block-level shade networks offer a useful unit of analysis. The template supports concise reporting, transparent limitations, and mixed quantitative and narrative evidence."
+    ]
+  },
+  "study_metrics": [
+    {"label": "STREET SEGMENTS", "value": "12"},
+    {"label": "MODELED INTERVALS", "value": "576"},
+    {"label": "SHADE GAP THRESHOLD", "value": "35 m"}
+  ],
+  "results_table": {
+    "caption": "Table 1. Synthetic outcomes by shade condition",
+    "headers": ["Condition", "Radiant temp.", "Exposed distance", "Median dwell"],
+    "rows": [
+      ["Connected shade", "39.8 C", "24 m", "6.4 min"],
+      ["Isolated shade", "42.7 C", "61 m", "3.8 min"],
+      ["Unshaded control", "45.1 C", "180 m", "1.9 min"]
+    ]
+  },
+  "figure": {
+    "caption": "Figure 1. Modeled reduction in radiant temperature relative to control",
+    "values": [
+      {"label": "Connected", "value": 5.3},
+      {"label": "Isolated", "value": 2.4},
+      {"label": "Control", "value": 0.0}
+    ]
+  },
+  "data_note": "All observations, institutions, authors, and references in this demonstration manuscript are synthetic and provided only to showcase the template.",
+  "references": [
+    "Marrow, E., and Vale, T. (2024). Short-distance thermal decisions in commercial streets. Journal of Demonstration Studies, 8(2), 44-59.",
+    "Chen, P. (2025). Designing for the next patch of shade. Synthetic Urban Review, 14(1), 11-27.",
+    "Osei, N., and Bell, R. (2023). Continuous comfort networks in public space. Example Planning Quarterly, 19(3), 101-118.",
+    "Vale, T. (2026). A protocol for block-scale radiant temperature sampling. Field Methods Template Series, 5, 1-16.",
+    "Kwon, A., Marrow, E., and Idris, S. (2022). Route choice under simulated heat stress. Illustrative Mobility Research, 6(4), 77-93."
+  ]
+}

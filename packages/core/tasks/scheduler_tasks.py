@@ -6,11 +6,13 @@ the appropriate execution task.
 """
 import asyncio
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from packages.core.celery_app import celery_app
 from packages.core.constants.execution import DEFAULT_AGENT_MAX_TURNS
+from packages.core.ai.llm_client import CreditExhaustedError
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,95 @@ _FILE_DELIVERABLE_KINDS = frozenset(
         "mp3",
     }
 )
+
+_SCHEDULED_JOB_BILLING_SOURCE = "scheduled_job"
+_SCHEDULED_JOB_MODEL_ROLES = {
+    "agent": "primary",
+    "orchestrator_prompt": "primary",
+    "skill": "primary",
+    "workflow": "workflow_runner",
+    "briefing": "briefing",
+    "chat_insight_extraction": "chat_insight_extraction",
+    "strategist_review": "strategist",
+}
+
+
+async def runtime_assert_credit_available(*args, **kwargs):
+    """Lazy Runtime import so scheduler module loading stays lightweight."""
+    from packages.core.ai.runtime import runtime_assert_credit_available as _assert
+
+    return await _assert(*args, **kwargs)
+
+
+def _scheduled_job_model_role(job) -> str:
+    """Resolve the model role used by a scheduled job before dispatch."""
+    target = getattr(job, "execution_target", None) or {}
+    if (getattr(job, "execution_type", None) or "agent") in {
+        "agent", "orchestrator_prompt", "skill",
+    }:
+        complexity = str(target.get("complexity") or "").strip().lower()
+        if complexity in {"primary", "worker"}:
+            return complexity
+    return _SCHEDULED_JOB_MODEL_ROLES.get(
+        getattr(job, "execution_type", None) or "agent",
+        "primary",
+    )
+
+
+def _scheduled_job_requires_credit_gate(job) -> bool:
+    """Return whether dispatch should stop when tenant credits are exhausted."""
+    return (getattr(job, "execution_type", None) or "agent") in {
+        "agent",
+        "orchestrator_prompt",
+        "skill",
+        "workflow",
+        "briefing",
+        "strategist_review",
+        "chat_insight_extraction",
+    }
+
+
+async def _preflight_scheduled_job_credits(
+    job,
+    *,
+    db=None,
+    workspace_id: str | None = None,
+) -> None:
+    """Block a scheduled AI dispatch before it creates downstream work.
+
+    The worker still performs its normal per-call preflight. This boundary
+    check prevents exhausted tenants from creating workflow runs, resetting
+    tasks, or enqueueing Celery retries that can never make progress.
+    """
+    entity_id = str(getattr(job, "entity_id", None) or "").strip()
+    if not entity_id or not _scheduled_job_requires_credit_gate(job):
+        return
+
+    user_id = getattr(job, "user_id", None)
+    byok = False
+    try:
+        from packages.core.ai.llm_client import metadata_has_native_byok
+        from packages.core.services.model_resolver import resolve_llm_metadata_for_user
+
+        metadata = await resolve_llm_metadata_for_user(
+            _scheduled_job_model_role(job),
+            user_id=user_id,
+            entity_id=entity_id,
+            db=db,
+        )
+        byok = metadata_has_native_byok(metadata)
+    except Exception:
+        # The credit gate itself fails closed. If metadata resolution is
+        # unavailable, leave byok=False so a cloud tenant cannot bypass it.
+        logger.debug("Unable to resolve scheduled-job BYOK metadata", exc_info=True)
+
+    await runtime_assert_credit_available(
+        entity_id,
+        source=_SCHEDULED_JOB_BILLING_SOURCE,
+        user_id=user_id,
+        workspace_id=workspace_id or getattr(job, "workspace_id", None),
+        byok=byok,
+    )
 
 
 def _run_async(coro):
@@ -225,7 +316,12 @@ async def _async_tick():
             if _is_due(job, now):
                 try:
                     # Fan out: dispatch each job's execution as a separate Celery task
-                    _dispatch_job_task.delay(job.id, now.isoformat())
+                    occurrence_key = _scheduled_occurrence_key(job, now)
+                    _dispatch_job_task.delay(
+                        job.id,
+                        now.isoformat(),
+                        occurrence_key=occurrence_key,
+                    )
                     # Mark as dispatched to prevent re-triggering next tick
                     job.last_run_at = now
                     job.last_status = "dispatched"
@@ -403,22 +499,42 @@ def _previous_cron_occurrence(
 
 
 @celery_app.task(bind=True, name="scheduler.dispatch_job", max_retries=2)
-def _dispatch_job_task(self, job_db_id: str, now_iso: str, manual: bool = False):
+def _dispatch_job_task(
+    self,
+    job_db_id: str,
+    now_iso: str,
+    manual: bool = False,
+    occurrence_key: str | None = None,
+):
     """Execute a single scheduled job — fanned out from scheduler_tick
     or invoked directly via the run_now API.
 
     Each job runs as its own Celery task, so 100 due jobs = 100 parallel
     tasks across the worker pool, not a single blocking loop.
     """
+    if manual and not occurrence_key:
+        delivery_id = str(getattr(self.request, "id", "") or now_iso)
+        occurrence_key = f"manual:{delivery_id}"
     try:
-        _run_async(_async_dispatch_single(job_db_id, now_iso, manual=manual))
+        _run_async(
+            _async_dispatch_single(
+                job_db_id,
+                now_iso,
+                manual=manual,
+                occurrence_key=occurrence_key,
+            )
+        )
     except Exception as exc:
         logger.error("dispatch_job %s failed: %s", job_db_id, exc, exc_info=True)
         raise self.retry(exc=exc, countdown=30)
 
 
 async def _async_dispatch_single(
-    job_db_id: str, now_iso: str, *, manual: bool = False,
+    job_db_id: str,
+    now_iso: str,
+    *,
+    manual: bool = False,
+    occurrence_key: str | None = None,
 ):
     from packages.core.database import create_worker_session
     from sqlalchemy import select
@@ -432,7 +548,13 @@ async def _async_dispatch_single(
         if not job:
             return
 
-        await _dispatch_job(db, job, now, manual=manual)
+        await _dispatch_job(
+            db,
+            job,
+            now,
+            manual=manual,
+            occurrence_key=occurrence_key,
+        )
         await db.commit()
 
 
@@ -471,6 +593,26 @@ def _parse_run_at(run_at: str, job) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_job_zoneinfo(job))
     return dt.astimezone(timezone.utc)
+
+
+def _scheduled_occurrence_key(job, now: datetime) -> str:
+    """Return the stable identity of one scheduler-generated occurrence."""
+
+    now_utc = _as_aware_utc(now)
+    if job.schedule_kind == "cron":
+        minute = now_utc.replace(second=0, microsecond=0)
+        return f"cron:{minute.isoformat()}"
+    if job.schedule_kind == "at" and job.run_at:
+        try:
+            return f"at:{_parse_run_at(job.run_at, job).isoformat()}"
+        except (TypeError, ValueError):
+            pass
+    if job.schedule_kind in INTERVAL_SCHEDULE_KINDS and job.every_seconds:
+        interval_seconds = max(float(job.every_seconds), 0.001)
+        bucket = math.floor(now_utc.timestamp() / interval_seconds)
+        return f"interval:{interval_seconds:g}:{bucket}"
+    minute = now_utc.replace(second=0, microsecond=0)
+    return f"scheduled:{minute.isoformat()}"
 
 
 def _is_due(job, now: datetime) -> bool:
@@ -580,13 +722,21 @@ def _cron_field_matches(field_val: int, pattern: str) -> bool:
     return False
 
 
-async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
+async def _dispatch_job(
+    db,
+    job,
+    now: datetime,
+    *,
+    manual: bool = False,
+    occurrence_key: str | None = None,
+):
     """Dispatch the appropriate execution for a job."""
     from packages.core.ai.runtime import (
         runtime_scheduled_job_prompt,
         runtime_scheduled_skill_prompt,
     )
-    from packages.core.services.scheduler_service import create_job_run
+    from packages.core.models.base import generate_ulid
+    from packages.core.services.scheduler_service import claim_job_run
 
     if manual:
         trigger_type = "manual"
@@ -595,12 +745,33 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
     else:
         trigger_type = job.schedule_kind or "scheduled"
 
-    # Record the run
-    run = await create_job_run(
+    if occurrence_key:
+        resolved_occurrence_key = occurrence_key
+    elif manual:
+        # Production entrypoints always supply a request/delivery key.  Keep
+        # direct internal callers independent by treating each call as a new
+        # operator request.
+        resolved_occurrence_key = f"manual:{generate_ulid()}"
+    else:
+        resolved_occurrence_key = _scheduled_occurrence_key(job, now)
+
+    # Atomically claim the occurrence before creating Tasks, Workflow runs, or
+    # outbound messages. A redelivered Celery message returns here; a distinct
+    # same-day occurrence has a distinct key and proceeds normally.
+    run, claimed = await claim_job_run(
         db, job.job_id, status="running",
+        idempotency_key=resolved_occurrence_key,
         trigger_type=trigger_type,
         started_at=now,
     )
+    if not claimed:
+        logger.info(
+            "Ignored duplicate scheduler occurrence job=%s key=%s run=%s",
+            job.job_id,
+            resolved_occurrence_key,
+            run.id,
+        )
+        return
     run_id = run.id
 
     # Update job state
@@ -632,6 +803,15 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
         job.last_status = "skipped"
         await db.flush()
 
+    entity_id = str(getattr(job, "entity_id", None) or "").strip()
+    if not entity_id and _scheduled_job_requires_credit_gate(job):
+        await _mark_run_error("scheduled job missing entity_id")
+        logger.warning(
+            "Scheduled job %s blocked before fan-out: missing entity_id",
+            job.job_id,
+        )
+        return
+
     # M13: resolve the per-run effective config. While the owning experiment
     # is running its overlay patch is shallow-merged over execution_target
     # for THIS run only (the stored config is untouched, no revision bump);
@@ -657,6 +837,20 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
         if workspace.status != "active":
             await _mark_run_skipped(f"workspace_{workspace.status}")
             return
+
+    try:
+        await _preflight_scheduled_job_credits(
+            job,
+            db=db,
+            workspace_id=workspace_id,
+        )
+    except CreditExhaustedError as exc:
+        await _mark_run_error(f"credits_exhausted: {exc}")
+        logger.warning(
+            "Scheduled job %s blocked before fan-out: credits exhausted",
+            job.job_id,
+        )
+        return
 
     # An active experiment patch may override the run's payload_message /
     # execution_script (config-level keys) without touching the job row.
@@ -812,6 +1006,34 @@ async def _dispatch_job(db, job, now: datetime, *, manual: bool = False):
             kwargs={"run_id": run_id, "job_id_str": job.job_id},
         )
 
+    elif exec_type == "workspace_stat_collection":
+        from sqlalchemy import select
+        target = job.execution_target or {}
+        stat_id = target.get("stat_id")
+        if not stat_id:
+            await _mark_run_error(
+                "exec_type='workspace_stat_collection' but no stat_id in execution_target"
+            )
+            return
+        from packages.core.models.workspace_stat import WorkspaceStat
+        from packages.core.stats.scheduling import should_schedule
+        stat = (await db.execute(
+            select(WorkspaceStat).where(WorkspaceStat.id == stat_id)
+        )).scalar_one_or_none()
+        if stat is None:
+            await _mark_run_skipped("stat_not_found")
+            job.enabled = False
+            return
+        if not should_schedule(stat):
+            await _mark_run_skipped("stat_collection_not_scheduled")
+            job.enabled = False
+            return
+        from packages.core.tasks.ai_tasks import run_workspace_stat_collection
+        run_workspace_stat_collection.apply_async(
+            args=[stat_id],
+            kwargs={"run_id": run_id, "job_id_str": job.job_id},
+        )
+
     elif exec_type in ("strategist_review", "briefing", "outcome_evaluation", "chat_insight_extraction"):
         # All four workspace-scoped scheduled tasks share the same
         # dispatch shape: extract workspace_id, validate, fan out to the
@@ -917,6 +1139,9 @@ async def _dispatch_agent_task(db, job, now, prompt: str, run_id: str | None = N
         deliverable=deliverable,
     )
     max_turns = _agent_task_max_turns_for_target(target)
+    required_plan_steps = target.get("required_plan_steps")
+    if not isinstance(required_plan_steps, list):
+        required_plan_steps = None
 
     details_base = {
         "scheduled_job_id": job.job_id,
@@ -930,6 +1155,8 @@ async def _dispatch_agent_task(db, job, now, prompt: str, run_id: str | None = N
         "max_turns": max_turns,
         "model_role": target.get("complexity", "primary"),
     }
+    if required_plan_steps is not None:
+        details_base["required_plan_steps"] = required_plan_steps
 
     if not task_id:
         from packages.core.services.task_service import create_task

@@ -103,7 +103,7 @@ def list_tools() -> List[Dict[str, Any]]:
                         "type": "string",
                         "description": (
                             "Embedding model id. Defaults to "
-                            "text-embedding-3-small (1536 dim, cheap)."
+                            "text-embedding-3-small (1024 dim, cheap)."
                         ),
                     },
                 },
@@ -182,9 +182,12 @@ async def _embed(api_key: str, args: Dict[str, Any]) -> str:
     inputs = args.get("input")
     if not inputs:
         return "Error: input is required."
+    from packages.core.services.embedding_service import get_embedding_dimensions
+
     body = {
         "model": args.get("model") or "text-embedding-3-small",
         "input": inputs,
+        "dimensions": get_embedding_dimensions(),
     }
     async with httpx.AsyncClient(timeout=_TIMEOUT) as cx:
         r = await cx.post(

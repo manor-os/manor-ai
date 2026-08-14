@@ -18,6 +18,7 @@ from packages.core.ai.runtime import (
     RUNTIME_SANDBOX_IDLE_THRESHOLD,
     runtime_init_sandbox_context,
     runtime_load_sandbox_context,
+    runtime_sandbox_context_owner_matches,
     runtime_binding_owner_matches,
     runtime_skill_binding_ref,
 )
@@ -26,6 +27,8 @@ from packages.core.models.permission import Visibility
 from packages.core.models.skill import Skill, AgentSkillBinding
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SKILL_MAX_ROUNDS = 200
 
 # Script extensions that indicate a sandbox skill when found in skill_dir
 _SCRIPT_EXTENSIONS = {".py", ".sh", ".bash", ".js", ".ts", ".rb"}
@@ -110,7 +113,12 @@ def _sandbox_skill_runtime_contract(
         "## Next Tool Guidance",
         f"- Use `sandbox_exec(sandbox_id=\"{sandbox_id}\", command=\"...\")` or `sandbox_read_file` for additional targeted inspection when needed.",
         "- Run the bundled scripts/workflow required by `/skill/SKILL.md`.",
-        "- After the final artifact exists, call `sandbox_save_result`; then call `sandbox_destroy` once to release the sandbox.",
+        (
+            "- After the final artifact exists, call `sandbox_save_result` with "
+            "`artifact_role=\"final\"` so Chat receives a clickable file card; use "
+            "`artifact_role=\"intermediate\"` for supporting files that should stay hidden."
+        ),
+        "- Call `sandbox_destroy` once after the final artifact has been saved to release the sandbox.",
     ])
     return "\n".join(lines)
 
@@ -660,7 +668,23 @@ async def get_skill_by_slug(
     duplicate active rows. Runtime invocation must choose deterministically
     instead of raising MultipleResultsFound in the middle of a plan.
     """
-    conditions = [Skill.slug == slug, Skill.status == "active"]
+    requested_slug = _normalize_requested_slug(slug)
+    canonical_slug = _normalize_skill_identifier(requested_slug)
+    slug_aliases = {
+        value
+        for value in (
+            requested_slug,
+            canonical_slug,
+            canonical_slug.replace("_", "-"),
+        )
+        if value
+    }
+    conditions = [Skill.slug.in_(slug_aliases), Skill.status == "active"]
+    slug_priority = case(
+        (Skill.slug == requested_slug, 0),
+        (Skill.slug == canonical_slug, 1),
+        else_=2,
+    )
     if entity_id:
         conditions.append(
             or_(Skill.entity_id == entity_id, Skill.entity_id.is_(None))
@@ -676,7 +700,12 @@ async def get_skill_by_slug(
     result = await db.execute(
         select(Skill)
         .where(*conditions)
-        .order_by(priority.asc(), Skill.created_at.desc(), Skill.id.desc())
+        .order_by(
+            priority.asc(),
+            slug_priority.asc(),
+            Skill.created_at.desc(),
+            Skill.id.desc(),
+        )
         .limit(1)
     )
     return result.scalars().first()
@@ -1122,7 +1151,65 @@ async def _invoke_sandbox_skill(
         existing_ctx = await runtime_load_sandbox_context(conversation_id or "")
         existing_sandbox_id = (existing_ctx or {}).get("sandbox_id")
 
-        if existing_sandbox_id:
+        if existing_sandbox_id and not runtime_sandbox_context_owner_matches(
+            existing_ctx,
+            entity_id=entity_id,
+            user_id=user_id,
+        ):
+            logger.info(
+                "[skill_service] sandbox reuse skipped: owner mismatch skill=%s sandbox=%s",
+                skill.name, existing_sandbox_id,
+            )
+            existing_sandbox_id = None
+
+        same_skill_ready = False
+        expected_skill_name = skill.slug or skill.name
+        if (
+            existing_sandbox_id
+            and str((existing_ctx or {}).get("skill_id") or "").strip()
+            == expected_skill_name
+        ):
+            try:
+                current_status = await client.status(existing_sandbox_id)
+                current_state = str(getattr(current_status, "status", "") or "").strip().lower()
+                if expected_workspace_volume and not _sandbox_has_expected_workspace_mount(
+                    current_status,
+                ):
+                    logger.info(
+                        "[skill_service] same-skill reuse skipped: missing /workspace mount "
+                        "skill=%s sandbox=%s",
+                        skill.name,
+                        existing_sandbox_id,
+                    )
+                    existing_sandbox_id = None
+                elif (
+                    current_state == "ready"
+                    and str(getattr(current_status, "skill_name", "") or "").strip()
+                    == expected_skill_name
+                ):
+                    result_sandbox_id = existing_sandbox_id
+                    same_skill_ready = True
+                    skill_info_parts.append(
+                        f"sandbox_id: {result_sandbox_id}  *(reused, skill already loaded)*"
+                    )
+                    logger.info(
+                        "[skill_service] same-skill sandbox reused: skill=%s sandbox=%s",
+                        skill.name,
+                        existing_sandbox_id,
+                    )
+                elif current_state == "executing":
+                    await client.close()
+                    return _sandbox_skill_error_response(
+                        skill,
+                        "The active skill sandbox is still executing. Wait for its current "
+                        "command to finish, then retry the continuation.",
+                    )
+                else:
+                    existing_sandbox_id = None
+            except SandboxError:
+                existing_sandbox_id = None
+
+        if existing_sandbox_id and not same_skill_ready:
             try:
                 if expected_workspace_volume:
                     status = await client.status(existing_sandbox_id)
@@ -1220,15 +1307,17 @@ async def _invoke_sandbox_skill(
                     f"env_blocked ({len(create_result.env_blocked)}): "
                     f"{_compact_skill_items(create_result.env_blocked)}"
                 )
-            if conversation_id:
-                await runtime_init_sandbox_context(
-                    conversation_id,
-                    result_sandbox_id,
-                    skill.slug or skill.name,
-                )
             logger.info(
                 "[skill_service] sandbox created: skill=%s sandbox=%s entity=%s",
                 skill.name, result_sandbox_id, entity_id or "(none)",
+            )
+        if conversation_id:
+            await runtime_init_sandbox_context(
+                conversation_id,
+                result_sandbox_id,
+                skill.slug or skill.name,
+                entity_id=entity_id,
+                user_id=user_id,
             )
     finally:
         await client.close()
@@ -1436,6 +1525,31 @@ async def invoke_skill(
     skill_extra_files = _load_prompt_skill_extra_files(skill, config)
     effective_prompt = minio_prompt if minio_prompt else skill.system_prompt
     effective_prompt = _append_skill_bundle_manifest(effective_prompt, skill_extra_files)
+    if str(skill.slug or "").strip().lower() in {
+        "stickman-video-creator",
+        "stickman_video_creator",
+    }:
+        runtime_artifact_root = str(
+            dict(runtime_tool_context or {}).get(
+                "_workflow_lineage_root_run_id_from_context"
+            )
+            or dict(runtime_tool_context or {}).get("_workflow_run_id_from_context")
+            or ""
+        ).strip()
+        if runtime_artifact_root:
+            effective_prompt = (
+                f"{effective_prompt.rstrip()}\n\n"
+                "## Runtime-Enforced Workflow Artifact Scope\n"
+                f"The authoritative run_artifact_prefix is `runs/{runtime_artifact_root}`. "
+                "It is stable across retries in this Workflow lineage and overrides the "
+                "topic-slug fallback. Use this exact prefix for every Task-scoped read and "
+                "write. The Runtime transparently remaps generated-media paths into this "
+                "prefix and will not let a root-level or different-run artifact satisfy "
+                "recovery, QA, or publication. Workspace-owned identity references remain "
+                "outside this prefix. For generate_file and generate_video, the tool schema "
+                "calls this required path argument `name` (not `output_name`); always pass "
+                "name inside the authoritative prefix."
+            )
     authorization_user_message = (
         input_text if active_user_message is None else active_user_message
     )
@@ -1468,12 +1582,12 @@ async def invoke_skill(
     # A skill is real work — generating documents, running scripts,
     # iterating on errors — and cutting it off mid-task produces worse
     # outcomes than letting it finish (the parent agent re-does the
-    # work, doubling cost). 20 rounds is a safety ceiling for genuinely
+    # work, doubling cost). 200 rounds is a safety ceiling for genuinely
     # stuck loops, not a deadline. Skills that converge in 3-5 rounds
     # cost nothing extra; the cap only bites on pathological retries.
     # Override per-skill via DB ``config.max_rounds`` when a skill needs
     # more (or less).
-    max_rounds = config.get("max_rounds", 100)
+    max_rounds = config.get("max_rounds", DEFAULT_SKILL_MAX_ROUNDS)
     temperature = config.get("temperature", 0.7)
 
     skill_tool_executor = runtime_prompt_skill_tool_executor(

@@ -14,6 +14,7 @@ What flows OUT:
   subscriptions          service_key + agent_slug (NOT agent_id) so it can
                          re-resolve on import
   scheduled_jobs         the trigger definition; last_run_at / status dropped
+  workflows              workspace bindings + portable runtime graph
   custom_fields          definitions
   governance_policy      current revision's policy dict
   channel_requirements   from existing ChannelConfig rows — type + name only
@@ -43,17 +44,20 @@ from packages.core.blueprints.payload import (
     _is_secret_shape,
     validate_payload,
 )
+from packages.core.blueprints.simulation import generate_simulation_experience
 from packages.core.governance.policy import policy_to_dict
 from packages.core.governance.service import get_policy
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.custom_field import CustomFieldDefinition
-from packages.core.models.document import Document, DocumentGroup
+from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.goal import Goal
+from packages.core.models.workspace_stat import WorkspaceStat
 from packages.core.models.integration_session import IntegrationSession
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
 from packages.core.models.memory import AgentMemory
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.skill import AgentSkillBinding, Skill
+from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import (
     Agent,
     AgentSubscription,
@@ -96,6 +100,7 @@ class ExportError(Exception):
 _RUNTIME_SETTINGS_KEYS = frozenset({
     "sandbox",          # gets re-set by installer based on mode
     "_blueprint",       # blueprint provenance metadata
+    "simulation_experience",  # regenerated into recipe on export
     "last_briefing_at", # runtime cursor
     "created_by_user_id",
     "provisioning",
@@ -114,6 +119,17 @@ _NONPORTABLE_REFERENCE_KEYS = frozenset({
     "group_id",
     "task_id",
     "goal_id",
+    "workflow_id",
+    "workflow_binding_id",
+    "integration_session_id",
+    "browser_session_id",
+    "session_id",
+    "mcp_server_id",
+    "tool_id",
+    "skill_id",
+    "sla_policy_id",
+    "category_id",
+    "connection_id",
     "created_by_user_id",
     "source_existing_group_id",
     "source_template_group_id",
@@ -127,7 +143,10 @@ def _without_nonportable_references(value: Any) -> Any:
         return {
             key: _without_nonportable_references(item)
             for key, item in value.items()
-            if key not in _NONPORTABLE_REFERENCE_KEYS
+            if (
+                key not in _NONPORTABLE_REFERENCE_KEYS
+                and not _is_secret_shape(str(key))
+            )
         }
     if isinstance(value, list):
         return [_without_nonportable_references(item) for item in value]
@@ -142,12 +161,15 @@ class ExportContext:
 
     include_subscriptions: bool = True
     include_goals: bool = True
+    include_stats: bool = True
     include_scheduled_jobs: bool = True
+    include_workflows: bool = True
     include_custom_fields: bool = True
     include_governance: bool = True
     include_channel_requirements: bool = True
     include_session_requirements: bool = True
-    # Memory files are large + opinionated — opt-in.
+    # Backward-compatible alias used by the original API/UI. When true and no
+    # explicit knowledge_pack_mode is supplied, safe inline Markdown is used.
     include_memory_files: bool = False
     # v1.1 embedded sections. Default-on so a fresh export carries the
     # workspace-private agents/skills the operator built; turn off for a
@@ -157,7 +179,7 @@ class ExportContext:
     include_knowledge_packs: bool = True
     # Knowledge_pack body inclusion is opt-in even when the section is
     # exported — default ``skeleton`` mode emits folder structure only.
-    knowledge_pack_mode: str = "skeleton"   # 'skeleton' | 'inline_text'
+    knowledge_pack_mode: Optional[str] = None  # 'skeleton' | 'inline_text'
     # Agent-level starter_memory inclusion. Off by default because
     # accumulated agent memories often encode author-private style hints
     # (voice, reaction patterns) that don't translate to other entities.
@@ -206,9 +228,17 @@ async def export_workspace(
         await _export_goals(db, workspace.entity_id, workspace_id)
         if ctx.include_goals else []
     )
+    stats = (
+        await _export_stats(db, workspace.entity_id, workspace_id)
+        if ctx.include_stats else []
+    )
     scheduled_jobs = (
         await _export_scheduled_jobs(db, workspace_id)
         if ctx.include_scheduled_jobs else []
+    )
+    workflows = (
+        await _export_workflows(db, workspace.entity_id, workspace_id)
+        if ctx.include_workflows else []
     )
     custom_fields = (
         await _export_custom_fields(db, workspace.entity_id, workspace_id)
@@ -223,10 +253,19 @@ async def export_workspace(
         if ctx.include_channel_requirements else []
     )
     sessions = (
-        # Sessions are entity-scoped — but we only surface ones bound
-        # by the workspace's existing subscriptions / goal configs to
-        # avoid leaking other workspaces' integrations.
-        await _export_session_requirements(db, workspace.entity_id)
+        await _export_session_requirements(
+            db,
+            workspace.entity_id,
+            references=[
+                workspace.operating_model,
+                workspace.settings,
+                subscriptions,
+                goals,
+                scheduled_jobs,
+                workflows,
+                channels,
+            ],
+        )
         if ctx.include_session_requirements else []
     )
 
@@ -254,9 +293,17 @@ async def export_workspace(
         required_skills = embed_result["required_skills"]
         required_agents = embed_result["required_agents"]
 
+    knowledge_pack_mode = (
+        ctx.knowledge_pack_mode
+        or ("inline_text" if ctx.include_memory_files else "skeleton")
+    )
+    if knowledge_pack_mode not in {"skeleton", "inline_text"}:
+        raise ExportError(
+            "knowledge_pack_mode must be 'skeleton' or 'inline_text'"
+        )
     knowledge_packs = (
         await _export_knowledge_packs(
-            db, workspace.entity_id, workspace_id, mode=ctx.knowledge_pack_mode
+            db, workspace.entity_id, workspace_id, mode=knowledge_pack_mode
         )
         if ctx.include_knowledge_packs else []
     )
@@ -290,6 +337,33 @@ async def export_workspace(
     }
     if ws_settings:
         om.setdefault("settings", ws_settings)
+    blueprint_prompts = list(om.pop("blueprint_prompts", []) or [])
+    blueprint_governance_rules = list(om.pop("blueprint_governance_rules", []) or [])
+    strategist = None
+    stored_strategist = om.pop("strategist", None)
+    if isinstance(stored_strategist, dict) and stored_strategist:
+        strategist = {
+            key: _without_nonportable_references(stored_strategist[key])
+            for key in (
+                "business_model",
+                "proposal_shape",
+                "priors",
+                "evaluation_rubric",
+                "do_not_propose",
+                "voice",
+                "system_prompt_override",
+            )
+            if key in stored_strategist
+        }
+        cadence = stored_strategist.get("cadence")
+        trigger_conditions = stored_strategist.get("trigger_conditions")
+        if cadence is not None or trigger_conditions is not None:
+            strategist["cadence"] = {
+                "schedule": cadence,
+                "trigger_conditions": _without_nonportable_references(
+                    trigger_conditions
+                ),
+            }
 
     payload: dict[str, Any] = {
         "manifest": {
@@ -329,16 +403,20 @@ async def export_workspace(
         },
         "recipe": {
             "operating_model": om,
-            "strategist": None,
-            "prompts": [],
+            "strategist": strategist,
+            "prompts": blueprint_prompts,
             "subscriptions": subscriptions,
             "scheduled_jobs": scheduled_jobs,
-            "workflows": [],
+            "workflows": workflows,
+            "stats": stats,
             "goals": goals,
             "task_categories": [],
             "custom_fields": custom_fields,
             "sla_policies": [],
-            "escalation_rules": [],
+            "escalation_rules": blueprint_governance_rules,
+            # Filled below from the complete portable payload so every new
+            # Blueprint is immediately demonstrable after sandbox install.
+            "simulation_experience": None,
         },
         "policy": {
             "governance": governance,
@@ -346,6 +424,8 @@ async def export_workspace(
             "expected_baseline": None,
         },
     }
+
+    payload["recipe"]["simulation_experience"] = generate_simulation_experience(payload)
 
     # Last-line defence: validate (catches any future divergence
     # between exporter helpers and the payload schema).
@@ -418,11 +498,21 @@ async def _export_goals(
             Goal.status == "active",
         )
     )).scalars().all())
+    stat_ids = {goal.stat_id for goal in rows if goal.stat_id}
+    stats_by_id: dict[str, WorkspaceStat] = {}
+    if stat_ids:
+        stats = list((await db.execute(select(WorkspaceStat).where(
+            WorkspaceStat.entity_id == entity_id,
+            WorkspaceStat.workspace_id == workspace_id,
+            WorkspaceStat.id.in_(stat_ids),
+        ))).scalars().all())
+        stats_by_id = {stat.id: stat for stat in stats}
     return [
         {
             "title": g.title,
             "description": g.description,
             "metric_key": g.metric_key,
+            "stat_key": stats_by_id[g.stat_id].key if g.stat_id in stats_by_id else None,
             "target_value": float(g.target_value) if g.target_value is not None else None,
             # baseline is config-ish (operator-set starting point) so
             # we keep it; current_value / pace are runtime — dropped.
@@ -435,6 +525,33 @@ async def _export_goals(
             "priority": g.priority,
         }
         for g in rows
+    ]
+
+
+async def _export_stats(
+    db: AsyncSession, entity_id: str, workspace_id: str,
+) -> list[dict[str, Any]]:
+    rows = list((await db.execute(select(WorkspaceStat).where(
+        WorkspaceStat.entity_id == entity_id,
+        WorkspaceStat.workspace_id == workspace_id,
+        WorkspaceStat.status == "active",
+    ))).scalars().all())
+    return [
+        {
+            "library_key": stat.library_key,
+            "key": stat.key,
+            "name": stat.name,
+            "description": stat.description,
+            "value_type": stat.value_type,
+            "unit": stat.unit,
+            "window": stat.window,
+            "collector_type": stat.collector_type,
+            "collector_config": _without_nonportable_references(stat.collector_config),
+            "collection_cadence": stat.collection_cadence,
+            "freshness_limit_seconds": stat.freshness_limit_seconds,
+            "goal_eligible": stat.goal_eligible,
+        }
+        for stat in rows
     ]
 
 
@@ -485,6 +602,152 @@ async def _export_scheduled_jobs(
             "execution_script": j.execution_script,
             "default_delivery_mode": j.default_delivery_mode,
         })
+    return out
+
+
+def _portable_workflow_slug(
+    workflow: WorkflowDefinition,
+    binding: Optional[WorkflowBinding] = None,
+) -> str:
+    binding_config = dict(binding.config or {}) if binding is not None else {}
+    configured = str(
+        binding_config.get("workspace_blueprint_workflow_slug") or ""
+    ).strip()
+    if configured:
+        return configured
+    raw = str(workflow.name or "").strip()
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,118}[a-z0-9]", raw):
+        return raw
+    return _portable_slug(
+        raw,
+        fallback="workspace-workflow",
+        row_id=workflow.id,
+    )
+
+
+def _export_workflow_row(
+    workflow: WorkflowDefinition,
+    *,
+    binding: Optional[WorkflowBinding] = None,
+    slug: Optional[str] = None,
+) -> dict[str, Any]:
+    """Serialize the canonical runtime graph into the workflow shape the
+    v1.1 installer already accepts.
+
+    Runtime graphs use ``type/config/next`` while hand-authored Blueprint
+    graphs may use ``kind/depends_on``. The installer accepts both, so keeping
+    the runtime representation avoids a lossy graph inversion.
+    """
+    definition_variables = dict(workflow.variables or {})
+    binding_variables = dict(binding.variables or {}) if binding is not None else {}
+    variables = {**definition_variables, **binding_variables}
+
+    trigger_type = (
+        binding.trigger_type if binding is not None else workflow.trigger_type
+    ) or "manual"
+    trigger_config = {
+        **dict(workflow.trigger_config or {}),
+        **(dict(binding.trigger_config or {}) if binding is not None else {}),
+    }
+    binding_config = dict(binding.config or {}) if binding is not None else {}
+    for key in (
+        "source",
+        "source_template_id",
+        "workspace_blueprint_workflow_slug",
+    ):
+        binding_config.pop(key, None)
+
+    payload: dict[str, Any] = {
+        "slug": slug or _portable_workflow_slug(workflow, binding),
+        "name": (
+            binding.name
+            if binding is not None and binding.name
+            else workflow.name
+        ),
+        "description": workflow.description,
+        "trigger_type": trigger_type,
+        "variables": [
+            {"key": key, "default": _without_nonportable_references(value)}
+            for key, value in sorted(variables.items())
+        ],
+        "steps": _without_nonportable_references(list(workflow.steps or [])),
+        "category": workflow.category,
+        "tags": list(workflow.tags or []),
+        "version": int(workflow.version or 1),
+        "internal": False,
+        "binding_config": _without_nonportable_references(binding_config),
+    }
+    trigger_ref = trigger_config.get("trigger_ref")
+    if trigger_ref:
+        payload["trigger_ref"] = _without_nonportable_references(trigger_ref)
+
+    # Preserve the portable input declaration kept on installed trigger nodes.
+    for step in workflow.steps or []:
+        if not isinstance(step, dict) or step.get("type") != "trigger":
+            continue
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        run_inputs = config.get("run_inputs")
+        if isinstance(run_inputs, list):
+            payload["run_inputs"] = _without_nonportable_references(run_inputs)
+        break
+    return payload
+
+
+async def _export_workflows(
+    db: AsyncSession,
+    entity_id: str,
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    """Export active workflow deployments belonging to this workspace.
+
+    A definition can be entity-scoped and deployed through a Workspace
+    binding, or directly scoped to the Workspace. Both forms are included.
+    Multiple active bindings of the same definition are kept as distinct
+    portable components so their trigger/config overrides survive.
+    """
+    bound_rows = list((await db.execute(
+        select(WorkflowBinding, WorkflowDefinition)
+        .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
+        .where(
+            WorkflowBinding.entity_id == entity_id,
+            WorkflowBinding.workspace_id == workspace_id,
+            WorkflowBinding.enabled.is_(True),
+            WorkflowBinding.status == "active",
+            WorkflowDefinition.entity_id == entity_id,
+            WorkflowDefinition.status == "active",
+            WorkflowDefinition.is_active.is_(True),
+        )
+        .order_by(WorkflowDefinition.name, WorkflowBinding.id)
+    )).all())
+
+    out: list[dict[str, Any]] = []
+    bound_definition_ids: set[str] = set()
+    used_slugs: set[str] = set()
+    for binding, workflow in bound_rows:
+        bound_definition_ids.add(workflow.id)
+        base_slug = _portable_workflow_slug(workflow, binding)
+        slug = base_slug
+        if slug in used_slugs:
+            slug = f"{base_slug[:109].rstrip('-_')}-{binding.id[-8:].lower()}"
+        used_slugs.add(slug)
+        out.append(_export_workflow_row(workflow, binding=binding, slug=slug))
+
+    scoped = list((await db.execute(
+        select(WorkflowDefinition).where(
+            WorkflowDefinition.entity_id == entity_id,
+            WorkflowDefinition.workspace_id == workspace_id,
+            WorkflowDefinition.status == "active",
+            WorkflowDefinition.is_active.is_(True),
+        ).order_by(WorkflowDefinition.name, WorkflowDefinition.id)
+    )).scalars().all())
+    for workflow in scoped:
+        if workflow.id in bound_definition_ids:
+            continue
+        slug = _portable_workflow_slug(workflow)
+        if slug in used_slugs:
+            slug = f"{slug[:109].rstrip('-_')}-{workflow.id[-8:].lower()}"
+        used_slugs.add(slug)
+        out.append(_export_workflow_row(workflow, slug=slug))
     return out
 
 
@@ -554,21 +817,100 @@ async def _export_channel_requirements(
     ]
 
 
+_SESSION_REFERENCE_ID_KEYS = frozenset({
+    "session_id",
+    "browser_session_id",
+    "integration_session_id",
+})
+
+
+def _collect_session_references(
+    value: Any,
+    *,
+    ids: set[str],
+    providers: set[str],
+    labels_by_provider: dict[str, set[str]],
+) -> None:
+    if isinstance(value, dict):
+        for key in _SESSION_REFERENCE_ID_KEYS:
+            raw_id = value.get(key)
+            if isinstance(raw_id, str) and raw_id.strip():
+                ids.add(raw_id.strip())
+
+        provider = str(
+            value.get("provider")
+            or value.get("session_provider")
+            or ""
+        ).strip().lower()
+        label = str(
+            value.get("session_label")
+            or value.get("label")
+            or ""
+        ).strip().lower()
+        if provider:
+            providers.add(provider)
+            if label:
+                labels_by_provider.setdefault(provider, set()).add(label)
+
+        for item in value.values():
+            _collect_session_references(
+                item,
+                ids=ids,
+                providers=providers,
+                labels_by_provider=labels_by_provider,
+            )
+    elif isinstance(value, list):
+        for item in value:
+            _collect_session_references(
+                item,
+                ids=ids,
+                providers=providers,
+                labels_by_provider=labels_by_provider,
+            )
+
+
 async def _export_session_requirements(
-    db: AsyncSession, entity_id: str,
+    db: AsyncSession,
+    entity_id: str,
+    *,
+    references: list[Any],
 ) -> list[dict[str, Any]]:
-    """Browser sessions are entity-scoped, but a blueprint's caller
-    only sees the ones bound to *some* configuration. We include all
-    active sessions in the entity — the installer will dedupe by
-    (provider, label) so re-installing doesn't duplicate work."""
+    """Export only entity sessions referenced by this workspace's config.
+
+    IntegrationSession has no workspace_id. Matching every active entity row
+    leaked unrelated Workspace requirements into the Blueprint, so references
+    are resolved by explicit session id or provider/label declarations found
+    in the Workspace's portable configuration.
+    """
+    referenced_ids: set[str] = set()
+    referenced_providers: set[str] = set()
+    labels_by_provider: dict[str, set[str]] = {}
+    _collect_session_references(
+        references,
+        ids=referenced_ids,
+        providers=referenced_providers,
+        labels_by_provider=labels_by_provider,
+    )
+    if not referenced_ids and not referenced_providers:
+        return []
+
     rows = list((await db.execute(
         select(IntegrationSession).where(
             IntegrationSession.entity_id == entity_id,
             IntegrationSession.status == "active",
-        )
+        ).order_by(IntegrationSession.provider, IntegrationSession.label, IntegrationSession.id)
     )).scalars().all())
     out: list[dict[str, Any]] = []
     for s in rows:
+        provider = str(s.provider or "").strip().lower()
+        label = str(s.label or "").strip().lower()
+        provider_labels = labels_by_provider.get(provider)
+        referenced = s.id in referenced_ids or (
+            provider in referenced_providers
+            and (not provider_labels or label in provider_labels)
+        )
+        if not referenced:
+            continue
         md = s.metadata_json or {}
         out.append({
             "provider": s.provider,
@@ -905,39 +1247,45 @@ async def _export_knowledge_packs(
 
     out: list[dict[str, Any]] = []
     for g in groups:
-        # Documents tied to this group via folder hierarchy — we don't
-        # currently model a direct DocumentGroup→Document FK, so the
-        # safest move is to use group.settings.document_ids if present;
-        # otherwise emit just the group shell.
-        document_ids = list((g.settings or {}).get("document_ids") or [])
-        docs: list[Document] = []
-        if document_ids:
-            docs = list((await db.execute(
-                select(Document).where(Document.id.in_(document_ids))
-            )).scalars().all())
+        # Group membership is canonical. Older exports looked for a legacy
+        # settings.document_ids list, which made normal Knowledge groups appear
+        # empty even though DocumentGroupMember rows existed.
+        docs = list((await db.execute(
+            select(Document)
+            .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+            .where(
+                Document.entity_id == entity_id,
+                DocumentGroupMember.group_id == g.id,
+            )
+            .order_by(Document.name, Document.id)
+        )).scalars().all())
 
         folder_structure: list[dict[str, Any]] = []
         starter_documents: list[dict[str, Any]] = []
         for d in docs:
             if not _document_safe_to_export(d):
                 continue
+            metadata = d.metadata_ if isinstance(d.metadata_, dict) else {}
+            path = str(
+                metadata.get("blueprint_starter_path")
+                or d.name
+                or "document.md"
+            ).strip()
             folder_structure.append({
-                "path": d.name,
-                "description": (d.metadata_ or {}).get("description"),
+                "path": path,
+                "description": metadata.get("description"),
             })
             if mode == "inline_text" and _document_is_markdown(d):
-                # body_md isn't actually stored in Document; the body
-                # lives at fs_path or file_url. Exporter is read-only
-                # so we attach a pointer + a TODO note rather than
-                # synchronously fetching. Installer will surface this
-                # as a knowledge-pack-pending todo.
-                starter_documents.append({
-                    "path": d.name if d.name.endswith(".md") else f"{d.name}.md",
-                    "body_md": (
-                        "# TODO: paste content from "
-                        f"{d.fs_path or d.file_url or 'source'} here"
-                    ),
-                })
+                body = metadata.get("content_text")
+                if isinstance(body, str) and body.strip():
+                    exported_document = {
+                        "path": path if path.lower().endswith(".md") else f"{path}.md",
+                        "body_md": body,
+                    }
+                    template = metadata.get("blueprint_template")
+                    if isinstance(template, dict):
+                        exported_document["template"] = dict(template)
+                    starter_documents.append(exported_document)
 
         out.append({
             "slug": _slugify(g.name),

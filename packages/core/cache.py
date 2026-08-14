@@ -91,6 +91,50 @@ class Cache:
             logger.debug("Cache set error for %s: %s", key, e)
             return False
 
+    async def get_many(self, keys: list[str]) -> list[Any | None]:
+        """Fetch several JSON values in one Redis round trip."""
+        if not keys:
+            return []
+        r = await _get_redis()
+        if r is None:
+            return [None] * len(keys)
+        try:
+            values = await r.mget([f"{self.PREFIX}{key}" for key in keys])
+            decoded: list[Any | None] = []
+            for value in values:
+                if value is None:
+                    decoded.append(None)
+                    continue
+                try:
+                    decoded.append(json.loads(value))
+                except (TypeError, ValueError):
+                    decoded.append(None)
+            return decoded
+        except Exception as e:
+            logger.debug("Cache multi-get error: %s", e)
+            return [None] * len(keys)
+
+    async def set_many(self, values: dict[str, Any], ttl: int = 300) -> bool:
+        """Store several JSON values with one non-transactional pipeline."""
+        if not values:
+            return True
+        r = await _get_redis()
+        if r is None:
+            return False
+        try:
+            async with r.pipeline(transaction=False) as pipeline:
+                for key, value in values.items():
+                    pipeline.set(
+                        f"{self.PREFIX}{key}",
+                        json.dumps(value, default=str),
+                        ex=ttl,
+                    )
+                await pipeline.execute()
+            return True
+        except Exception as e:
+            logger.debug("Cache multi-set error: %s", e)
+            return False
+
     async def delete(self, key: str) -> bool:
         """Delete a key from cache."""
         r = await _get_redis()
@@ -100,6 +144,19 @@ class Cache:
             await r.delete(f"{self.PREFIX}{key}")
             return True
         except Exception:
+            return False
+
+    async def touch(self, key: str, ttl: int) -> bool:
+        """Extend a cache entry's TTL without downloading or rewriting it."""
+        if ttl <= 0:
+            return False
+        r = await _get_redis()
+        if r is None:
+            return False
+        try:
+            return bool(await r.expire(f"{self.PREFIX}{key}", ttl))
+        except Exception as e:
+            logger.debug("Cache touch error for %s: %s", key, e)
             return False
 
     async def incr(self, key: str, amount: int = 1, ttl: int | None = None) -> int | None:

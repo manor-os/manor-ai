@@ -45,6 +45,7 @@ def _valid_request():
         "start_url": "https://app.example.test",
         "audience": "Operations teams",
         "promotion_goal": "Show the approval flow",
+        "duration_seconds": 8,
         "video_type": "feature_promotion",
         "must_show": ["Submit a request", "See the approved result"],
         "must_not_show": ["Customer data"],
@@ -258,8 +259,8 @@ def _valid_subtitle_analysis():
         "maximum_line_count": 2,
         "style_evidence": {
             "Default": {
-                "font_size": 52,
-                "outline": 2,
+                "font_size": 20,
+                "outline": 1,
                 "shadow": 0,
                 "alignment": 2,
                 "margin_v": 72,
@@ -505,6 +506,7 @@ def test_product_video_request_declares_stable_ui_field_order():
         "audience",
         "video_type",
         "promotion_goal",
+        "duration_seconds",
         "must_show",
         "must_not_show",
         "final_cta",
@@ -549,7 +551,7 @@ def test_product_video_start_requires_only_identity_url_and_required_moments():
             "Follow the brief's language and tone and use one continuous narration track."
         ),
         "subtitle_instructions": (
-            "Use 52px subtitles on a 1920x1080 canvas, scale proportionally for other "
+            "Use 20px subtitles on a 1920x1080 canvas, scale proportionally for other "
             "resolutions, keep at most two lines, a light outline, and the bottom safe area."
         ),
         "production_constraints": [
@@ -576,6 +578,27 @@ def test_product_video_start_requires_only_identity_url_and_required_moments():
     assert "minItems" not in template.PRODUCT_VIDEO_REQUEST_SCHEMA["properties"][
         "must_not_show"
     ]
+
+
+def test_product_video_duration_input_overrides_the_default_output_range():
+    duration_schema = template.PRODUCT_VIDEO_REQUEST_SCHEMA["properties"][
+        "duration_seconds"
+    ]
+    run_inputs = {
+        item["key"]: item
+        for item in template.PRODUCT_VIDEO_REQUEST_RUN_INPUTS
+    }
+    normalize = _step("create-product-video-v1", "normalize_request")
+
+    assert duration_schema == {
+        "type": "number",
+        "title": "Target duration (seconds)",
+        "minimum": 1,
+        "maximum": 3600,
+    }
+    assert run_inputs["duration_seconds"]["target"] == "request.duration_seconds"
+    assert "request.duration_seconds is supplied" in normalize["config"]["input"]
+    assert "target_duration_seconds.min and max" in normalize["config"]["input"]
 
 
 def test_product_video_request_requires_an_http_product_url():
@@ -885,6 +908,62 @@ def test_scene_collector_executes_only_the_canonical_scene_contract():
     assert "target_page, ordered_actions, and expected_visual_state" in chrome_input
 
 
+def test_discovery_and_planning_keep_conceptual_requirements_out_of_visible_labels():
+    discovery_step = _step("create-product-video-v1", "explore_product")
+    planning_step = _step("create-product-video-v1", "plan_video")
+    discovery_prompt = " ".join(discovery_step["config"]["input"].split())
+    chrome_input = " ".join(
+        discovery_step["config"]["forced_tool_calls"][0]["arguments"]["input"].split()
+    )
+    planning_prompt = " ".join(planning_step["config"]["input"].split())
+
+    expected_rule = (
+        "Treat request.must_show values as conceptual requirements, not literal visible labels"
+    )
+    literal_rule = (
+        "include a label in observations only when Chrome returned that exact visible text"
+    )
+    assert expected_rule in discovery_prompt
+    assert literal_rule in discovery_prompt
+    assert expected_rule in chrome_input
+    assert literal_rule in chrome_input
+    assert (
+        "expected_visual_state.visible_labels must contain only exact labels from discovery observations"
+        in planning_prompt
+    )
+
+
+def test_scene_collector_receives_operator_revision_notes_on_retry():
+    capture_step = _step("create-product-video-v1", "collect_assets")
+    prompt = capture_step["config"]["input"]
+    chrome_input = capture_step["config"]["forced_tool_calls"][0]["arguments"][
+        "input"
+    ]
+
+    assert "Operator revision notes are {{revision_notes}}" in prompt
+    assert "Operator revision notes are {{revision_notes}}" in chrome_input
+
+
+def test_scene_collector_returns_validator_provenance_and_project_capture_paths():
+    capture_step = _step("create-product-video-v1", "collect_assets")
+    prompt = capture_step["config"]["input"]
+    chrome_input = capture_step["config"]["forced_tool_calls"][0]["arguments"][
+        "input"
+    ]
+
+    assert "provenance.acceptance_evidence" in prompt
+    assert "acceptance_verified=true" in prompt
+    assert "bitmap_acceptance_verified=true" in prompt
+    assert (
+        "Set knowledge_folder exactly to Knowledge/{{project.state.project_root}}/"
+        "captures/recordings"
+    ) in chrome_input
+    assert (
+        "Set knowledge_folder exactly to Knowledge/{{project.state.project_root}}/"
+        "captures/screenshots"
+    ) in chrome_input
+
+
 def test_scene_collector_rejects_proxy_footage_and_mismatched_reuse():
     capture_step = _step("create-product-video-v1", "collect_assets")
     prompt = capture_step["config"]["input"]
@@ -1100,6 +1179,130 @@ def test_collection_validator_accepts_verified_browser_capture_receipts():
             provenance["acceptance_verified"] = True
         else:
             provenance["bitmap_acceptance_verified"] = True
+
+    result = _execute_validator(
+        validator["config"]["code"],
+        {
+            "selected_scenes": plan["scenes"],
+            "selected_scene_ids": plan["scene_ids"],
+            "granted_scene_ids": plan["scene_ids"],
+            "collection_result": collection,
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["errors"] == []
+    assert result["validated_segments"] == collection["segments"]
+    assert result["validated_artifacts"] == collection["artifacts"]
+
+
+def test_collection_validator_repairs_verified_screenshot_evidence_from_legacy_plans():
+    validator = _step("create-product-video-v1", "validate_collection_contract")
+    plan = _valid_plan()
+    for evidence in plan["scenes"][0]["acceptance_evidence"]:
+        evidence["required_asset_type"] = "recording"
+    collection = _valid_collection_result(plan)
+    screenshot = next(
+        artifact for artifact in collection["artifacts"] if artifact["kind"] == "image"
+    )
+    screenshot["provenance"].update(
+        {
+            "source_url": plan["scenes"][0]["target_page"],
+            "bitmap_acceptance_verified": True,
+            "acceptance_evidence": deepcopy(
+                plan["scenes"][0]["acceptance_evidence"][:1]
+            ),
+        }
+    )
+
+    result = _execute_validator(
+        validator["config"]["code"],
+        {
+            "selected_scenes": plan["scenes"],
+            "selected_scene_ids": plan["scene_ids"],
+            "granted_scene_ids": plan["scene_ids"],
+            "collection_result": collection,
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["errors"] == []
+    normalized_screenshot = next(
+        artifact
+        for artifact in result["validated_artifacts"]
+        if artifact["kind"] == "image"
+    )
+    assert {
+        evidence["required_asset_type"]
+        for evidence in normalized_screenshot["provenance"]["acceptance_evidence"]
+    } == {"screenshot"}
+
+
+@pytest.mark.parametrize(
+    ("source", "source_url", "verified"),
+    [
+        ("generated", "/requests/new", True),
+        ("browser_capture", "/wrong-page", True),
+        ("browser_capture", "/requests/new", False),
+    ],
+)
+def test_collection_validator_rejects_unverified_legacy_screenshot_repairs(
+    source,
+    source_url,
+    verified,
+):
+    validator = _step("create-product-video-v1", "validate_collection_contract")
+    plan = _valid_plan()
+    for evidence in plan["scenes"][0]["acceptance_evidence"]:
+        evidence["required_asset_type"] = "recording"
+    collection = _valid_collection_result(plan)
+    screenshot = next(
+        artifact for artifact in collection["artifacts"] if artifact["kind"] == "image"
+    )
+    screenshot["source"] = source
+    screenshot["provenance"].update(
+        {
+            "source_url": source_url,
+            "acceptance_evidence": [
+                {
+                    **deepcopy(plan["scenes"][0]["acceptance_evidence"][0]),
+                    "required_asset_type": "screenshot",
+                }
+            ],
+        }
+    )
+    if verified:
+        screenshot["provenance"]["bitmap_acceptance_verified"] = True
+
+    result = _execute_validator(
+        validator["config"]["code"],
+        {
+            "selected_scenes": plan["scenes"],
+            "selected_scene_ids": plan["scene_ids"],
+            "granted_scene_ids": plan["scene_ids"],
+            "collection_result": collection,
+        },
+    )
+
+    assert result["valid"] is False
+    assert screenshot["artifact_id"] in result["rejected_artifact_ids"]
+    assert "artifact_acceptance_evidence_mismatch" in {
+        error["code"] for error in result["errors"]
+    }
+
+
+def test_collection_validator_accepts_text_verified_browser_capture_receipts():
+    validator = _step("create-product-video-v1", "validate_collection_contract")
+    plan = _valid_plan()
+    collection = _valid_collection_result(plan)
+    scenes_by_id = {scene["scene_id"]: scene for scene in plan["scenes"]}
+
+    for artifact in collection["artifacts"]:
+        provenance = artifact["provenance"]
+        provenance.pop("scene_id")
+        provenance.pop("acceptance_evidence")
+        provenance["source_url"] = scenes_by_id[artifact["scene_id"]]["target_page"]
+        provenance["acceptance"] = "Captured artifact visibly matches the approved scene."
 
     result = _execute_validator(
         validator["config"]["code"],
@@ -1339,6 +1542,20 @@ def test_planning_maps_only_authoritative_must_show_items_to_scene_evidence():
     ) in prompt
 
 
+def test_product_video_planners_require_evidence_for_every_required_asset_type():
+    create_prompt = _step("create-product-video-v1", "plan_video")["config"]["input"]
+    planning_prompt = _step("plan-product-video-v1", "plan_video")["config"]["input"]
+    revision_prompt = _step("revise-product-video-v1", "plan_revision")["config"]["input"]
+    required_rule = (
+        "For every required_asset_types value, include at least one acceptance_evidence "
+        "entry whose required_asset_type matches that value"
+    )
+
+    assert required_rule in create_prompt
+    assert required_rule in planning_prompt
+    assert required_rule in revision_prompt
+
+
 def test_plan_contract_validator_executes_cross_field_coverage_checks():
     steps = _steps_by_id("create-product-video-v1")
     validator = steps["validate_plan_contract"]
@@ -1404,6 +1621,32 @@ def test_plan_contract_validator_executes_cross_field_coverage_checks():
     assert result["valid"] is False
     assert "scene_acceptance_evidence_mismatch" in {
         error["code"] for error in result["errors"]
+    }
+
+    missing_asset_evidence = _valid_plan()
+    for evidence in missing_asset_evidence["scenes"][0]["acceptance_evidence"]:
+        evidence["required_asset_type"] = "recording"
+    for coverage_item in missing_asset_evidence["must_show_coverage"]:
+        for evidence in coverage_item["acceptance_evidence"]:
+            evidence["required_asset_type"] = "recording"
+    result = _execute_validator(
+        code,
+        {"request": _valid_request(), "plan": missing_asset_evidence},
+    )
+    assert result["valid"] is False
+    assert result["invalid_scene_ids"] == ["scene-1"]
+    asset_evidence_error = next(
+        error
+        for error in result["errors"]
+        if error["code"] == "scene_asset_acceptance_evidence_mismatch"
+    )
+    assert asset_evidence_error == {
+        "code": "scene_asset_acceptance_evidence_mismatch",
+        "scene_id": "scene-1",
+        "expected_asset_types": ["recording", "screenshot"],
+        "actual_asset_types": ["recording"],
+        "missing_asset_types": ["screenshot"],
+        "unexpected_asset_types": [],
     }
 
     overlong_narration = _valid_plan()
@@ -1619,6 +1862,7 @@ def test_product_video_workflow_surface_and_graphs_match_the_design():
             "audience",
             "video_type",
             "promotion_goal",
+            "duration_seconds",
             "must_show",
             "must_not_show",
             "final_cta",
@@ -1896,6 +2140,11 @@ def test_producer_uses_one_take_measured_narration_and_explicit_scene_intervals(
     prompt = _step("create-product-video-v1", "produce_video")["config"]["input"]
 
     assert "one continuous final narration take from plan.canonical_narration" in prompt
+    assert (
+        "set generate_audio prompt exactly equal to plan.canonical_narration with no prefix or suffix"
+        in prompt
+    )
+    assert "Put delivery and style directions only in voice_instructions" in prompt
     assert "Do not synthesize or stitch per-scene narration" in prompt
     assert (
         "final narration audio, canonical transcript, and explicit visual scene intervals "
@@ -1905,8 +2154,11 @@ def test_producer_uses_one_take_measured_narration_and_explicit_scene_intervals(
     assert "Never use proportional cue scaling" in prompt
     assert "Map aligned sentence intervals to visual scene boundaries" in prompt
     assert "Produce ASS subtitles" in prompt
+    assert "20 px at 1080p and 16 px at 720p" in prompt
     assert "rebuild the clean picture master" in prompt
     assert "measured narration boundaries" in prompt
+    assert "exactly project.state.request.duration_seconds" in prompt
+    assert "keep the final approved scene visible" in prompt
 
 
 def test_every_planner_budgets_narration_to_scene_duration():
@@ -2248,9 +2500,9 @@ def test_quality_requires_scene_evidence_measured_sync_and_compact_subtitles():
     assert "Treat the supplied probe, audio, subtitle, and frame results as authoritative" in prompt
     assert "acceptance evidence for every request.must_show scene" in prompt
     assert "Probe final video and narration audio" in prompt
-    assert "52 px at 1080p" in prompt
+    assert "20 px at 1080p" in prompt
     assert "no more than two lines" in prompt
-    assert "outline (2 px at 1080p)" in prompt
+    assert "outline (1 px at 1080p)" in prompt
     assert "Shadow=0" in prompt
     assert "bottom-safe margin" in prompt
     assert "measured cue-to-scene sync" in prompt
@@ -2435,6 +2687,14 @@ def test_quality_validator_executes_authoritative_scene_and_evidence_checks():
         error["code"] for error in result["errors"]
     }
 
+    wrong_duration = deepcopy(inputs)
+    wrong_duration["media_probe"]["report"]["duration_seconds"] = 6
+    result = _execute_validator(validator["config"]["code"], wrong_duration)
+    assert result["valid"] is False
+    assert "final_duration_mismatch" in {
+        error["code"] for error in result["errors"]
+    }
+
     failed_audio = deepcopy(inputs)
     failed_audio["audio_analysis"].update(
         {"status": "completed", "verdict": "fail", "non_empty": False}
@@ -2454,7 +2714,7 @@ def test_quality_validator_executes_authoritative_scene_and_evidence_checks():
     unreadable_style = deepcopy(inputs)
     unreadable_style["subtitle_analysis"]["style_evidence"]["Default"][
         "font_size"
-    ] = 18
+    ] = 52
     result = _execute_validator(validator["config"]["code"], unreadable_style)
     assert result["valid"] is False
     assert "subtitle_style_failed" in {
@@ -2463,7 +2723,7 @@ def test_quality_validator_executes_authoritative_scene_and_evidence_checks():
 
     invalid_style = deepcopy(inputs)
     invalid_style["subtitle_analysis"]["style_evidence"]["Default"].update(
-        {"font_size": 52, "outline": 3, "shadow": 1, "bottom_safe": False}
+        {"font_size": 20, "outline": 3, "shadow": 1, "bottom_safe": False}
     )
     result = _execute_validator(validator["config"]["code"], invalid_style)
     assert result["valid"] is False

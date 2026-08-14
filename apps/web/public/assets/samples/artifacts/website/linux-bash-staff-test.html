@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Linux / Bash Staff-Level 面试测试</title>
+  <style data-manor-preview-src="styles.css">
+:root {
+  --bg: #0f172a;
+  --panel: #111827;
+  --panel-2: #172033;
+  --card: #ffffff;
+  --text: #0f172a;
+  --muted: #64748b;
+  --line: #e2e8f0;
+  --green: #16a34a;
+  --red: #dc2626;
+  --amber: #d97706;
+  --blue: #2563eb;
+  --purple: #7c3aed;
+  --soft: #f8fafc;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: #eef2f7;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: linear-gradient(180deg, #0f172a, #111827);
+  color: white;
+  padding: 28px 20px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+
+.brand {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 32px;
+}
+
+.brand-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  background: linear-gradient(135deg, #22c55e, #3b82f6);
+}
+
+.brand h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.brand p {
+  color: #94a3b8;
+  margin: 2px 0 0;
+  font-size: 13px;
+}
+
+.nav {
+  display: grid;
+  gap: 8px;
+}
+
+.nav-item {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #cbd5e1;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 15px;
+}
+
+.nav-item:hover,
+.nav-item.active {
+  background: rgba(255,255,255,0.1);
+  color: white;
+}
+
+.progress-card {
+  margin-top: 32px;
+  padding: 16px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.08);
+}
+
+.progress-card span {
+  color: #cbd5e1;
+  font-size: 13px;
+}
+
+.progress-card strong {
+  display: block;
+  font-size: 32px;
+  margin: 8px 0;
+}
+
+.progress-bar {
+  height: 8px;
+  background: rgba(255,255,255,0.16);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-bar div {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #3b82f6);
+}
+
+.main {
+  padding: 32px;
+  max-width: 1180px;
+  width: 100%;
+}
+
+.view { display: none; }
+.view.active { display: block; }
+
+.hero {
+  display: grid;
+  grid-template-columns: 1fr 260px;
+  gap: 24px;
+  padding: 36px;
+  border-radius: 28px;
+  background: white;
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.08);
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: var(--blue);
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+h2 {
+  font-size: 34px;
+  line-height: 1.15;
+  margin: 0 0 12px;
+}
+
+h3 { margin-top: 0; }
+
+.hero-copy {
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1.65;
+  max-width: 720px;
+}
+
+.hero-actions,
+.mock-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 22px;
+}
+
+button {
+  font-family: inherit;
+}
+
+.primary,
+.secondary {
+  border: 0;
+  border-radius: 12px;
+  padding: 11px 16px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.primary {
+  background: var(--blue);
+  color: white;
+}
+
+.secondary {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.score-panel {
+  background: linear-gradient(180deg, #eff6ff, #f8fafc);
+  border: 1px solid #dbeafe;
+  border-radius: 22px;
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.score-panel span { color: var(--muted); }
+.score-panel strong { font-size: 38px; margin: 8px 0; }
+.score-panel p { margin: 0; color: var(--muted); }
+
+.grid.cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+  margin-top: 22px;
+}
+
+.card,
+.section-block,
+.question-card,
+.scenario-card,
+.command-card,
+.mock-card {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 22px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.04);
+}
+
+.card p,
+.card li,
+.scenario-card p,
+.command-card p {
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.section-block {
+  margin-top: 22px;
+}
+
+pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 18px;
+  border-radius: 16px;
+  overflow-x: auto;
+  line-height: 1.55;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 22px;
+}
+
+.question-list,
+.scenario-list {
+  display: grid;
+  gap: 16px;
+}
+
+.question-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 9px;
+  font-size: 12px;
+  font-weight: 700;
+  background: #eef2ff;
+  color: #3730a3;
+}
+
+.options {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.option {
+  border: 1px solid var(--line);
+  background: #f8fafc;
+  padding: 12px;
+  border-radius: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.option:hover { border-color: var(--blue); }
+.option.correct { border-color: var(--green); background: #ecfdf5; }
+.option.wrong { border-color: var(--red); background: #fef2f2; }
+
+.explanation {
+  display: none;
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f8fafc;
+  color: #334155;
+  line-height: 1.6;
+}
+
+.explanation.show { display: block; }
+
+.scenario-answer {
+  display: none;
+  margin-top: 12px;
+}
+
+.scenario-answer.show { display: block; }
+
+.command-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px;
+}
+
+.command-card code {
+  display: inline-block;
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 4px 8px;
+  border-radius: 8px;
+  margin: 2px;
+}
+
+.search {
+  min-width: 320px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  font-size: 15px;
+}
+
+textarea {
+  width: 100%;
+  min-height: 260px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 16px;
+  font-size: 15px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.feedback {
+  margin-top: 16px;
+  line-height: 1.7;
+}
+
+.feedback .ok { color: var(--green); font-weight: 700; }
+.feedback .miss { color: var(--amber); font-weight: 700; }
+
+@media (max-width: 900px) {
+  .app-shell { grid-template-columns: 1fr; }
+  .sidebar { position: relative; height: auto; }
+  .hero { grid-template-columns: 1fr; }
+  .grid.cards,
+  .command-grid { grid-template-columns: 1fr; }
+  .section-head { align-items: flex-start; flex-direction: column; }
+  .search { min-width: 100%; width: 100%; }
+}
+
+</style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">L</div>
+        <div>
+          <h1>Linux/Bash Test</h1>
+          <p>Robinhood Infra Prep</p>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <button class="nav-item active" data-view="dashboard">总览</button>
+        <button class="nav-item" data-view="quiz">章节测试</button>
+        <button class="nav-item" data-view="scenario">生产场景题</button>
+        <button class="nav-item" data-view="commands">命令速查</button>
+        <button class="nav-item" data-view="mock">模拟面试</button>
+      </nav>
+
+      <div class="progress-card">
+        <span>当前得分</span>
+        <strong id="sidebarScore">0%</strong>
+        <div class="progress-bar">
+          <div id="sidebarProgress" style="width: 0%"></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section id="dashboard" class="view active">
+        <div class="hero">
+          <div>
+            <p class="eyebrow">Staff-Level Linux Troubleshooting</p>
+            <h2>从基础命令到生产环境排障的完整测试网站</h2>
+            <p class="hero-copy">
+              用这套测试检查你是否能把 Linux、Bash、系统资源排查和生产事故分析讲到 Infra onsite 的强水平。
+            </p>
+            <div class="hero-actions">
+              <button class="primary" data-jump="quiz">开始章节测试</button>
+              <button class="secondary" data-jump="scenario">练生产场景</button>
+            </div>
+          </div>
+          <div class="score-panel">
+            <span>总完成度</span>
+            <strong id="completionText">0 / 0</strong>
+            <p id="levelText">还未开始</p>
+          </div>
+        </div>
+
+        <div class="grid cards">
+          <article class="card">
+            <h3>测试范围</h3>
+            <ul>
+              <li>Shell / Bash 基础</li>
+              <li>文件系统、权限、进程</li>
+              <li>CPU / Memory / Disk / Network 排查</li>
+              <li>systemd、journalctl、日志分析</li>
+              <li>Staff-level troubleshooting framework</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>面试目标</h3>
+            <p>
+              不只是会命令，而是能解释问题分类、证据链、mitigation、root cause 和 prevention。
+            </p>
+          </article>
+          <article class="card">
+            <h3>推荐练法</h3>
+            <p>
+              先做章节测试，再做生产场景题，最后用模拟面试区把答案用英文讲出来。
+            </p>
+          </article>
+        </div>
+
+        <div class="section-block">
+          <h3>Staff-level 排障模板</h3>
+          <pre><code>I would first determine the blast radius and check the golden signals: latency, traffic, errors, and saturation.
+Then I would correlate with recent deploys, config changes, dependency incidents, and traffic spikes.
+At the host level, I would check CPU, memory, disk, and network using top, free, df, iostat, ss, curl, dig, and journalctl.
+If user impact is high, I would mitigate first through rollback, scaling, feature flag disablement, or failover.
+After mitigation, I would continue root cause analysis and add prevention such as alerts, rate limits, circuit breakers, capacity planning, or runbook automation.</code></pre>
+        </div>
+      </section>
+
+      <section id="quiz" class="view">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Chapter Quiz</p>
+            <h2>章节测试</h2>
+          </div>
+          <button class="secondary" id="resetQuiz">重置答案</button>
+        </div>
+        <div id="quizList" class="question-list"></div>
+      </section>
+
+      <section id="scenario" class="view">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Production Scenarios</p>
+            <h2>生产场景题</h2>
+          </div>
+          <button class="secondary" id="showScenarioAnswers">显示/隐藏参考答案</button>
+        </div>
+        <div id="scenarioList" class="scenario-list"></div>
+
+        <div class="answer-lab" id="scenarioAnswerLab">
+          <p class="eyebrow">Interactive Answer Check</p>
+          <h3>新增生产场景题：输入答案后自动检测覆盖点</h3>
+          <p>
+            随机抽一道 Staff-level Infra 场景题，用英文或中文回答。系统会检查你是否覆盖了症状澄清、假设、命令、证据、缓解、根因和预防。
+          </p>
+          <div class="answer-meta">
+            <span id="scenarioQuestionIndex">题目 1</span>
+            <span id="scenarioDifficulty">Difficulty: Staff</span>
+          </div>
+          <h4 id="interactiveScenarioQuestion"></h4>
+          <textarea id="interactiveScenarioAnswer" placeholder="建议结构：impact / blast radius → hypotheses → Linux commands → evidence → mitigation → root cause → prevention"></textarea>
+          <div class="answer-toolbar">
+            <button class="primary" id="checkScenarioAnswer">检测答案</button>
+            <button class="secondary" id="nextScenarioQuestion">换一道场景题</button>
+            <button class="secondary" id="showScenarioSample">显示参考答案</button>
+          </div>
+          <div id="scenarioAnswerFeedback" class="rubric-grid"></div>
+          <div id="scenarioSampleAnswer" class="sample-answer" hidden></div>
+        </div>
+      </section>
+
+      <section id="commands" class="view">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Command Cheat Sheet</p>
+            <h2>命令速查与用途</h2>
+          </div>
+          <input id="commandSearch" class="search" placeholder="搜索命令，例如 grep、iostat、ss..." />
+        </div>
+        <div id="commandGrid" class="command-grid"></div>
+      </section>
+
+      <section id="mock" class="view">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Mock Interview</p>
+            <h2>模拟面试口述练习</h2>
+          </div>
+          <button class="primary" id="newMockQuestion">随机换题</button>
+        </div>
+        <div class="mock-card">
+          <h3 id="mockQuestion">点击随机换题开始</h3>
+          <textarea id="mockAnswer" placeholder="用英文写/背你的答案。重点：symptom → hypothesis → commands → evidence → mitigation → prevention"></textarea>
+          <div class="mock-actions">
+            <button class="secondary" id="evaluateMock">检查答案覆盖点</button>
+            <button class="secondary" id="clearMock">清空</button>
+          </div>
+          <div id="mockFeedback" class="feedback"></div>
+
+          <div class="answer-lab" id="onsiteInterviewLab">
+            <p class="eyebrow">Onsite Interview Bank</p>
+            <h3>新增面试题：输入答案后检测 Staff-level 信号</h3>
+            <div class="answer-meta">
+              <span id="interviewQuestionType">类型：Troubleshooting</span>
+              <span id="interviewQuestionIndex">题目 1</span>
+            </div>
+            <h4 id="interactiveInterviewQuestion"></h4>
+            <textarea id="interactiveInterviewAnswer" placeholder="用英文回答更贴近 onsite。重点展示：clarifying questions、trade-offs、debug plan、communication、ownership、prevention。"></textarea>
+            <div class="answer-toolbar">
+              <button class="primary" id="checkInterviewAnswer">检测答案</button>
+              <button class="secondary" id="nextInterviewQuestion">换一道面试题</button>
+              <button class="secondary" id="showInterviewSample">显示参考答案</button>
+            </div>
+            <div id="interviewAnswerFeedback" class="rubric-grid"></div>
+            <div id="interviewSampleAnswer" class="sample-answer" hidden></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <style>
+    .answer-lab {
+      margin-top: 24px;
+      padding: 20px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      border-radius: 18px;
+      background: rgba(15, 23, 42, 0.45);
+    }
+
+    .answer-lab h3 {
+      margin-top: 0;
+    }
+
+    .answer-lab textarea {
+      width: 100%;
+      min-height: 140px;
+      margin: 12px 0;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(2, 6, 23, 0.72);
+      color: inherit;
+      resize: vertical;
+      line-height: 1.55;
+    }
+
+    .answer-toolbar,
+    .answer-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .answer-meta {
+      margin: 12px 0;
+      color: #94a3b8;
+      font-size: 14px;
+    }
+
+    .score-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(34, 197, 94, 0.12);
+      color: #86efac;
+      font-weight: 700;
+    }
+
+    .rubric-grid {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .rubric-item {
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+    }
+
+    .rubric-item.good {
+      border-color: rgba(34, 197, 94, 0.45);
+    }
+
+    .rubric-item.missing {
+      border-color: rgba(248, 113, 113, 0.45);
+    }
+
+    .rubric-item strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .sample-answer {
+      margin-top: 14px;
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(30, 41, 59, 0.72);
+      border-left: 4px solid #38bdf8;
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+  </style>
+  <script data-manor-preview-src="app.js">
+const quizQuestions = [
+  {
+    category: "基础 / 文件系统",
+    q: "/proc 在 Linux 中主要是什么？",
+    options: ["普通磁盘目录", "虚拟文件系统，暴露 kernel 和 process runtime 信息", "用户 home 目录", "系统二进制目录"],
+    answer: 1,
+    explanation: "/proc 是虚拟文件系统，不是真实磁盘文件。常用于查看 /proc/<pid>/status、/proc/<pid>/fd、/proc/meminfo。"
+  },
+  {
+    category: "权限",
+    q: "chmod 755 script.sh 表示什么？",
+    options: ["所有人都可写", "owner 可读写执行，group/others 可读执行", "只有 root 可执行", "删除执行权限"],
+    answer: 1,
+    explanation: "7=读写执行，5=读执行。目录的 x 表示可进入目录，文件的 x 表示可执行。"
+  },
+  {
+    category: "Bash",
+    q: "为什么生产 Bash 脚本常用 set -euo pipefail？",
+    options: ["让脚本更慢但更安全", "失败时尽早退出，未定义变量报错，pipeline 任一步失败都算失败", "自动重试失败命令", "自动记录日志"],
+    answer: 1,
+    explanation: "set -e / -u / pipefail 是健壮脚本的基础，但不是银弹，复杂错误仍需显式处理。"
+  },
+  {
+    category: "文本处理",
+    q: "统计 access.log 中 HTTP status 出现次数的典型命令是？",
+    options: ["awk '{print $9}' access.log | sort | uniq -c | sort -nr", "cat access.log > /dev/null", "chmod 644 access.log", "df -h access.log"],
+    answer: 0,
+    explanation: "awk 取状态码列，sort 排序，uniq -c 计数，再按数量降序排列。"
+  },
+  {
+    category: "进程",
+    q: "为什么生产环境不应该一开始就 kill -9？",
+    options: ["kill -9 无效", "它阻止进程 graceful shutdown 和 cleanup", "它只会暂停进程", "它会删除文件系统"],
+    answer: 1,
+    explanation: "优先 SIGTERM，让服务清理连接、flush 日志、释放资源；无响应再升级到 SIGKILL。"
+  },
+  {
+    category: "CPU",
+    q: "load average 代表什么？",
+    options: ["CPU 温度", "过去 1/5/15 分钟 runnable 或 uninterruptible tasks 数量", "磁盘剩余空间", "网络连接数"],
+    answer: 1,
+    explanation: "load 要结合 CPU 核数看。4 核机器 load 4 约等于满载，load 8 压力较大。"
+  },
+  {
+    category: "Memory",
+    q: "Linux 中 free memory 很低一定代表内存问题吗？",
+    options: ["一定是", "不一定，Linux 会积极使用 page cache，应看 available、swap、OOM、RSS", "只看 swap 即可", "只看 CPU 即可"],
+    answer: 1,
+    explanation: "available memory 比 free 更重要。低 free 可能只是 page cache。"
+  },
+  {
+    category: "Disk",
+    q: "df 显示磁盘满，但 du 找不到大文件，最可能是什么？",
+    options: ["CPU 太高", "deleted file still held by process", "DNS 失败", "权限 755"],
+    answer: 1,
+    explanation: "文件被删除后，如果进程仍持有 fd，空间不会释放。可用 lsof | grep deleted 排查。"
+  },
+  {
+    category: "Network",
+    q: "CLOSE_WAIT 很多通常说明什么？",
+    options: ["对端已经关闭连接，但本地应用没有关闭 socket，可能 connection leak", "DNS 完全正常", "磁盘 inode 满", "CPU user 高"],
+    answer: 0,
+    explanation: "CLOSE_WAIT 多通常指向应用没有正确 close socket，需要看连接池/代码/依赖行为。"
+  },
+  {
+    category: "systemd",
+    q: "服务启动失败时第一批常用命令是？",
+    options: ["systemctl status + journalctl -u", "chmod -R 777 /", "rm -rf /tmp", "kill -9 1"],
+    answer: 0,
+    explanation: "systemctl status 看服务状态，journalctl -u 看该 service 的日志。"
+  },
+  {
+    category: "Staff-level",
+    q: "线上 latency spike，Staff-level 第一反应应该是什么？",
+    options: ["直接重启所有机器", "先确认 blast radius 和 golden signals，再关联 deploy/config/dependency/traffic", "只 grep ERROR", "只看一台机器 top"],
+    answer: 1,
+    explanation: "先确定影响范围，再看 latency/traffic/errors/saturation，并考虑最近变更和依赖。"
+  },
+  {
+    category: "Network",
+    q: "排查服务连不上依赖时，合理层次是？",
+    options: ["DNS → TCP → TLS → HTTP → application", "CPU → chmod → rm", "只看浏览器", "只看磁盘"],
+    answer: 0,
+    explanation: "把网络问题拆层，避免把 DNS/TCP/TLS/HTTP/App 混在一起。"
+  }
+];
+
+const scenarios = [
+  {
+    title: "场景 1：服务 latency 突然升高",
+    prompt: "一个核心 API P99 latency 从 100ms 升到 2s，error rate 也略有升高。你怎么在 Linux/生产环境里排查？",
+    answer: [
+      "先确定 blast radius：单实例、单 AZ、单 region，还是全局。",
+      "检查 golden signals：latency、traffic、errors、saturation。",
+      "关联最近 deploy、config、dependency、traffic spike。",
+      "Host-level：top/mpstat 看 CPU，free/OOM logs 看内存，df/du/iostat 看磁盘，ss/curl/dig/nc 看网络。",
+      "App-level：日志、thread dump、GC、connection pool、retry rate。",
+      "如果用户影响大，先 mitigation：rollback、scale out、disable feature flag、failover、load shedding。",
+      "最后补 prevention：alert、runbook、capacity、circuit breaker、rate limit。"
+    ]
+  },
+  {
+    title: "场景 2：CPU 95%",
+    prompt: "一台 host CPU 长时间 95%，你会怎么判断是正常流量还是异常问题？",
+    answer: [
+      "先看 traffic/throughput 是否同步升高，latency 是否恶化。",
+      "top、ps aux --sort=-%cpu、mpstat 1、pidstat -p <pid> 1。",
+      "区分 user/system/iowait/steal。",
+      "如果 user 高：hot loop、序列化、压缩、GC、计算密集。",
+      "如果 system 高：系统调用、网络、上下文切换、锁竞争。",
+      "如果 iowait 高：磁盘或网络 IO。",
+      "不是一上来 kill，而是先拿证据；必要时 rollback/scale。"
+    ]
+  },
+  {
+    title: "场景 3：Memory 增长并 OOM",
+    prompt: "服务运行几小时后 RSS 持续增长，最终被 OOM killer 杀掉。你怎么查？",
+    answer: [
+      "free -h 看 available 和 swap，不只看 free。",
+      "ps aux --sort=-%mem、pmap -x、/proc/<pid>/status 看 RSS/VmSize/Threads。",
+      "dmesg 或 journalctl -k grep OOM 确认 OOM killer。",
+      "区分 host-level memory pressure 和 cgroup/container limit。",
+      "关联 deploy、traffic、cache size、batch job、GC 行为。",
+      "可能原因：memory leak、unbounded cache、并发过高、大对象、容器 limit 太低。"
+    ]
+  },
+  {
+    title: "场景 4：磁盘满但 du 看不到大文件",
+    prompt: "df -h 显示 /var 满了，但 du -sh /var/* 找不到对应大文件。为什么？",
+    answer: [
+      "最可能是 deleted file still held by process。",
+      "Linux 删除文件只是移除目录项；如果进程仍打开 fd，空间不会释放。",
+      "用 lsof | grep deleted 找持有者。",
+      "安全处理：让进程 reopen log、重启对应服务，或清理 fd。",
+      "同时检查 log rotation 配置，防止复发。"
+    ]
+  },
+  {
+    title: "场景 5：服务无法连接依赖",
+    prompt: "服务报 dependency connect timeout。你怎么从 Linux 层排查？",
+    answer: [
+      "按层拆：DNS → TCP → TLS → HTTP → application。",
+      "DNS：getent hosts、dig、nslookup。",
+      "TCP：nc -vz host port、ss -ant、ip route。",
+      "HTTP/TLS：curl -v、curl -w 分阶段耗时。",
+      "看是否是防火墙/security group、端口未监听、依赖挂了、DNS 变更、连接池耗尽。",
+      "如果影响大，fallback/failover/circuit breaker/降级。"
+    ]
+  }
+];
+
+const commands = [
+  { group: "文件", cmds: ["ls -lah", "find", "du -sh", "df -h", "tree"], desc: "查看目录、查找文件、定位大文件和磁盘占用。" },
+  { group: "权限", cmds: ["chmod", "chown", "sudo", "umask"], desc: "处理 owner/group/mode，生产环境遵循 least privilege。" },
+  { group: "文本", cmds: ["grep", "awk", "sed", "sort", "uniq", "wc", "cut", "xargs"], desc: "日志分析、字段提取、统计、替换和批处理。" },
+  { group: "进程", cmds: ["ps aux", "top", "htop", "kill -15", "pgrep", "lsof -p"], desc: "定位进程、CPU/内存占用、打开文件和端口。" },
+  { group: "CPU", cmds: ["uptime", "mpstat 1", "pidstat", "top -H"], desc: "看 load、user/system/iowait/steal、线程级 CPU。" },
+  { group: "Memory", cmds: ["free -h", "pmap -x", "cat /proc/meminfo", "dmesg | grep -i oom"], desc: "判断 available、RSS、OOM、container/host pressure。" },
+  { group: "Disk", cmds: ["df -h", "df -i", "du --max-depth=1", "iostat -xz 1", "lsof | grep deleted"], desc: "排查空间、inode、IO latency、deleted fd。" },
+  { group: "Network", cmds: ["ss -lntp", "ss -ant", "curl -v", "dig", "nc -vz", "ip route"], desc: "排查监听、连接状态、DNS、TCP、HTTP/TLS。" },
+  { group: "服务", cmds: ["systemctl status", "systemctl restart", "systemctl reload", "journalctl -u", "journalctl -k"], desc: "管理 systemd service，查看应用和 kernel 日志。" },
+  { group: "传输/压缩", cmds: ["tar", "gzip", "scp", "rsync", "ssh"], desc: "打包、压缩、远程复制和登录。" }
+];
+
+const mockQuestions = [
+  "A service latency suddenly increases. How do you debug it on Linux?",
+  "CPU is 95% on one host. What commands do you run and why?",
+  "Memory keeps growing and the process gets OOM killed. How do you debug?",
+  "Disk is full but du does not show large files. What happened?",
+  "A service cannot connect to another service. How do you debug DNS/TCP/HTTP?",
+  "How do you explain load average to a junior engineer?",
+  "What is the difference between restart and reload in systemd?",
+  "How would you write a safe Bash script for production automation?"
+];
+
+let answers = JSON.parse(localStorage.getItem("linuxQuizAnswers") || "{}");
+let scenarioAnswersVisible = false;
+
+function $(selector) { return document.querySelector(selector); }
+function $all(selector) { return [...document.querySelectorAll(selector)]; }
+
+function showView(id) {
+  $all(".view").forEach(v => v.classList.remove("active"));
+  $(`#${id}`).classList.add("active");
+  $all(".nav-item").forEach(btn => btn.classList.toggle("active", btn.dataset.view === id));
+}
+
+function renderQuiz() {
+  const list = $("#quizList");
+  list.innerHTML = quizQuestions.map((item, idx) => {
+    const selected = answers[idx];
+    return `<article class="question-card">
+      <div class="question-meta">
+        <span class="badge">${item.category}</span>
+        <span>${selected !== undefined ? "已作答" : "未作答"}</span>
+      </div>
+      <h3>${idx + 1}. ${item.q}</h3>
+      <div class="options">
+        ${item.options.map((opt, optIdx) => {
+          let cls = "option";
+          if (selected !== undefined) {
+            if (optIdx === item.answer) cls += " correct";
+            else if (optIdx === selected) cls += " wrong";
+          }
+          return `<button class="${cls}" data-q="${idx}" data-opt="${optIdx}">${opt}</button>`;
+        }).join("")}
+      </div>
+      <div class="explanation ${selected !== undefined ? "show" : ""}">${item.explanation}</div>
+    </article>`;
+  }).join("");
+
+  $all(".option").forEach(btn => btn.addEventListener("click", () => {
+    answers[btn.dataset.q] = Number(btn.dataset.opt);
+    localStorage.setItem("linuxQuizAnswers", JSON.stringify(answers));
+    renderQuiz();
+    updateScore();
+  }));
+}
+
+function updateScore() {
+  const total = quizQuestions.length;
+  const answered = Object.keys(answers).length;
+  const correct = Object.entries(answers).filter(([idx, opt]) => quizQuestions[idx].answer === opt).length;
+  const pct = total ? Math.round((correct / total) * 100) : 0;
+  $("#sidebarScore").textContent = `${pct}%`;
+  $("#sidebarProgress").style.width = `${pct}%`;
+  $("#completionText").textContent = `${answered} / ${total}`;
+  let level = "还未开始";
+  if (answered > 0 && pct < 60) level = "基础还需要补强";
+  if (pct >= 60) level = "接近面试可用水平";
+  if (pct >= 80) level = "强 Senior 水平";
+  if (pct >= 92) level = "接近 Staff-level 表达";
+  $("#levelText").textContent = level;
+}
+
+function renderScenarios() {
+  const list = $("#scenarioList");
+  list.innerHTML = scenarios.map((s, idx) => `<article class="scenario-card">
+    <span class="badge">Scenario ${idx + 1}</span>
+    <h3>${s.title}</h3>
+    <p>${s.prompt}</p>
+    <div class="scenario-answer ${scenarioAnswersVisible ? "show" : ""}">
+      <h4>参考答案要点</h4>
+      <ul>${s.answer.map(a => `<li>${a}</li>`).join("")}</ul>
+    </div>
+  </article>`).join("");
+}
+
+function renderCommands(filter = "") {
+  const f = filter.trim().toLowerCase();
+  const data = commands.filter(c => [c.group, c.desc, ...c.cmds].join(" ").toLowerCase().includes(f));
+  $("#commandGrid").innerHTML = data.map(c => `<article class="command-card">
+    <h3>${c.group}</h3>
+    <p>${c.desc}</p>
+    <div>${c.cmds.map(cmd => `<code>${cmd}</code>`).join(" ")}</div>
+  </article>`).join("");
+}
+
+function pickMockQuestion() {
+  const q = mockQuestions[Math.floor(Math.random() * mockQuestions.length)];
+  $("#mockQuestion").textContent = q;
+  $("#mockFeedback").innerHTML = "";
+}
+
+function evaluateMock() {
+  const text = $("#mockAnswer").value.toLowerCase();
+  const checks = [
+    { label: "blast radius / scope", keys: ["blast", "scope", "host", "region", "az"] },
+    { label: "golden signals", keys: ["latency", "traffic", "error", "saturation"] },
+    { label: "recent changes", keys: ["deploy", "config", "change", "traffic spike"] },
+    { label: "Linux commands", keys: ["top", "free", "df", "iostat", "ss", "curl", "journalctl", "dig"] },
+    { label: "mitigation", keys: ["rollback", "scale", "feature flag", "failover", "mitigate"] },
+    { label: "prevention", keys: ["alert", "runbook", "circuit breaker", "capacity", "prevention"] }
+  ];
+  const rows = checks.map(c => {
+    const ok = c.keys.some(k => text.includes(k));
+    return `<div><span class="${ok ? "ok" : "miss"}">${ok ? "✓" : "△"}</span> ${c.label}</div>`;
+  });
+  $("#mockFeedback").innerHTML = `<h4>覆盖点检查</h4>${rows.join("")}<p>目标答案结构：symptom → hypothesis → commands → evidence → mitigation → prevention。</p>`;
+}
+
+function init() {
+  $all(".nav-item").forEach(btn => btn.addEventListener("click", () => showView(btn.dataset.view)));
+  $all("[data-jump]").forEach(btn => btn.addEventListener("click", () => showView(btn.dataset.jump)));
+
+  $("#resetQuiz").addEventListener("click", () => {
+    answers = {};
+    localStorage.removeItem("linuxQuizAnswers");
+    renderQuiz();
+    updateScore();
+  });
+
+  $("#showScenarioAnswers").addEventListener("click", () => {
+    scenarioAnswersVisible = !scenarioAnswersVisible;
+    renderScenarios();
+  });
+
+  $("#commandSearch").addEventListener("input", e => renderCommands(e.target.value));
+  $("#newMockQuestion").addEventListener("click", pickMockQuestion);
+  $("#evaluateMock").addEventListener("click", evaluateMock);
+  $("#clearMock").addEventListener("click", () => {
+    $("#mockAnswer").value = "";
+    $("#mockFeedback").innerHTML = "";
+  });
+
+  renderQuiz();
+  renderScenarios();
+  renderCommands();
+  updateScore();
+  pickMockQuestion();
+}
+
+init();
+
+</script>
+  <script>
+    const extraScenarioQuestions = [
+      {
+        question: "A production API suddenly has high p99 latency. CPU looks normal, but users report timeouts. Walk me through your Linux-level debugging plan.",
+        difficulty: "Staff",
+        keywords: {
+          "影响面与黄金指标": ["impact", "blast", "p99", "latency", "errors", "traffic", "saturation", "用户", "影响面"],
+          "假设分层": ["hypothesis", "network", "disk", "dependency", "lock", "thread", "connection", "queue", "假设"],
+          "Linux 命令": ["top", "htop", "vmstat", "iostat", "ss", "netstat", "curl", "journalctl", "dmesg", "pidstat", "strace"],
+          "证据链": ["correlate", "evidence", "compare", "baseline", "logs", "metrics", "trace", "证据", "对比"],
+          "缓解优先": ["rollback", "scale", "rate limit", "feature flag", "restart", "failover", "mitigate", "缓解", "回滚"],
+          "复盘预防": ["postmortem", "alert", "runbook", "capacity", "timeout", "circuit breaker", "prevention", "预防"]
+        },
+        sample: "I would first quantify user impact through p95/p99 latency, error rate, traffic, and saturation. Then I would split hypotheses between application, host, network, disk, and dependencies. On the host I would check top/pidstat for CPU scheduling, free/vmstat for memory pressure, iostat for disk latency, ss for socket states and connection backlog, curl for local dependency latency, and journalctl/application logs for errors. I would correlate the timing with deploys, config changes, traffic spikes, or dependency incidents. If impact is high, I would mitigate first by rollback, scaling, disabling a feature flag, or failing over. After recovery, I would confirm the root cause and add alerts, dashboards, runbooks, timeouts, circuit breakers, or capacity changes."
+      },
+      {
+        question: "A host is running out of disk space during peak traffic. The service is still serving requests. What do you do first, and how do you avoid making it worse?",
+        difficulty: "Staff",
+        keywords: {
+          "风险判断": ["impact", "peak", "risk", "serving", "blast", "read-only", "风险", "影响"],
+          "定位空间来源": ["df", "du", "lsof", "deleted", "inode", "find", "logs", "journalctl", "空间"],
+          "安全缓解": ["rotate", "truncate", "compress", "move", "cleanup", "rollback", "scale", "drain", "安全", "清理"],
+          "避免破坏": ["do not delete", "backup", "verify", "open file", "restart risk", "不要", "确认"],
+          "长期预防": ["logrotate", "retention", "alert", "quota", "capacity", "runbook", "预警", "保留策略"]
+        },
+        sample: "I would avoid random deletion. First I would check df -h and df -i to know whether it is bytes or inodes. Then I would use du -xhd1 to find large directories and lsof +L1 to detect deleted files still held by processes. If logs are the cause, I would rotate, compress, or safely truncate the right files after confirming ownership. If the service is at risk, I would drain traffic, scale out, or fail over before cleanup. I would avoid restarting blindly because deleted-but-open files, caches, or stateful processes may have side effects. Prevention would include logrotate, retention limits, disk alerts, quotas, and a runbook."
+      },
+      {
+        question: "After a deploy, several Linux services fail to start under systemd. The binary works manually. How would you debug it?",
+        difficulty: "Senior/Staff",
+        keywords: {
+          "变更关联": ["deploy", "change", "config", "version", "rollback", "变更"],
+          "systemd 工具": ["systemctl", "status", "journalctl", "unit", "service", "systemd-analyze"],
+          "环境差异": ["environment", "working directory", "user", "permission", "path", "ulimit", "env", "权限"],
+          "验证方法": ["reproduce", "compare", "logs", "exit code", "ExecStart", "验证"],
+          "缓解与预防": ["rollback", "canary", "health check", "runbook", "test", "prevention", "回滚"]
+        },
+        sample: "I would correlate the failures with the deploy and check systemctl status plus journalctl -u service for exit codes and stderr. Since the binary works manually, I would compare the systemd runtime environment: user, group, working directory, PATH, environment variables, file permissions, ulimit, sandboxing options, and ExecStart arguments. I would reproduce with systemd-run or by running as the same user. If many services are down, I would roll back or disable the bad config first. Prevention includes validating unit files in CI, canary deploys, health checks, and better startup failure alerts."
+      },
+      {
+        question: "A service has intermittent connection failures to a dependency. DNS, TCP, and TLS are all possible. What commands and evidence would you use?",
+        difficulty: "Staff",
+        keywords: {
+          "分层排查": ["dns", "tcp", "tls", "layer", "dependency", "分层"],
+          "DNS 检查": ["dig", "nslookup", "resolv.conf", "ttl", "resolver", "DNS"],
+          "网络连接": ["ss", "tcpdump", "curl", "nc", "mtr", "traceroute", "connection", "网络"],
+          "TLS 验证": ["openssl", "certificate", "handshake", "sni", "tls", "证书"],
+          "缓解预防": ["retry", "timeout", "circuit breaker", "cache", "failover", "alert", "重试", "熔断"]
+        },
+        sample: "I would separate DNS, TCP, and TLS. For DNS I would use dig against the configured resolver, check TTLs, /etc/resolv.conf, and resolver errors. For TCP I would use ss to inspect socket states, curl or nc for connectivity, mtr/traceroute for path issues, and tcpdump if packet-level evidence is needed. For TLS I would use openssl s_client with SNI to inspect certificate chain and handshake errors. I would compare successful and failed attempts over time. Mitigation could be failover, dependency rollback, DNS cache adjustment, retries with jitter, timeouts, and circuit breakers."
+      }
+    ];
+
+    const extraInterviewQuestions = [
+      {
+        type: "Troubleshooting",
+        question: "Tell me about a time you debugged a severe production incident. How did you prioritize mitigation versus root cause analysis?",
+        keywords: {
+          "明确影响": ["impact", "severity", "users", "sla", "blast", "影响"],
+          "结构化排查": ["hypothesis", "metrics", "logs", "traces", "dashboard", "排查"],
+          "优先缓解": ["mitigation", "rollback", "failover", "scale", "feature flag", "缓解"],
+          "沟通协作": ["communicate", "stakeholder", "timeline", "incident commander", "update", "沟通"],
+          "复盘改进": ["postmortem", "action item", "prevention", "alert", "runbook", "复盘"]
+        },
+        sample: "I would frame the story with impact and severity first. During the incident I prioritized user recovery: identify blast radius, check golden signals, assign owners, and mitigate through rollback, failover, or feature flag disablement. In parallel I would preserve evidence and continue hypothesis-driven debugging with metrics, logs, traces, and recent changes. I would communicate frequent updates to stakeholders. After recovery I would lead a blameless postmortem, identify root cause, and create prevention items such as better alerts, safer deploys, runbooks, and automated checks."
+      },
+      {
+        type: "Linux Depth",
+        question: "How would you explain load average to an interviewer, and how is it different from CPU utilization?",
+        keywords: {
+          "定义": ["runnable", "uninterruptible", "queue", "1 5 15", "load average", "定义"],
+          "区别 CPU": ["cpu utilization", "cores", "saturation", "idle", "CPU"],
+          "排查命令": ["top", "uptime", "vmstat", "iostat", "pidstat", "ps"],
+          "可能原因": ["io wait", "disk", "lock", "threads", "run queue", "原因"],
+          "面试表达": ["baseline", "compare", "evidence", "hypothesis", "解释"]
+        },
+        sample: "Load average is the average number of tasks that are runnable or in uninterruptible sleep over 1, 5, and 15 minutes. It is not the same as CPU utilization. A machine can have high load because many tasks are waiting for CPU, but also because tasks are stuck in disk I/O. I would normalize it by CPU core count and then check top, uptime, vmstat, pidstat, and iosta   {
+        type: "Behavioral / Staff Signal",
+        question: "Describe a time you improved reliability beyond fixing one bug. What durable system change did you make?",
+        keywords: {
+          "问题背景": ["reliability", "incident", "pattern", "recurring", "背景"],
+          "系统性改进": ["automation", "architecture", "runbook", "alert", "slo", "系统"],
+          "权衡": ["trade-off", "cost", "complexity", "risk", "权衡"],
+          "影响量化": ["reduced", "improved", "mttr", "availability", "latency", "量化"],
+          "跨团队推动": ["alignment", "stakeholder", "team", "review", "推动"]
+        },
+        sample: "I would pick an example where the fix changed the system, not just one line of code. I would explain the recurring reliability pattern, the trade-offs considered, and the durable change: automation, better alerting, SLOs, safer deploys, runbooks, or architectural isolation. I would quantify the impact if possible, such as reduced MTTR, fewer pages, or better availability. I would also describe how I aligned teams and made the change maintainable."
+      },
+      {
+        type: "Architecture / Infra",
+        question: "A cron-based batch job became business-critical and now misses deadlines. How would you redesign or harden it?",
+        keywords: {
+          "需求澄清": ["deadline", "sla", "volume", "failure", "business", "需求"],
+          "可靠性设计": ["idempotent", "retry", "checkpoint", "backfill", "queue", "可靠"],
+          "可观测性": ["metrics", "logs", "alert", "dashboard", "tracing", "监控"],
+          "扩展性": ["parallel", "sharding", "worker", "capacity", "scale", "扩展"],
+          "运维策略": ["runbook", "oncall", "rollback", "manual override", "预案"]
+        },
+        sample: "I would first clarify the SLA, data volume, failure modes, and downstream impact. Then I would harden the job with idempotency, checkpoints,ough queues or sharded workers. I would add metrics for duration, lag, success rate, and records processed, plus alerts before the deadline is missed. Finally I would document runbooks, manual overrides, and rollback plans."
+      }
+    ];
+
+    function normalizeAnswer(text) {
+      return (text || "").toLowerCase();
+    }
+
+    function scoreAnswer(answer, keywordGroups) {
+      const normalized = normalizeAnswer(answer);
+      return Object.entries(keywordGroups).map(([category, words]) => {
+        const hits = words.filter((word) => normalized.includes(word.toLowerCase()));
+        return {
+          category,
+          hits,
+          passed: hits.length > 0,
+          hint: words.slice(0, 5).join(" / ")
+        };
+      });
+    }
+
+    function renderFeedback(targetId, answer, keywordGroups) {
+      const target = document.getElementById(targetId);
+      if (!target) return;
+
+      const results = scoreAnswer(answer, keywordGroups);
+      const passed = results.filter((item) => item.passed).length;
+      const score = Math.round((passed / results.length) * 100);
+      const level = score >= 85 ? "Strong Staff signal" : score >= 65 ? "Good, but add evidence/trade-offs" : "Needs more structure";
+
+      target.innerHTML = `
+        <div class="rubric-item good">
+          <strong><span class="score-badge">${score}%</span> ${level}</strong>
+          <span>覆盖 ${passed} / ${results.length} 个关键维度。建议答案至少包含：impact、hypothesis、commands/evidence、mitigation、root cause、prevention。</span>
+        </div>
+        ${results.map((item) => `
+          <div class="rubric-item ${item.passed ? "good" : "missing"}">
+            <strong>${item.passed ? "✅" : "⚠️"} ${item.category}</strong>
+            <span>${item.passed ? `命中关键词：${item.hits.join("、")}` : `可补充：${item.hint}`}</span>
+          </div>
+        `).join("")}
+      `;
+    }
+
+    function setupInteractiveBank(config) {
+      let index = 0;
+      const questionEl = document.getElementById(config.questionId);
+      const answerEl = document.getElementById(config.answerId);
+      const feedbackId = config.feedbackId;
+      const sampleEl = document.getElementById(config.sampleId);
+      const indexEl = document.getElementById(config.indexId);
+      const metaEl = document.getElementById(config.metaId);
+
+      function renderQuestion() {
+        const item = config.bank[index];
+        if (!item || !questionEl) return;
+        questionEl.textContent = item.question;
+        if (indexEl) indexEl.textContent = `题目 ${index + 1} / ${config.bank.length}`;
+        if (metaEl) metaEl.textContent = config.metaLabel(item);
+        if (answerEl) answerEl.value = "";
+        const feedback = document.getElementById(feedbackId);
+        if (feedback) feedback.innerHTML = "";
+        if (sampleEl) {
+          sampleEl.textContent = item.sample;
+          sampleEl.hidden = true;
+        }
+      }
+
+      const checkBtn = document.getElementById(config.checkBtnId);
+      const nextBtn = document.getElementById(config.nextBtnId);
+      const sampleBtn = document.getElementById(config.sampleBtnId);
+
+      if (checkBtn) {
+        checkBtn.addEventListener("click", () => {
+          const item = config.bank[index];
+          renderFeedback(feedbackId, answerEl ? answerEl.value : "", item.keywords);
+        });
+      }
+
+      if (nextBtn) {
+        nextBtn.addEventListener("click", () => {
+          index = (index + 1) % config.bank.length;
+          renderQuestion();
+        });
+      }
+
+      if (sampleBtn && sampleEl) {
+        sampleBtn.addEventListener("click", () => {
+          sampleEl.hidden = !sampleEl.hidden;
+        });
+      }
+
+      renderQuestion();
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      setupInteractiveBank({
+        bank: extraScenarioQuestions,
+        questionId: "interactiveScenarioQuestion",
+        answerId: "interactiveScenarioAnswer",
+        feedbackId: "scenarioAnswerFeedback",
+        sampleId: "scenarioSampleAnswer",
+        indexId: "scenarioQuestionIndex",
+        metaId: "scenarioDifficulty",
+        checkBtnId: "checkScenarioAnswer",
+        nextBtnId: "nextScenarioQuestion",
+        sampleBtnId: "showScenarioSample",
+        metaLabel: (item) => `Difficulty: ${item.difficulty}`
+      });
+
+      setupInteractiveBank({
+        bank: extraInterviewQuestions,
+        questionId: "interactiveInterviewQuestion",
+        answerId: "interactiveInterviewAnswer",
+        feedbackId: "interviewAnswerFeedback",
+        sampleId: "interviewSampleAnswer",
+        indexId: "interviewQuestionIndex",
+        metaId: "interviewQuestionType",
+        checkBtnId: "checkInterviewAnswer",
+        nextBtnId: "nextInterviewQuestion",
+        sampleBtnId: "showInterviewSample",
+        metaLabel: (item) => `类型：${item.type}`
+      });
+    });
+  </script>
+</body>
+</html>

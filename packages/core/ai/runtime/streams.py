@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from packages.core.ai.runtime.output_policy import PREVIOUS_TOOL_ACTIVITY_MARKER
-from packages.core.ai.runtime.provider_approvals import normalize_provider_approval
+from packages.core.ai.runtime.provider_approvals import (
+    normalize_provider_approval,
+    normalize_provider_approval_resolution,
+)
+from packages.core.constants.hitl_envelope import parse_hitl_envelope
 
 
 RuntimeToolEventRecorder = Callable[[str, dict[str, Any]], None]
@@ -116,6 +120,11 @@ class RuntimeToolStreamSink:
         }
         if self.record_tool_event is not None:
             recorded_tool_call = dict(tool_call)
+            # The chat recorder needs the unformatted result to detect and
+            # persist nested HITL payloads.  Keep it off the SSE payload so
+            # large or sensitive provider responses are never exposed to the
+            # browser merely to support durable server-side bookkeeping.
+            recorded_tool_call["raw_result"] = result
             provider_approval = normalize_provider_approval(
                 tool_name,
                 args,
@@ -123,6 +132,13 @@ class RuntimeToolStreamSink:
             )
             if provider_approval is not None:
                 recorded_tool_call["provider_approval"] = provider_approval
+            provider_approval_resolution = normalize_provider_approval_resolution(
+                tool_name,
+                args,
+                result,
+            )
+            if provider_approval_resolution is not None:
+                recorded_tool_call["provider_approval_resolution"] = provider_approval_resolution
             self.record_tool_event("tool_end", {"tool_call": recorded_tool_call})
         self._emit("tool_end", payload)
 
@@ -722,7 +738,7 @@ def runtime_tool_path_memory_outcome(result: str) -> str | None:
     recording entirely for this call).
     """
     text = result if isinstance(result, str) else str(result)
-    if text.strip().startswith('{"__hitl__":'):
+    if parse_hitl_envelope(result) is not None:
         return None
     try:
         parsed = json.loads(text)
@@ -755,7 +771,7 @@ def runtime_tool_call_error(result: str) -> str | None:
     what keeps every consumer of the contract in agreement.
     """
     text = result if isinstance(result, str) else str(result)
-    if text.strip().startswith('{"__hitl__":'):
+    if parse_hitl_envelope(result) is not None:
         return None
     if text.startswith(RUNTIME_TOOL_ERROR_PREFIX):
         return text[len(RUNTIME_TOOL_ERROR_PREFIX):].strip() or text

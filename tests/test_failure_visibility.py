@@ -606,10 +606,8 @@ async def test_chat_tool_success_is_logged_with_success_outcome(db_session, monk
 
 
 @pytest.mark.asyncio
-async def test_chat_message_persists_the_agentic_loops_round_count(db_session, monkeypatch):
-    """result.rounds (an AgenticResult field, already in scope at both
-    record_chat_llm_usage call sites) must actually reach the DB row —
-    before this task it was computed and logged but silently dropped."""
+async def test_chat_message_wires_per_call_billing_callbacks(db_session, monkeypatch):
+    """Chat delegates billing to the per-call callbacks, not a final aggregate."""
     from unittest.mock import AsyncMock, patch
 
     from packages.core.models.base import generate_ulid
@@ -629,9 +627,6 @@ async def test_chat_message_persists_the_agentic_loops_round_count(db_session, m
 
     captured = {}
 
-    async def fake_record_chat_llm_usage(_db, **kwargs):
-        captured.update(kwargs)
-
     async def fake_context(*_args, **_kwargs):
         return (
             "system", [], [],
@@ -643,6 +638,8 @@ async def test_chat_message_persists_the_agentic_loops_round_count(db_session, m
         )
 
     async def fake_loop(**kwargs):
+        captured["before"] = kwargs.get("on_llm_call_before")
+        captured["settled"] = kwargs.get("on_llm_usage_settled")
         from packages.core.ai.agentic_loop import AgenticResult
         return AgenticResult(
             content="Done.", messages=[], usage={"total_tokens": 10}, rounds=7,
@@ -653,7 +650,6 @@ async def test_chat_message_persists_the_agentic_loops_round_count(db_session, m
         patch("packages.core.services.chat_service.resolve_runtime_chat_context", new=fake_context),
         patch("packages.core.services.chat_service.runtime_execute_chat_agent_loop", new=fake_loop),
         patch("packages.core.services.model_resolver.resolve_model_for_user", new=AsyncMock(return_value="openai/gpt-5.5")),
-        patch("packages.core.services.chat_service.record_chat_llm_usage", new=fake_record_chat_llm_usage),
         patch("packages.core.services.chat_service.resolve_author_subscription_id", new=AsyncMock(return_value=None)),
         patch("packages.core.services.chat_service.record_chat_runtime_learning", new=AsyncMock(return_value=[])),
         patch("packages.core.services.chat_service.schedule_learning_candidate_applies", new=AsyncMock()),
@@ -664,7 +660,8 @@ async def test_chat_message_persists_the_agentic_loops_round_count(db_session, m
             entity_id=entity_id, user_id=user_id, db=db_session,
         )
 
-    assert captured["rounds"] == 7
+    assert callable(captured["before"])
+    assert callable(captured["settled"])
 
 
 # ── Defect B: the worker path writes tool-call rows at all ─────────

@@ -14,13 +14,15 @@ from pathlib import Path
 from typing import Any
 
 from packages.core.blueprints.payload import validate_payload
+from packages.core.blueprints.simulation import resolve_simulation_experience
 
 
-FROZEN_AT = "2026-06-03"
+FROZEN_AT = "2026-08-02"
 CONFIG_DIR = Path(__file__).with_name("configs") / "solo_company"
 CONFIG_ORDER = (
     "product-video-studio-v1.json",
     "solo-video-account-studio-v1.json",
+    "solo-content-distribution-studio-v1.json",
     "solo-faceless-stickman-studio-v1.json",
     "solo-productized-service-os-v1.json",
     "solo-digital-product-store-v1.json",
@@ -37,6 +39,12 @@ class FrozenSoloCompanyBlueprint:
 
 def _load_payload(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    validate_payload(payload)
+    recipe = payload["recipe"]
+    recipe.setdefault(
+        "simulation_experience",
+        resolve_simulation_experience(payload),
+    )
     validate_payload(payload)
     return payload
 

@@ -35,6 +35,14 @@ DEFAULT_OUTPUT_PROFILE = {
     "voice_profile": "natural_explainer",
     "subtitle_profile": "clean_bottom",
 }
+PRODUCT_VIDEO_CHAT_FINAL_OUTPUT_FIELDS = [
+    "business_outcome",
+    "project_id",
+    "project_root",
+    "final_video",
+    "retry_segment_ids",
+    "retry_from_step_id",
+]
 
 
 ARTIFACT_REF_SCHEMA = {
@@ -226,6 +234,7 @@ PRODUCT_VIDEO_REQUEST_SCHEMA = {
             "audience",
             "video_type",
             "promotion_goal",
+            "duration_seconds",
             "must_show",
             "must_not_show",
             "final_cta",
@@ -255,6 +264,12 @@ PRODUCT_VIDEO_REQUEST_SCHEMA = {
             "description": "The product promise and outcome this video must prove.",
             "minLength": 1,
             "x-ui": {"control": "textarea", "rows": 3},
+        },
+        "duration_seconds": {
+            "type": "number",
+            "title": "Target duration (seconds)",
+            "minimum": 1,
+            "maximum": 3600,
         },
         "video_type": {
             "type": "string",
@@ -364,7 +379,7 @@ DEFAULT_PRODUCT_VIDEO_REQUEST = {
         "Follow the brief's language and tone and use one continuous narration track."
     ),
     "subtitle_instructions": (
-        "Use 52px subtitles on a 1920x1080 canvas, scale proportionally for other "
+        "Use 20px subtitles on a 1920x1080 canvas, scale proportionally for other "
         "resolutions, keep at most two lines, a light outline, and the bottom safe area."
     ),
     "production_constraints": [
@@ -1408,6 +1423,27 @@ if declared_scene_ids != scene_object_ids:
     )
 
 for scene_id, scene in scenes_by_id.items():
+    required_asset_types = {
+        asset_type for asset_type in scene.get("required_asset_types", [])
+        if isinstance(asset_type, str) and asset_type
+    }
+    evidence_asset_types = {
+        evidence.get("required_asset_type")
+        for evidence in scene.get("acceptance_evidence", [])
+        if isinstance(evidence, dict)
+        and isinstance(evidence.get("required_asset_type"), str)
+        and evidence.get("required_asset_type")
+    }
+    if required_asset_types != evidence_asset_types:
+        invalid_scene_ids.add(scene_id)
+        fail(
+            "scene_asset_acceptance_evidence_mismatch",
+            scene_id=scene_id,
+            expected_asset_types=sorted(required_asset_types),
+            actual_asset_types=sorted(evidence_asset_types),
+            missing_asset_types=sorted(required_asset_types - evidence_asset_types),
+            unexpected_asset_types=sorted(evidence_asset_types - required_asset_types),
+        )
     available_seconds = float(scene.get("target_duration_seconds") or 0)
     estimated_seconds = estimated_narration_seconds(scene.get("canonical_narration"))
     allowed_overage = min(0.75, available_seconds * 0.10)
@@ -1707,10 +1743,20 @@ def validate_artifact(artifact):
         retry_scene_ids.add(scene_id)
         return False, scene_id, kind
     asset_type = matching_asset_types[0]
-    expected_evidence = [
+    scene_acceptance_evidence = [
         item for item in approved_scene.get("acceptance_evidence", [])
-        if isinstance(item, dict) and item.get("required_asset_type") == asset_type
+        if isinstance(item, dict)
     ]
+    expected_evidence = [
+        item for item in scene_acceptance_evidence
+        if item.get("required_asset_type") == asset_type
+    ]
+    legacy_asset_evidence = not expected_evidence and bool(scene_acceptance_evidence)
+    if legacy_asset_evidence:
+        expected_evidence = [
+            {**item, "required_asset_type": asset_type}
+            for item in scene_acceptance_evidence
+        ]
     provenance = artifact.get("provenance")
     provenance = provenance if isinstance(provenance, dict) else {}
     artifact_evidence = provenance.get("acceptance_evidence")
@@ -1731,13 +1777,25 @@ def validate_artifact(artifact):
     )
     verified_capture_receipt = (
         artifact.get("source") == "browser_capture"
-        and provenance.get(verification_field) is True
         and provenance.get("source_url") in expected_source_urls
+        and (
+            provenance.get(verification_field) is True
+            or (
+                isinstance(provenance.get("acceptance"), str)
+                and bool(provenance.get("acceptance").strip())
+                and isinstance(artifact.get("document_id"), str)
+                and bool(artifact.get("document_id").strip())
+            )
+        )
     )
     evidence_matches = bool(expected_evidence) and (
-        canonical(artifact_evidence) == canonical(expected_evidence)
-        if artifact_evidence
-        else verified_capture_receipt
+        verified_capture_receipt and provenance.get(verification_field) is True
+        if legacy_asset_evidence
+        else (
+            canonical(artifact_evidence) == canonical(expected_evidence)
+            if artifact_evidence
+            else verified_capture_receipt
+        )
     )
     if not evidence_matches:
         reject(
@@ -2106,6 +2164,25 @@ if not isinstance(probe_report.get("video_stream"), dict) or not probe_report.ge
     fail("video_stream_probe_missing")
 if not isinstance(probe_report.get("audio_stream"), dict) or not probe_report.get("audio_stream"):
     fail("audio_stream_probe_missing")
+requested_duration = request.get("duration_seconds")
+actual_duration = probe_report.get("duration_seconds")
+if (
+    isinstance(requested_duration, (int, float))
+    and not isinstance(requested_duration, bool)
+    and requested_duration > 0
+):
+    duration_tolerance = max(0.5, min(1.0, requested_duration * 0.02))
+    if (
+        not isinstance(actual_duration, (int, float))
+        or isinstance(actual_duration, bool)
+        or abs(actual_duration - requested_duration) > duration_tolerance
+    ):
+        fail(
+            "final_duration_mismatch",
+            expected_seconds=requested_duration,
+            actual_seconds=actual_duration,
+            tolerance_seconds=duration_tolerance,
+        )
 
 audio_findings = audio_analysis.get("findings")
 if (
@@ -2165,12 +2242,9 @@ if (
 ):
     expected_subtitle_font_size = max(
         16,
-        min(56, round(min(video_width, video_height) * 14 / 288)),
+        min(20, round(min(video_width, video_height) * 20 / 1080)),
     )
-    expected_subtitle_outline = max(
-        1,
-        min(2, round(min(video_width, video_height) / 540)),
-    )
+    expected_subtitle_outline = 1
     expected_subtitle_margin_v = max(
         28,
         min(80, round(min(video_width, video_height) / 15)),
@@ -2860,7 +2934,10 @@ def _plan_steps() -> list[dict[str, Any]]:
             prompt=(
                 "Validate and normalize this structured product video request into exactly the supplied "
                 "JSON schema. "
-                "Do not invent a product, URL, audience, CTA, credentials, or product journey. Apply "
+                "Do not invent a product, URL, audience, CTA, credentials, or product journey. "
+                "When request.duration_seconds is supplied, preserve it and set "
+                "output_profile.target_duration_seconds.min and max to that exact value; this explicit "
+                "duration overrides the default range. Apply "
                 f"this output profile only for omitted presentation fields: {DEFAULT_OUTPUT_PROFILE}. "
                 "Request: {{request}}"
             ),
@@ -2954,7 +3031,9 @@ def _plan_steps() -> list[dict[str, Any]]:
                 "Create one evidence-backed product video plan. Every scene needs a stable scene_id, "
                 "target_page, precondition, ordered_actions, expected_visual_state, canonical_narration, "
                 "required_asset_types, acceptance_evidence, target_duration_seconds, dependencies, recovery, "
-                "and privacy. Every request.must_show item must map to one or more explicit scene_id values and "
+                "and privacy. For every required_asset_types value, include at least one acceptance_evidence "
+                "entry whose required_asset_type matches that value. Every request.must_show item must map to one "
+                "or more explicit scene_id values and "
                 "acceptance_evidence entries. Create generated video scenes only for request.must_show; never "
                 "turn a generic promotion_goal claim or workflow acceptance check into another scene. No product "
                 "claim may appear in canonical_narration without an evidence-backed scene. Knowledge completeness "
@@ -4215,6 +4294,9 @@ def _flat_planning_steps(*, terminal: bool) -> list[dict[str, Any]]:
             prompt=(
                 "Validate and normalize this structured product video request into exactly the supplied "
                 "JSON schema. Do not invent a product, URL, audience, CTA, credentials, or product journey. "
+                "When request.duration_seconds is supplied, preserve it and set "
+                "output_profile.target_duration_seconds.min and max to that exact value; this explicit "
+                "duration overrides the default range. "
                 f"Apply this output profile only for omitted presentation fields: {DEFAULT_OUTPUT_PROFILE}. "
                 "Request: {{request}}"
             ),
@@ -4399,7 +4481,9 @@ def _flat_planning_steps(*, terminal: bool) -> list[dict[str, Any]]:
                 "menu, open reversible option menus, enumerate every visible option, then close them without "
                 "selecting an option. Stop immediately once every must-show requirement is verified. "
                 "Do not inspect unrelated selectors, menus, account controls, or routes. For every must-show "
-                "requirement, report the exact route and control label. Readiness depends only on must-show "
+                "requirement, report the exact route and control label. Treat request.must_show values as "
+                "conceptual requirements, not literal visible labels; include a label in observations only when "
+                "Chrome returned that exact visible text. Readiness depends only on must-show "
                 "coverage and actionable browser blockers; final_cta is downstream narration, not a discovery "
                 "requirement. Do not open a control when must-show only asks to show its label or current state. "
                 "For capabilities that must be opened, report the exact route and control "
@@ -4426,7 +4510,9 @@ def _flat_planning_steps(*, terminal: bool) -> list[dict[str, Any]]:
                             "For each selector, open reversible option menus and enumerate every visible option "
                             "before closing them only when the selector is required by must-show. "
                             "Stop immediately once every must-show requirement is verified. Do not inspect unrelated "
-                            "selectors, menus, account controls, or routes. Readiness depends only on must-show coverage "
+                            "selectors, menus, account controls, or routes. Treat request.must_show values as conceptual "
+                            "requirements, not literal visible labels; include a label in observations only when Chrome "
+                            "returned that exact visible text. Readiness depends only on must-show coverage "
                             "and actionable browser blockers; final_cta is downstream narration, not a discovery "
                             "requirement. Do not open a control when must-show only asks to show its label or current state. "
                             "Observe the exact route and control label for "
@@ -4584,7 +4670,9 @@ def _flat_planning_steps(*, terminal: bool) -> list[dict[str, Any]]:
                 "wrapper project directory. Every scene is a stable Retry Segment ID with an exact "
                 "target_page, precondition, ordered_actions, expected_visual_state, canonical_narration, "
                 "required_asset_types, acceptance_evidence, target_duration_seconds, dependencies, recovery, and "
-                "privacy. Every request.must_show item must map to one or more explicit scene_id values and "
+                "privacy. For every required_asset_types value, include at least one acceptance_evidence entry "
+                "whose required_asset_type matches that value. Every request.must_show item must map to one or more "
+                "explicit scene_id values and "
                 "acceptance_evidence entries; copy the requested item into acceptance_evidence.must_show and into "
                 "one must_show_coverage entry containing the exact requirement, non-empty scene_ids, and non-empty "
                 "acceptance_evidence. Set must_show_coverage_complete true only when every request.must_show value "
@@ -4599,6 +4687,8 @@ def _flat_planning_steps(*, terminal: bool) -> list[dict[str, Any]]:
                 "subtitle files, final MP4 playback, machine QA, and final operator acceptance are downstream "
                 "workflow outputs; never put them in a scene precondition, ordered action, expected visual state, "
                 "required asset type, or acceptance evidence. Use only routes and controls observed in discovery. "
+                "expected_visual_state.visible_labels must contain only exact labels from discovery observations; "
+                "never copy a conceptual request.must_show phrase there unless discovery observed it verbatim. "
                 "Treat the supplied start input as authoritative; promotion_goal and final_cta may shape claims "
                 "only inside the evidence-backed must-show scenes. Request: {{request}}. "
                 "Discovery: {{discovered_journey}}. Return only JSON."
@@ -4769,14 +4859,23 @@ def _collector_agent_step(
         prompt=(
             "Collect the approved product-video asset batch in the current paired Chrome session. The complete "
             f"approved shot list is {segments_ref}; operate only on Retry Segment IDs {retry_ids_ref}. Use the "
+            "Operator revision notes are {{revision_notes}}; apply them only to resolve the reported blocker without "
+            "changing approved scene identity, route, or scope. Use the "
             "authoritative product source {{project.state.product_source}}, capture grant "
-            "{{capture_grant.grant_id}}, and exact project root {{project.state.project_root}}. Split work "
+            "{{capture_grant.grant_id}}, and exact project root {{project.state.project_root}}. The inline "
+            "WorkflowProject state and approved shot list are complete and authoritative. Do not call list_files "
+            "or read_file to discover a project, prior run, ledger, manifest, scene, or artifact; those searches "
+            "can select a different Workspace and consume the browser-operation budget. Split work "
             "internally into bounded Chrome phases containing one coherent operation or at most two adjacent "
             "assets. Use one Browser Group, create separate retryable clips, stop recording during long waits, "
             "and call finalize_tabs only in the final phase. Execute only each scene's approved ordered_actions, "
             "in order, on target_page: restore precondition, observe expected_visual_state, and return every "
             "required_asset_types asset and its acceptance_evidence. A product-side effect reuse decision does not "
-            "authorize skipping the requested screenshot or recording. Reuse existing ready artifact IDs only "
+            "authorize skipping the requested screenshot or recording. "
+            "For every ready artifact, copy the matching approved evidence exactly into "
+            "provenance.acceptance_evidence. Also set provenance.acceptance_verified=true for recordings and "
+            "provenance.bitmap_acceptance_verified=true for screenshots only after inspecting the captured result. "
+            "Reuse existing ready artifact IDs only "
             "when their provenance and acceptance evidence match the same scene_id and required asset type. For "
             "retry or reuse, consider only validator-approved artifacts already persisted in project.state.artifacts "
             "({{project.state.artifacts}}). Never reuse raw artifacts or preserved receipts from collection_result "
@@ -4799,8 +4898,21 @@ def _collector_agent_step(
                     "skill": "chrome",
                     "input": (
                         "Use Chrome for the approved product-video asset batch at "
-                        "{{project.state.product_source}}. Work only inside project root "
-                        "{{project.state.project_root}} and only on the supplied Retry Segment IDs. Return to "
+                        "{{project.state.product_source}}. Approved scenes are "
+                        f"{segments_ref}. Retry Segment IDs are {retry_ids_ref}. "
+                        "Operator revision notes are {{revision_notes}}; apply them only to resolve the reported "
+                        "blocker without changing approved scene identity, route, or scope. "
+                        "Work only on the supplied Retry Segment IDs. "
+                        "Work only inside project root "
+                        "{{project.state.project_root}}. The inline WorkflowProject state is complete. Do not "
+                        "call list_files or read_file to discover projects, ledgers, manifests, scenes, or prior "
+                        "artifacts. Save recordings to Knowledge/{{project.state.project_root}}/captures/recordings "
+                        "and save screenshots to Knowledge/{{project.state.project_root}}/captures/screenshots. "
+                        "Set knowledge_folder exactly to Knowledge/{{project.state.project_root}}/captures/recordings "
+                        "on every recording call and Set knowledge_folder exactly to "
+                        "Knowledge/{{project.state.project_root}}/captures/screenshots on every screenshot call; "
+                        "do not use Knowledge/Recordings or Knowledge/Screenshots. "
+                        "Return to "
                         "each exact approved target_page and execute only ordered_actions after verifying the "
                         "precondition. Verify target_page, ordered_actions, and expected_visual_state exactly; "
                         "never substitute a similarly named global or sidebar control. Never substitute Dashboard, "
@@ -5035,15 +5147,20 @@ def _flat_media_pipeline_steps(
                 "an executable path when a durable document_id is already present. Build or reuse the clean "
                 "picture master, convert only planned stills, and remove or accelerate non-critical waits. Generate "
                 "one continuous final narration take from plan.canonical_narration through the Account-selected "
-                "BYOK voice model, then normalize that final audio. Do not synthesize or stitch per-scene narration. "
+                "BYOK voice model: set generate_audio prompt exactly equal to plan.canonical_narration with no prefix "
+                "or suffix. Put delivery and style directions only in voice_instructions. Do not include instructions "
+                "or labels in the spoken prompt. Then normalize that final audio. Do not synthesize or stitch "
+                "per-scene narration. "
                 "Pass the final narration audio, canonical transcript, and explicit visual scene intervals to "
                 "align_subtitles and require measured semantic sentence/word timestamps. Never use proportional cue "
-                "scaling. Produce ASS subtitles, never SRT, using the v3 visual baseline reduced by two type "
-                "points: 52 px at 1080p and 35 px at 720p (scale by the canvas short edge), a two-line maximum, "
-                "2 px outline and 72 px bottom-safe margin at 1080p. Map "
+                "scaling. Produce ASS subtitles, never SRT, at 20 px at 1080p and 16 px at 720p (scale by the "
+                "canvas short edge), a two-line maximum, 1 px outline and 72 px bottom-safe margin at 1080p. Map "
                 "aligned sentence intervals to visual scene boundaries. Use the "
                 "measured narration boundaries to rebuild the clean picture master so every narration interval falls "
                 "inside its matching visual scene interval without recapturing already sufficient source footage. "
+                "The final MP4 duration must be exactly project.state.request.duration_seconds within media timing "
+                "tolerance. When the continuous narration ends before that target, keep the final approved scene visible "
+                "for the remaining time; never shorten the requested video to the narration duration. "
                 "Compute each narration span "
                 "and visual duration directly from timeline.visual_scene_intervals; when the resulting deficit "
                 "exceeds min(0.75 seconds, 10% "
@@ -5414,8 +5531,8 @@ def _flat_media_pipeline_steps(
                 "measured_sync_passed true only when measured cue-to-scene sync passes. machine_pass requires all "
                 "three booleans true and every coverage status covered. Return covered_must_show as the covered "
                 "requirement strings in exact project.state.request.must_show order. "
-                "Validate subtitle style at 52 px at 1080p or 35 px at 720p, no more than two lines, a proportional "
-                "outline (2 px at 1080p), Shadow=0, and a proportional bottom-safe margin (72 px at 1080p). Check "
+                "Validate subtitle style at 20 px at 1080p or 16 px at 720p, no more than two lines, a proportional "
+                "outline (1 px at 1080p), Shadow=0, and a proportional bottom-safe margin (72 px at 1080p). Check "
                 "measured cue-to-scene sync against the explicit visual "
                 "scene intervals, plus wrong or "
                 "private states, UI overlap, claims, and no-publish status. When the source brief explicitly permits "
@@ -5991,6 +6108,8 @@ def _flat_revision_steps() -> list[dict[str, Any]]:
                 "produce a complete updated plan and approval; page-state corrections keep the approved plan "
                 "version. Recompute updated_plan.must_show_coverage and covered_must_show from the authoritative "
                 "project request, and set must_show_coverage_complete only when every requirement remains mapped. "
+                "For every required_asset_types value, include at least one acceptance_evidence entry whose "
+                "required_asset_type matches that value. "
                 "Browser scenes may depend only on states available before post-production. Narration, "
                 "subtitles, final MP4 playback, QA, and acceptance are downstream workflow outputs; never put them "
                 "in a scene precondition or browser acceptance criterion. Project: {{project.state}}."
@@ -6521,7 +6640,15 @@ async def _seed_workspace_workflows(
                         "description": spec["description"],
                         "minimum_confidence": 0.85,
                     },
-                    "projection": {"progress": True, "step_outputs": "explicit"},
+                    "projection": {
+                        "progress": True,
+                        "step_outputs": "none",
+                        "final_output": True,
+                        "approval_review": "history",
+                        "final_output_fields": list(
+                            PRODUCT_VIDEO_CHAT_FINAL_OUTPUT_FIELDS
+                        ),
+                    },
                     "wait_bridge": True,
                 },
                 "no_external_publish": True,

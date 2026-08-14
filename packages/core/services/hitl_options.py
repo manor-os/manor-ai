@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-ApprovalChoice = Literal["approve", "always_approve", "reject"]
+ApprovalChoice = Literal["approve", "always_approve", "revise", "reject"]
 
 APPROVAL_CHOICE_APPROVE: ApprovalChoice = "approve"
 APPROVAL_CHOICE_ALWAYS_APPROVE: ApprovalChoice = "always_approve"
+APPROVAL_CHOICE_REVISE: ApprovalChoice = "revise"
 APPROVAL_CHOICE_REJECT: ApprovalChoice = "reject"
+
+APPROVAL_CHOICES: list[ApprovalChoice] = [
+    APPROVAL_CHOICE_APPROVE,
+    APPROVAL_CHOICE_ALWAYS_APPROVE,
+    APPROVAL_CHOICE_REVISE,
+    APPROVAL_CHOICE_REJECT,
+]
 
 DEFAULT_APPROVAL_OPTIONS: list[ApprovalChoice] = [
     APPROVAL_CHOICE_APPROVE,
@@ -18,13 +26,13 @@ def normalize_approval_choice(value: Any) -> ApprovalChoice | None:
     """Normalize an approval choice to the fixed public schema.
 
     Approval cards and action APIs must pass exactly one of:
-    ``approve``, ``always_approve``, or ``reject``. Plain-text replies such as
+    ``approve``, ``always_approve``, ``revise``, or ``reject``. Plain-text replies such as
     "yes" or "可以" should be classified by an edge adapter before they reach
     this schema boundary.
     """
 
     normalized = str(value or "").strip().lower()
-    if normalized in DEFAULT_APPROVAL_OPTIONS:
+    if normalized in APPROVAL_CHOICES:
         return normalized  # type: ignore[return-value]
     return None
 

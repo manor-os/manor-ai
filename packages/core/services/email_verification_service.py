@@ -16,7 +16,14 @@ _sync_redis = None
 
 
 def _generate_code() -> str:
-    return f"{secrets.randbelow(900000) + 100000}"
+    # CASA test guidance expects a verifier containing both letters and
+    # numbers. Exclude ambiguous glyphs while preserving at least one of each.
+    letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    digits = "23456789"
+    chars = [secrets.choice(letters), secrets.choice(digits)]
+    chars.extend(secrets.choice(letters + digits) for _ in range(6))
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
 
 
 def _redis():
@@ -48,7 +55,7 @@ async def create_verification(email: str, user_id: str) -> str:
     else:
         _fallback[email] = {"code": code, "user_id": user_id, "attempts": 0}
 
-    logger.warning("DEV — Verification code for %s: %s", email, code)
+    logger.info("Email verification code issued", extra={"verification_user_id": user_id})
     return code
 
 

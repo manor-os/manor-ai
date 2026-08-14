@@ -462,12 +462,22 @@ async def _connection_options(db: AsyncSession, user: User) -> list[CalendarConn
         .order_by(OAuthAccount.created_at.asc())
     )).scalars().all()
     options: list[CalendarConnectionOption] = []
+    from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+
     seen: set[str] = set()
     for row in rows:
         profile = row.profile or {}
         email = _first_email(profile.get("email"), row.provider_user_id)
         if not email:
-            email = await _calendar_email_from_token(row.provider, row.access_token)
+            creds = lease_oauth_account_tokens(
+                row,
+                requester_id=user.id,
+                reason="oauth.calendar_connection_label",
+                requester_kind="user",
+            )
+            email = await _calendar_email_from_token(
+                row.provider, creds.get("access_token"),
+            )
         display = _calendar_account_label(
             row.provider,
             email,
@@ -795,8 +805,14 @@ async def _resolve_calendar_token(
                 OAuthAccount.provider.in_(aliases),
             )
         )).scalar_one_or_none()
-        if oauth and oauth.access_token:
-            return oauth.access_token
+        if oauth:
+            from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+            return lease_oauth_account_tokens(
+                oauth,
+                requester_id=owner.id,
+                reason="oauth.calendar_action",
+                requester_kind="user",
+            ).get("access_token")
         integration = (await db.execute(
             select(Integration).where(
                 Integration.id == account_id,
@@ -819,8 +835,15 @@ async def _resolve_calendar_token(
     )).scalars().all()
     if oauth_rows:
         chosen = next((row for row in oauth_rows if (row.profile or {}).get("is_default")), oauth_rows[0])
-        if chosen.access_token:
-            return chosen.access_token
+        from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+        token = lease_oauth_account_tokens(
+            chosen,
+            requester_id=owner.id,
+            reason="oauth.calendar_action_default",
+            requester_kind="user",
+        ).get("access_token")
+        if token:
+            return token
 
     integrations = (await db.execute(
         select(Integration)

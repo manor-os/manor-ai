@@ -88,7 +88,7 @@ test("the workflow AI edit button reuses FloatingChat live edit", async () => {
   assert.match(flowsSource, /fileType: "workflow"/);
   assert.match(flowsSource, /getContent: \(\) => serializeWorkflowLiveEdit/);
   assert.match(flowsSource, /const update = parseWorkflowLiveEdit\(content\)/);
-  assert.match(flowsSource, /<AiEditButton[^>]*onClick=\{openWorkflowAiEdit\}/);
+  assert.match(flowsSource, /<AiEditButton[\s\S]*?onClick=\{openWorkflowAiEdit\}/);
   assert.match(flowsSource, /closeEditorLiveChat\(\)/);
   assert.doesNotMatch(flowsSource, /WorkflowAiPanel/);
 
